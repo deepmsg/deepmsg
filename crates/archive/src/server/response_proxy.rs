@@ -805,7 +805,7 @@ mod tests {
         };
 
         let dir = TempDir::new();
-        let mut catalog = Catalog::create(dir.path(), DEFAULT_CAPACITY, 100).expect("a catalog");
+        let mut catalog = Catalog::create(dir.path(), DEFAULT_CAPACITY, 100, 0).expect("a catalog");
 
         let written = Recording {
             recording_id: 0,

@@ -7411,6 +7411,22 @@ impl ArchiveConductor {
     /// own: whether the recorder is this conductor's object or a thread of its
     /// own is `aeron.archive.threading.mode`, which the launcher reads to decide
     /// what to start — so it is handed the one it decided on
+    /// The reference's close-time force on the catalog
+    /// (`Catalog.unmapAndCloseChannel`, `:1252-1259`).
+    ///
+    /// ★ It is the **one** force the sync level does not govern — the reference
+    /// writes `fsync(catalogChannel, true, true)` with both arguments literal —
+    /// and it is here rather than on the archive's own shutdown because the
+    /// catalog is this object's field.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::catalog::CatalogError::Io`] when the force fails, which is the
+    /// reference's own handling: it rethrows.
+    pub fn close_catalog(&self) -> Result<(), crate::catalog::CatalogError> {
+        self.catalog.close()
+    }
+
     /// ([`RecorderHalf`]) rather than making one here and finding out
     /// afterwards.
     #[allow(clippy::too_many_arguments)] // one per thing the archive was built with
@@ -7797,7 +7813,7 @@ mod tests {
     fn catalog_with_a_recording() -> (TempDir, Catalog) {
         let dir = TempDir::new();
         let mut catalog =
-            Catalog::create(dir.path(), crate::catalog::DEFAULT_CAPACITY, 0).expect("a catalog");
+            Catalog::create(dir.path(), crate::catalog::DEFAULT_CAPACITY, 0, 0).expect("a catalog");
 
         catalog
             .add_recording(&Recording {
@@ -7827,7 +7843,7 @@ mod tests {
     fn catalog_with_recordings(recordings: &[(i32, &str)]) -> (TempDir, Catalog) {
         let dir = TempDir::new();
         let mut catalog =
-            Catalog::create(dir.path(), crate::catalog::DEFAULT_CAPACITY, 0).expect("a catalog");
+            Catalog::create(dir.path(), crate::catalog::DEFAULT_CAPACITY, 0, 0).expect("a catalog");
 
         for (index, (stream_id, channel)) in recordings.iter().enumerate() {
             let index = i64::try_from(index).expect("small");

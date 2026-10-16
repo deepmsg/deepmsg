@@ -27,6 +27,7 @@
 //! leaves owed rather than leaving it to be discovered.
 
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -337,6 +338,45 @@ pub struct Catalog {
     next_recording_id: i64,
     next_offset: usize,
     index: CatalogIndex,
+    /// Above zero the catalog is forced after every change, above one its
+    /// metadata as well (`Catalog.java:161-162`) — the same two lines
+    /// `RecordingWriter.java:88-89` sets for the segments, and the same two
+    /// [`crate::segment::SegmentWriter`] sets from the file's own level.
+    force_writes: bool,
+    force_metadata: bool,
+    /// The descriptor every force on the catalog goes through, which is **not**
+    /// the one the mapping came from: [`MappedFile`] keeps only the path,
+    /// because a mapping outlives its descriptor. The reference's
+    /// `catalogChannel` is the channel its mapping came from and stays open for
+    /// as long as the catalog does (`Catalog.java:195`), so the shape is the
+    /// reference's rather than a consequence of ours — and it is why an `fsync`
+    /// here reaches pages this process wrote through `mmap`.
+    ///
+    /// ★ **Open at every level**, because the close-time force is not a level's
+    /// business (`:1257`, [`Catalog::close`]). The reference's `null` case is
+    /// its **read-only** constructor (`:254-257`), which this build has no
+    /// counterpart for: every catalog here is opened read-write.
+    catalog_channel: File,
+    /// How many forces have been made, which is what a test can see of a promise
+    /// that is otherwise between this process and the device.
+    ///
+    /// ★ **Deliberately self-referential, and here on purpose.** It observes
+    /// *this* code asking, not the kernel answering — a `sync_data` that
+    /// returned `Ok` without doing anything would leave it green. What it can
+    /// catch is the error that is actually available in this shape: a change
+    /// that lands and forgets to force, which is the whole risk of the rule.
+    /// The claim that the kernel is reached is a **separate reading**, taken once
+    /// with `strace` (`analysis/archive/deepmsg-p2-12-plan-catalog-file-sync.md`
+    /// §4.2), and that one is not a gate.
+    #[cfg(test)]
+    forces: std::cell::Cell<usize>,
+    /// The archive directory, for the one force the reference makes on it — a
+    /// catalog that has just been **created** (`Catalog.java:226`), so that the
+    /// new file's directory entry is durable. `None` at level 0, which is
+    /// `channelForDirectorySync`'s own answer (`Archive.java:3917-3931`): there
+    /// is a catalog file to force at every level, and a directory entry only
+    /// when something is being forced.
+    archive_dir_channel: Option<File>,
 }
 
 impl Catalog {
@@ -351,10 +391,14 @@ impl Catalog {
     ///
     /// [`CatalogError::Capacity`] for a capacity the format cannot hold, and
     /// the file system's own errors.
+    /// `file_sync_level` is `aeron.archive.catalog.file.sync.level`
+    /// (`Archive.java:380`, default 0): above zero every change is forced to
+    /// disk, above one the metadata as well (`Catalog.java:161-162`).
     pub fn create(
         directory: &Path,
         capacity: usize,
         next_recording_id: i64,
+        file_sync_level: i32,
     ) -> Result<Self, CatalogError> {
         if !(MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity) {
             return Err(CatalogError::Capacity { asked: capacity });
@@ -362,6 +406,8 @@ impl Catalog {
 
         let path = directory.join(FILENAME);
         let file = MappedFile::create(&path, capacity)?;
+        let (catalog_channel, archive_dir_channel) =
+            Self::force_channels(&path, directory, file_sync_level)?;
         let mut catalog = Self {
             file,
             path,
@@ -369,9 +415,21 @@ impl Catalog {
             next_recording_id,
             next_offset: HEADER_LENGTH,
             index: CatalogIndex::new(),
+            force_writes: file_sync_level > 0,
+            force_metadata: file_sync_level > 1,
+            catalog_channel,
+            archive_dir_channel,
+            #[cfg(test)]
+            forces: std::cell::Cell::new(0),
         };
 
         catalog.write_header()?;
+
+        // The reference forces the **directory** here, and this is the only
+        // place it does (`Catalog.java:226`): the catalog has just been created,
+        // so what is new is the directory entry. The file's own bytes are not
+        // forced here — their first force is the first recording's.
+        catalog.force_archive_directory()?;
 
         Ok(catalog)
     }
@@ -384,9 +442,12 @@ impl Catalog {
     ///
     /// [`CatalogError::Version`] for a file written by another major — only the
     /// major, as the mark file's own rule does.
-    pub fn open(directory: &Path) -> Result<Self, CatalogError> {
+    /// `file_sync_level` is as [`Catalog::create`]'s.
+    pub fn open(directory: &Path, file_sync_level: i32) -> Result<Self, CatalogError> {
         let path = directory.join(FILENAME);
         let file = MappedFile::open_readwrite(&path)?;
+        let (catalog_channel, archive_dir_channel) =
+            Self::force_channels(&path, directory, file_sync_level)?;
         let mut catalog = Self {
             file,
             path,
@@ -394,6 +455,12 @@ impl Catalog {
             next_recording_id: 0,
             next_offset: HEADER_LENGTH,
             index: CatalogIndex::new(),
+            force_writes: file_sync_level > 0,
+            force_metadata: file_sync_level > 1,
+            catalog_channel,
+            archive_dir_channel,
+            #[cfg(test)]
+            forces: std::cell::Cell::new(0),
         };
 
         let header = catalog.header_bytes()?;
@@ -424,12 +491,123 @@ impl Catalog {
         directory: &Path,
         capacity: usize,
         next_recording_id: i64,
+        file_sync_level: i32,
     ) -> Result<Self, CatalogError> {
         if directory.join(FILENAME).exists() {
-            Self::open(directory)
+            Self::open(directory, file_sync_level)
         } else {
-            Self::create(directory, capacity, next_recording_id)
+            Self::create(directory, capacity, next_recording_id, file_sync_level)
         }
+    }
+
+    /// The descriptors a force goes through: the catalog's **always**, the
+    /// archive directory's only above level 0.
+    ///
+    /// The two answers differ because the reference asks two questions. "Is
+    /// there a catalog file to force?" is answered yes at every level — its
+    /// channel is the mapping's own, and the close-time force uses it whatever
+    /// the level says (`:195`, `:1257`). "Is there a directory entry to force?"
+    /// is answered by the level, because the directory channel is opened for
+    /// that force alone (`channelForDirectorySync`, `Archive.java:3917-3931`).
+    ///
+    /// Their failures differ for the same reason: the catalog's channel is
+    /// opened where the mapping is opened and a failure there is the mapping's
+    /// failure (a `throw`, `:191-196`), while the directory's is **swallowed**
+    /// and answered with `null` (`:3925-3927`) — a directory that will not open
+    /// is a directory entry that will not be forced, not an archive that will
+    /// not start.
+    fn force_channels(
+        catalog: &Path,
+        archive_dir: &Path,
+        file_sync_level: i32,
+    ) -> Result<(File, Option<File>), CatalogError> {
+        let channel = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(catalog)
+            .map_err(CatalogError::Io)?;
+
+        let directory = if file_sync_level > 0 {
+            File::open(archive_dir).ok()
+        } else {
+            None
+        };
+
+        Ok((channel, directory))
+    }
+
+    /// Force the catalog after a change that has landed
+    /// (`Catalog.forceWrites(catalogChannel)`).
+    ///
+    /// Silent at level 0 — which is [`Catalog::force`]'s guard, and the whole of
+    /// the difference between this and [`Catalog::close`].
+    fn force_catalog(&self) -> Result<(), CatalogError> {
+        self.force(&self.catalog_channel)
+    }
+
+    /// Force the catalog one last time, on the way out
+    /// (`Catalog.unmapAndCloseChannel`, `:1252-1259`).
+    ///
+    /// ★ **Both of the reference's arguments here are literal** —
+    /// `fsync(catalogChannel, true, true)` — so this force happens at **every**
+    /// level, including 0, and asks for the metadata whether or not the level
+    /// did. It is the one force the level does not govern, and the reason the
+    /// catalog's channel is opened at all at level 0.
+    ///
+    /// A failure is an error like every other force's (`:1115` rethrows), which
+    /// is why this is a method rather than something `Drop` does: a drop cannot
+    /// say what went wrong.
+    ///
+    /// # Errors
+    ///
+    /// [`CatalogError::Io`] when the force fails.
+    pub fn close(&self) -> Result<(), CatalogError> {
+        self.catalog_channel.sync_all().map_err(CatalogError::Io)?;
+
+        #[cfg(test)]
+        self.forces.set(self.forces.get() + 1);
+
+        Ok(())
+    }
+
+    /// The one force the reference makes on the archive directory, after a
+    /// catalog has been created (`Catalog.java:226`).
+    fn force_archive_directory(&self) -> Result<(), CatalogError> {
+        match &self.archive_dir_channel {
+            Some(channel) => self.force(channel),
+            None => Ok(()),
+        }
+    }
+
+    /// `FileChannel.force(metaData)`, which is `fsync` when the metadata is
+    /// asked for and `fdatasync` when it is not — the pair
+    /// [`crate::segment::SegmentWriter`] already uses for the segments.
+    ///
+    /// **A force that fails is an error, not a warning.** The reference
+    /// rethrows it unchecked (`Catalog.java:1115`), so a catalog that could not
+    /// be made durable is something the caller is told about rather than
+    /// something it is not.
+    fn force(&self, channel: &File) -> Result<(), CatalogError> {
+        if !self.force_writes {
+            return Ok(());
+        }
+
+        #[cfg(test)]
+        self.forces.set(self.forces.get() + 1);
+
+        if self.force_metadata {
+            channel.sync_all()
+        } else {
+            channel.sync_data()
+        }
+        .map_err(CatalogError::Io)
+    }
+
+    /// How many forces this catalog has made — see the field for what that is
+    /// and is not evidence of.
+    #[cfg(test)]
+    pub fn forces(&self) -> usize {
+        self.forces.get()
     }
 
     /// The file this is.
@@ -573,6 +751,7 @@ impl Catalog {
         self.next_offset += frame.len();
         self.next_recording_id = recording_id + 1;
         self.write_header()?;
+        self.force_catalog()?;
 
         Ok(recording_id)
     }
@@ -713,7 +892,8 @@ impl Catalog {
             .recording_offset(recording_id)
             .ok_or(CatalogError::UnknownRecording { recording_id })?;
 
-        self.write_stop(offset, stop_position, now_ms)
+        self.write_stop(offset, stop_position, now_ms)?;
+        self.force_catalog()
     }
 
     /// Move a recording's **start**, which is what a detach is
@@ -735,7 +915,8 @@ impl Catalog {
     /// [`CatalogError::UnknownRecording`] when the index has no such id, and
     /// [`CatalogError::Malformed`] when the record cannot be written.
     pub fn start_position(&mut self, recording_id: i64, position: i64) -> Result<(), CatalogError> {
-        self.write_position(recording_id, START_POSITION_OFFSET, position)
+        self.write_position(recording_id, START_POSITION_OFFSET, position)?;
+        self.force_catalog()
     }
 
     /// Move a recording's **stop**, which is what a truncate is
@@ -751,7 +932,8 @@ impl Catalog {
     ///
     /// As [`Catalog::start_position`].
     pub fn stop_position(&mut self, recording_id: i64, position: i64) -> Result<(), CatalogError> {
-        self.write_position(recording_id, STOP_POSITION_OFFSET, position)
+        self.write_position(recording_id, STOP_POSITION_OFFSET, position)?;
+        self.force_catalog()
     }
 
     /// One of the two position fields, which differ in where they live and in
@@ -827,7 +1009,9 @@ impl Catalog {
             .ok_or(CatalogError::Malformed {
                 offset,
                 length: i32::try_from(block_length).unwrap_or(i32::MAX),
-            })
+            })?;
+
+        self.force_catalog()
     }
 
     /// Write a recording's record again, in place, with a record that may be a
@@ -928,7 +1112,8 @@ impl Catalog {
                 })?;
         }
 
-        self.write_header()
+        self.write_header()?;
+        self.force_catalog()
     }
 
     /// How long a record's frame is, from the length in its own header
@@ -987,6 +1172,12 @@ impl Catalog {
                 offset,
                 length: DESCRIPTOR_HEADER_LENGTH as i32,
             })?;
+
+        // ★ Inside the branch that found the row, which is where the reference
+        // has it (`Catalog.java:791`): a state change that matched nothing wrote
+        // nothing, and a force for a write that did not happen is the one thing
+        // this rule is not.
+        self.force_catalog()?;
 
         Ok(true)
     }
@@ -1293,6 +1484,11 @@ impl fmt::Debug for Catalog {
             .field("alignment", &self.alignment)
             .field("next_recording_id", &self.next_recording_id)
             .field("entries", &self.index.len())
+            // The reference's own summary carries these two (`Catalog.toString`,
+            // `:1398-1399`), and they are the first thing a person asks when a
+            // catalog is not being forced: what level did it get?
+            .field("force_writes", &self.force_writes)
+            .field("force_metadata", &self.force_metadata)
             .finish()
     }
 }
@@ -1464,7 +1660,232 @@ mod tests {
     }
 
     fn created(dir: &TempDir) -> Catalog {
-        Catalog::create(dir.path(), CAPACITY, NEXT_ID).expect("create")
+        Catalog::create(dir.path(), CAPACITY, NEXT_ID, 0).expect("create")
+    }
+
+    fn created_at(dir: &TempDir, file_sync_level: i32) -> Catalog {
+        Catalog::create(dir.path(), CAPACITY, NEXT_ID, file_sync_level).expect("create")
+    }
+
+    /// The level picks the two flags and the **directory** descriptor, and `> 1`
+    /// is not `== 2` (`Catalog.java:161-162` reads `> 0` and `> 1`, so a level of
+    /// three is a level of two).
+    ///
+    /// The catalog's own descriptor is not in this table because it is not a
+    /// level's question: it is open at every level, which is what makes the
+    /// close-time force possible at level 0.
+    #[test]
+    fn the_level_picks_the_flags_and_the_directory_channel() {
+        for (level, writes, metadata, directory) in [
+            (0, false, false, false),
+            (1, true, false, true),
+            (2, true, true, true),
+            (3, true, true, true),
+        ] {
+            let dir = TempDir::new();
+            let catalog = created_at(&dir, level);
+
+            assert_eq!(writes, catalog.force_writes, "level {level}");
+            assert_eq!(metadata, catalog.force_metadata, "level {level}");
+            assert_eq!(
+                directory,
+                catalog.archive_dir_channel.is_some(),
+                "level {level}: the directory's descriptor is `channelForDirectorySync`'s \
+                 own answer (`Archive.java:3917-3931`)"
+            );
+        }
+    }
+
+    /// ★ **Level 0 forces nothing while the catalog is in use, and once when it
+    /// closes** — and the second half is the reference's, not an oversight: the
+    /// close-time force is `fsync(catalogChannel, true, true)` with both
+    /// arguments literal (`Catalog.java:1257`), so it happens whatever the level
+    /// says.
+    ///
+    /// The first half is the criterion that makes "nothing changed by default"
+    /// an assertion rather than an absence of evidence: 0 is the reference's own
+    /// default (`Archive.java:388`, `:369`), so before this slice a deployment
+    /// got exactly this whether it asked or not.
+    ///
+    /// ★ Reading the two halves apart is the point of the test: "no force" and
+    /// "no level" are not the same statement, and a build that took the first
+    /// for the second would drop the one force the reference always makes.
+    #[test]
+    fn level_zero_forces_nothing_until_it_closes() {
+        let dir = TempDir::new();
+        let mut catalog = created_at(&dir, 0);
+
+        assert!(catalog.archive_dir_channel.is_none());
+
+        let id = catalog.add_recording(&recording(0)).expect("added");
+        catalog.recording_stopped(id, 4096, NOW).expect("stopped");
+        catalog.start_position(id, 128).expect("start moved");
+        catalog.stop_position(id, 8192).expect("stop moved");
+        catalog.extend_recording(id, 1, 2, 3).expect("extended");
+        catalog
+            .change_state(id, RecordingState::DELETED)
+            .expect("state");
+
+        assert_eq!(
+            0,
+            catalog.forces(),
+            "level 0 forces nothing while it is in use"
+        );
+
+        catalog.close().expect("close");
+        assert_eq!(
+            1,
+            catalog.forces(),
+            "★ and exactly one when it closes — the reference's close-time force has both \
+             arguments literal (`Catalog.java:1257`), so it is not the level's business"
+        );
+    }
+
+    /// ★ **Every change that lands is forced, once, and the force follows the
+    /// write.**
+    ///
+    /// The count is what catches a mutation that deletes one `force_catalog()`
+    /// — the error this rule is actually exposed to, since a missing site is
+    /// invisible in every other way.
+    #[test]
+    fn every_change_that_lands_is_forced() {
+        let dir = TempDir::new();
+        let mut catalog = created_at(&dir, 2);
+
+        assert_eq!(
+            1,
+            catalog.forces(),
+            "creating a catalog forces the **directory**, once (`Catalog.java:226`)"
+        );
+
+        let id = catalog.add_recording(&recording(0)).expect("added");
+        assert_eq!(2, catalog.forces(), "a new recording (`:426`)");
+
+        catalog.recording_stopped(id, 4096, NOW).expect("stopped");
+        assert_eq!(3, catalog.forces(), "a stop (`:634`)");
+
+        catalog.start_position(id, 128).expect("start moved");
+        assert_eq!(4, catalog.forces(), "a start position (`:766`)");
+
+        catalog.stop_position(id, 8192).expect("stop moved");
+        assert_eq!(5, catalog.forces(), "a stop position (`:645`)");
+
+        catalog.extend_recording(id, 1, 2, 3).expect("extended");
+        assert_eq!(6, catalog.forces(), "an extend (`:661`)");
+
+        let mut replacement = recording(1);
+        replacement.recording_id = id;
+        catalog.replace_recording(&replacement).expect("replaced");
+        assert_eq!(7, catalog.forces(), "a replace (`:745`)");
+
+        assert!(
+            catalog
+                .change_state(id, RecordingState::DELETED)
+                .expect("state")
+        );
+        assert_eq!(8, catalog.forces(), "a state change (`:791`)");
+
+        catalog.close().expect("close");
+        assert_eq!(
+            9,
+            catalog.forces(),
+            "and the close, which is the one the level does not govern (`:1257`)"
+        );
+    }
+
+    /// The other half of "the force follows the write": a change that matched
+    /// nothing wrote nothing, and the reference's own site for the state change
+    /// is **inside** the branch that found the row (`Catalog.java:791`).
+    #[test]
+    fn a_change_that_matched_nothing_is_not_forced() {
+        let dir = TempDir::new();
+        let mut catalog = created_at(&dir, 2);
+        let before = catalog.forces();
+
+        assert!(
+            !catalog
+                .change_state(4242, RecordingState::DELETED)
+                .expect("no such id")
+        );
+        assert!(catalog.recording_stopped(4242, 0, NOW).is_err());
+        assert!(catalog.start_position(4242, 0).is_err());
+
+        assert_eq!(
+            before,
+            catalog.forces(),
+            "a force for a write that did not happen is the one thing this rule is not"
+        );
+    }
+
+    /// ★ A force after the file has **grown**, which is where a descriptor
+    /// opened before the remap could have gone stale.
+    ///
+    /// It cannot here — `grow` reopens and remaps but never renames, so the
+    /// descriptor a force goes through still names the same inode — and this is
+    /// what says so rather than leaving it to be reasoned about. The reference
+    /// has the same reopen and, there too, no force beside it (`:872-873`).
+    #[test]
+    fn a_force_still_works_after_the_catalog_has_grown() {
+        let dir = TempDir::new();
+        let mut catalog = Catalog::create(dir.path(), MIN_CAPACITY, 0, 2).expect("create");
+
+        let mut added = 0;
+        while catalog.capacity() == MIN_CAPACITY {
+            catalog.add_recording(&recording(added)).expect("added");
+            added += 1;
+            assert!(
+                added < 4096,
+                "a {MIN_CAPACITY}-byte catalog should have grown by now"
+            );
+        }
+
+        let before = catalog.forces();
+        let mut replacement = recording(added);
+        replacement.recording_id = added - 1;
+        catalog.replace_recording(&replacement).expect("replaced");
+
+        assert_eq!(
+            before + 1,
+            catalog.forces(),
+            "a force after the remap is a force like any other"
+        );
+
+        let rows = catalog.count_entries();
+        drop(catalog);
+
+        assert_eq!(
+            rows,
+            Catalog::open(dir.path(), 2)
+                .expect("the grown file reopens")
+                .count_entries(),
+            "and the grown file is still a catalog with the same rows in it"
+        );
+    }
+
+    /// A force is about **when** the bytes reach the device, not which bytes —
+    /// so a level-2 catalog and a level-0 one doing the same things leave the
+    /// same file.
+    #[test]
+    fn forcing_does_not_change_what_is_written() {
+        let plain = TempDir::new();
+        let forced = TempDir::new();
+
+        {
+            let mut a = created_at(&plain, 0);
+            let mut b = created_at(&forced, 2);
+
+            for catalog in [&mut a, &mut b] {
+                let id = catalog.add_recording(&recording(0)).expect("added");
+                catalog.recording_stopped(id, 4096, NOW).expect("stopped");
+                catalog.stop_position(id, 8192).expect("stop moved");
+            }
+        }
+
+        assert_eq!(
+            std::fs::read(plain.path().join(FILENAME)).expect("read"),
+            std::fs::read(forced.path().join(FILENAME)).expect("read"),
+            "the same changes, forced or not, are the same bytes"
+        );
     }
 
     /// A new catalog is a header and nothing else: the version this build
@@ -1591,7 +2012,7 @@ mod tests {
             ids
         };
 
-        let reopened = Catalog::open(dir.path()).expect("open");
+        let reopened = Catalog::open(dir.path(), 0).expect("open");
 
         assert_eq!(3, reopened.count_entries());
         assert_eq!(
@@ -1646,7 +2067,7 @@ mod tests {
 
         // And the record's bytes are still there: a reopened catalog walks past
         // it rather than losing the bytes behind it.
-        let reopened = Catalog::open(dir.path()).expect("open");
+        let reopened = Catalog::open(dir.path(), 0).expect("open");
 
         assert_eq!(1, reopened.count_entries());
         assert_eq!(kept, reopened.recording_ids().next().expect("one"));
@@ -1929,7 +2350,7 @@ mod tests {
         let region = file.region_mut(0, 4).expect("the version field");
         region.store_i32_release(0, 2 << 16).expect("patched");
 
-        let error = Catalog::open(dir.path()).expect_err("major 2 is not ours");
+        let error = Catalog::open(dir.path(), 0).expect_err("major 2 is not ours");
         assert!(
             matches!(
                 error,
@@ -1960,7 +2381,7 @@ mod tests {
     #[test]
     fn a_catalog_that_runs_out_of_room_grows() {
         let dir = TempDir::new();
-        let mut catalog = Catalog::create(dir.path(), MIN_CAPACITY, NEXT_ID).expect("create");
+        let mut catalog = Catalog::create(dir.path(), MIN_CAPACITY, NEXT_ID, 0).expect("create");
         let first = catalog
             .add_recording(&recording(0))
             .expect("the first fits");
@@ -2009,7 +2430,7 @@ mod tests {
 
         drop(catalog);
 
-        let reopened = Catalog::open(dir.path()).expect("open");
+        let reopened = Catalog::open(dir.path(), 0).expect("open");
 
         assert_eq!(capacity, reopened.capacity());
         assert_eq!(
@@ -2034,7 +2455,7 @@ mod tests {
     #[test]
     fn growth_past_the_maximum_is_refused() {
         let dir = TempDir::new();
-        let mut catalog = Catalog::create(dir.path(), MIN_CAPACITY, NEXT_ID).expect("create");
+        let mut catalog = Catalog::create(dir.path(), MIN_CAPACITY, NEXT_ID, 0).expect("create");
         let id = catalog.add_recording(&recording(0)).expect("added");
 
         let before = catalog.capacity();
@@ -2153,7 +2574,7 @@ mod tests {
 
         drop(catalog);
 
-        let reopened = Catalog::open(dir.path()).expect("open");
+        let reopened = Catalog::open(dir.path(), 0).expect("open");
         assert_eq!(
             65_536,
             reopened.recording(id).expect("read back").stop_position,
@@ -2212,7 +2633,7 @@ mod tests {
 
         drop(catalog);
 
-        let reopened = Catalog::open(dir.path()).expect("open");
+        let reopened = Catalog::open(dir.path(), 0).expect("open");
         let read_back = reopened.recording(id).expect("read back");
         assert_eq!(262_144, read_back.start_position);
         assert_eq!(524_288, read_back.stop_position);
@@ -2268,7 +2689,7 @@ mod tests {
 
         drop(catalog);
 
-        let reopened = Catalog::open(dir.path()).expect("open");
+        let reopened = Catalog::open(dir.path(), 0).expect("open");
         assert_eq!(
             changed.original_channel,
             reopened
@@ -2357,7 +2778,7 @@ mod tests {
 
         drop(catalog);
 
-        let reopened = Catalog::open(dir.path()).expect("open");
+        let reopened = Catalog::open(dir.path(), 0).expect("open");
         assert_eq!(
             NULL_VALUE,
             reopened.recording(id).expect("read back").stop_position,

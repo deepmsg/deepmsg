@@ -414,10 +414,18 @@ pub fn run(
     // **fresh** catalog starts at recording id 0, because the reference's field
     // starts at 0 and `Archive` constructs its `Catalog` without seeding it
     // (`Catalog.java:148`, `Archive.java:1503-1511`).
+    // And the third: how much of it is forced, which is
+    // `aeron.archive.catalog.file.sync.level` (`Catalog.java:161-162` for the two
+    // flags, `:226` for the directory force a *new* catalog takes). The reference
+    // hands its `Catalog` the same level it handed `RecordingWriter`, having
+    // refused a catalog below it before either was built
+    // (`Archive.java:1202-1205`, and `server::config` refuses it in the same
+    // words).
     let mut catalog = Catalog::open_or_create(
         &archive_config.archive_dir,
         archive_config.catalog_capacity,
         0,
+        archive_config.catalog_file_sync_level,
     )
     .map_err(|error| format!("could not open the archive's catalog: {error}"))?;
 
@@ -614,6 +622,38 @@ fn run_conductor(
     client: &mut Client,
     half: &mut DriverHalf<'_>,
     mut idle: deepmsg_driver::idle::Strategy,
+) -> Result<(), String> {
+    let turns = run_turns(name, conductor, client, half, &mut idle);
+
+    // ★ The reference's **close-time force**, which is the one force the sync
+    // level does not govern: `fsync(catalogChannel, true, true)` with both
+    // arguments literal (`Catalog.java:1257`), so a level-0 archive forces the
+    // catalog exactly once and this is it. On the reference's side it is
+    // `ArchiveConductor.close()`, called however the loop ended — which is why
+    // it is here, outside the loop, and not on the signal path only.
+    //
+    // It is a method rather than a `Drop` for the reason the reference rethrows
+    // it (`LangUtil.rethrowUnchecked`, `:1115`): a failure has to be sayable,
+    // and a drop cannot say anything.
+    //
+    // When both the loop and the close have something to report, **the loop
+    // wins** — a control plane that stopped is the more useful thing to be told
+    // about than the force that followed it.
+    let closed = conductor
+        .close_catalog()
+        .map_err(|error| format!("the archive's catalog could not be forced on close: {error}"));
+
+    turns.and(closed)
+}
+
+/// The loop itself, so that [`run_conductor`] can close the catalog whichever
+/// way it ends.
+fn run_turns(
+    name: &str,
+    conductor: &mut ArchiveConductor,
+    client: &mut Client,
+    half: &mut DriverHalf<'_>,
+    idle: &mut deepmsg_driver::idle::Strategy,
 ) -> Result<(), String> {
     loop {
         if let Some(signal) = sys::stop_signal() {

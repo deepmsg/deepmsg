@@ -1181,8 +1181,8 @@ them without the list moving.
 
 | | How many | What it means |
 |---|---|---|
-| Honoured | 36 | setting it changes the resolved configuration; a name may be spelled `128m` or `7s` where the reference reads a size or a duration |
-| Accepted, not honoured | 8 | setting it changes nothing, and the reason is beside it in `server::config::NOT_HONOURED` |
+| Honoured | 37 | setting it changes the resolved configuration; a name may be spelled `128m` or `7s` where the reference reads a size or a duration |
+| Accepted, not honoured | 7 | setting it changes nothing, and the reason is beside it in `server::config::NOT_HONOURED` |
 | Refused by name | 1 | `aeron.archive.recording.events.enabled`, which this build refuses rather than accepting with nothing behind it |
 
 The eight are the deviations worth naming. **Two of them are the reference's
@@ -1196,15 +1196,30 @@ recorded deviation on that side, `crates/archive/src/client/context.rs`). Two
 more are read by the reference only where the recording-events publication is
 enabled, and this build refuses that name rather than pretending
 (`aeron.archive.recording.events.enabled`, the one row of "refused by name").
-The remaining four are work this build has not done: the recording and replay
-checksums, the catalog's file sync level, and the replay publication's linger.
+The remaining three are work this build has not done: the recording and replay
+checksums, and the replay publication's linger.
+
+★ **The catalog's file sync level left that list in P2-12**, and it left behind a
+rule worth naming here because it is the reference's own trap:
+`aeron.archive.catalog.file.sync.level` defaults to the **static** `0`
+(`CATALOG_FILE_SYNC_LEVEL_DEFAULT` is `FILE_SYNC_LEVEL_DEFAULT`,
+`Archive.java:388`, `:369`), *not* to the file level that was configured, and a
+catalog **below** the recording files' is an error rather than a warning
+(`Archive.java:1202-1205`, the reference's words verbatim). So
+`aeron.archive.file.sync.level=2` on its own is **refused** — the pair has to be
+raised together. Pinned by
+`crates/archive/src/server/config.rs::a_catalog_below_the_recording_files_is_refused_with_the_references_words`,
+`::the_two_sync_levels_may_be_equal_and_both_arrive` and
+`::the_catalogs_default_is_not_the_file_level`.
 
 ★ **This split read 31/13 until P2-9a, and three of that difference was not this
 slice's**: P2-9b wired the three cycle thresholds — they are what the 104
 counters are measured against — and left them in this table, so it named them as
 un-done work while `server::config` held them in the honoured list. The lists are
 the account (`every_name_the_reference_reads_is_accounted_for`); the numbers here
-were not.
+were not. **P2-12 moved one more** — the catalog's file sync level, `36/8/1` →
+`37/7/1` — and the numbers were read **off the lists** rather than adjusted from
+the previous reading, which is the whole of that lesson.
 
 ★ **The archive's own idle strategy was one of them until P2-9a**, and
 the shape of that gap is worth keeping: `aeron.archive.idle.strategy` was a name
