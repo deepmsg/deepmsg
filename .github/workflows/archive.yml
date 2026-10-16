@@ -41,21 +41,25 @@ name: archive
 #   * `AeronArchivePersistentSubscriptionTest.shouldDropFromLiveBackToReplayThenJoinLiveAgain`
 #   * `PersistentSubscriptionWrapperTest.shouldCycleThroughMultipleLiveReplayTransitions`
 #
-# ★ **And a fifth, which is this build's and is on CI only.** The first runs of
-# this job found `shouldRecoverFromArchiveRestartDuringReplay` failing with the
-# archive dead at start-up — `deepmsg-archive: the driver refused a subscription
-# to aeron:udp?endpoint=localhost:8010|sparse=true: the media driver has been shut
+# ★ **A fifth was this build's, and it is fixed** — kept here because the
+# baseline moving is what this job exists to notice. Its first runs found
+# `shouldRecoverFromArchiveRestartDuringReplay` failing with the archive dead at
+# start-up — `deepmsg-archive: the driver refused a subscription to
+# aeron:udp?endpoint=localhost:8010|sparse=true: the media driver has been shut
 # down` — and the test then timing out on `aeron_archive_connect`. The harness
 # starts a media driver and an archive back to back in the same aeron directory,
-# and this build's archive binary subscribes as soon as it finds the CnC file:
-# it reads the one the **previous** case left behind, is refused, and exits. The
-# reference's archive waits for a live driver there (its Aeron client waits on the
-# CnC's liveness), which is why this is a deviation here and not a flaky test. It
-# is recorded in the baseline below and is **not** a defect of the suite: it is
-# the first thing this job found, which is what it is for.
+# and this build's archive subscribed as soon as it found the CnC file: it read
+# the one the **previous** case left behind — published, with the shutdown marker
+# that driver wrote on its way out
+# (`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`) — and was refused. The
+# reference's client waits for a **live** driver at connect instead, which is the
+# fourth step of `aeron_client_connect_to_driver` (`aeronc.c:136-168`: a heartbeat
+# older than `driver_timeout_ms` is answered by unmapping the file and looking
+# again), and this build's client does that now too. Pinned by
+# `tests/integration/connect_window.rs`.
 #
-# They are shown exactly as they are, and the report is
-# `analysis/fix/upstream-issue-drop-wait-races-the-flood.md`.
+# The four below are the reference's own, and they are shown exactly as they are;
+# the report is `analysis/fix/upstream-issue-drop-wait-races-the-flood.md`.
 #
 # ★ What that is **not** is a list of failures to ignore. The job asserts that the
 # failing set is **exactly** the recorded four: a fifth failure fails the job, and
@@ -187,10 +191,6 @@ jobs:
               "AeronArchivePersistentSubscriptionTest.cannotFallbackToReplayWhenRecordingHasBeenRemoved",
               "AeronArchivePersistentSubscriptionTest.shouldDropFromLiveBackToReplayThenJoinLiveAgain",
               "PersistentSubscriptionWrapperTest.shouldCycleThroughMultipleLiveReplayTransitions",
-              # ★ This build's, and only on CI: the archive binary subscribes to a
-              # CnC a previous case left behind rather than waiting for a live
-              # driver. The header says so; the fix is its own piece.
-              "AeronArchivePersistentSubscriptionTest.shouldRecoverFromArchiveRestartDuringReplay",
           }
 
           path = Path("archive-suite.tsv")

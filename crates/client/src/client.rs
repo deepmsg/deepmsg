@@ -109,6 +109,44 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (`aeron-client/src/main/c/aeron_context.c:35`, used at `aeronc.c:74`).
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long the connect wait looks away from the CnC file's heartbeat while the
+/// driver has not written one yet (`aeronc.c:147`).
+const HEARTBEAT_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
+/// How long it waits between **whole** attempts when the file's driver is gone:
+/// the reference unmaps and sleeps this long before looking again
+/// (`aeronc.c:165`), because what it is waiting for by then is another driver
+/// creating another file at the same path.
+const REPLACED_DRIVER_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Whether the driver behind `cnc` is alive, waiting out the window in which it
+/// may still be writing its first heartbeat.
+///
+/// The two branches are the reference's (`aeronc.c:136-168`): a heartbeat that is
+/// still **zero** is a driver that has not written one yet, waited for a
+/// millisecond at a time (`:147`); one older than `window` — which is what an
+/// orderly shutdown's `NULL_VALUE` is, by arithmetic — is a driver that has gone,
+/// and the caller's answer to that is to re-map the file (`:165`). The window and
+/// the deadline are the same `driver_timeout_ms` in the reference, which is why
+/// they are one value here.
+fn wait_for_a_live_driver(cnc: &CncFile, window: Duration, deadline: Instant) -> bool {
+    let window_ms = window.as_millis() as i64;
+
+    loop {
+        match cnc.consumer_heartbeat_ms() {
+            Some(0) => {}
+            Some(heartbeat) => return now_ms().saturating_sub(heartbeat) <= window_ms,
+            None => return false,
+        }
+
+        if Instant::now() >= deadline {
+            return false;
+        }
+
+        std::thread::sleep(HEARTBEAT_RETRY_INTERVAL);
+    }
+}
+
 /// Default fragment budget for one poll, matching
 /// `AERON_IMAGE_FRAGMENT_LIMIT_DEFAULT`.
 pub const FRAGMENT_LIMIT: usize = 10;
@@ -123,6 +161,17 @@ pub enum ConnectError {
     NoEventRing,
     /// The to-driver region cannot be written as a command ring.
     NoCommandRing,
+    /// A CnC file was found, and no live driver behind it — the heartbeat in it
+    /// is missing, or older than the window the caller waited
+    /// (`aeronc.c:136-168`, the reference's `AERON_CLIENT_ERROR_DRIVER_TIMEOUT`).
+    ///
+    /// ★ Separate from [`ConnectError::Cnc`] because the two are different
+    /// situations a caller may want to tell apart: there is no file here, or
+    /// there is a file and the driver that wrote it has gone. An orderly
+    /// shutdown leaves exactly this — a published file whose heartbeat is
+    /// `NULL_VALUE` — so a driver being *replaced* at the same path reads as
+    /// this for as long as the replacement takes.
+    NoLiveDriver { timeout_ms: u64 },
 }
 
 impl std::fmt::Display for ConnectError {
@@ -131,6 +180,11 @@ impl std::fmt::Display for ConnectError {
             Self::Cnc(error) => write!(f, "could not open the CnC file: {error}"),
             Self::NoEventRing => f.write_str("the to-clients region is not a readable ring"),
             Self::NoCommandRing => f.write_str("the to-driver region is not a writable ring"),
+            Self::NoLiveDriver { timeout_ms } => write!(
+                f,
+                "no driver heartbeat was detected within {timeout_ms} ms; the CnC file is there \
+                 and the driver behind it is not"
+            ),
         }
     }
 }
@@ -800,29 +854,59 @@ impl Client {
         Self::connect_with_timeout(aeron_dir, CONNECT_TIMEOUT)
     }
 
-    /// Connect, waiting at most `timeout` for a driver that is starting.
+    /// Connect, waiting at most `timeout` for a driver that is starting — or for
+    /// one arriving to replace a driver that has gone.
     ///
-    /// The window is a setting in the reference — `driver_timeout_ms`,
-    /// `AERON_DRIVER_TIMEOUT`, ten seconds by default — and this is the same
-    /// knob.
+    /// `timeout` is the reference's `driver_timeout_ms` (`AERON_DRIVER_TIMEOUT`,
+    /// ten seconds by default), and it is **two** things at once there and here:
+    /// how long the whole wait may take, and the window inside which a heartbeat
+    /// counts as live.
     ///
     /// # Errors
     ///
-    /// As [`Client::connect`], including the timeout expiring.
+    /// As [`Client::connect`], including the timeout expiring — which is
+    /// [`ConnectError::NoLiveDriver`] once a CnC file has been found.
     pub fn connect_with_timeout(aeron_dir: &Path, timeout: Duration) -> Result<Self, ConnectError> {
-        // A client that arrives while the driver is starting has to wait for
-        // it, not fail: the CnC file is created first and published a moment
-        // later, and for a 46 MB file that moment is not small. The reference
-        // waits out exactly this window, in four steps — file, mapping,
-        // version, heartbeat — for up to `driver_timeout_ms`
-        // (`aeron_client_connect_to_driver`, `aeronc.c:70-125`).
-        //
-        // What this does *not* wait for is a heartbeat: a driver that published
-        // a version and then stopped is one this client connects to and then
-        // notices, which is P0's behaviour and the client conductor's job
-        // (`crates/client/src/conductor.rs`), not the connect path's.
-        let cnc = CncFile::open_writable(aeron_dir, timeout).map_err(ConnectError::Cnc)?;
+        let deadline = Instant::now() + timeout;
 
+        loop {
+            // The reference's four steps, in its order
+            // (`aeron_client_connect_to_driver`, `aeronc.c:70-168`). The first
+            // three are `open_writable`'s — file, mapping, version — and they are
+            // why a client that arrives while a driver is creating its 46 MB file
+            // waits rather than failing.
+            let cnc = CncFile::open_writable(aeron_dir, timeout).map_err(ConnectError::Cnc)?;
+
+            // The fourth is the heartbeat, and it is what tells a driver that is
+            // starting from a **file** a driver left behind. A heartbeat older
+            // than the window means the driver behind this file is gone — an
+            // orderly shutdown leaves `NULL_VALUE` in it
+            // (`aeron_driver_conductor.c:3493`), and a killed driver leaves a
+            // timestamp that ages out — and the reference's answer is
+            // deliberately *not* to fail: it **unmaps the file and looks again**,
+            // because what replaces a dead driver is a new file at the same path,
+            // and holding the old mapping is waiting for an inode nothing will
+            // ever write to again.
+            if wait_for_a_live_driver(&cnc, timeout, deadline) {
+                return Self::from_cnc(cnc);
+            }
+
+            // Dropped before the sleep, so that the next look is a new mapping of
+            // whatever is at the path by then.
+            drop(cnc);
+
+            if Instant::now() >= deadline {
+                return Err(ConnectError::NoLiveDriver {
+                    timeout_ms: timeout.as_millis() as u64,
+                });
+            }
+
+            std::thread::sleep(REPLACED_DRIVER_RETRY_INTERVAL);
+        }
+    }
+
+    /// The rest of a connection, once the file's four steps have all answered.
+    fn from_cnc(cnc: CncFile) -> Result<Self, ConnectError> {
         // The client id comes from the ring's shared counter, exactly as the
         // reference's does. Two consecutive values are not needed here — that
         // is the terminate path's habit — but one is, and this is where the
