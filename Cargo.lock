@@ -236,6 +236,7 @@ name = "deepmsg-bench"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "deepmsg-archive",
  "deepmsg-client",
  "deepmsg-core",
  "deepmsg-tests",
