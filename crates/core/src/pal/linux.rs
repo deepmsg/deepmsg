@@ -30,13 +30,21 @@ use crate::buffer::{AtomicBuffer, ReadWrite};
 /// need. A hot loop wants what the kernel's own `clock_gettime` costs, and this
 /// is that and nothing else.
 ///
-/// **It is a measured candidate, not what `monotonic_nano_time` reads today.**
-/// On this machine the bare call is ~13.6 ns and `Instant::now` underneath it is
-/// the same order (13.6–14.1 ns), so replacing the `Duration`/`u128` arithmetic
-/// with this saves only ~4 ns a reading — below the bar that would justify
-/// putting the driver's own duty cycles on it, and `monotonic_nano_time` was
-/// left as it is. The primitive is kept as the evidence for that decision, and
-/// it is here so the seam stays the only place the raw call could live.
+/// **It was measured against the driver's own clock and lost, once.** On this
+/// machine the bare call is ~13.6 ns and `Instant::now` underneath it is the
+/// same order (13.6–14.1 ns), so replacing the `Duration`/`u128` arithmetic with
+/// this saves only ~4 ns a reading — and that was below the bar at the time,
+/// which is why `monotonic_nano_time` was left as it was. The primitive is kept
+/// because it is the evidence for that decision, and because the seam is the
+/// only place the raw call could live — the rig's own clock reads it still
+/// (`crate::bench`'s `SystemClock`, whose reading is on the measured path).
+///
+/// **The bar moved and the number did not.** A pass turned out to be worth
+/// several times its own length on the round trip
+/// (`analysis/dpdk/deepmsg-dpdk-d8-record.md` §7.6), which makes four
+/// nanoseconds a reading worth having — and a counter clock, in
+/// [`crate::pal::tsc`], worth more again. `monotonic_nano_time` now reads that
+/// one where the platform has it, and this one elsewhere.
 ///
 /// # Errors and saturation
 ///
