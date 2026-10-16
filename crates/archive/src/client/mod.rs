@@ -42,6 +42,7 @@ pub mod descriptor_poller;
 pub mod persistent_subscription;
 pub mod poller;
 pub mod proxy;
+pub mod recording_events;
 pub mod replay_merge;
 pub mod subscription_descriptor_poller;
 
