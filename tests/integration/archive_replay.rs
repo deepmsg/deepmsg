@@ -188,17 +188,22 @@ fn properties() -> Vec<String> {
 }
 
 /// A recording replayed back, frame for frame, carrying the replay's own ids.
-#[test]
-fn a_recording_replays_its_own_frames_across_its_segments() {
-    let Some(mut archive) = Archive::start(
-        "archive-replay-frames",
-        CONNECT_CORRELATION_ID,
-        &properties(),
-    ) else {
+/// One replay round trip, under whichever archive `properties` names.
+///
+/// `channel` is a parameter rather than [`RECORDING_CHANNEL`] because the two
+/// criteria below run at once in one binary and a UDP endpoint belongs to one
+/// process at a time.
+fn a_replay_round_trip(
+    test_name: &str,
+    channel: &str,
+    replay_channel: &str,
+    properties: &[String],
+) {
+    let Some(mut archive) = Archive::start(test_name, CONNECT_CORRELATION_ID, properties) else {
         return;
     };
 
-    let recording = a_recording(RECORDING_CHANNEL);
+    let recording = a_recording(channel);
     let recorded = archive.record(&recording);
 
     // The recording has to be long enough that reading it back crosses a
@@ -227,14 +232,14 @@ fn a_recording_replays_its_own_frames_across_its_segments() {
     // subscription's registration id (`archive.rs:1652-1687`). The subscription
     // this replay is read through is the one made just above, and an id the
     // product picked for a subscription is not the id asserted below.
-    let subscription = archive.subscribe(REPLAY_CHANNEL, REPLAY_STREAM_ID);
+    let subscription = archive.subscribe(replay_channel, REPLAY_STREAM_ID);
     let replay_session_id = archive
         .session
         .archive_mut()
         .start_replay(
             &mut archive.client,
             recorded.recording_id,
-            REPLAY_CHANNEL,
+            replay_channel,
             REPLAY_STREAM_ID,
             &ReplayParams {
                 file_io_max_length: FILE_IO_MAX_LENGTH,
@@ -325,6 +330,38 @@ fn a_recording_replays_its_own_frames_across_its_segments() {
     );
 
     let _ = archive.stop();
+}
+#[test]
+fn a_recording_replays_its_own_frames_across_its_segments() {
+    a_replay_round_trip(
+        "archive-replay-frames",
+        RECORDING_CHANNEL,
+        REPLAY_CHANNEL,
+        &properties(),
+    );
+}
+
+/// ★ P2-9a: the same round trip with the archive's **`DEDICATED`** mode, where
+/// the replayer is an agent on a thread of its own.
+///
+/// It is the claim the replayer's thread rests on: a replay driven by a thread
+/// that is not the conductor's is still a replay — the frames come back frame
+/// for frame, and the three read statistics (108/109/110) are published to the
+/// counter region by the conductor from what that thread reported.
+///
+/// The thread **names** are `archive_threading.rs`'s; what this adds is that the
+/// thread works.
+#[test]
+fn a_recording_replays_with_the_replayer_on_its_own_thread() {
+    let mut properties = properties();
+    properties.push("-Daeron.archive.threading.mode=DEDICATED".to_owned());
+
+    a_replay_round_trip(
+        "archive-replay-dedicated",
+        "aeron:udp?endpoint=localhost:33444",
+        "aeron:udp?endpoint=localhost:33445",
+        &properties,
+    );
 }
 
 /// A bounded replay ends when its limit counter goes, and the slot it held comes

@@ -86,6 +86,7 @@ use crate::server::counters::{
     archive_id_label, find_archive_id_counter,
 };
 use crate::server::recorder::{RecorderHalf, RecorderThread};
+use crate::server::replayer::{ReplayerHalf, ReplayerThread};
 use crate::server::threading::{self, Role};
 
 /// `SystemCounterDescriptor.ERRORS.id()` (`ArchivingMediaDriver.java:87`) —
@@ -462,31 +463,44 @@ pub fn run(
         .map_err(|error| format!("could not signal the archive ready: {error}"))?;
 
     // ★ P2-9a, and the whole of what `aeron.archive.threading.mode` decides:
-    // under `DEDICATED` the recorder is an agent on a thread of its own
-    // (`DedicatedModeArchiveConductor.java:54`), so what the conductor holds is
-    // a channel to it; under `SHARED` it is the conductor's own object, driven
-    // inside the conductor's turn (`SharedModeArchiveConductor.java:57-66`).
-    //
-    // The **replayer** is not split yet: it is still driven inside the
-    // conductor's turn either way, which is the remaining half of this slice.
-    let (recorder, recorder_worker) =
-        if matches!(archive_config.threading_mode, ThreadingMode::Dedicated) {
-            // The worker is built here and started below, once the conductor
-            // that will talk to it exists: a worker whose conductor was never
-            // built is a thread nothing can stop.
-            let (thread, worker) = RecorderThread::pair(
-                archive_id,
-                &aeron_dir,
-                // `ctx.recorderIdleStrategy()`, which falls back to the archive's
-                // own supplier when nothing names one (`Archive.java:1423-1437`).
-                archive_config.idle_strategy.strategy(),
-                COMMAND_TIMEOUT,
-            )?;
+    // under `DEDICATED` the recorder and the replayer are agents on threads of
+    // their own (`DedicatedModeArchiveConductor.java:54-55`), so what the
+    // conductor holds is a channel to each; under `SHARED` both are the
+    // conductor's own objects, driven inside the conductor's turn
+    // (`SharedModeArchiveConductor.java:57-66`). The **conductor** is on a thread
+    // of its own either way when there is more than one agent — see below.
+    let dedicated = matches!(archive_config.threading_mode, ThreadingMode::Dedicated);
 
-            (RecorderHalf::threaded(thread), Some(worker))
-        } else {
-            (RecorderHalf::new(archive_id), None)
-        };
+    // The workers are built here and started below, once the conductor that will
+    // talk to them exists: a worker whose conductor was never built is a thread
+    // nothing can stop.
+    let (recorder, recorder_worker) = if dedicated {
+        let (thread, worker) = RecorderThread::pair(
+            archive_id,
+            &aeron_dir,
+            // `ctx.recorderIdleStrategy()`, which falls back to the archive's own
+            // supplier when nothing names one (`Archive.java:1423-1437`).
+            archive_config.idle_strategy.strategy(),
+            COMMAND_TIMEOUT,
+        )?;
+
+        (RecorderHalf::threaded(thread), Some(worker))
+    } else {
+        (RecorderHalf::new(archive_id), None)
+    };
+
+    let (replayer, replayer_worker) = if dedicated {
+        let (thread, worker) = ReplayerThread::pair(
+            &aeron_dir,
+            // `ctx.replayerIdleStrategy()`, the same rule (`:1432-1440`).
+            archive_config.idle_strategy.strategy(),
+            COMMAND_TIMEOUT,
+        )?;
+
+        (ReplayerHalf::threaded(thread), Some(worker))
+    } else {
+        (ReplayerHalf::new(), None)
+    };
 
     let mut conductor = ArchiveConductor::new(
         archive_config,
@@ -498,6 +512,7 @@ pub fn run(
         remote_subscription_id,
         local_subscription_id,
         recorder,
+        replayer,
     )
     .map_err(|error| format!("could not build the archive's conductor: {error}"))?;
 
@@ -525,15 +540,27 @@ pub fn run(
     // One agent, one thread: without a recorder of its own there is nothing for
     // the conductor's thread to be apart *from*, and the archive runs where it
     // always has — on the caller's.
-    let Some(worker) = recorder_worker else {
+    let Some(recorder_worker) = recorder_worker else {
         return run_conductor(name, &mut conductor, &mut client, half, idle);
     };
 
     let recorder_handle =
         threading::spawn(Role::Recorder, archive_config.thread_naming, move || {
-            worker.run()
+            recorder_worker.run()
         })
         .map_err(|error| format!("could not start the recorder's thread: {error}"))?;
+
+    // ★ The replayer's thread, and there is one whenever there is a recorder's:
+    // both are what the same mode asks for.
+    let replayer_handle = match replayer_worker {
+        Some(worker) => Some(
+            threading::spawn(Role::Replayer, archive_config.thread_naming, move || {
+                worker.run()
+            })
+            .map_err(|error| format!("could not start the replayer's thread: {error}"))?,
+        ),
+        None => None,
+    };
 
     // ★ The conductor is an agent on a thread of its own in **both** the
     // reference's running modes — `DEDICATED` and `SHARED` alike are
@@ -565,6 +592,10 @@ pub fn run(
     // shutdown rather than an exit: a session still writing its segment is read
     // to the end of its turn rather than abandoned mid-write.
     let _ = recorder_handle.join();
+
+    if let Some(handle) = replayer_handle {
+        let _ = handle.join();
+    }
 
     outcome
 }

@@ -23,6 +23,9 @@ use deepmsg_client::client::Client;
 use deepmsg_cnc::counters::CountersReader;
 use deepmsg_core::buffer::ReadWrite;
 
+use crate::mark::NULL_VALUE;
+use crate::server::replay_session::{Progress, Publication, ReplaySession, State};
+
 use crate::server::counters::{
     ARCHIVE_REPLAY_SESSION_COUNT_TYPE_ID, ARCHIVE_REPLAYER_MAX_READ_TIME_TYPE_ID,
     ARCHIVE_REPLAYER_TOTAL_READ_BYTES_TYPE_ID, ARCHIVE_REPLAYER_TOTAL_READ_TIME_TYPE_ID,
@@ -235,6 +238,504 @@ impl Replayer {
     #[must_use]
     pub const fn totals(&self) -> (i64, i64, i64) {
         self.totals.totals()
+    }
+}
+
+/// What one turn reads about a replay's limit, per replay in flight.
+///
+/// The two arms are `ReplaySession.notExtended`'s (`ReplaySession.java:561-577`),
+/// and the difference between them is the whole of how a bounded replay ends:
+/// [`LimitUpdate::ExtendTo`] moves the stop position forward and nothing else,
+/// and [`LimitUpdate::Gone`] clamps what the replay may still send to where it
+/// has already got to — which is what takes it to `INACTIVE`.
+///
+/// ★ **The conductor computes it and a session cannot** (P2-9a): the number is a
+/// recording's position, which lives either in the driver's counters or in the
+/// **conductor's own** `recordingSessionByIdMap`, and a replay's thread has
+/// neither. So it crosses — one per live replay per turn, and only when it
+/// moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitUpdate {
+    /// The counter, or the live recording, says this.
+    ExtendTo(i64),
+    /// There is nothing left to read: the counter was closed, or its slot has
+    /// been taken by another counter.
+    Gone,
+}
+
+/// A replay that is running, with everything it needs to run on its own.
+///
+/// This is what moves to the replayer's thread: the session, the publication it
+/// writes through, and the two ids that name it.
+pub struct RunningReplay {
+    /// The id the client's OK carried, which is the conductor's key too.
+    pub replay_session_id: i64,
+    /// `ReplaySession.recordingId()`, which `abortReplaysOf` is asked by.
+    pub recording_id: i64,
+    /// The publication the frames go out on, taken out of the client by
+    /// [`Sessions::open_replay`](crate::server::conductor::Sessions) before this
+    /// was built. Giving it back is still the conductor's, **by registration
+    /// id**, so it is not here.
+    pub publication: Box<dyn Publication>,
+    /// The replay itself.
+    pub session: ReplaySession,
+}
+
+/// What the conductor tells a replayer that is on a thread of its own.
+pub enum ReplayCommand {
+    /// Run this.
+    Add(Box<RunningReplay>),
+    /// What the source has got to, this turn.
+    Extend {
+        /// Which replay.
+        replay_session_id: i64,
+        /// Where its stop position now is.
+        update: LimitUpdate,
+    },
+    /// Stop one (`ArchiveConductor.stopReplay`).
+    Abort {
+        /// Which replay.
+        replay_session_id: i64,
+    },
+    /// Stop every replay of one recording, or of every recording when the id is
+    /// `NULL_VALUE` (`ArchiveConductor.stopAllReplays`, `:1056-1064`).
+    AbortRecording {
+        /// Which recording, or [`NULL_VALUE`](crate::mark::NULL_VALUE).
+        recording_id: i64,
+    },
+}
+
+/// What the conductor has to hear about from the replayer.
+///
+/// ★ **Only what changed.** A replay that sat idle sends nothing at all, which
+/// is what keeps this channel off the data path: the frames go out through the
+/// publication, in shared memory, and none of them pass through here.
+#[derive(Debug)]
+pub enum ReplayNotice {
+    /// The segment opened and its header checked: the OK carrying the
+    /// `replaySessionId` goes out **now**, and exactly once
+    /// (`ReplaySession.java:338`).
+    Started {
+        /// Which replay.
+        replay_session_id: i64,
+        /// Where it has read up to.
+        replay_position: i64,
+    },
+    /// The turn got somewhere: a block went out, or the publication connected.
+    ///
+    /// It carries the position because that is the one thing a session has that
+    /// the conductor cannot ask it for once the two are on different threads —
+    /// `isValidDetach` reads it (`ArchiveConductor.java:2322-2332`).
+    Worked {
+        /// Which replay.
+        replay_session_id: i64,
+        /// Where it has read up to.
+        replay_position: i64,
+    },
+    /// It ended — cleanly, or with the error the client is owed
+    /// (`ReplaySession.sendPendingError`, `:288-295`).
+    Ended {
+        /// Which replay.
+        replay_session_id: i64,
+        /// Whether its publication is to be **revoked** rather than closed: a
+        /// replay that failed or was cancelled gets no linger
+        /// (`ReplaySession.java:175-194`).
+        revoke: bool,
+        /// `code` is the response's `relevantId`, `message` what it carries.
+        error: Option<(i32, String)>,
+    },
+    /// This turn's read, for the replayer's 108–110
+    /// (`ReplaySession.readBytes`, which the reference reads back after the
+    /// call, `:431-434`).
+    ///
+    /// Sent only when there was one: adding zero to a running total is adding
+    /// nothing, and a turn that read nothing is a turn this channel stays quiet
+    /// for.
+    Read {
+        /// The bytes this turn read.
+        bytes: u64,
+        /// The nanoseconds the read and the frame walk took.
+        time_ns: u64,
+    },
+}
+
+/// The replayer as the conductor holds it (P2-9a).
+///
+/// Under `SHARED` the sessions are the conductor's own and are driven in its own
+/// turn (`SharedModeArchiveConductor.java:57-66`, which invokes the replayer's
+/// `AgentInvoker` twice a turn). Under `DEDICATED` they are an agent on a thread
+/// of their own (`DedicatedModeArchiveConductor.java:55`) and what the conductor
+/// holds is a channel to it. The conductor asks the same questions either way.
+pub enum ReplayerHalf {
+    /// `SHARED`: the conductor's turn drives every replay.
+    Inline(Replays),
+    /// `DEDICATED`: the replayer is on a thread of its own.
+    Threaded(ReplayerThread),
+}
+
+/// The replays a `SHARED` archive is running, driven inside the conductor's
+/// turn.
+pub struct Replays {
+    running: std::collections::HashMap<i64, RunningReplay>,
+}
+
+impl Replays {
+    /// Nothing running.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            running: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Default for Replays {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The conductor's end of a replayer that is on a thread of its own.
+///
+/// The mirror of [`RecorderThread`](crate::server::recorder::RecorderThread),
+/// and the same two channels: commands down, notices up.
+pub struct ReplayerThread {
+    commands: std::sync::mpsc::Sender<ReplayCommand>,
+    notices: std::sync::mpsc::Receiver<ReplayNotice>,
+}
+
+/// The body a replayer runs when it is on a thread of its own.
+///
+/// It owns the sessions and the publications they write through, and it opens
+/// its own view of the counters region for the one thing a session needs from
+/// it — the driver's `position_limit`, which bounds every offer
+/// ([`Publication::available_window`]). It does **not** own the client: the
+/// reference's rule is that one `Aeron` has one thread driving it, and what a
+/// replay needs from the client — the publication — has already been handed over
+/// by the time the session arrives here.
+pub struct ReplayerWorker {
+    running: Replays,
+    cnc: deepmsg_cnc::CncFile,
+    idle: deepmsg_driver::idle::Strategy,
+    commands: std::sync::mpsc::Receiver<ReplayCommand>,
+    notices: std::sync::mpsc::Sender<ReplayNotice>,
+    /// Reused between turns so a turn does not allocate per notice.
+    scratch: Vec<ReplayNotice>,
+}
+
+impl ReplayerHalf {
+    /// A replayer for an archive whose sessions the conductor drives itself.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::Inline(Replays::new())
+    }
+
+    /// A replayer for this archive running on the worker's thread.
+    #[must_use]
+    pub const fn threaded(thread: ReplayerThread) -> Self {
+        Self::Threaded(thread)
+    }
+
+    /// Run this replay from here on.
+    pub fn add(&mut self, replay: RunningReplay) {
+        match self {
+            Self::Inline(replays) => replays.add(replay),
+            Self::Threaded(thread) => thread.send(ReplayCommand::Add(Box::new(replay))),
+        }
+    }
+
+    /// Tell it where the source has got to, this turn.
+    pub fn extend(&mut self, replay_session_id: i64, update: LimitUpdate) {
+        match self {
+            Self::Inline(replays) => replays.extend(replay_session_id, update),
+            Self::Threaded(thread) => thread.send(ReplayCommand::Extend {
+                replay_session_id,
+                update,
+            }),
+        }
+    }
+
+    /// Stop one replay (`stopReplay`).
+    pub fn abort(&mut self, replay_session_id: i64) {
+        match self {
+            Self::Inline(replays) => replays.abort(replay_session_id),
+            Self::Threaded(thread) => thread.send(ReplayCommand::Abort { replay_session_id }),
+        }
+    }
+
+    /// Stop every replay of a recording, or all of them (`stopAllReplays`).
+    pub fn abort_recording(&mut self, recording_id: i64) {
+        match self {
+            Self::Inline(replays) => replays.abort_recording(recording_id),
+            Self::Threaded(thread) => thread.send(ReplayCommand::AbortRecording { recording_id }),
+        }
+    }
+
+    /// One turn, and what the conductor has to be told about it.
+    ///
+    /// The per-replay limit has already been given through
+    /// [`ReplayerHalf::extend`], because the **conductor** is what works it out;
+    /// see [`LimitUpdate`] for why it cannot be worked out here.
+    pub fn drive(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+        now_ns: u64,
+    ) -> Vec<ReplayNotice> {
+        match self {
+            Self::Inline(replays) => replays.drive(counters, now_ns),
+            // The worker drives itself; what this side owes the turn is what the
+            // worker has said since the last one.
+            Self::Threaded(thread) => thread.drain(),
+        }
+    }
+}
+
+impl Default for ReplayerHalf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Replays {
+    /// Run this replay from here on.
+    pub fn add(&mut self, replay: RunningReplay) {
+        self.running.insert(replay.replay_session_id, replay);
+    }
+
+    /// Tell it where the source has got to.
+    pub fn extend(&mut self, replay_session_id: i64, update: LimitUpdate) {
+        let Some(replay) = self.running.get_mut(&replay_session_id) else {
+            return;
+        };
+
+        apply_limit(replay, update);
+    }
+
+    /// Stop one.
+    pub fn abort(&mut self, replay_session_id: i64) {
+        if let Some(replay) = self.running.get_mut(&replay_session_id) {
+            replay.session.abort();
+        }
+    }
+
+    /// Stop every replay of a recording, or all of them.
+    pub fn abort_recording(&mut self, recording_id: i64) {
+        for replay in self.running.values_mut() {
+            if recording_id == NULL_VALUE || replay.recording_id == recording_id {
+                replay.session.abort();
+            }
+        }
+    }
+
+    /// One turn of every replay, in **no particular order** — and that is the
+    /// reference's own, which walks a hash map's values
+    /// (`ArchiveConductor.replaySessionByIdMap`).
+    pub fn drive(
+        &mut self,
+        counters: &CountersReader<'_, ReadWrite>,
+        now_ns: u64,
+    ) -> Vec<ReplayNotice> {
+        let mut notices = Vec::new();
+        let mut ended = Vec::new();
+
+        for (replay_session_id, replay) in &mut self.running {
+            drive_one(replay, counters, now_ns, &mut notices);
+
+            if replay.session.state() == State::Done {
+                ended.push(*replay_session_id);
+            }
+        }
+
+        for replay_session_id in ended {
+            self.running.remove(&replay_session_id);
+        }
+
+        notices
+    }
+}
+
+impl ReplayerThread {
+    /// The two ends: what the conductor keeps, and the body to run on the
+    /// replayer's own thread.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplayerWorker::new`]'s, when the counter region will not open.
+    pub fn pair(
+        aeron_dir: &std::path::Path,
+        idle: deepmsg_driver::idle::Strategy,
+        timeout: std::time::Duration,
+    ) -> Result<(Self, ReplayerWorker), String> {
+        let (commands, from_conductor) = std::sync::mpsc::channel();
+        let (to_conductor, notices) = std::sync::mpsc::channel();
+
+        Ok((
+            Self { commands, notices },
+            ReplayerWorker::new(aeron_dir, idle, timeout, from_conductor, to_conductor)?,
+        ))
+    }
+
+    /// Tell the replayer something. A send that fails is a replayer thread that
+    /// has stopped, which is not something a control request can act on.
+    fn send(&mut self, command: ReplayCommand) {
+        let _ = self.commands.send(command);
+    }
+
+    /// What it has said since the last turn.
+    fn drain(&mut self) -> Vec<ReplayNotice> {
+        self.notices.try_iter().collect()
+    }
+}
+
+impl ReplayerWorker {
+    /// A worker over a counter region it opens itself.
+    ///
+    /// # Errors
+    ///
+    /// The message from [`deepmsg_cnc::CncFile::open_writable`] when the region
+    /// will not open.
+    pub fn new(
+        aeron_dir: &std::path::Path,
+        idle: deepmsg_driver::idle::Strategy,
+        timeout: std::time::Duration,
+        commands: std::sync::mpsc::Receiver<ReplayCommand>,
+        notices: std::sync::mpsc::Sender<ReplayNotice>,
+    ) -> Result<Self, String> {
+        let cnc = deepmsg_cnc::CncFile::open_writable(aeron_dir, timeout)
+            .map_err(|error| format!("the replayer could not open the counter region: {error}"))?;
+
+        Ok(Self {
+            running: Replays::new(),
+            cnc,
+            idle,
+            commands,
+            notices,
+            scratch: Vec::new(),
+        })
+    }
+
+    /// The replayer's own loop, which ends when the conductor's end of the
+    /// command channel is gone — the same stop condition the recorder's worker
+    /// has, and for the same reason: it is one thing to keep in step instead of
+    /// two.
+    pub fn run(mut self) {
+        loop {
+            let mut work = 0;
+
+            loop {
+                match self.commands.try_recv() {
+                    Ok(ReplayCommand::Add(replay)) => {
+                        self.running.add(*replay);
+                        work += 1;
+                    }
+                    Ok(ReplayCommand::Extend {
+                        replay_session_id,
+                        update,
+                    }) => {
+                        self.running.extend(replay_session_id, update);
+                        work += 1;
+                    }
+                    Ok(ReplayCommand::Abort { replay_session_id }) => {
+                        self.running.abort(replay_session_id);
+                        work += 1;
+                    }
+                    Ok(ReplayCommand::AbortRecording { recording_id }) => {
+                        self.running.abort_recording(recording_id);
+                        work += 1;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                }
+            }
+
+            let Some(counters) = self.cnc.counters_writable() else {
+                self.idle.idle(work);
+
+                continue;
+            };
+
+            let now_ns =
+                u64::try_from(deepmsg_core::clock::monotonic_nano_time()).unwrap_or(u64::MAX);
+            self.scratch.clear();
+            let mut notices = std::mem::take(&mut self.scratch);
+            notices.extend(self.running.drive(&counters, now_ns));
+
+            let ended = notices
+                .iter()
+                .filter(|notice| matches!(notice, ReplayNotice::Ended { .. }))
+                .count();
+
+            for notice in notices.drain(..) {
+                if self.notices.send(notice).is_err() {
+                    return;
+                }
+            }
+
+            self.scratch = notices;
+            work += ended;
+            self.idle.idle(work);
+        }
+    }
+}
+
+/// One turn of one replay, and what the conductor has to hear about it.
+///
+/// The shared half of both arms: `SHARED` calls it from the conductor's turn and
+/// `DEDICATED` from the replayer's, which is what makes the two modes the same
+/// replay.
+fn drive_one(
+    replay: &mut RunningReplay,
+    counters: &CountersReader<'_, ReadWrite>,
+    now_ns: u64,
+    notices: &mut Vec<ReplayNotice>,
+) {
+    let progress = replay
+        .session
+        .do_work(replay.publication.as_mut(), counters, now_ns);
+    let replay_session_id = replay.replay_session_id;
+    let replay_position = replay.session.replay_position();
+
+    // **One notice per turn that did anything, and none at all for a quiet
+    // one.** That is what the reference's `workCount` counts
+    // (`ArchiveConductor.java:2779-2790`: `!matches!(progress, Idle)`), so the
+    // conductor's own count of it is exact rather than derived.
+    match progress {
+        Progress::Started => notices.push(ReplayNotice::Started {
+            replay_session_id,
+            replay_position,
+        }),
+        Progress::Worked => notices.push(ReplayNotice::Worked {
+            replay_session_id,
+            replay_position,
+        }),
+        Progress::Finished => notices.push(ReplayNotice::Ended {
+            replay_session_id,
+            revoke: replay.session.is_revoking(),
+            error: None,
+        }),
+        Progress::Failed { code, message } => notices.push(ReplayNotice::Ended {
+            replay_session_id,
+            revoke: replay.session.is_revoking(),
+            error: Some((code, message)),
+        }),
+        Progress::Idle => {}
+    }
+
+    let bytes = u64::try_from(replay.session.read_bytes()).unwrap_or(u64::MAX);
+
+    if bytes > 0 || replay.session.read_time_ns() > 0 {
+        notices.push(ReplayNotice::Read {
+            bytes,
+            time_ns: replay.session.read_time_ns(),
+        });
+    }
+}
+
+/// `ReplaySession.notExtended`'s effect on one session.
+fn apply_limit(replay: &mut RunningReplay, update: LimitUpdate) {
+    match update {
+        LimitUpdate::ExtendTo(position) => replay.session.extend_stop_position(position),
+        LimitUpdate::Gone => replay.session.limit_counter_gone(),
     }
 }
 

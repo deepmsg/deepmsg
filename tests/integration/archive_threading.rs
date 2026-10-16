@@ -68,17 +68,13 @@ const NEW_NAMING: &str = "-Daeron.thread.naming=new";
 fn a_dedicated_archive_runs_the_references_agents_by_their_classic_names() {
     let names = threads_of_a_dedicated_archive("classic", &[]);
 
-    // The two agents this build has: the conductor and the recorder. The
-    // replayer is still driven inside the conductor's turn, which is the
-    // remaining half of P2-9a.
-    assert!(
-        names.iter().any(|name| name == "archive-conduct"),
-        "the conductor's thread is not among {names:?}"
-    );
-    assert!(
-        names.iter().any(|name| name == "archive-recorde"),
-        "the recorder's thread is not among {names:?}"
-    );
+    // The reference's three agents, by the names the kernel kept.
+    for name in ["archive-conduct", "archive-recorde", "archive-replaye"] {
+        assert!(
+            names.iter().any(|thread| thread == name),
+            "{name} is not among {names:?}"
+        );
+    }
 }
 
 #[test]
@@ -87,7 +83,7 @@ fn a_dedicated_archive_runs_the_references_agents_by_aeron_thread_naming() {
 
     // The short spellings fit inside fifteen bytes, so these are the whole
     // names rather than truncations.
-    for name in ["aeron-ar-cnd", "aeron-ar-rec"] {
+    for name in ["aeron-ar-cnd", "aeron-ar-rec", "aeron-ar-rep"] {
         assert!(
             names.iter().any(|thread| thread == name),
             "{name} is not among {names:?}"
@@ -96,11 +92,11 @@ fn a_dedicated_archive_runs_the_references_agents_by_aeron_thread_naming() {
 }
 
 /// Every thread the archive's process is running, by the name the kernel holds
-/// for it, once the two agents this slice adds are both there.
+/// for it, once the reference's three agents are all there.
 ///
-/// Both, and not just one: the assertion is about a *set*, and a reading taken
-/// before the second thread starts would fail for a reason that has nothing to
-/// do with what is being asserted.
+/// All three, and not just one: the assertion is about a *set*, and a reading
+/// taken before the third thread starts would fail for a reason that has nothing
+/// to do with what is being asserted.
 fn threads_of_a_dedicated_archive(naming: &str, extra: &[&str]) -> Vec<String> {
     let archive_dir = TempDir::new(&format!("archive-threads-{naming}"));
 
@@ -135,13 +131,15 @@ fn threads_of_a_dedicated_archive(naming: &str, extra: &[&str]) -> Vec<String> {
 
 /// Whether both of the agents this slice adds are running, under `naming`.
 fn has_both(names: &[String], naming: &str) -> bool {
-    let (conductor, recorder) = if "new" == naming {
-        ("aeron-ar-cnd", "aeron-ar-rec")
+    let expected: [&str; 3] = if "new" == naming {
+        ["aeron-ar-cnd", "aeron-ar-rec", "aeron-ar-rep"]
     } else {
-        ("archive-conduct", "archive-recorde")
+        ["archive-conduct", "archive-recorde", "archive-replaye"]
     };
 
-    names.iter().any(|name| name == conductor) && names.iter().any(|name| name == recorder)
+    expected
+        .iter()
+        .all(|agent| names.iter().any(|name| name == agent))
 }
 
 /// Every thread the process is running, by the name the kernel holds for it.
