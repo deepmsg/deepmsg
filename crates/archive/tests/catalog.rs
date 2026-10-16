@@ -75,7 +75,7 @@ fn text(readings: &BTreeMap<(String, String), String>, key: &str, field: &str) -
 #[test]
 fn the_headers_fields_are_what_the_reference_read() {
     let readings = readings();
-    let catalog = Catalog::open(&fixtures()).expect("the golden opens");
+    let catalog = Catalog::open(&fixtures(), 0).expect("the golden opens");
 
     assert_eq!(
         number(&readings, "header", "nextRecordingId"),
@@ -117,7 +117,7 @@ fn the_headers_fields_are_what_the_reference_read() {
 #[test]
 fn every_record_is_where_the_reference_walked_to_it() {
     let readings = readings();
-    let catalog = Catalog::open(&fixtures()).expect("the golden opens");
+    let catalog = Catalog::open(&fixtures(), 0).expect("the golden opens");
     let records = usize::try_from(number(&readings, "file", "records")).expect("positive");
 
     assert_eq!(records, catalog.count_entries());
@@ -249,7 +249,7 @@ fn the_alignment_come_from_the_header_not_from_a_constant() {
             .expect("patched");
     }
 
-    let catalog = Catalog::open(dir.path()).expect("the patched copy opens");
+    let catalog = Catalog::open(dir.path(), 0).expect("the patched copy opens");
 
     assert_eq!(
         LEGACY_ALIGNMENT as usize,
@@ -295,7 +295,7 @@ impl Drop for TempDir {
 #[test]
 fn the_records_are_on_the_alignment_the_header_names() {
     let readings = readings();
-    let catalog = Catalog::open(&fixtures()).expect("the golden opens");
+    let catalog = Catalog::open(&fixtures(), 0).expect("the golden opens");
     let alignment = catalog.alignment();
 
     assert_ne!(

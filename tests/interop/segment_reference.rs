@@ -111,7 +111,7 @@ fn a_died_mid_write_recording(dir: &TempDir, checksum: Option<Checksum>) -> (Cat
     let written = writer.offset() as i64;
 
     let mut catalog =
-        Catalog::create(dir.path(), DEFAULT_CAPACITY, RECORDING_ID).expect("a catalog");
+        Catalog::create(dir.path(), DEFAULT_CAPACITY, RECORDING_ID, 0).expect("a catalog");
     let id = catalog
         .add_recording(&Recording {
             recording_id: 0,
@@ -273,7 +273,7 @@ fn both_readers_recover_the_same_stop_position() {
 
     // And the file now holds what the reference wrote, which is the same thing
     // again from the file's side.
-    let reopened = Catalog::open(dir.path()).expect("open");
+    let reopened = Catalog::open(dir.path(), 0).expect("open");
     assert_eq!(
         ours,
         reopened.recording(id).expect("the record").stop_position

@@ -414,10 +414,18 @@ pub fn run(
     // **fresh** catalog starts at recording id 0, because the reference's field
     // starts at 0 and `Archive` constructs its `Catalog` without seeding it
     // (`Catalog.java:148`, `Archive.java:1503-1511`).
+    // And the third: how much of it is forced, which is
+    // `aeron.archive.catalog.file.sync.level` (`Catalog.java:161-162` for the two
+    // flags, `:226` for the directory force a *new* catalog takes). The reference
+    // hands its `Catalog` the same level it handed `RecordingWriter`, having
+    // refused a catalog below it before either was built
+    // (`Archive.java:1202-1205`, and `server::config` refuses it in the same
+    // words).
     let mut catalog = Catalog::open_or_create(
         &archive_config.archive_dir,
         archive_config.catalog_capacity,
         0,
+        archive_config.catalog_file_sync_level,
     )
     .map_err(|error| format!("could not open the archive's catalog: {error}"))?;
 

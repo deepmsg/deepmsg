@@ -7797,7 +7797,7 @@ mod tests {
     fn catalog_with_a_recording() -> (TempDir, Catalog) {
         let dir = TempDir::new();
         let mut catalog =
-            Catalog::create(dir.path(), crate::catalog::DEFAULT_CAPACITY, 0).expect("a catalog");
+            Catalog::create(dir.path(), crate::catalog::DEFAULT_CAPACITY, 0, 0).expect("a catalog");
 
         catalog
             .add_recording(&Recording {
@@ -7827,7 +7827,7 @@ mod tests {
     fn catalog_with_recordings(recordings: &[(i32, &str)]) -> (TempDir, Catalog) {
         let dir = TempDir::new();
         let mut catalog =
-            Catalog::create(dir.path(), crate::catalog::DEFAULT_CAPACITY, 0).expect("a catalog");
+            Catalog::create(dir.path(), crate::catalog::DEFAULT_CAPACITY, 0, 0).expect("a catalog");
 
         for (index, (stream_id, channel)) in recordings.iter().enumerate() {
             let index = i64::try_from(index).expect("small");

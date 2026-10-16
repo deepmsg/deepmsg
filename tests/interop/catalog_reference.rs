@@ -92,7 +92,7 @@ fn our_archive_directory(dir: &TempDir) -> (Catalog, Vec<i64>) {
     .expect("a mark file");
     mark.signal_ready(NOW).expect("signalled");
 
-    let mut catalog = Catalog::create(dir.path(), DEFAULT_CAPACITY, 0).expect("a catalog");
+    let mut catalog = Catalog::create(dir.path(), DEFAULT_CAPACITY, 0, 0).expect("a catalog");
     let mut ids = Vec::new();
 
     for index in 0..RECORDINGS {
@@ -187,7 +187,7 @@ fn the_reference_reads_a_catalog_that_grew() {
     .expect("a mark file");
     mark.signal_ready(NOW).expect("signalled");
 
-    let mut catalog = Catalog::create(dir.path(), MIN_CAPACITY, 0).expect("a catalog");
+    let mut catalog = Catalog::create(dir.path(), MIN_CAPACITY, 0, 0).expect("a catalog");
     let mut ids = Vec::new();
 
     // Eight recordings into a catalog that is 32 bytes to begin with: the file
@@ -241,7 +241,7 @@ fn both_readers_agree_about_the_golden() {
     };
 
     let golden = fixtures();
-    let catalog = Catalog::open(&golden).expect("the golden opens");
+    let catalog = Catalog::open(&golden, 0).expect("the golden opens");
 
     let counted = archive_tool(&jar, &golden, &["count-entries"]);
 

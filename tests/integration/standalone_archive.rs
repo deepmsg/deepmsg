@@ -132,8 +132,8 @@ fn an_archive_repairs_a_stop_position_that_was_never_written() {
     let start_position = 64;
 
     let recording_id = {
-        let mut catalog =
-            Catalog::create(archive_dir.path(), CATALOG_CAPACITY, 0).expect("the catalog is made");
+        let mut catalog = Catalog::create(archive_dir.path(), CATALOG_CAPACITY, 0, 0)
+            .expect("the catalog is made");
 
         catalog
             .add_recording(&Recording {
@@ -171,7 +171,7 @@ fn an_archive_repairs_a_stop_position_that_was_never_written() {
 
     // Read it back out of the file, not out of the archive: what the repair
     // wrote is what the next start will load.
-    let catalog = Catalog::open(archive_dir.path()).expect("the catalog opens again");
+    let catalog = Catalog::open(archive_dir.path(), 0).expect("the catalog opens again");
     let recording = catalog
         .recording(recording_id)
         .expect("the recording is still there");
