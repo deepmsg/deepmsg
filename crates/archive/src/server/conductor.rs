@@ -7412,7 +7412,7 @@ impl ArchiveConductor {
     /// own is `aeron.archive.threading.mode`, which the launcher reads to decide
     /// what to start — so it is handed the one it decided on
     /// The reference's close-time force on the catalog
-    /// (`Catalog.unmapAndCloseChannel`, `:1253-1259`).
+    /// (`Catalog.unmapAndCloseChannel`, `:1252-1259`).
     ///
     /// ★ It is the **one** force the sync level does not govern — the reference
     /// writes `fsync(catalogChannel, true, true)` with both arguments literal —

@@ -633,7 +633,7 @@ fn run_conductor(
     // it is here, outside the loop, and not on the signal path only.
     //
     // It is a method rather than a `Drop` for the reason the reference rethrows
-    // it (`LangUtil.rethrowUnchecked`, `:1114`): a failure has to be sayable,
+    // it (`LangUtil.rethrowUnchecked`, `:1115`): a failure has to be sayable,
     // and a drop cannot say anything.
     //
     // When both the loop and the close have something to report, **the loop

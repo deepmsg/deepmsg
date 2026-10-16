@@ -513,7 +513,7 @@ impl Catalog {
     /// Their failures differ for the same reason: the catalog's channel is
     /// opened where the mapping is opened and a failure there is the mapping's
     /// failure (a `throw`, `:191-196`), while the directory's is **swallowed**
-    /// and answered with `null` (`:3924-3928`) — a directory that will not open
+    /// and answered with `null` (`:3925-3927`) — a directory that will not open
     /// is a directory entry that will not be forced, not an archive that will
     /// not start.
     fn force_channels(
@@ -546,7 +546,7 @@ impl Catalog {
     }
 
     /// Force the catalog one last time, on the way out
-    /// (`Catalog.unmapAndCloseChannel`, `:1253-1259`).
+    /// (`Catalog.unmapAndCloseChannel`, `:1252-1259`).
     ///
     /// ★ **Both of the reference's arguments here are literal** —
     /// `fsync(catalogChannel, true, true)` — so this force happens at **every**
@@ -554,7 +554,7 @@ impl Catalog {
     /// did. It is the one force the level does not govern, and the reason the
     /// catalog's channel is opened at all at level 0.
     ///
-    /// A failure is an error like every other force's (`:1114` rethrows), which
+    /// A failure is an error like every other force's (`:1115` rethrows), which
     /// is why this is a method rather than something `Drop` does: a drop cannot
     /// say what went wrong.
     ///
@@ -584,7 +584,7 @@ impl Catalog {
     /// [`crate::segment::SegmentWriter`] already uses for the segments.
     ///
     /// **A force that fails is an error, not a warning.** The reference
-    /// rethrows it unchecked (`Catalog.java:1114`), so a catalog that could not
+    /// rethrows it unchecked (`Catalog.java:1115`), so a catalog that could not
     /// be made durable is something the caller is told about rather than
     /// something it is not.
     fn force(&self, channel: &File) -> Result<(), CatalogError> {
@@ -1814,6 +1814,51 @@ mod tests {
             before,
             catalog.forces(),
             "a force for a write that did not happen is the one thing this rule is not"
+        );
+    }
+
+    /// ★ A force after the file has **grown**, which is where a descriptor
+    /// opened before the remap could have gone stale.
+    ///
+    /// It cannot here — `grow` reopens and remaps but never renames, so the
+    /// descriptor a force goes through still names the same inode — and this is
+    /// what says so rather than leaving it to be reasoned about. The reference
+    /// has the same reopen and, there too, no force beside it (`:872-873`).
+    #[test]
+    fn a_force_still_works_after_the_catalog_has_grown() {
+        let dir = TempDir::new();
+        let mut catalog = Catalog::create(dir.path(), MIN_CAPACITY, 0, 2).expect("create");
+
+        let mut added = 0;
+        while catalog.capacity() == MIN_CAPACITY {
+            catalog.add_recording(&recording(added)).expect("added");
+            added += 1;
+            assert!(
+                added < 4096,
+                "a {MIN_CAPACITY}-byte catalog should have grown by now"
+            );
+        }
+
+        let before = catalog.forces();
+        let mut replacement = recording(added);
+        replacement.recording_id = added - 1;
+        catalog.replace_recording(&replacement).expect("replaced");
+
+        assert_eq!(
+            before + 1,
+            catalog.forces(),
+            "a force after the remap is a force like any other"
+        );
+
+        let rows = catalog.count_entries();
+        drop(catalog);
+
+        assert_eq!(
+            rows,
+            Catalog::open(dir.path(), 2)
+                .expect("the grown file reopens")
+                .count_entries(),
+            "and the grown file is still a catalog with the same rows in it"
         );
     }
 
