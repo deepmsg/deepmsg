@@ -155,12 +155,14 @@ pub enum ConfigError {
     /// two (`:1208-1211`). It is also a recording session's
     /// `blockLengthLimit`'s upper bound (`RecordingSession.java:81`).
     InvalidFileIoMaxLength { length: usize },
-    /// The archive was told to publish recording events
-    /// (`aeron.archive.recording.events.enabled`), which this build does not
-    /// do yet — the P2-S2 plan's §4. Refused rather than accepted-and-ignored:
-    /// a client waiting for events that will never come is the silent kind of
-    /// wrong.
-    RecordingEventsNotImplemented,
+    /// The archive was told to publish recording events and not told **where**
+    /// (`Archive.java:1240-1245`), which the reference refuses in these words.
+    ///
+    /// This is what replaced this build's own refusal of the name: until P2-13
+    /// `aeron.archive.recording.events.enabled` was refused outright, because a
+    /// client waiting for events that will never come is the silent kind of
+    /// wrong — and it was the one row of `docs/compat.md`'s "Refused by name".
+    RecordingEventsChannelMissing,
     /// `aeron.archive.catalog.file.sync.level` is below
     /// `aeron.archive.file.sync.level` (`Archive.java:1202-1205`), which the
     /// reference refuses with these words.
@@ -202,10 +204,12 @@ impl fmt::Display for ConfigError {
             Self::InvalidFileIoMaxLength { length } => {
                 write!(f, "invalid fileIoMaxLength={length}")
             }
-            Self::RecordingEventsNotImplemented => write!(
+            // The reference's own composition, character for character
+            // (`Archive.java:1242-1244`).
+            Self::RecordingEventsChannelMissing => write!(
                 f,
-                "aeron.archive.recording.events.enabled is not supported by this build \
-                 (see the P2-S2 plan, which defers the events publication)"
+                "Archive.Context.recordingEventsChannel must be set if \
+                 Archive.Context.recordingEventsEnabled is true"
             ),
             // The reference's own composition, character for character
             // (`Archive.java:1204-1205`).
@@ -385,18 +389,23 @@ mod settings {
 ///
 /// It is here, and not only in the test below, because it is the thing a reader
 /// of this module needs: the reference's 45 names all change its behaviour, and
-/// eight of them do not change this build's — **these seven**, which are
-/// accepted and ignored, and `recording.events.enabled`, which is refused. Two
-/// are the reference's own doing — `max.catalog.entries` has no reader there
-/// either, and `client.name` is read by the *client* — two are read there only
-/// where the events publication is enabled, and the remaining **three** are work
-/// this build has not done: the recording and replay checksums, and the replay
-/// publication's linger.
+/// **five** of them do not change this build's. Two are the reference's own
+/// doing — `max.catalog.entries` has no reader there either, and `client.name`
+/// is read by the *client* — and the other three are work this build has not
+/// done: the recording and replay checksums, and the replay publication's
+/// linger.
 ///
-/// ★ The counts in that paragraph are the **list's**, not a previous reading's:
-/// P2-12 took the catalog's sync level out of it (it is honoured now) and the
-/// numbers here had to be recounted rather than decremented — which is the same
-/// mistake P2-9a made in `docs/compat.md`, one table over.
+/// ★ **Nothing is refused by name any more.** `recording.events.enabled` was the
+/// one, and P2-13 honours it; what made a name belong in that third list was
+/// that accepting it would be the *silent* kind of wrong — a client waiting for
+/// events that never come — and no name is like that now.
+///
+/// ★ The counts in that paragraph are the **list's**, not a previous reading's.
+/// This is the fourth slice to move a name between the lists and it is the same
+/// mistake every time: P2-9a adjusted a number instead of recounting
+/// (`31/13/1`), P2-12 did the same one table over (`36/8/1`), and each time the
+/// fix was to count. P2-13 is the first to leave one of the three lists
+/// **empty**, which is a thing to look at rather than to round off.
 ///
 /// Every name here is **accepted**, which is the reference's own behaviour for a
 /// name it does not know (`System.getProperty` per name, no validation): a
@@ -426,14 +435,6 @@ pub const NOT_HONOURED: &[(&str, &str)] = &[
         "★ it is read by the *client* (`AeronArchive.java:3025`); this build's client takes \
          it from `AERON_ARCHIVE_CLIENT_NAME` instead, which is a recorded deviation on \
          that side",
-    ),
-    (
-        settings::RECORDING_EVENTS_CHANNEL,
-        "only read when the events publication is enabled, and this build refuses that",
-    ),
-    (
-        settings::RECORDING_EVENTS_STREAM_ID,
-        "the same: it is the events publication's stream",
     ),
 ];
 
@@ -477,6 +478,12 @@ const MAX_CONCURRENT_REPLAYS_DEFAULT: i32 = 20;
 const SEGMENT_FILE_LENGTH_DEFAULT: usize = 128 * 1024 * 1024;
 /// `Archive.java:295`.
 const FILE_IO_MAX_LENGTH_DEFAULT: usize = 1024 * 1024;
+
+/// `AeronArchive.Configuration.RECORDING_EVENTS_STREAM_ID_DEFAULT` (`:2791`).
+///
+/// A constant here rather than at a call site because there is a rule that
+/// reads it: the channel may be absent and the stream id may not.
+const RECORDING_EVENTS_STREAM_ID_DEFAULT: i32 = 30;
 /// `LogBufferDescriptor.java:58` and `:63`, which the segment file length is
 /// bounded by (`Archive.java:1486-1489`).
 const TERM_MIN_LENGTH: usize = 64 * 1024;
@@ -611,9 +618,16 @@ pub struct ArchiveConfig {
     /// for why it is not the file level.
     pub catalog_file_sync_level: i32,
     /// Whether the archive publishes recording events
-    /// (`AeronArchive.java:2797`). This build refuses it — see
-    /// [`ConfigError::RecordingEventsNotImplemented`].
+    /// (`AeronArchive.java:2797`, default false at `:2803`).
     pub recording_events_enabled: bool,
+    /// Where they go (`:2770`) — the property or `null` (`:2988`), with no
+    /// default, which is why [`ConfigError::RecordingEventsChannelMissing`] can
+    /// exist.
+    pub recording_events_channel: Option<String>,
+    /// The stream they go on (`:2785`, default 30 at `:2791`). One stream for
+    /// every recording: the events of all of them are interleaved on it and told
+    /// apart by `recordingId` (`RecordingEventsProxy.started`, `:53-73`).
+    pub recording_events_stream_id: i32,
     /// How long a control session waits for the archive's answer
     /// (`AeronArchive.java:2680`, ten seconds) — what this build's sessions
     /// already wait, now a name a deployment can set.
@@ -829,11 +843,27 @@ impl ArchiveConfig {
             });
         }
 
+        // The events publication's three names, and the one rule between them
+        // (`Archive.java:1240-1245`): an archive told to publish events without
+        // being told **where** is an error rather than an archive that publishes
+        // into nowhere. The reference's words for it are kept verbatim.
+        //
+        // ★ The channel has no default (`AeronArchive.Configuration
+        // .recordingEventsChannel()` is the property or `null`, `:2988`) while
+        // the stream id has one (`:2791`) — which is what makes the rule
+        // expressible at all.
         let recording_events_enabled =
             boolean(get(settings::RECORDING_EVENTS_ENABLED)).unwrap_or(false);
+        let recording_events_channel =
+            non_empty(get(settings::RECORDING_EVENTS_CHANNEL)).map(ToOwned::to_owned);
+        let recording_events_stream_id: i32 = stream_id(
+            get(settings::RECORDING_EVENTS_STREAM_ID),
+            settings::RECORDING_EVENTS_STREAM_ID,
+        )?
+        .unwrap_or(RECORDING_EVENTS_STREAM_ID_DEFAULT);
 
-        if recording_events_enabled {
-            return Err(ConfigError::RecordingEventsNotImplemented);
+        if recording_events_enabled && recording_events_channel.is_none() {
+            return Err(ConfigError::RecordingEventsChannelMissing);
         }
 
         // The two sync levels, and the order the reference puts them in: a
@@ -951,6 +981,8 @@ impl ArchiveConfig {
             file_sync_level,
             catalog_file_sync_level,
             recording_events_enabled,
+            recording_events_channel,
+            recording_events_stream_id,
             // The three names this slice wires. Each is read the way its
             // neighbours are — through the same helpers — so that a value that
             // will not parse is the *same* refusal as everywhere else in this
@@ -1301,20 +1333,48 @@ mod tests {
         );
     }
 
-    /// The events publication is a later slice's, and a build that was told to
-    /// publish events it will never publish is the silent kind of wrong — so
-    /// the name is read and **refused**, not ignored. The harness sets it
-    /// false (`TestArchive.h:47`), which is the branch this slice runs.
+    /// ★ The events publication's one rule, in the reference's own words
+    /// (`Archive.java:1240-1245`): an archive told to publish events and not
+    /// told **where** is refused, because publishing into nowhere is the silent
+    /// kind of wrong.
+    ///
+    /// What this replaced: until P2-13 the *name* was refused outright, and this
+    /// test asserted that. The rule is narrower now and still refuses the silent
+    /// case — what changed is that there is an answer that is not silent.
     #[test]
-    fn recording_events_are_refused_rather_than_ignored() {
+    fn events_without_a_channel_are_refused_with_the_references_words() {
         let mut properties = archive_defaults();
         properties.push((
             settings::RECORDING_EVENTS_ENABLED.to_owned(),
             "true".to_owned(),
         ));
 
-        let refused = ArchiveConfig::resolve(&properties).expect_err("not this build's");
-        assert_eq!(refused, ConfigError::RecordingEventsNotImplemented);
+        let refused = ArchiveConfig::resolve(&properties).expect_err("no channel, no events");
+        assert_eq!(
+            "Archive.Context.recordingEventsChannel must be set if \
+             Archive.Context.recordingEventsEnabled is true",
+            refused.to_string()
+        );
+    }
+
+    /// And the other half of the rule: the publication is **off** by default, so
+    /// nothing is published and no channel is needed — the branch every archive
+    /// that does not ask runs, including the reference's own C suite
+    /// (`TestArchive.h:47` sets it false).
+    ///
+    /// ★ The stream id is in this test because it is the asymmetry the rule rests
+    /// on: it has a default (`AeronArchive.java:2791`) and the channel does not
+    /// (`:2988`).
+    #[test]
+    fn events_are_off_by_default_and_need_no_channel() {
+        let config = ArchiveConfig::resolve(&archive_defaults()).expect("the defaults resolve");
+
+        assert!(!config.recording_events_enabled);
+        assert_eq!(None, config.recording_events_channel);
+        assert_eq!(
+            RECORDING_EVENTS_STREAM_ID_DEFAULT,
+            config.recording_events_stream_id
+        );
     }
 
     /// A default-configured archive has to be able to *start*, so the two
@@ -1706,10 +1766,32 @@ mod tests {
             // this list.
             (settings::RECORDER_IDLE_STRATEGY, "spin"),
             (settings::REPLAYER_IDLE_STRATEGY, "noop"),
+            // P2-13: the events publication's three names, which this build used
+            // to refuse as a set — the switch by name, the other two by being
+            // read only where the switch was on. They are given values that are
+            // neither the default nor each other's, so a name that did nothing
+            // would not pass.
+            //
+            // ★ `enabled` cannot be probed alone: the reference refuses it
+            // without a channel (`Archive.java:1240-1245`), so `companions()`
+            // supplies one. That is the same shape as the sync levels' pair, and
+            // for the same reason — a cross-field rule is not a property of
+            // either name.
+            (settings::RECORDING_EVENTS_ENABLED, "true"),
+            (settings::RECORDING_EVENTS_CHANNEL, "aeron:ipc"),
+            (settings::RECORDING_EVENTS_STREAM_ID, "31"),
         ];
 
         // (name, a value) — the one the reference has that this build refuses
-        const REFUSED: &[(&str, &str)] = &[(settings::RECORDING_EVENTS_ENABLED, "true")];
+        // (name, a value) — the names the reference has that this build refuses
+        // rather than accepting with nothing behind them.
+        //
+        // ★ **Empty since P2-13.** It held `recording.events.enabled`, which
+        // this slice honours. What makes a name belong here rather than in the
+        // list above is that accepting it would be the *silent* kind of wrong —
+        // a client waiting for events that never come — and no name is like that
+        // any more.
+        const REFUSED: &[(&str, &str)] = &[];
 
         let baseline = ArchiveConfig::resolve(&archive_defaults()).expect("the defaults resolve");
 
@@ -1739,15 +1821,17 @@ mod tests {
             );
         }
 
-        for (name, value) in REFUSED {
-            assert!(
-                matches!(
-                    resolve_with(&archive_defaults(), name, value),
-                    Err(ConfigError::RecordingEventsNotImplemented)
-                ),
-                "{name}={value} must be refused by name"
-            );
-        }
+        // ★ **The third list is empty as of P2-13**, and that is a statement
+        // rather than a tidy-up: "refused by name" means a name this build
+        // cannot honour *and will not accept silently*, and the one that was
+        // there — `recording.events.enabled` — is honoured now. The list stays
+        // so that the day one comes back is the day `docs/compat.md`'s third row
+        // comes back with it.
+        assert!(
+            REFUSED.is_empty(),
+            "a name is refused only when this build cannot honour it and will not \
+             accept it silently; there are none: {REFUSED:?}"
+        );
 
         assert_eq!(
             45,
@@ -1824,6 +1908,14 @@ mod tests {
             vec![(
                 settings::CATALOG_FILE_SYNC_LEVEL.to_owned(),
                 value.to_owned(),
+            )]
+        } else if name == settings::RECORDING_EVENTS_ENABLED && value == "true" {
+            // The events channel, with no default of its own
+            // (`AeronArchive.java:2988`): enabling the publication without one
+            // is the other refusal (`Archive.java:1240-1245`).
+            vec![(
+                settings::RECORDING_EVENTS_CHANNEL.to_owned(),
+                "aeron:ipc".to_owned(),
             )]
         } else {
             Vec::new()
