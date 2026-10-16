@@ -170,14 +170,21 @@ fn a_recording(channel: &str) -> Recording {
 /// that **fits in one file**, which is every claim this file makes about
 /// crossing a segment. `max(64k, 64k)` is what the pair gives.
 fn properties() -> Vec<String> {
-    vec![
-        archive::PROPERTIES[0].to_owned(),
-        archive::PROPERTIES[1].to_owned(),
-        "-Daeron.spies.simulate.connection=true".to_owned(),
-        format!("-Daeron.term.buffer.length={SEGMENT_FILE_LENGTH}"),
-        format!("-Daeron.archive.segment.file.length={SEGMENT_FILE_LENGTH}"),
-        format!("-Daeron.archive.max.concurrent.replays={MAX_CONCURRENT_REPLAYS}"),
-    ]
+    let mut properties: Vec<String> = archive::PROPERTIES
+        .iter()
+        .map(|property| (*property).to_owned())
+        .collect();
+
+    properties.push("-Daeron.spies.simulate.connection=true".to_owned());
+    properties.push(format!("-Daeron.term.buffer.length={SEGMENT_FILE_LENGTH}"));
+    properties.push(format!(
+        "-Daeron.archive.segment.file.length={SEGMENT_FILE_LENGTH}"
+    ));
+    properties.push(format!(
+        "-Daeron.archive.max.concurrent.replays={MAX_CONCURRENT_REPLAYS}"
+    ));
+
+    properties
 }
 
 /// A recording replayed back, frame for frame, carrying the replay's own ids.

@@ -114,14 +114,26 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The properties every one of these tests starts the archive with.
 ///
-/// `SHARED` because this driver's default is `DEDICATED` and the archiving media
-/// driver drives the driver itself — it refuses a mode that would leave the work
-/// on threads it does not own. And the control channel is left on so that both
-/// control subscriptions on stream 10 are real; the client reaches the archive
-/// over the IPC one, which is the shape P2-1c had to fix.
-pub const PROPERTIES: [&str; 2] = [
+/// The two `SHARED`s are two different modes with the same name. The first is
+/// the **driver's** (`aeron.threading.mode`): this driver's default is
+/// `DEDICATED`, and the archiving media driver drives the driver itself — it
+/// refuses a mode that would leave the work on threads it does not own. The
+/// second is the **archive's** (`aeron.archive.threading.mode`), and it is here
+/// for the same reason the reference's own suite has it: `TestArchive.h:46`
+/// starts every archive it spawns as `SHARED`, so `SHARED` is the mode those 306
+/// criteria are written against. Leaving it out would not mean "the default" to
+/// a reader — it would silently move this whole suite onto the threads P2-9a
+/// adds, which is a different rig. `archive_recording.rs`'s duty-cycle criterion
+/// and P2-9a's own `threading` test are where the other modes are asked for on
+/// purpose.
+///
+/// And the control channel is left on so that both control subscriptions on
+/// stream 10 are real; the client reaches the archive over the IPC one, which is
+/// the shape P2-1c had to fix.
+pub const PROPERTIES: [&str; 3] = [
     "-Daeron.threading.mode=SHARED",
     "-Daeron.archive.control.channel=aeron:udp?endpoint=localhost:0",
+    "-Daeron.archive.threading.mode=SHARED",
 ];
 
 /// What a decoded `ControlResponse` is read for.

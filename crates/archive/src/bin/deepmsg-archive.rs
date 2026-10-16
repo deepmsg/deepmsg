@@ -26,12 +26,22 @@
 //!
 //! # What is not here
 //!
-//! `aeron.archive.threading.mode` other than `SHARED` is refused by name rather
-//! than run as something else. The reference's default for it is `DEDICATED`,
-//! and a dedicated archive is a conductor, a recorder and a replayer on threads
-//! of their own (P2-9a); this build runs the archive on the calling thread, so
-//! DEDICATED and INVOKER are refused loudly until that slice exists. The
-//! reference's own suite sets `SHARED` (`TestStandaloneArchive.h:121`).
+//! `aeron.archive.threading.mode=INVOKER` is refused by name rather than run as
+//! something else, and for a reason that is this program's rather than a missing
+//! implementation: `INVOKER` is the mode where the **caller** drives the
+//! archive's agent (`Archive.launch:253-256` starts an `AgentInvoker` and no
+//! runner), and a process that is its own caller has nobody to be invoked by —
+//! the reference's `Archive.main` under `INVOKER` waits on `barrier.await()` and
+//! serves nothing at all.
+//!
+//! `DEDICATED` and `SHARED` are both served. The reference's own suite sets
+//! `SHARED` (`TestStandaloneArchive.h:121`), and what a deployment says nothing
+//! about is `DEDICATED` (`Archive.java:393`), which is the mode with threads of
+//! its own.
+//!
+//! ★ The replayer is still driven inside the conductor's turn under `DEDICATED`
+//! as well: it is the other half of P2-9a, and until it lands a DEDICATED archive
+//! here runs two of the reference's three agents.
 //!
 //! Property **files** named on the command line are not read either: the
 //! reference's `loadPropertiesFiles` takes URLs or filenames, and this build's
@@ -53,11 +63,17 @@ fn main() -> ExitCode {
         Err(error) => return fail(&format_args!("{error}")),
     };
 
-    if !matches!(archive_config.threading_mode, ThreadingMode::Shared) {
+    // `DEDICATED` and `SHARED` are both run; `INVOKER` is not, and the reason is
+    // a property of this program rather than a missing implementation: in the
+    // reference `INVOKER` means the *caller* drives the archive's agent
+    // (`Archive.launch:253-256` starts an `AgentInvoker` and no runner at all),
+    // and there is no caller here — `launch::run` is the loop. A process whose
+    // archive is nobody's to invoke is the reference's `Archive.main` under
+    // `INVOKER`, which waits on `barrier.await()` and serves nothing.
+    if matches!(archive_config.threading_mode, ThreadingMode::Invoker) {
         return fail(&format_args!(
-            "aeron.archive.threading.mode is {}; this build runs the archive on the calling \
-             thread and needs it to be SHARED",
-            archive_config.threading_mode
+            "aeron.archive.threading.mode is INVOKER; this build runs the archive's agents \
+             itself, and INVOKER asks for an agent the caller drives"
         ));
     }
 

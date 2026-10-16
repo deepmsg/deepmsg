@@ -7379,6 +7379,13 @@ impl ArchiveConductor {
     /// `error_counter_id` is the driver's `ERRORS` counter
     /// (`ArchivingMediaDriver.java:87-89`), which the archive writes its
     /// errors into rather than keeping one of its own.
+    ///
+    /// `recorder` is likewise the launcher's to choose, and for a reason of its
+    /// own: whether the recorder is this conductor's object or a thread of its
+    /// own is `aeron.archive.threading.mode`, which the launcher reads to decide
+    /// what to start — so it is handed the one it decided on
+    /// ([`RecorderHalf`]) rather than making one here and finding out
+    /// afterwards.
     #[allow(clippy::too_many_arguments)] // one per thing the archive was built with
     pub fn new(
         config: &ArchiveConfig,
@@ -7389,6 +7396,7 @@ impl ArchiveConductor {
         duty_cycle_requests: DutyCycleRequests,
         remote_subscription_id: Option<i64>,
         local_subscription_id: i64,
+        recorder: RecorderHalf,
     ) -> Result<Self, AuthError> {
         let authenticator = authenticator(&config.authenticator_supplier)?;
         let authorisation = authorisation_service(&config.authorisation_service_supplier)?;
@@ -7450,7 +7458,7 @@ impl ArchiveConductor {
             duty_cycles: None,
             cnc,
             catalog,
-            recorder: RecorderHalf::new(config.archive_id.unwrap_or(ARCHIVE_ID_DEFAULT)),
+            recorder,
             command_timeout: DEFAULT_TIMEOUT,
         })
     }
@@ -9828,5 +9836,23 @@ mod tests {
         assert_eq!(Some(2), sessions.replay_session_by_token(new, 7, 100));
 
         assert_eq!(0, sessions.check_replay_tokens(100), "and nothing else is");
+    }
+
+    /// ★ Under `DEDICATED` the conductor is an agent on a thread of its own
+    /// (`AgentRunner.startOnThread`, `Archive.java:262`), so everything it holds
+    /// has to be movable there. This is that claim, made where the compiler can
+    /// check it rather than where a thread would fail to start.
+    ///
+    /// It is not free: the two collaborator traits are `dyn` objects, and a
+    /// `Box<dyn Authenticator>` that is not `Send` is exactly what would make
+    /// this fail — which is why
+    /// [`crate::server::auth::Authenticator`] and its sibling carry `Send` as a
+    /// supertrait.
+    #[test]
+    fn the_conductor_can_be_moved_to_a_thread_of_its_own() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<ArchiveConductor>();
+        assert_send::<Sessions>();
     }
 }

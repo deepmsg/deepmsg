@@ -58,7 +58,7 @@
 //! that would read as "the driver's rule, applied to the archive".
 
 use std::io;
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, ScopedJoinHandle};
 
 use crate::server::config::ThreadNaming;
 
@@ -121,6 +121,35 @@ where
     std::thread::Builder::new()
         .name(role.name(naming).to_owned())
         .spawn(body)
+}
+
+/// The same, for a body that borrows something it cannot own.
+///
+/// ★ **This is what the conductor's thread is started with.** An archive that
+/// owns its media driver drives it from the same loop as everything else
+/// (`launch::run`), so the thread that runs the archive borrows `&mut Driver`
+/// from the launcher's stack — the reference's `ArchivingMediaDriver` does the
+/// same thing with an `AgentInvoker` it does not own (`:94`) — and a `'static`
+/// thread could not. [`std::thread::scope`] is what lets a borrowed one be
+/// started, and `Builder::spawn_scoped` is the spelling of [`spawn`] that sets
+/// the name on it.
+///
+/// # Errors
+///
+/// [`io::Error`] if the thread cannot be started.
+pub fn spawn_scoped<'scope, 'env, F, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    role: Role,
+    naming: ThreadNaming,
+    body: F,
+) -> io::Result<ScopedJoinHandle<'scope, T>>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    std::thread::Builder::new()
+        .name(role.name(naming).to_owned())
+        .spawn_scoped(scope, body)
 }
 
 #[cfg(test)]

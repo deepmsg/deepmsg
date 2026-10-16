@@ -167,13 +167,18 @@ const DETACHED_CHANNEL: &str = "aeron:udp?endpoint=localhost:33456";
 /// what the pair gives, and it is the smallest segment a recording can be made
 /// to span.
 fn properties() -> Vec<String> {
-    vec![
-        archive::PROPERTIES[0].to_owned(),
-        archive::PROPERTIES[1].to_owned(),
-        "-Daeron.spies.simulate.connection=true".to_owned(),
-        format!("-Daeron.term.buffer.length={SEGMENT_FILE_LENGTH}"),
-        format!("-Daeron.archive.segment.file.length={SEGMENT_FILE_LENGTH}"),
-    ]
+    let mut properties: Vec<String> = archive::PROPERTIES
+        .iter()
+        .map(|property| (*property).to_owned())
+        .collect();
+
+    properties.push("-Daeron.spies.simulate.connection=true".to_owned());
+    properties.push(format!("-Daeron.term.buffer.length={SEGMENT_FILE_LENGTH}"));
+    properties.push(format!(
+        "-Daeron.archive.segment.file.length={SEGMENT_FILE_LENGTH}"
+    ));
+
+    properties
 }
 
 /// A recording of `messages` messages on `channel`, with a mark at [`MARK`].

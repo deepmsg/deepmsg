@@ -116,7 +116,7 @@ impl std::error::Error for AuthError {}
 /// (`ArchiveConductor.java:514`), and its hooks are all keyed by session id
 /// because of it — so this is lent to a session for a call rather than owned by
 /// one, the same way the publications an egress writes through are.
-pub trait Authenticator {
+pub trait Authenticator: Send {
     /// A connect request arrived (`Authenticator.java:36`).
     fn on_connect_request(&mut self, session_id: i64, encoded_credentials: &[u8], now_ms: i64);
 
@@ -145,7 +145,7 @@ pub trait Authenticator {
 /// they are (`AdminRequestType`). The archive passes `null` everywhere it calls
 /// this, and this slice has no cluster in it, so the parameter is left out
 /// rather than carried as an argument that is always `None`.
-pub trait AuthorisationService {
+pub trait AuthorisationService: Send {
     /// `isAuthorised(protocolId, actionId, type, encodedPrincipal)`, with the
     /// protocol id a schema id and the action id a template id
     /// (`ControlSessionAdapter.java:1207`).

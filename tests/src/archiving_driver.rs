@@ -144,6 +144,12 @@ impl OwnArchivingMediaDriver {
         self.driver.aeron_dir()
     }
 
+    /// The operating system's id for the running process — see
+    /// [`ReferenceDriver::pid`], which this is.
+    pub fn pid(&self) -> u32 {
+        self.driver.pid()
+    }
+
     /// The archive directory it owns — where its mark file, and later its
     /// catalog and segments, live.
     pub fn archive_dir(&self) -> &Path {

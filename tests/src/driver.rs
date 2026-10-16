@@ -343,7 +343,7 @@ impl OwnDriver {
             .map(Self)
     }
 
-    /// The aeron directory this driver owns.
+    /// The aeron directory this driver owns — where its CnC file lives.
     pub fn aeron_dir(&self) -> &Path {
         self.0.aeron_dir()
     }
@@ -530,6 +530,11 @@ impl ReferenceDriver {
     }
 
     /// The driver's process id.
+    ///
+    /// For a probe that reads the process from the outside: which threads it
+    /// runs is only visible in `/proc/<pid>/task`, and that is the one place a
+    /// thread's own name is (`driver_process_contract.rs` turns that into
+    /// criteria for the driver, `archive_threading.rs` for the archive).
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
