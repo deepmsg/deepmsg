@@ -20,8 +20,8 @@
 //!   `QUEUE_DROP_COUNT`) that a deliberately overloaded ring does, so the
 //!   falsification the design asks for stops distinguishing anything. The
 //!   floor is one window; the default is two, because a burst of
-//!   [`RX_BURST`] frames for one destination arrives between two drains that
-//!   take one frame each (§3.2 of the plan).
+//!   [`StackParams::rx_burst`] frames for one destination arrives between two
+//!   drains that take one frame each (§3.2 of the plan).
 //! * **The length is an atomic outside the lock.** With the threads split, the
 //!   sender thread asks a slot it does not own whether anything is waiting,
 //!   every pass, about a million times a second; a lock there is a cache line
@@ -53,11 +53,13 @@ use super::neighbour::{self, NEIGHBOUR_CAPACITY, NeighbourTable, NextHop};
 use super::packet_io::{ReadyFrame, RxPort, SlotId, TxPort};
 use super::ports::{Binding, EPHEMERAL_PORTS, PortTable, SLOT_CAPACITY};
 
-/// How many frames one pass takes off the port.
+/// How many frames one pass takes off the port unless it is told otherwise.
 ///
-/// The design's §4.5 number. It is a batch and not a budget: what one pass
-/// does with them is bounded by the ring capacity, which is why the two
-/// numbers have to be read together (§3.2).
+/// The design's §4.5 number, and the value a stack built from
+/// [`StackParams::new`] starts with; what a running stack takes is
+/// [`StackParams::rx_burst`], which is `deepmsg.dpdk.rx.burst`. It is a batch
+/// and not a budget: what one pass does with them is bounded by the ring
+/// capacity, which is why the two numbers have to be read together (§3.2).
 pub const RX_BURST: usize = 32;
 
 /// How a stack tells the time.
@@ -124,6 +126,14 @@ pub struct StackParams {
     /// How many bytes of datagrams the transport believes it can hold — the
     /// receive window the ring's capacity is derived from.
     pub receive_window: usize,
+    /// How many frames one pass takes off the port (`deepmsg.dpdk.rx.burst`).
+    ///
+    /// This is the whole of what that setting means, and it is a ceiling
+    /// rather than a wait: a pass reads up to this many frames and hands each
+    /// kept one to the transport it is addressed to, and a port holding fewer
+    /// hands back fewer. The port takes fewer still when its own limit is
+    /// lower than this (the DPDK port's is `SHIM_BURST_MAX`).
+    pub rx_burst: usize,
     /// The range an ephemeral bind draws from.
     pub ephemeral_ports: std::ops::RangeInclusive<u16>,
     /// How long to wait between ARP requests for one address.
@@ -153,6 +163,7 @@ impl StackParams {
             gateway: None,
             mtu: MTU_LENGTH_DEFAULT as usize,
             receive_window: RCV_INITIAL_WINDOW_LENGTH_DEFAULT as usize,
+            rx_burst: RX_BURST,
             ephemeral_ports: EPHEMERAL_PORTS,
             arp_interval: Duration::from_secs(1),
             arp_timeout: Duration::from_secs(300),
@@ -748,8 +759,8 @@ impl Stack {
         self.slots.get(slot)
     }
 
-    /// One pass over the receive port: take up to [`RX_BURST`] frames and hand
-    /// each to the transport it is addressed to.
+    /// One pass over the receive port: take up to [`StackParams::rx_burst`]
+    /// frames and hand each to the transport it is addressed to.
     ///
     /// This is what a poller's `pump` does for a userspace stack
     /// (`poller_poll_func`'s first half): the frames are read here and the
@@ -766,7 +777,7 @@ impl Stack {
         let handed = {
             let mut rx = self.rx.lock().expect("the receive port");
             rx.rx_burst(
-                RX_BURST,
+                self.params.rx_burst,
                 &mut |frame| demux::route(self, frame, &mut deferred),
                 &mut kept,
             )
@@ -1337,6 +1348,50 @@ mod tests {
             ring.push(ring.generation(), ReadyFrame::Bytes(vec![0u8; 4].into()))
         );
         assert_eq!(ring.capacity(), ring.len());
+    }
+
+    /// A pass takes the burst its stack was built with, and no more.
+    ///
+    /// This is the only meaning `deepmsg.dpdk.rx.burst` has, and it is worth a
+    /// criterion of its own because the setting spent its whole life parsed,
+    /// validated, documented in three places and **read by nobody**: every
+    /// value of it ran the same 32 frames, so the sweep that was supposed to
+    /// measure it (`analysis/dpdk/d6-rx-burst-sweep.md`) measured one setting
+    /// six times. A criterion that pins the number a pass takes is what makes
+    /// such a sweep mean anything (D8 plan §3.1).
+    #[test]
+    fn a_pass_takes_the_burst_the_stack_was_built_with() {
+        for burst in [1, 3, 32] {
+            let wire = Wire::new();
+            let params = StackParams {
+                rx_burst: burst,
+                ..params()
+            };
+            let stack = Stack::over_a_fake_wire(&wire, Side::A, params, Clock::Monotonic);
+            let (_, ring) = bind(&stack, 40462);
+
+            let far = &mut far_end(&wire);
+            for _ in 0..8 {
+                send_udp(far, OWN, 40462, b"one of eight");
+            }
+
+            let handed = stack.pump();
+
+            assert_eq!(
+                burst.min(8),
+                handed,
+                "a pass built for {burst} frames took {handed} of the eight on \
+                 the wire"
+            );
+            assert_eq!(burst.min(8), ring.len(), "and delivered all of them");
+        }
+    }
+
+    /// A stack nobody configured takes the default the reports were measured
+    /// with, so wiring the setting changed nothing about them.
+    #[test]
+    fn a_stack_nobody_configured_takes_the_default_burst() {
+        assert_eq!(RX_BURST, params().rx_burst);
     }
 
     /// A window's worth of frames arrives intact: the criterion a ring of 64

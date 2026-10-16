@@ -685,6 +685,7 @@ fn stack_params(
         gateway: settings.gateway,
         mtu: MTU_LENGTH_DEFAULT as usize,
         receive_window,
+        rx_burst: settings.rx_burst,
         ephemeral_ports: settings.ephemeral_ports.clone(),
         arp_interval: settings.arp_retry,
         arp_timeout: settings.arp_timeout,
@@ -871,6 +872,30 @@ mod tests {
             Some((params.address, params.prefix_length)),
             "and the rest of the parameters are still the media's"
         );
+    }
+
+    /// The burst is the setting's, and it reaches the pass that uses it.
+    ///
+    /// `deepmsg.dpdk.rx.burst` was parsed, validated and documented for a whole
+    /// release while `Stack::pump` read a constant, so every value of it ran
+    /// the same 32 frames (D8 plan §1.1). This is the top half of the seam —
+    /// the setting lands in [`StackParams`] — and
+    /// `stack::tests::a_pass_takes_the_burst_the_stack_was_built_with` is the
+    /// bottom half.
+    ///
+    /// A value that is not the default, because a default compared against a
+    /// default is a test that cannot fail.
+    #[test]
+    fn the_burst_is_the_settings_and_the_pass_is_given_it() {
+        let settings = DpdkSettings {
+            rx_burst: 1,
+            ..settings()
+        };
+
+        let params = stack_params(&settings, [0x02, 0, 0, 0, 0, 0x01], 32 * 1024)
+            .expect("a stack's parameters");
+
+        assert_eq!(1, params.rx_burst);
     }
 
     /// The receive window is the caller's, not this module's.
