@@ -249,6 +249,105 @@ impl Port {
         })
     }
 
+    /// The names of this port's extended statistics — the numbers the PMD
+    /// exposes by hardware register name, over and above `rte_eth_stats`.
+    ///
+    /// **Once per port, not once per read.** A PMD's set of statistics is a
+    /// property of the driver, so the names are the same every time; what
+    /// changes is the values ([`extended_stats`](Self::extended_stats)), which
+    /// come back in this order and are read against it.
+    ///
+    /// A device can answer none — and that is not a failure, which is worth
+    /// saying because the two are easy to conflate: `-ENOTSUP` is DPDK's way of
+    /// saying the PMD does not do extended statistics, and it becomes an empty
+    /// list here. The virtual devices this build tests on do **not** take that
+    /// path: `net_pcap` and `net_null` each answer thirteen of them (measured
+    /// through `show port xstats`, and read back in the gate by
+    /// `crates/driver/tests/dpdk_port.rs`), because DPDK hands a PMD that
+    /// implements none of its own the basic set.
+    ///
+    /// # Errors
+    ///
+    /// The error from the PMD, with DPDK's own words when it set an errno.
+    pub fn extended_stat_names(&self) -> Result<Vec<String>, Error> {
+        let port = c_uint::from(self.id);
+
+        // SAFETY: the port id is one this value was started with, and a null
+        // array with a count of zero is the call's own way of asking for the
+        // number of names.
+        let count = unsafe { sys::shim_port_xstats_count(port) };
+        if count < 0 {
+            return Err(Error::from_call(
+                "the port would not report its extended statistics",
+                count,
+            ));
+        }
+        let count = count.unsigned_abs();
+
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut raw = vec![
+            sys::ShimXstatName {
+                name: [0; sys::SHIM_XSTAT_NAME_MAX],
+            };
+            count as usize
+        ];
+
+        // SAFETY: the array is `count` elements of the struct DPDK fills, and
+        // the shim asserts at compile time that its length is DPDK's own.
+        let written = unsafe { sys::shim_port_xstats_names(port, raw.as_mut_ptr(), count) };
+        if written != count as i32 {
+            return Err(Error::from_call(
+                "the port would not report the names of its extended statistics",
+                written,
+            ));
+        }
+
+        Ok(raw
+            .into_iter()
+            .map(|name| {
+                // SAFETY: the shim writes a NUL-terminated name into every
+                // element it filled, and every element was filled.
+                unsafe { CStr::from_ptr(name.name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect())
+    }
+
+    /// Read this port's extended statistics into `out`, in the order
+    /// [`extended_stat_names`](Self::extended_stat_names) gave them.
+    ///
+    /// **Into the caller's array**, because this is read on a timer: nothing
+    /// here allocates, and a buffer the caller keeps is a buffer that is not
+    /// built again every second. One call into the PMD, which is where the
+    /// registers are actually read — on the X540 that is the expensive half of
+    /// a media's counter work, which is why it is not on a data path.
+    ///
+    /// # Errors
+    ///
+    /// The error from the PMD. A port that answers fewer values than `out`
+    /// holds is one whose PMD changed under a caller that read the names
+    /// earlier, and it is an error rather than a partial fill.
+    pub fn extended_stats(&self, out: &mut [u64]) -> Result<(), Error> {
+        let n = u32::try_from(out.len()).unwrap_or(u32::MAX);
+
+        // SAFETY: the array is the caller's, it is `n` elements long by
+        // construction, and the port id is one this value was started with.
+        let written =
+            unsafe { sys::shim_port_xstats_values(c_uint::from(self.id), out.as_mut_ptr(), n) };
+        if written != n as i32 {
+            return Err(Error::from_call(
+                "the port would not report its extended statistics",
+                written,
+            ));
+        }
+
+        Ok(())
+    }
+
     /// What the link is doing, without waiting for it.
     ///
     /// The non-blocking form on purpose: a link that is still auto-negotiating

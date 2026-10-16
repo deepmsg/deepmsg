@@ -91,6 +91,19 @@ pub struct ShimPortLink {
     pub full_duplex: u8,
 }
 
+/// The name one extended statistic answers to (mirrors `shim_xstat_name_t`,
+/// which the shim holds to DPDK's own `RTE_ETH_XSTATS_NAME_SIZE` by an
+/// assertion — the array is handed to DPDK, so the two lengths have to be the
+/// same one).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ShimXstatName {
+    pub name: [c_char; SHIM_XSTAT_NAME_MAX],
+}
+
+/// See [`ShimXstatName`].
+pub const SHIM_XSTAT_NAME_MAX: usize = 64;
+
 /// One burst carries at most this many frames (`SHIM_BURST_MAX` in the shim).
 pub const SHIM_BURST_MAX: usize = 64;
 
@@ -150,6 +163,9 @@ unsafe extern "C" {
     pub fn shim_port_mtu(port: c_uint, out: *mut u16) -> c_int;
     pub fn shim_port_stats(port: c_uint, out: *mut ShimPortStats) -> c_int;
     pub fn shim_port_link(port: c_uint, out: *mut ShimPortLink) -> c_int;
+    pub fn shim_port_xstats_count(port: c_uint) -> c_int;
+    pub fn shim_port_xstats_names(port: c_uint, out: *mut ShimXstatName, n: c_uint) -> c_int;
+    pub fn shim_port_xstats_values(port: c_uint, out: *mut u64, n: c_uint) -> c_int;
 
     // The data path, in batches: one call per burst, whatever it carries.
     pub fn shim_rx_burst(port: c_uint, queue: c_uint, out: *mut ShimRxDesc, max: c_uint) -> c_uint;
