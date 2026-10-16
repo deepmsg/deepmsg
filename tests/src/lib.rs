@@ -10,7 +10,8 @@
 //! client crate yet. [`standalone_archive`] is the fifth and the newest: the
 //! archive that attaches to a driver somebody else runs, which is the same pair
 //! of binaries again with the difference that the aeron directory is borrowed
-//! rather than owned.
+//! rather than owned. [`java_driver`] is the sixth: the reference's **Java** media
+//! driver with no archive beside it, which is the one pairing a mixed gate needs.
 
 #![forbid(unsafe_code)]
 
@@ -19,6 +20,7 @@ pub mod archiving_driver;
 pub mod driver;
 pub mod java;
 pub mod java_archiving_driver;
+pub mod java_driver;
 pub mod samples;
 pub mod standalone_archive;
 pub mod synthetic;

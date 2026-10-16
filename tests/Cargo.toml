@@ -74,6 +74,14 @@ name = "recording_events_reference"
 path = "interop/recording_events_reference.rs"
 required-features = ["interop"]
 
+# ★ `B0′`: our archive attached to the reference's Java media driver, with the
+# reference's own `AeronArchive` client as the instrument. The gate the
+# archive-vs-Java benchmark's `R-attach` arm rests on.
+[[test]]
+name = "attached_to_the_reference_driver"
+path = "interop/attached_to_the_reference_driver.rs"
+required-features = ["interop"]
+
 # Runs in CI, unlike `c_driver_basic`: it needs only a committed capture of a
 # real driver's CnC header, not the reference checkout.
 [[test]]
