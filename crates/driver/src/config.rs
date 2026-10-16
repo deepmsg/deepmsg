@@ -598,6 +598,23 @@ pub const DPDK_TX_DESCRIPTORS_DEFAULT: u16 = 1024;
 pub const DPDK_MEMPOOL_CACHE_DEFAULT: u32 = 256;
 /// `design.md` §4.5's burst: one pass takes up to this many frames.
 pub const DPDK_RX_BURST_DEFAULT: usize = 32;
+/// The largest burst, which is the port's own limit rather than a number this
+/// file chose: a DPDK port takes at most `SHIM_BURST_MAX` frames in one call
+/// and clamps anything larger, so a setting above it would be a value that is
+/// accepted, recorded and half-used.
+///
+/// The two are the same number by construction where the media is built in —
+/// see the assertion below.
+pub const DPDK_RX_BURST_MAX: usize = 64;
+
+/// The setting's cap and the port's own limit, held equal rather than merely
+/// agreeing today: the port clamps what it is handed
+/// (`min(SHIM_BURST_MAX)`, `crates/dpdk/src/port.rs`), so a setting above its
+/// limit is a value that is accepted, recorded and then half-used — the shape
+/// this file spent a whole release getting wrong (`deepmsg.dpdk.rx.burst`
+/// itself: parsed, validated, documented, read by nobody).
+#[cfg(feature = "dpdk")]
+const _: () = assert!(DPDK_RX_BURST_MAX == deepmsg_dpdk::SHIM_BURST_MAX);
 /// `design.md` §4.7's cross-thread ring, which in this build is the ready ring.
 pub const DPDK_SENDER_RING_DEFAULT: usize = 1024;
 /// The design's ARP ageing.
@@ -2194,7 +2211,12 @@ impl Setting {
         env: "DEEPMSG_DPDK_MEMPOOL_CACHE",
     };
     /// `deepmsg.dpdk.rx.burst` (`DEEPMSG_DPDK_RX_BURST`): how many frames one
-    /// pass takes off the port.
+    /// pass takes off the port, up to [`DPDK_RX_BURST_MAX`].
+    ///
+    /// It lands in [`StackParams::rx_burst`] and is read by `Stack::pump`,
+    /// which is the one pass over the receive port a userspace stack has. What
+    /// it is *not* is a promise that a pass takes that many: a port holding
+    /// fewer frames hands back fewer, and none of it makes a pass wait.
     const DPDK_RX_BURST: Self = Self {
         property: "dpdk.rx.burst",
         env: "DEEPMSG_DPDK_RX_BURST",
@@ -3377,7 +3399,7 @@ fn parse_dpdk(
     }
     if let Some(value) = get(&Setting::DPDK_RX_BURST) {
         let burst = parse_count(&Setting::DPDK_RX_BURST, &value)?;
-        if !(1..=1024).contains(&burst) {
+        if !(1..=DPDK_RX_BURST_MAX as i64).contains(&burst) {
             return Err(ConfigError::OutOfRange {
                 name: Setting::DPDK_RX_BURST.property,
                 value,
@@ -5407,6 +5429,7 @@ mod tests {
                 "10.10.0.2=02:00:00:00:00:02,10.10.0.3=02:00:00:00:00:03",
             ),
             ("deepmsg.dpdk.rx.descriptors", "2048"),
+            ("deepmsg.dpdk.rx.burst", "64"),
             ("deepmsg.dpdk.ephemeral.ports", "40000-40100"),
             ("deepmsg.dpdk.arp.timeout.ms", "1500"),
         ])
@@ -5425,7 +5448,9 @@ mod tests {
         assert_eq!(2048, config.dpdk.rx_descriptors);
         assert_eq!(40000..=40100, config.dpdk.ephemeral_ports);
         assert_eq!(Duration::from_millis(1500), config.dpdk.arp_timeout);
-        assert_eq!(DPDK_RX_BURST_DEFAULT, config.dpdk.rx_burst, "and the rest");
+        // The largest burst a port will take, which is the value that used to
+        // be accepted-and-ignored like every other one.
+        assert_eq!(DPDK_RX_BURST_MAX, config.dpdk.rx_burst, "and the rest");
 
         // And the environment variable is the property name, not a spelling of
         // its own.
@@ -5457,6 +5482,9 @@ mod tests {
             ("deepmsg.dpdk.ephemeral.ports", "40000"),
             ("deepmsg.dpdk.ephemeral.ports", "40100-40000"),
             ("deepmsg.dpdk.rx.burst", "0"),
+            // One past what a port will take in one call: accepted-and-clamped
+            // is the shape this setting's own history is made of.
+            ("deepmsg.dpdk.rx.burst", "65"),
             ("deepmsg.dpdk.sender.ring", "1"),
             ("deepmsg.dpdk.rx.descriptors", "70000"),
             ("deepmsg.dpdk.rx.descriptors", "lots"),

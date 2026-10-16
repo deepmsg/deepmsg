@@ -51,6 +51,7 @@ pub use port::{
     TxOffloads,
 };
 pub use ring::{Consumer, FrameRing, Producer};
+pub use sys::SHIM_BURST_MAX;
 
 /// The lcore id of a thread EAL knows nothing about.
 const LCORE_ID_ANY: u32 = u32::MAX;
