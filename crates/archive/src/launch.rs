@@ -478,9 +478,11 @@ pub fn run(
         let (thread, worker) = RecorderThread::pair(
             archive_id,
             &aeron_dir,
-            // `ctx.recorderIdleStrategy()`, which falls back to the archive's own
-            // supplier when nothing names one (`Archive.java:1423-1437`).
-            archive_config.idle_strategy.strategy(),
+            // `ctx.recorderIdleStrategy()`, which is the recorder's own name or
+            // — when that names nothing — the archive's (`Archive.java:1423-1431`);
+            // the fallback is resolved in the configuration, where both names can
+            // be refused in the same words.
+            archive_config.recorder_idle_strategy.strategy(),
             COMMAND_TIMEOUT,
         )?;
 
@@ -492,8 +494,8 @@ pub fn run(
     let (replayer, replayer_worker) = if dedicated {
         let (thread, worker) = ReplayerThread::pair(
             &aeron_dir,
-            // `ctx.replayerIdleStrategy()`, the same rule (`:1432-1440`).
-            archive_config.idle_strategy.strategy(),
+            // `ctx.replayerIdleStrategy()`, the same rule (`:1433-1440`).
+            archive_config.replayer_idle_strategy.strategy(),
             COMMAND_TIMEOUT,
         )?;
 

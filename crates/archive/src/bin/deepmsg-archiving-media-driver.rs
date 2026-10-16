@@ -44,7 +44,7 @@
 use std::process::ExitCode;
 
 use deepmsg_archive::launch::{self, DriverHalf};
-use deepmsg_archive::server::config::ArchiveConfig;
+use deepmsg_archive::server::config::{ArchiveConfig, ThreadingMode as ArchiveThreadingMode};
 use deepmsg_cnc::{CncCreateError, CncFile, CncIdentity};
 use deepmsg_core::clock;
 use deepmsg_driver::config::{DriverConfig, ThreadingMode};
@@ -77,6 +77,23 @@ fn main() -> ExitCode {
             "aeron.threading.mode is {}; archiving media driver runs the driver and the archive \
              on one thread and needs it to be SHARED or INVOKER",
             driver_config.threading_mode.as_str()
+        ));
+    }
+
+    // The archive half's mode, refused the way `deepmsg-archive` refuses it and
+    // with the same words: two binaries that disagree about a mode cannot be
+    // reasoned about from a configuration file, and this one used to run
+    // `INVOKER` as `SHARED` without saying so.
+    //
+    // `INVOKER` asks for an agent the *caller* drives (`Archive.launch:253-256`
+    // starts an `AgentInvoker` and no runner at all), and the caller here is
+    // this program's own loop — `launch::run`. An agent nobody invokes is the
+    // reference's `Archive.main` under `INVOKER`, which waits on
+    // `barrier.await()` and serves nothing.
+    if matches!(archive_config.threading_mode, ArchiveThreadingMode::Invoker) {
+        return fail(&format_args!(
+            "aeron.archive.threading.mode is INVOKER; this build runs the archive's agents \
+             itself, and INVOKER asks for an agent the caller drives"
         ));
     }
 

@@ -143,8 +143,9 @@ pub enum ConfigError {
     /// (`io.aeron.driver.Configuration.agentIdleStrategy:2098-2143`). The
     /// reference refuses the same way for a name nothing answers to; see
     /// [`crate::server::idle`] for the one class of name it accepts and this
-    /// build does not.
-    UnknownIdleStrategy { value: String },
+    /// build does not. Carries the property it came from: three names resolve
+    /// through this table — the archive's own and each agent's.
+    UnknownIdleStrategy { name: String, value: String },
     /// `aeron.archive.segment.file.length` is not a power of two
     /// (`Archive.java:1482-1485`).
     SegmentFileLengthNotPowerOfTwo { length: usize },
@@ -208,10 +209,9 @@ impl fmt::Display for ConfigError {
                     "aeron.archive.threading.mode={value} is not one of DEDICATED, SHARED, INVOKER"
                 )
             }
-            Self::UnknownIdleStrategy { value } => write!(
+            Self::UnknownIdleStrategy { name, value } => write!(
                 f,
-                "aeron.archive.idle.strategy={value} is not an idle strategy this build can \
-                 give an archive agent"
+                "{name}={value} is not an idle strategy this build can give an archive agent"
             ),
             Self::UnknownThreadNaming { value } => {
                 write!(f, "aeron.thread.naming={value} is not one of classic, new")
@@ -376,9 +376,11 @@ mod settings {
 ///
 /// It is here, and not only in the test below, because it is the thing a reader
 /// of this module needs: the reference's 45 names all change its behaviour, and
-/// fourteen of them do not change this build's. Two of the fourteen are the
-/// reference's own doing — `max.catalog.entries` has no reader there either, and
-/// `client.name` is read by the *client* — and the rest are work this build has
+/// nine of them do not change this build's — these eight, which are accepted and
+/// ignored, and `recording.events.enabled`, which is refused. Two of the eight
+/// are the reference's own doing — `max.catalog.entries` has no reader there
+/// either, and `client.name` is read by the *client* — two are read there only
+/// where the events publication is enabled, and the rest are work this build has
 /// not done.
 ///
 /// Every name here is **accepted**, which is the reference's own behaviour for a
@@ -401,16 +403,6 @@ pub const NOT_HONOURED: &[(&str, &str)] = &[
     (
         settings::CATALOG_FILE_SYNC_LEVEL,
         "the catalog is not forced to disk on a level",
-    ),
-    (
-        settings::RECORDER_IDLE_STRATEGY,
-        "P2-9a: under `SHARED` the recorder is an invoker driven inside the conductor's turn \
-         and never idles on its own; the thread that would idle arrives with the recorder's \
-         own thread",
-    ),
-    (
-        settings::REPLAYER_IDLE_STRATEGY,
-        "the same, for the replayer's",
     ),
     (
         settings::MAX_CATALOG_ENTRIES,
@@ -564,13 +556,19 @@ pub struct ArchiveConfig {
     /// — so the suite could not tell the difference and a deployment that asked
     /// for anything else was told nothing.
     ///
-    /// The **recorder's and replayer's** names are a different question and are
-    /// still not honoured. Under `SHARED` neither agent has a runner of its own:
-    /// `SharedModeArchiveConductor.onStart` drives each through an
+    /// The **recorder's and replayer's** names sit beside this one, and under
+    /// `SHARED` none of the three is used: neither agent has a runner of its own
+    /// — `SharedModeArchiveConductor.onStart` drives each through an
     /// `AgentInvoker` (`:40-44`), which has no idle strategy at all, and the
-    /// conductor's `doWork` invokes both inside its own turn (`:57-64`). The
-    /// threads that would idle arrive with the agents' own threads (P2-9a).
+    /// conductor's `doWork` invokes both inside its own turn (`:57-64`).
     pub idle_strategy: IdleStrategy,
+    /// The recorder's own (`Archive.java:406`), which is what its thread idles
+    /// with under `DEDICATED`; the archive's when this names nothing
+    /// (`:1423-1431`). ★ Honoured since P2-9a — the thread that idles arrived
+    /// with the recorder's own thread.
+    pub recorder_idle_strategy: IdleStrategy,
+    /// The replayer's (`Archive.java:412`), the same rule (`:1433-1440`).
+    pub replayer_idle_strategy: IdleStrategy,
     /// The authenticator to build (`Archive.java:590-597`).
     pub authenticator_supplier: String,
     /// The authorisation service to build (`Archive.java:603-610`).
@@ -730,10 +728,35 @@ impl ArchiveConfig {
             None => IdleStrategy::DEFAULT,
             Some(value) => {
                 IdleStrategy::parse(value).ok_or_else(|| ConfigError::UnknownIdleStrategy {
+                    name: settings::IDLE_STRATEGY.to_owned(),
                     value: value.to_owned(),
                 })?
             }
         };
+
+        // ★ P2-9a: the two per-agent names, and the reference's fallback — a
+        // per-agent name that names nothing gets the **archive's** strategy, not
+        // the default (`Archive.java:1423-1440`; the property is read by
+        // `Configuration.recorderIdleStrategySupplier(null)` and only the
+        // fallback is the archive's own supplier). Resolved here rather than
+        // where each thread is built, so that a name this build has no strategy
+        // for is refused at the same point and in the same words as the
+        // archive's own — the reference reads these two inside its `DEDICATED`
+        // arm, so under `SHARED` it never looks at them; this build resolves
+        // every name it is given.
+        let fall_back_to_the_archives = |name: &str| -> Result<IdleStrategy, ConfigError> {
+            match get(name) {
+                None => Ok(idle_strategy),
+                Some(value) => {
+                    IdleStrategy::parse(value).ok_or_else(|| ConfigError::UnknownIdleStrategy {
+                        name: name.to_owned(),
+                        value: value.to_owned(),
+                    })
+                }
+            }
+        };
+        let recorder_idle_strategy = fall_back_to_the_archives(settings::RECORDER_IDLE_STRATEGY)?;
+        let replayer_idle_strategy = fall_back_to_the_archives(settings::REPLAYER_IDLE_STRATEGY)?;
 
         let archive_id = match get(settings::ARCHIVE_ID) {
             // Absent is "not told", which the archive runs as
@@ -849,6 +872,8 @@ impl ArchiveConfig {
             threading_mode,
             thread_naming,
             idle_strategy,
+            recorder_idle_strategy,
+            replayer_idle_strategy,
             authenticator_supplier: non_empty(get(settings::AUTHENTICATOR_SUPPLIER))
                 .unwrap_or(AUTHENTICATOR_SUPPLIER_DEFAULT)
                 .to_owned(),
@@ -1364,15 +1389,60 @@ mod tests {
         // and the reference's own `default ->` arm loads a class by reflection —
         // neither is a strategy this build can hand an agent, so both are
         // refused by name rather than idled as something else.
-        for name in ["controllable", "com.example.MyIdleStrategy"] {
-            assert!(
-                matches!(
-                    resolve_with(&archive_defaults(), settings::IDLE_STRATEGY, name),
-                    Err(ConfigError::UnknownIdleStrategy { value }) if value == name
-                ),
-                "{name} is refused by name"
-            );
+        //
+        // All three names, because one table answers for all three: a name it
+        // has no strategy for is refused wherever it was written, and the
+        // refusal says which property it came from.
+        for property in [
+            settings::IDLE_STRATEGY,
+            settings::RECORDER_IDLE_STRATEGY,
+            settings::REPLAYER_IDLE_STRATEGY,
+        ] {
+            for name in ["controllable", "com.example.MyIdleStrategy"] {
+                assert!(
+                    matches!(
+                        resolve_with(&archive_defaults(), property, name),
+                        Err(ConfigError::UnknownIdleStrategy { name: refused, value })
+                            if refused == property && value == name
+                    ),
+                    "{property}={name} is refused by name"
+                );
+            }
         }
+    }
+
+    /// ★ The reference's fallback for the two per-agent names: a name that names
+    /// nothing gets the **archive's** strategy rather than the default
+    /// (`Archive.java:1423-1440` — the property is read first, and only an
+    /// absent one falls through to the archive's own supplier).
+    #[test]
+    fn an_agents_idle_strategy_falls_back_to_the_archives_own() {
+        // `archive_defaults` carries the suite's own `yield`, so the archive's
+        // strategy is asked of a list that names it explicitly.
+        let mut properties = archive_defaults();
+        properties.retain(|(property, _)| property != settings::IDLE_STRATEGY);
+        properties.push((settings::IDLE_STRATEGY.to_owned(), "spin".to_owned()));
+
+        let config = ArchiveConfig::resolve(&properties).expect("the defaults resolve");
+        assert_eq!(config.idle_strategy, IdleStrategy::BusySpinning);
+        assert_eq!(
+            config.recorder_idle_strategy,
+            IdleStrategy::BusySpinning,
+            "a recorder that names nothing idles the way the archive does"
+        );
+        assert_eq!(config.replayer_idle_strategy, IdleStrategy::BusySpinning);
+
+        // A name of its own wins over the archive's, for that agent and no
+        // other.
+        properties.push((
+            settings::RECORDER_IDLE_STRATEGY.to_owned(),
+            "noop".to_owned(),
+        ));
+
+        let config = ArchiveConfig::resolve(&properties).expect("the defaults resolve");
+        assert_eq!(config.idle_strategy, IdleStrategy::BusySpinning);
+        assert_eq!(config.recorder_idle_strategy, IdleStrategy::Noop);
+        assert_eq!(config.replayer_idle_strategy, IdleStrategy::BusySpinning);
     }
 
     #[test]
@@ -1505,7 +1575,7 @@ mod tests {
     /// * **honoured**: setting it changes the resolved configuration;
     /// * **accepted, not honoured**: setting it changes nothing, and the reason
     ///   beside it is a fact about this build or about the reference — not an
-    ///   apology. Two of the fourteen are the reference's own doing:
+    ///   apology. Two of the eight are the reference's own doing:
     ///   `max.catalog.entries` has **no reader there either**
     ///   (`Archive.maxCatalogEntries()` is defined and never called), and
     ///   `client.name` is read by the *client*, whose handling of it here is a
@@ -1514,7 +1584,8 @@ mod tests {
     ///   than accepted with nothing behind it.
     ///
     /// What this replaces is silence: before this slice a deployment could set
-    /// any of the fourteen and be told nothing at all — three of them
+    /// any of the fourteen names this list held then and be told nothing at all
+    /// — three of them
     /// (`message.timeout`, `message.retry.attempts`, `error.buffer.length`) were
     /// hardcoded to the reference's own defaults, so only a deployment that
     /// *changed* one was affected, and it could not tell.
@@ -1580,6 +1651,13 @@ mod tests {
                 settings::IDLE_STRATEGY,
                 "org.agrona.concurrent.SleepingIdleStrategy",
             ),
+            // P2-9a: the two per-agent names, which the reference reads inside
+            // its `DEDICATED` arm and this build resolves for every mode. The
+            // values are neither the default nor the archive's own: a fallback
+            // that is never overridden would let a name that does nothing pass
+            // this list.
+            (settings::RECORDER_IDLE_STRATEGY, "spin"),
+            (settings::REPLAYER_IDLE_STRATEGY, "noop"),
         ];
 
         // (name, a value) — the one the reference has that this build refuses
