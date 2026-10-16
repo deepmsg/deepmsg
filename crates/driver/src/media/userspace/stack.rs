@@ -917,13 +917,41 @@ impl Stack {
     }
 
     /// Put a frame into the ring of the slot that claimed it.
+    ///
+    /// **Both ways of not getting there are counted**, and neither was before
+    /// D6 went looking: a slot that is gone, and a ring whose binding was
+    /// rebound under the frame that was on its way to it. The fact in both
+    /// cases is the unclaimed fact — no transport has this frame now — so they
+    /// are counted where an unclaimed frame is counted, on the counter the
+    /// frame's own type decides (86/95).
+    ///
+    /// The last one cannot read the frame's type: `ReadyRing::push` has taken
+    /// the frame by the time it answers `Stale`, which is also why the
+    /// generation is checked here first, while the bytes are still in hand.
     fn deliver(&self, binding: Binding, frame: ReadyFrame) {
         let Some(ring) = self.slots.get(binding.slot) else {
+            demux::count_a_frame_nobody_has(self, frame.as_bytes());
             return;
         };
 
-        if ring.push(binding.generation, frame) == Pushed::Full {
-            self.counters.queue_drop.fetch_add(1, Ordering::Relaxed);
+        if ring.generation() != binding.generation {
+            demux::count_a_frame_nobody_has(self, frame.as_bytes());
+            return;
+        }
+
+        match ring.push(binding.generation, frame) {
+            Pushed::Full => {
+                self.counters.queue_drop.fetch_add(1, Ordering::Relaxed);
+            }
+            // Only reachable when the slot is rebound between the check above
+            // and the push: counted on the receiver's, which is what
+            // `is_data_plane` answers when the frame is not there to be asked.
+            Pushed::Stale => {
+                self.counters
+                    .rx_receiver_discard
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Pushed::Taken => {}
         }
     }
 }
@@ -933,6 +961,7 @@ mod tests {
     use super::*;
     use crate::media::userspace::fake_port::{FakePort, Injection};
     use crate::media::userspace::frame::Received;
+    use crate::protocol::frame_type;
     use crate::sys::AddressFamily;
     use std::net::IpAddr;
 
@@ -975,6 +1004,41 @@ mod tests {
 
     fn stack(wire: &Wire) -> Arc<Stack> {
         Stack::over_a_fake_wire(wire, Side::A, params(), Clock::Monotonic)
+    }
+
+    /// An Ethernet frame whose UDP payload is an Aeron frame of `frame_type`.
+    ///
+    /// The payload is eight bytes of nothing with the type written where a
+    /// frame header keeps it — which is all `is_data_plane` reads, and all this
+    /// needs: the question here is which of the two discard counters a frame
+    /// belongs on, not what the frame says.
+    fn a_frame_of_type(frame_type: i16) -> Box<[u8]> {
+        let mut payload = [0u8; 8];
+        // The type sits at six bytes into a frame header: length (4), version
+        // (1), flags (1), type (2) — `aeron_udp_protocol.h:31-34`.
+        payload[6..8].copy_from_slice(&frame_type.to_le_bytes());
+
+        let mut bytes = vec![0u8; frame::IPV4_UDP_HEADER_LENGTH + payload.len()];
+        bytes[frame::IPV4_UDP_HEADER_LENGTH..].copy_from_slice(&payload);
+        let written = frame::write_ipv4_udp(
+            &mut bytes,
+            &frame::UdpWrite {
+                ipv4: frame::Ipv4Write {
+                    destination_hardware: [0x02, 0, 0, 0, 0, 0x01],
+                    source_hardware: [0x02, 0, 0, 0, 0, 0x02],
+                    source: PEER,
+                    destination: OWN,
+                    identification: 1,
+                },
+                source_port: 40_000,
+                destination_port: 40_460,
+                payload_length: payload.len(),
+            },
+        )
+        .expect("a frame");
+        bytes.truncate(written);
+
+        bytes.into_boxed_slice()
     }
 
     fn bind(stack: &Stack, port: u16) -> (Binding, Arc<ReadyRing>) {
@@ -1139,6 +1203,72 @@ mod tests {
         send_udp(far, OWN, 40459, b"still the peer");
         assert_eq!(1, stack.pump());
         assert_eq!(2, connected.len());
+    }
+
+    /// A frame for a binding that has gone is **counted**, on the counter an
+    /// unclaimed frame gets.
+    ///
+    /// The fact is the same one: no transport has this frame now. It used to be
+    /// dropped with nothing written down — both here and in the ring's own
+    /// refusal below — which is the one thing this media's counters exist to
+    /// prevent (`demux.rs`'s module note says so, and D6 spent an hour reading
+    /// zeroes that meant "nobody counted this", not "nothing happened").
+    ///
+    /// The frame's own type decides *which* of the two counters, exactly as it
+    /// does for a frame nobody bound: a data-plane frame on the receiver's, a
+    /// sender's frame on the sender's.
+    #[test]
+    fn a_frame_for_a_binding_that_has_gone_is_counted() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+        let (binding, _ring) = bind(&stack, 40_460);
+
+        let data = stack.counters().rx_receiver_discard.load(Ordering::Relaxed);
+        let sender = stack.counters().rx_sender_discard.load(Ordering::Relaxed);
+
+        // Released, and then a frame arrives for it: the race the generation
+        // exists for.
+        stack.release(binding);
+        stack.deliver(binding, ReadyFrame::Bytes(a_frame_of_type(frame_type::PAD)));
+
+        assert_eq!(
+            data + 1,
+            stack.counters().rx_receiver_discard.load(Ordering::Relaxed),
+            "a data-plane frame nobody has is 95"
+        );
+        assert_eq!(
+            sender,
+            stack.counters().rx_sender_discard.load(Ordering::Relaxed)
+        );
+
+        // And the other half of the split, on the same gone binding: a frame
+        // whose type travels towards a publisher is 86.
+        stack.deliver(binding, ReadyFrame::Bytes(a_frame_of_type(frame_type::SM)));
+
+        assert_eq!(
+            data + 1,
+            stack.counters().rx_receiver_discard.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            sender + 1,
+            stack.counters().rx_sender_discard.load(Ordering::Relaxed),
+            "a sender's frame nobody has is 86"
+        );
+
+        // And a slot that was never there at all, which is the other way
+        // `deliver` can find nothing to put a frame in.
+        let nowhere = Binding {
+            slot: u16::try_from(SLOT_CAPACITY).expect("a slot index past the table"),
+            port: 40_461,
+            generation: 1,
+        };
+        stack.deliver(nowhere, ReadyFrame::Bytes(a_frame_of_type(frame_type::PAD)));
+
+        assert_eq!(
+            data + 2,
+            stack.counters().rx_receiver_discard.load(Ordering::Relaxed),
+            "a frame for a slot the table has not got is counted too"
+        );
     }
 
     /// G12 at the level of the ring: a released port's frames are gone, and

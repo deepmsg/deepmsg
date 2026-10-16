@@ -69,7 +69,7 @@ pub(crate) fn route(
     let received = match frame::read(frame.bytes, frame.checksums) {
         Ok(received) => received,
         Err(discard) => {
-            count(stack, discard);
+            count_a_discard(stack, discard);
             return Disposition::Consumed;
         }
     };
@@ -154,7 +154,13 @@ fn answer_echo(
 }
 
 /// Count a frame the parser would not take.
-fn count(stack: &Stack, discard: Discard) {
+///
+/// **The one place that says which `Discard` is which counter**, so that a
+/// frame rejected somewhere other than here lands on the same counter it would
+/// have landed on here: [`super::transport`]'s re-read of a frame it will not
+/// hand up asks this, and that is the whole reason it is not private — one
+/// frame, one decision, one counter, wherever the decision is made.
+pub(crate) fn count_a_discard(stack: &Stack, discard: Discard) {
     let counters = stack.counters();
 
     match discard {
@@ -173,7 +179,7 @@ fn count(stack: &Stack, discard: Discard) {
 
 /// Count a datagram for a port nobody bound, on the counter its frame type
 /// belongs to.
-fn count_unclaimed(stack: &Stack, payload: &[u8]) {
+pub(crate) fn count_unclaimed(stack: &Stack, payload: &[u8]) {
     let counter = if is_data_plane(payload) {
         &stack.counters().rx_receiver_discard
     } else {
@@ -181,6 +187,26 @@ fn count_unclaimed(stack: &Stack, payload: &[u8]) {
     };
 
     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Count a whole frame that was routed to a binding that is no longer there.
+///
+/// **The second half of the rule this module's note states**: every decision
+/// about a received frame lands on a counter, and `Stack::deliver` has two ways
+/// to drop one — a slot that is gone, and a ring whose binding has been rebound
+/// under it. The fact is the unclaimed fact ("no transport has it now"), so it
+/// is counted the same way, from the frame's own bytes. A frame whose bytes do
+/// not read back as UDP takes [`is_data_plane`]'s own way out — the side is not
+/// there to ask, so it is the data plane's. (The third way, `Pushed::Stale`,
+/// cannot ask this: the ring has consumed the frame by then. It counts on the
+/// receiver's counter for the same reason, stated where it happens.)
+pub(crate) fn count_a_frame_nobody_has(stack: &Stack, frame: &[u8]) {
+    let payload = match frame::read(frame, frame::Checksums::Software) {
+        Ok(Received::Udp { datagram, .. }) => datagram.payload,
+        Ok(Received::Arp(_) | Received::Echo { .. }) | Err(_) => &[],
+    };
+
+    count_unclaimed(stack, payload);
 }
 
 /// Whether an Aeron frame carries data — which is what says its datagram was
