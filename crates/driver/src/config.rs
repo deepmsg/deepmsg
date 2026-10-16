@@ -557,8 +557,6 @@ pub struct DpdkSettings {
     pub mempool_cache: u32,
     /// How many frames one pass takes off the port.
     pub rx_burst: usize,
-    /// The capacity of the cross-thread ring — the ready ring, in this build.
-    pub sender_ring: usize,
     /// The range a bind of port zero draws from.
     pub ephemeral_ports: RangeInclusive<u16>,
     /// How long a learned address stays good.
@@ -581,7 +579,6 @@ impl Default for DpdkSettings {
             mempool_size: None,
             mempool_cache: DPDK_MEMPOOL_CACHE_DEFAULT,
             rx_burst: DPDK_RX_BURST_DEFAULT,
-            sender_ring: DPDK_SENDER_RING_DEFAULT,
             ephemeral_ports: crate::media::userspace::ports::EPHEMERAL_PORTS,
             arp_timeout: DPDK_ARP_TIMEOUT_DEFAULT,
             arp_retry: DPDK_ARP_RETRY_DEFAULT,
@@ -615,8 +612,6 @@ pub const DPDK_RX_BURST_MAX: usize = 64;
 /// itself: parsed, validated, documented, read by nobody).
 #[cfg(feature = "dpdk")]
 const _: () = assert!(DPDK_RX_BURST_MAX == deepmsg_dpdk::SHIM_BURST_MAX);
-/// `design.md` §4.7's cross-thread ring, which in this build is the ready ring.
-pub const DPDK_SENDER_RING_DEFAULT: usize = 1024;
 /// The design's ARP ageing.
 pub const DPDK_ARP_TIMEOUT_DEFAULT: Duration = Duration::from_secs(300);
 /// The design's ARP retry interval.
@@ -2221,13 +2216,6 @@ impl Setting {
         property: "dpdk.rx.burst",
         env: "DEEPMSG_DPDK_RX_BURST",
     };
-    /// `deepmsg.dpdk.sender.ring` (`DEEPMSG_DPDK_SENDER_RING`): the capacity
-    /// of the cross-thread ring — which in this build is the ready ring itself
-    /// (§4.7's plan A, as the D2 slice left it).
-    const DPDK_SENDER_RING: Self = Self {
-        property: "dpdk.sender.ring",
-        env: "DEEPMSG_DPDK_SENDER_RING",
-    };
     /// `deepmsg.dpdk.ephemeral.ports` (`DEEPMSG_DPDK_EPHEMERAL_PORTS`):
     /// `first-last`, the range a bind of port zero draws from.
     const DPDK_EPHEMERAL_PORTS: Self = Self {
@@ -3406,16 +3394,6 @@ fn parse_dpdk(
             });
         }
         dpdk.rx_burst = usize::try_from(burst).expect("a positive count");
-    }
-    if let Some(value) = get(&Setting::DPDK_SENDER_RING) {
-        let ring = parse_count(&Setting::DPDK_SENDER_RING, &value)?;
-        if ring < 2 {
-            return Err(ConfigError::OutOfRange {
-                name: Setting::DPDK_SENDER_RING.property,
-                value,
-            });
-        }
-        dpdk.sender_ring = usize::try_from(ring).expect("a positive count");
     }
     if let Some(value) = get(&Setting::DPDK_EPHEMERAL_PORTS) {
         dpdk.ephemeral_ports = parse_ports(&Setting::DPDK_EPHEMERAL_PORTS, &value)?;
@@ -5485,7 +5463,6 @@ mod tests {
             // One past what a port will take in one call: accepted-and-clamped
             // is the shape this setting's own history is made of.
             ("deepmsg.dpdk.rx.burst", "65"),
-            ("deepmsg.dpdk.sender.ring", "1"),
             ("deepmsg.dpdk.rx.descriptors", "70000"),
             ("deepmsg.dpdk.rx.descriptors", "lots"),
         ] {
