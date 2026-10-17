@@ -1,0 +1,18 @@
+The first 8192 bytes — the header — of a cluster mark file written by the
+reference's own ClusterMarkFile at 664f58e705, with:
+    componentType   CONSENSUS_MODULE
+    clock           1_700_000_000_000
+    clusterId       7
+    memberId        3
+    signalReady     1_700_000_000_123
+    pid            whatever the generator process had (not stable, not read)
+
+It is the "Java writes, Rust reads" direction of LC-5. Regenerate with
+regen/GenMark.java; it needs the reference jar and JDK 21's export:
+
+    javac -cp aeron-all-1.53.2.jar GenMark.java
+    java --add-exports java.base/jdk.internal.misc=ALL-UNNAMED \
+         -cp aeron-all-1.53.2.jar:. GenMark <dir> cluster-mark-header.bin
+
+The export flag is not optional on JDK 21+: agrona 2.6.1 reaches
+jdk.internal.misc.Unsafe, and without it the JVM refuses at class init.

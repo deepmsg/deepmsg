@@ -270,6 +270,10 @@ dependencies = [
 [[package]]
 name = "deepmsg-cluster-common"
 version = "0.1.0"
+dependencies = [
+ "deepmsg-codec-cluster-mark",
+ "deepmsg-core",
+]
 
 [[package]]
 name = "deepmsg-cluster-service"
