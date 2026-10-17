@@ -18,8 +18,10 @@
 use core::hash::{BuildHasherDefault, Hasher};
 
 pub mod agrona;
+pub mod ring;
 
 pub use agrona::{Long2LongHashMap, even_hash, find_next_positive_power_of_two, hash};
+pub use ring::ExpandableRingBuffer;
 
 /// FNV-1a, 64-bit. Chosen for being boring: deterministic, no seed, one
 /// multiply per byte, and short enough to check by eye. It is not a fast

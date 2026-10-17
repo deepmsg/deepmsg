@@ -8,8 +8,17 @@
 //!
 //! Everything below was read out of `agrona-2.6.1.jar` with `javap -p -c`, and
 //! is pinned against the jar's own behaviour by
-//! `tests/agrona_order.rs` — the fixture in `tests/fixtures/agrona-order.tsv`
-//! was produced by *running* the jar, not by reading it.
+//! `tests/agrona_order.rs` — the fixtures in `tests/fixtures/` were produced by
+//! *running* the jar, not by reading it.
+//!
+//! # Two iteration orders, and the one the snapshot uses
+//!
+//! `forEachLong` (`for_each`) walks the slots **ascending**. `entrySet()
+//! .iterator()` (`for_each_entry`) does not: its `AbstractIterator` starts at
+//! `positionCounter - 2` and walks **down**, wrapping through the mask, which
+//! is what `WheelTimerService.snapshot` (`:120-129`) writes into the snapshot.
+//! The two are different orders over the same map; both are reproduced here and
+//! both have a fixture.
 //!
 //! Traps worth knowing before changing anything here:
 //!
@@ -153,8 +162,10 @@ impl Long2LongHashMap {
         }
     }
 
-    /// `forEachLong(LongLongConsumer)` — **the iteration order the snapshot
-    /// sees**. Entries come out in slot order, which is hash order.
+    /// `forEachLong(LongLongConsumer)` — ascending slot order.
+    ///
+    /// This is **not** the order the timer snapshot sees: that one is
+    /// [`Self::for_each_entry`]. The fixture `agrona-order.tsv` pins this one.
     pub fn for_each<F: FnMut(i64, i64)>(&self, mut visit: F) {
         let mut i = 1;
         while i < self.entries.len() {
@@ -163,6 +174,68 @@ impl Long2LongHashMap {
                 visit(self.entries[i - 1], value);
             }
             i += 2;
+        }
+    }
+
+    /// `entrySet().iterator()` — the order `WheelTimerService.snapshot` writes
+    /// the timers in (`WheelTimerService.java:120-129`).
+    ///
+    /// Agrona's `AbstractIterator` does **not** walk the slots ascending:
+    ///
+    /// * `reset()` sets `stopCounter` to the key slot before the **first empty
+    ///   value slot** (scanning odd slots from 1 upwards), or the array length
+    ///   when there is none, and `positionCounter = stopCounter + length`.
+    /// * `findNext()` starts at `positionCounter - 2`, maps it through the mask,
+    ///   and walks **downwards by two** until it reaches `stopCounter`, emitting
+    ///   the first occupied value slot it meets.
+    ///
+    /// So the walk is descending over the occupied range and wraps once through
+    /// the mask. `tests/agrona_order.rs` compares this against the jar's own
+    /// `entrySet()` order.
+    pub fn for_each_entry<F: FnMut(i64, i64)>(&self, mut visit: F) {
+        let length = self.entries.len();
+        if length == 0 || self.size == 0 {
+            return;
+        }
+        let missing = self.missing_value;
+        let mask = length - 1;
+
+        // `reset()`: the first empty value slot's key slot, or the length.
+        let mut stop_counter = length;
+        if self.entries[length - 1] != missing {
+            let mut i = 1;
+            while i < length {
+                if self.entries[i] == missing {
+                    stop_counter = i - 1;
+                    break;
+                }
+                i += 2;
+            }
+        }
+
+        let mut position_counter = (stop_counter + length) as isize;
+        let stop = stop_counter as isize;
+        let mut remaining = self.size;
+
+        while remaining > 0 {
+            let mut position = position_counter - 2;
+            let mut found = false;
+            while position >= stop {
+                let key_position = (position as usize) & mask;
+                if self.entries[key_position + 1] != missing {
+                    visit(self.entries[key_position], self.entries[key_position + 1]);
+                    position_counter = position;
+                    remaining -= 1;
+                    found = true;
+                    break;
+                }
+                position -= 2;
+            }
+            if !found {
+                // `size` and the slot array disagree; the Java iterator throws
+                // `IllegalStateException` here. There is nothing to visit.
+                break;
+            }
         }
     }
 

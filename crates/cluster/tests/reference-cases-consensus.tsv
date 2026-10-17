@@ -276,9 +276,9 @@ unit	ClusterNodeTest	shouldEchoMessageViaServiceUsingDirectOffer	A	P3-4f	unit
 unit	ClusterNodeTest	shouldEchoMessageViaServiceUsingTryClaim	A	P3-4f	unit			
 unit	ClusterNodeTest	shouldScheduleEventInService	A	P3-4f	unit			
 unit	ClusterNodeTest	shouldSendResponseAfterServiceMessage	A	P3-4f	unit			
-unit	ClusterTimerTest	shouldRestartServiceWithTimerFromSnapshotWithFurtherLog	A	P3-4c	unit			
-unit	ClusterTimerTest	shouldTriggerRescheduledTimerAfterReplay	A	P3-4c	unit			
-unit	ClusterTimerTest	shouldRescheduleTimerWhenSchedulingWithExistingCorrelationId	A	P3-4c	unit			
+unit	ClusterTimerTest	shouldRestartServiceWithTimerFromSnapshotWithFurtherLog	A	P3-4f	unit			
+unit	ClusterTimerTest	shouldTriggerRescheduledTimerAfterReplay	A	P3-4f	unit			
+unit	ClusterTimerTest	shouldRescheduleTimerWhenSchedulingWithExistingCorrelationId	A	P3-4f	unit			
 unit	ClusterWithNoServicesTest	shouldConnectAndSendKeepAliveWithExtensionLoaded	A	P3-4f	unit			
 unit	ClusterWithNoServicesTest	shouldSnapshotExtensionState	A	P3-4f	unit			
 unit	ClusterWithNoServicesTest	shouldShutdownWithExtension	A	P3-4f	unit			
@@ -329,38 +329,38 @@ unit	NodeStateFileTest	shouldPersistCandidateTermId	A	P3-1f	unit
 unit	NodeStateFileTest	shouldThrowIfVersionMismatch	A	P3-1f	unit			
 unit	NodeStateFileTest	shouldProposeNewMaxTermId	A	P3-1f	unit			
 unit	NodeStateFileTest	shouldHandleNodeStateFileCreatedWithEarlierVersion	A	P3-1f	unit			
-unit	PendingServiceMessageTrackerTest	snapshotEmpty	A	P3-4c	unit			
-unit	PendingServiceMessageTrackerTest	snapshotAfterEnqueueBeforePollAndSweep	A	P3-4c	unit			
-unit	PendingServiceMessageTrackerTest	snapshotAfterEnqueueAndPollBeforeSweep	A	P3-4c	unit			
-unit	PendingServiceMessageTrackerTest	snapshotAfterEnqueuePollAndSweepForLeader	A	P3-4c	unit			
-unit	PendingServiceMessageTrackerTest	snapshotAfterEnqueuePollAndSweepForFollower	A	P3-4c	unit			
-unit	PendingServiceMessageTrackerTest	loadInvalid	A	P3-4c	unit			
-unit	PendingServiceMessageTrackerTest	loadValid	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	throwsNullPointerExceptionIfTimerHandlerIsNull	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	pollIsANoOpWhenNoTimersWhereScheduled	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	pollIsANoOpWhenNoScheduledTimersAreExpired	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	pollShouldNotExpireTimerIfHandlerReturnsFalse	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	pollShouldExpireSingleTimer	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	pollShouldRemovedExpiredTimers	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	pollShouldExpireTimersInOrderOfDeadlineButWithinTheDeadlineOrderIsUndefined	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdIsANoOpIfNoTimersRegistered	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdReturnsFalseForUnknownCorrelationId	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdReturnsTrueAfterCancellingTheTimer	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdReturnsTrueAfterCancellingTheLastTimer	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdAfterPoll	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	scheduleTimerForAnExistingCorrelationIdIsANoOpIfDeadlineDoesNotChange	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	scheduleTimerForAnExistingCorrelationIdShouldShiftEntryUpWhenDeadlineIsDecreasing	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	scheduleTimerForAnExistingCorrelationIdShouldShiftEntryDownWhenDeadlineIsIncreasing	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	pollShouldStopAfterPollLimitIsReached	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	snapshotProcessesAllScheduledTimers	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	expireThanCancelTimer	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	moveUpAnExistingTimerAndCancelAnotherOne	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	moveDownAnExistingTimerAndCancelAnotherOne	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	cancelExpiredTimerIsANoOp	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	scheduleMustRetainOrderBetweenDeadlines	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	shouldReuseExpiredEntriesFromAFreeList	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	shouldReuseCanceledTimerEntriesFromAFreeList	A	P3-4c	unit			
-unit	PriorityHeapTimerServiceTest	manyRandomOperations	A	P3-4c	unit			
+unit	PendingServiceMessageTrackerTest	snapshotEmpty	A	P3-4c	unit			snapshot_empty
+unit	PendingServiceMessageTrackerTest	snapshotAfterEnqueueBeforePollAndSweep	A	P3-4c	unit			snapshot_after_enqueue_before_poll_and_sweep
+unit	PendingServiceMessageTrackerTest	snapshotAfterEnqueueAndPollBeforeSweep	A	P3-4c	unit			snapshot_after_enqueue_and_poll_before_sweep
+unit	PendingServiceMessageTrackerTest	snapshotAfterEnqueuePollAndSweepForLeader	A	P3-4c	unit			snapshot_after_enqueue_poll_and_sweep_for_leader
+unit	PendingServiceMessageTrackerTest	snapshotAfterEnqueuePollAndSweepForFollower	A	P3-4c	unit			snapshot_after_enqueue_poll_and_sweep_for_follower
+unit	PendingServiceMessageTrackerTest	loadInvalid	A	P3-4c	unit			load_invalid
+unit	PendingServiceMessageTrackerTest	loadValid	A	P3-4c	unit			load_valid
+unit	PriorityHeapTimerServiceTest	throwsNullPointerExceptionIfTimerHandlerIsNull	A	P3-4c	unit			the_constructor_requires_a_handler (type system: a Box<dyn TimerHandler> cannot be null)
+unit	PriorityHeapTimerServiceTest	pollIsANoOpWhenNoTimersWhereScheduled	A	P3-4c	unit			poll_is_a_no_op_when_no_timers_where_scheduled
+unit	PriorityHeapTimerServiceTest	pollIsANoOpWhenNoScheduledTimersAreExpired	A	P3-4c	unit			poll_is_a_no_op_when_no_scheduled_timers_are_expired
+unit	PriorityHeapTimerServiceTest	pollShouldNotExpireTimerIfHandlerReturnsFalse	A	P3-4c	unit			poll_should_not_expire_timer_if_handler_returns_false
+unit	PriorityHeapTimerServiceTest	pollShouldExpireSingleTimer	A	P3-4c	unit			poll_should_expire_single_timer
+unit	PriorityHeapTimerServiceTest	pollShouldRemovedExpiredTimers	A	P3-4c	unit			poll_should_removed_expired_timers
+unit	PriorityHeapTimerServiceTest	pollShouldExpireTimersInOrderOfDeadlineButWithinTheDeadlineOrderIsUndefined	A	P3-4c	unit			poll_should_expire_timers_in_order_of_deadline_but_within_the_deadline_order_is_undefined
+unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdIsANoOpIfNoTimersRegistered	A	P3-4c	unit			cancel_timer_by_correlation_id_is_a_no_op_if_no_timers_registered
+unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdReturnsFalseForUnknownCorrelationId	A	P3-4c	unit			cancel_timer_by_correlation_id_returns_false_for_unknown_correlation_id
+unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdReturnsTrueAfterCancellingTheTimer	A	P3-4c	unit			cancel_timer_by_correlation_id_returns_true_after_cancelling_the_timer
+unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdReturnsTrueAfterCancellingTheLastTimer	A	P3-4c	unit			cancel_timer_by_correlation_id_returns_true_after_cancelling_the_last_timer
+unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdAfterPoll	A	P3-4c	unit			cancel_timer_by_correlation_id_after_poll
+unit	PriorityHeapTimerServiceTest	scheduleTimerForAnExistingCorrelationIdIsANoOpIfDeadlineDoesNotChange	A	P3-4c	unit			schedule_timer_for_an_existing_correlation_id_is_a_no_op_if_deadline_does_not_change
+unit	PriorityHeapTimerServiceTest	scheduleTimerForAnExistingCorrelationIdShouldShiftEntryUpWhenDeadlineIsDecreasing	A	P3-4c	unit			schedule_timer_for_an_existing_correlation_id_should_shift_entry_up_when_deadline_is_decreasing
+unit	PriorityHeapTimerServiceTest	scheduleTimerForAnExistingCorrelationIdShouldShiftEntryDownWhenDeadlineIsIncreasing	A	P3-4c	unit			schedule_timer_for_an_existing_correlation_id_should_shift_entry_down_when_deadline_is_increasing
+unit	PriorityHeapTimerServiceTest	pollShouldStopAfterPollLimitIsReached	A	P3-4c	unit			poll_should_stop_after_poll_limit_is_reached
+unit	PriorityHeapTimerServiceTest	snapshotProcessesAllScheduledTimers	A	P3-4c	unit			snapshot_processes_all_scheduled_timers
+unit	PriorityHeapTimerServiceTest	expireThanCancelTimer	A	P3-4c	unit			expire_than_cancel_timer
+unit	PriorityHeapTimerServiceTest	moveUpAnExistingTimerAndCancelAnotherOne	A	P3-4c	unit			move_up_an_existing_timer_and_cancel_another_one
+unit	PriorityHeapTimerServiceTest	moveDownAnExistingTimerAndCancelAnotherOne	A	P3-4c	unit			move_down_an_existing_timer_and_cancel_another_one
+unit	PriorityHeapTimerServiceTest	cancelExpiredTimerIsANoOp	A	P3-4c	unit			cancel_expired_timer_is_a_no_op
+unit	PriorityHeapTimerServiceTest	scheduleMustRetainOrderBetweenDeadlines	A	P3-4c	unit			schedule_must_retain_order_between_deadlines
+unit	PriorityHeapTimerServiceTest	shouldReuseExpiredEntriesFromAFreeList	A	P3-4c	unit			should_reuse_expired_entries_from_a_free_list
+unit	PriorityHeapTimerServiceTest	shouldReuseCanceledTimerEntriesFromAFreeList	A	P3-4c	unit			should_reuse_canceled_timer_entries_from_a_free_list
+unit	PriorityHeapTimerServiceTest	manyRandomOperations	A	P3-4c	unit			many_random_operations
 unit	PublicationGroupTest	shouldUseAllPublicationsInListWhenGettingNextPublication	A	P3-6b	unit			
 unit	PublicationGroupTest	shouldNextPublicationAndReturnSameWithCurrent	A	P3-6b	unit			
 unit	PublicationGroupTest	shouldResultNullWhenCurrentCalledWithoutNext	A	P3-6b	unit			
@@ -412,10 +412,10 @@ unit	RecordingReplicationTest	shouldStopReplicationIfNotAlreadyStopped	A	P3-6b	u
 unit	RecordingReplicationTest	shouldNotStopReplicationIfStopSignalled	A	P3-6b	unit			
 unit	RecordingReplicationTest	shouldFailIfRecordingLogIsDeletedDuringReplication	A	P3-6b	unit			
 unit	RecordingReplicationTest	shouldPollForProgressAndFailIfNotProgressing	A	P3-6b	unit			
-unit	ServiceProxyTest	shouldLogWarningIfClusterMemberResponseFails	A	P3-4c	unit			
-unit	ServiceProxyTest	shouldSendClusterMemberResponse	A	P3-4c	unit			
-unit	ServiceProxyTest	shouldLogWarningIfClusterMemberExtendedResponseFails	A	P3-4c	unit			
-unit	ServiceProxyTest	shouldSendClusterMemberExtendedResponse	A	P3-4c	unit			
+unit	ServiceProxyTest	shouldLogWarningIfClusterMemberResponseFails	A	P3-4c	unit			should_log_warning_if_cluster_member_response_fails
+unit	ServiceProxyTest	shouldSendClusterMemberResponse	A	P3-4c	unit			should_send_cluster_member_response
+unit	ServiceProxyTest	shouldLogWarningIfClusterMemberExtendedResponseFails	A	P3-4c	unit			should_log_warning_if_cluster_member_extended_response_fails
+unit	ServiceProxyTest	shouldSendClusterMemberExtendedResponse	A	P3-4c	unit			should_send_cluster_member_extended_response
 unit	SessionManagerTest	shouldProcessPendingStandbySnapshotNotificationsAfterReachingCommitPosition	A	P3-4b	unit		n/a:premium	
 unit	SessionManagerTest	shouldRetryCreatingResponsePublicationWhenResourceTemporarilyUnavailable	A	P3-4b	unit			the_resource_temporarily_unavailable_answer_reissues_the_add (weakened: the decision over the driver's error, not a driver)
 unit	SessionManagerTest	shouldProcessPendingStandbySnapshotNotificationsAfterProcessingDelay	A	P3-4b	unit		n/a:premium	
