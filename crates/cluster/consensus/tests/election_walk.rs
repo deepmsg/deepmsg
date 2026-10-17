@@ -92,9 +92,9 @@ impl ElectionHost for Mock {
         s: i32,
         _u: bool,
     ) -> Result<(), ClusterError> {
-        // The log publication fixes the session id; the mock pins one so the
-        // recording entry can name it.
-        assert_eq!(s, -1, "the session id is chosen at join time");
+        // The session id is the one `add_log_publication` produced; the election
+        // carries it from the LEADER_LOG_REPLICATION transition into the join.
+        assert_eq!(s, 77, "the session id comes from the log publication");
         self.calls.push("join_log_as_leader");
         Ok(())
     }
@@ -109,6 +109,11 @@ impl ElectionHost for Mock {
     fn add_log_publication(&mut self, _a: i64) -> Result<usize, ClusterError> {
         self.calls.push("add_log_publication");
         Ok(1)
+    }
+    fn log_session_id(&self) -> i32 {
+        // What `addLogPublication` answers in the reference; the election reads
+        // it back through this accessor (the frozen seam returns a work count).
+        77
     }
     fn new_log_replay(&mut self, _l: i64, _a: i64) -> Result<LogReplay, ClusterError> {
         self.calls.push("new_log_replay");
@@ -179,6 +184,9 @@ impl ElectionHost for Mock {
     }
     fn now_ns(&mut self) -> i64 {
         self.now_ns
+    }
+    fn timestamp_from_nanos(&self, now_ns: i64) -> i64 {
+        now_ns / 1_000_000
     }
     fn epoch_ms(&self) -> i64 {
         self.now_ns / 1_000_000

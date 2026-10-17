@@ -23,10 +23,16 @@ deepmsg-driver = { path = "../crates/driver" }
 deepmsg-cnc = { path = "../crates/cnc" }
 deepmsg-codec = { path = "../crates/codec" }
 deepmsg-archive = { path = "../crates/archive" }
+deepmsg-cluster = { path = "../crates/cluster/consensus" }
+deepmsg-cluster-common = { path = "../crates/cluster/common" }
 
 [[test]]
 name = "basic_roundtrip"
 path = "integration/basic_roundtrip.rs"
+
+[[test]]
+name = "cluster_cm_launch"
+path = "integration/cluster_cm_launch.rs"
 
 [[test]]
 name = "forwarding_poll"

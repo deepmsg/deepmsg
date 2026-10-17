@@ -56,7 +56,10 @@ fn every_name_is_classified_or_pending() {
             }
         }
     }
-    assert_eq!(pending, NAMES.len(), "P3-1a leaves every row Pending");
+    // 27 honoured, 3 accepted-not-honoured, 1 refused: the rows P3-4a's
+    // configuration reads. Every other row is still Pending and must be gone by
+    // P3-11.
+    assert_eq!(pending, 49, "the P3-4a rows are classified");
 }
 
 #[test]

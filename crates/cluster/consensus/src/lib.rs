@@ -36,11 +36,18 @@
 // enables it.
 #![deny(clippy::disallowed_types)]
 
+pub mod agent;
+pub mod clock;
+pub mod config;
 pub mod election;
 pub mod error;
 pub mod handles;
+pub mod log_publisher;
 pub mod persist;
 pub mod state;
 
+pub use agent::ConsensusModuleAgent;
+pub use clock::{ClusterClock, MillisecondClusterClock};
+pub use config::ConsensusModuleConfig;
 pub use error::ClusterError;
 pub use state::{ModuleState, Role};

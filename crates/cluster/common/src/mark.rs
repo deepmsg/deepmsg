@@ -100,6 +100,10 @@ const COMPONENT_TYPE: usize = HEADER_OFFSET + 4;
 const START_TIMESTAMP: usize = HEADER_OFFSET + 16;
 const PID: usize = HEADER_OFFSET + 24;
 const CANDIDATE_TERM_ID: usize = HEADER_OFFSET + 32;
+const ARCHIVE_STREAM_ID: usize = HEADER_OFFSET + 40;
+const SERVICE_STREAM_ID: usize = HEADER_OFFSET + 44;
+const CONSENSUS_MODULE_STREAM_ID: usize = HEADER_OFFSET + 48;
+const INGRESS_STREAM_ID: usize = HEADER_OFFSET + 52;
 const MEMBER_ID: usize = HEADER_OFFSET + 56;
 const SERVICE_ID: usize = HEADER_OFFSET + 60;
 const HEADER_LENGTH_FIELD: usize = HEADER_OFFSET + 64;
@@ -405,6 +409,36 @@ impl ClusterMarkFile {
     }
 
     /// The cluster id.
+    /// The four stream ids the header names (`ClusterMarkFile.encoder()`,
+    /// `ConsensusModule.java:4577-4580`). One call because the reference writes
+    /// them together, and a half-written header is a header a `ClusterTool`
+    /// reports as wrong.
+    pub fn set_stream_ids(
+        &self,
+        archive_stream_id: i32,
+        service_stream_id: i32,
+        consensus_module_stream_id: i32,
+        ingress_stream_id: i32,
+    ) {
+        if let Ok(buffer) = self.header() {
+            buffer.store_i32_relaxed(ARCHIVE_STREAM_ID, archive_stream_id);
+            buffer.store_i32_relaxed(SERVICE_STREAM_ID, service_stream_id);
+            buffer.store_i32_relaxed(CONSENSUS_MODULE_STREAM_ID, consensus_module_stream_id);
+            buffer.store_i32_relaxed(INGRESS_STREAM_ID, ingress_stream_id);
+        }
+    }
+
+    /// The four stream ids back, in the same order.
+    pub fn stream_ids(&self) -> Option<(i32, i32, i32, i32)> {
+        let buffer = self.header().ok()?;
+        Some((
+            buffer.load_i32(ARCHIVE_STREAM_ID)?,
+            buffer.load_i32(SERVICE_STREAM_ID)?,
+            buffer.load_i32(CONSENSUS_MODULE_STREAM_ID)?,
+            buffer.load_i32(INGRESS_STREAM_ID)?,
+        ))
+    }
+
     pub fn cluster_id(&self) -> Option<i32> {
         self.header().ok()?.load_i32(CLUSTER_ID)
     }

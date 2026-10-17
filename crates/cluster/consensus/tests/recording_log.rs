@@ -210,3 +210,136 @@ fn an_oversized_endpoint_is_refused() {
         Err(RecordingLogError::EndpointTooLong { .. })
     ));
 }
+
+// ---------------------------------------------------------------------------
+// `createRecoveryPlan` (`RecordingLog.java:890-935`), with the archive's
+// `listRecording` replaced by a lookup table — the shape the reference's own
+// `RecordingLogTest` mocks.
+// ---------------------------------------------------------------------------
+
+use deepmsg_cluster::persist::recording_log::{NULL_POSITION, RecordingExtent, Snapshot};
+
+fn extent(recording_id: i64) -> RecordingExtent {
+    RecordingExtent {
+        recording_id,
+        start_position: 0,
+        stop_position: 100,
+        initial_term_id: 0,
+        term_buffer_length: 4096,
+        mtu_length: 1408,
+        session_id: 7,
+    }
+}
+
+#[test]
+fn an_empty_log_plans_no_replay() {
+    let path = scratch("recovery-empty");
+    let log = open(&path);
+
+    let plan = log
+        .create_recovery_plan(|_| None, 0, -1)
+        .expect("an empty plan");
+
+    assert_eq!(NULL_POSITION, plan.last_leadership_term_id);
+    assert_eq!(0, plan.last_term_base_log_position);
+    assert_eq!(0, plan.appended_log_position);
+    assert_eq!(0, plan.committed_log_position);
+    assert!(plan.snapshots.is_empty());
+    assert!(plan.log.is_none());
+    assert_eq!(-1, log.find_last_term_recording_id());
+}
+
+#[test]
+fn an_empty_log_with_a_replicated_recording_plans_to_replay_it() {
+    let path = scratch("recovery-replicated");
+    let log = open(&path);
+
+    let plan = log
+        .create_recovery_plan(|recording_id| Some(extent(recording_id)), 0, 42)
+        .expect("a replicated plan");
+
+    let replay = plan.log.expect("the replicated log");
+    assert_eq!(42, replay.recording_id);
+    assert_eq!(-1, replay.leadership_term_id);
+    assert_eq!(0, replay.start_position);
+    assert_eq!(100, replay.stop_position);
+    assert_eq!(100, plan.appended_log_position);
+}
+
+#[test]
+fn a_term_and_its_snapshots_are_planned_in_the_references_order() {
+    let path = scratch("recovery-snapshots");
+    let mut log = open(&path);
+
+    log.append_term(
+        1,
+        0,
+        100,
+        1_700_000_000_000,
+        42,
+        CONSENSUS_MODULE_SERVICE_ID,
+    )
+    .unwrap();
+    // The consensus module's snapshot last on disk, the service's first; the
+    // sorted view puts the service before the module entry, which is the order
+    // `addSnapshots` walks backwards from.
+    log.append_snapshot(
+        1,
+        0,
+        100,
+        1_700_000_000_000,
+        51,
+        CONSENSUS_MODULE_SERVICE_ID,
+    )
+    .unwrap();
+    log.append_snapshot(1, 0, 100, 1_700_000_000_000, 50, 0)
+        .unwrap();
+
+    let plan = log
+        .create_recovery_plan(|recording_id| Some(extent(recording_id)), 1, -1)
+        .expect("a snapshot plan");
+
+    let snapshots: Vec<Snapshot> = plan.snapshots.clone();
+    assert_eq!(2, snapshots.len());
+    assert_eq!(
+        51, snapshots[0].recording_id,
+        "the module's snapshot is first"
+    );
+    assert_eq!(50, snapshots[1].recording_id, "then the service's");
+
+    let replay = plan.log.expect("the term's log");
+    assert_eq!(42, replay.recording_id);
+    assert_eq!(100, replay.start_position, "replay starts at the snapshot");
+    assert_eq!(1, plan.last_leadership_term_id);
+    assert_eq!(100, plan.committed_log_position);
+}
+
+#[test]
+fn a_recording_the_archive_does_not_know_is_refused() {
+    let path = scratch("recovery-unknown");
+    let mut log = open(&path);
+    log.append_term(0, 0, 0, 1, 42, CONSENSUS_MODULE_SERVICE_ID)
+        .unwrap();
+
+    let error = log.create_recovery_plan(|_| None, 0, -1).unwrap_err();
+    assert!(matches!(error, RecordingLogError::UnknownRecording(42)));
+}
+
+#[test]
+fn a_snapshot_missing_for_a_service_is_refused() {
+    let path = scratch("recovery-missing-service");
+    let mut log = open(&path);
+    log.append_snapshot(0, 0, 10, 1, 51, CONSENSUS_MODULE_SERVICE_ID)
+        .unwrap();
+
+    let error = log
+        .create_recovery_plan(|recording_id| Some(extent(recording_id)), 1, -1)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        RecordingLogError::SnapshotMissing {
+            service_id: 1,
+            snapshot_index: 0,
+        }
+    ));
+}

@@ -150,6 +150,16 @@ pub enum RecordingLogError {
         /// Bytes the endpoint needs.
         length: usize,
     },
+    /// A recovery plan named a recording the archive does not know.
+    UnknownRecording(i64),
+    /// A recovery plan found the consensus module's snapshot but not the one
+    /// for a service it expects immediately before it.
+    SnapshotMissing {
+        /// The service whose snapshot is missing.
+        service_id: i32,
+        /// The index the module's snapshot was at.
+        snapshot_index: usize,
+    },
 }
 
 impl fmt::Display for RecordingLogError {
@@ -158,6 +168,16 @@ impl fmt::Display for RecordingLogError {
             Self::Io(error) => write!(f, "{error}"),
             Self::EntryTooLong { length } => write!(f, "entry of {length} bytes is too long"),
             Self::EndpointTooLong { length } => write!(f, "endpoint of {length} bytes is too long"),
+            Self::UnknownRecording(recording_id) => {
+                write!(f, "unknown recording id: {recording_id}")
+            }
+            Self::SnapshotMissing {
+                service_id,
+                snapshot_index,
+            } => write!(
+                f,
+                "snapshot missing for service at index {service_id} in entries ending at {snapshot_index}"
+            ),
         }
     }
 }
@@ -482,7 +502,13 @@ fn compare_entries(a: &Entry, b: &Entry) -> std::cmp::Ordering {
         other => return other,
     }
     // Reverse entry type order, as the reference does.
-    b.entry_type.cmp(&a.entry_type)
+    match b.entry_type.cmp(&a.entry_type) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    // And reverse service id, which is what puts a service's snapshot before
+    // the consensus module's at the same log position (`:540-544`).
+    b.service_id.cmp(&a.service_id)
 }
 
 const fn align(value: usize, alignment: usize) -> usize {
@@ -499,6 +525,287 @@ fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
 fn write_all_at(file: &File, offset: u64, buf: &[u8]) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.write_all_at(buf, offset)
+}
+
+// ---------------------------------------------------------------------------
+// Recovery: `findLastTermRecordingId`, and `createRecoveryPlan`
+// (`RecordingLog.java:707-730`, `:890-935`, `:1694-1760`).
+// ---------------------------------------------------------------------------
+
+/// The six fields of an archive recording a recovery plan needs.
+///
+/// The reference fills its `RecordingExtent` from `AeronArchive.listRecording`
+/// (`RecordingLog.java:1710-1715`). Keeping the query behind this value means
+/// the plan can be tested without an archive — which is how the reference's own
+/// `RecordingLogTest` tests it, with a mock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordingExtent {
+    /// The recording.
+    pub recording_id: i64,
+    /// Its first position.
+    pub start_position: i64,
+    /// Its last position, or the current one for a live recording.
+    pub stop_position: i64,
+    /// The term the recording's log began in.
+    pub initial_term_id: i32,
+    /// The term buffer length it was made with.
+    pub term_buffer_length: i32,
+    /// Its MTU.
+    pub mtu_length: i32,
+    /// The recording's publication session.
+    pub session_id: i32,
+}
+
+/// One snapshot the plan replays before the log (`RecordingLog.Snapshot`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    /// The recording holding it.
+    pub recording_id: i64,
+    /// The term it was taken in.
+    pub leadership_term_id: i64,
+    /// The log position the term started at.
+    pub term_base_log_position: i64,
+    /// The log position the snapshot covers.
+    pub log_position: i64,
+    /// Epoch milliseconds.
+    pub timestamp: i64,
+    /// The service, or `CONSENSUS_MODULE_SERVICE_ID`.
+    pub service_id: i32,
+}
+
+/// The log the plan replays after the snapshots (`RecordingLog.Log`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryLog {
+    /// The recording holding the log.
+    pub recording_id: i64,
+    /// The last term's id.
+    pub leadership_term_id: i64,
+    /// Where that term begins.
+    pub term_base_log_position: i64,
+    /// The committed position, or [`NULL_POSITION`].
+    pub log_position: i64,
+    /// Where replay starts: the snapshot's position, or the recording's start.
+    pub start_position: i64,
+    /// Where it stops.
+    pub stop_position: i64,
+    /// The recording's log shape, carried into the log publication.
+    pub initial_term_id: i32,
+    /// See [`RecordingExtent::term_buffer_length`].
+    pub term_buffer_length: i32,
+    /// See [`RecordingExtent::mtu_length`].
+    pub mtu_length: i32,
+    /// See [`RecordingExtent::session_id`].
+    pub session_id: i32,
+}
+
+/// What to replay, and where to restart the log (`RecordingLog.RecoveryPlan`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryPlan {
+    /// The last leadership term known to the log, or [`NULL_POSITION`].
+    pub last_leadership_term_id: i64,
+    /// The base position of that term.
+    pub last_term_base_log_position: i64,
+    /// The position the log was appended to.
+    pub appended_log_position: i64,
+    /// The position known to be committed.
+    pub committed_log_position: i64,
+    /// Snapshots to load, consensus module first, then by service id.
+    pub snapshots: Vec<Snapshot>,
+    /// The log to replay, if there is one.
+    pub log: Option<RecoveryLog>,
+}
+
+impl Default for RecoveryPlan {
+    /// The reference's initial values (`RecordingLog.java:894-897`): the term is
+    /// **`NULL_VALUE`**, not zero. A zero here would be a term that never
+    /// existed, and `Election` would start the next term at 1.
+    fn default() -> Self {
+        Self {
+            last_leadership_term_id: NULL_POSITION,
+            last_term_base_log_position: 0,
+            appended_log_position: 0,
+            committed_log_position: 0,
+            snapshots: Vec::new(),
+            log: None,
+        }
+    }
+}
+
+impl RecordingLog {
+    /// `findLastTermRecordingId()` (`:707-711`), with the reference's
+    /// `RecordingPos.NULL_RECORDING_ID` = `-1` for "none".
+    #[must_use]
+    pub fn find_last_term_recording_id(&self) -> i64 {
+        self.find_last_term().map_or(-1, |entry| entry.recording_id)
+    }
+
+    /// `findLastTerm()` (`:718-730`): the last valid term entry.
+    #[must_use]
+    pub fn find_last_term(&self) -> Option<&Entry> {
+        self.entries.iter().rev().find(|entry| entry.is_term())
+    }
+
+    /// `createRecoveryPlan` (`:890-935`).
+    ///
+    /// `list_recording` stands in for the archive: it is called once per
+    /// recording the plan needs, exactly as the reference calls
+    /// `AeronArchive.listRecording` (`:1710`, `:1740`). A recording the archive
+    /// does not know is [`RecordingLogError::UnknownRecording`], which the
+    /// reference raises as `ClusterException("unknown recording id: …")`.
+    ///
+    /// # Errors
+    ///
+    /// [`RecordingLogError::UnknownRecording`] for a named recording the closure
+    /// cannot describe, and [`RecordingLogError::SnapshotMissing`] when a
+    /// snapshot's service entry is not where the reference expects it.
+    pub fn create_recovery_plan(
+        &self,
+        mut list_recording: impl FnMut(i64) -> Option<RecordingExtent>,
+        service_count: i32,
+        replicated_recording_id: i64,
+    ) -> Result<RecoveryPlan, RecordingLogError> {
+        let mut plan = RecoveryPlan::default();
+        let mut snapshots: Vec<Snapshot> = Vec::new();
+        let mut log: Option<RecoveryLog> = None;
+
+        if self.entries.is_empty() {
+            if replicated_recording_id != -1 {
+                let Some(extent) = list_recording(replicated_recording_id) else {
+                    return Err(RecordingLogError::UnknownRecording(replicated_recording_id));
+                };
+                log = Some(RecoveryLog {
+                    recording_id: replicated_recording_id,
+                    leadership_term_id: -1,
+                    term_base_log_position: 0,
+                    log_position: 0,
+                    start_position: extent.start_position,
+                    stop_position: extent.stop_position,
+                    initial_term_id: extent.initial_term_id,
+                    term_buffer_length: extent.term_buffer_length,
+                    mtu_length: extent.mtu_length,
+                    session_id: extent.session_id,
+                });
+            }
+        } else {
+            // `planRecovery` walks backwards and takes the first valid snapshot
+            // of the consensus module and the first valid term with a recording.
+            let mut log_index: Option<usize> = None;
+            let mut snapshot_index: Option<usize> = None;
+
+            for (i, entry) in self.entries.iter().enumerate().rev() {
+                if snapshot_index.is_none()
+                    && entry.is_valid
+                    && entry.entry_type == ENTRY_TYPE_SNAPSHOT
+                    && entry.service_id == CONSENSUS_MODULE_SERVICE_ID
+                {
+                    snapshot_index = Some(i);
+                } else if log_index.is_none() && entry.is_term() && entry.recording_id != -1 {
+                    log_index = Some(i);
+                } else if snapshot_index.is_some() && log_index.is_some() {
+                    break;
+                }
+            }
+
+            if let Some(index) = snapshot_index {
+                add_snapshots(&mut snapshots, &self.entries, service_count, index)?;
+            }
+
+            if let Some(index) = log_index {
+                let entry = &self.entries[index];
+                let Some(extent) = list_recording(entry.recording_id) else {
+                    return Err(RecordingLogError::UnknownRecording(entry.recording_id));
+                };
+                let start_position = match snapshot_index {
+                    None => extent.start_position,
+                    Some(_) => snapshots[0].log_position,
+                };
+                log = Some(RecoveryLog {
+                    recording_id: entry.recording_id,
+                    leadership_term_id: entry.leadership_term_id,
+                    term_base_log_position: entry.term_base_log_position,
+                    log_position: entry.log_position,
+                    start_position,
+                    stop_position: extent.stop_position,
+                    initial_term_id: extent.initial_term_id,
+                    term_buffer_length: extent.term_buffer_length,
+                    mtu_length: extent.mtu_length,
+                    session_id: extent.session_id,
+                });
+            }
+        }
+
+        // The summary (`:897-926`): the snapshot's values first, then the log's.
+        if let Some(snapshot) = snapshots.first() {
+            plan.last_leadership_term_id = snapshot.leadership_term_id;
+            plan.last_term_base_log_position = snapshot.term_base_log_position;
+            plan.appended_log_position = snapshot.log_position;
+            plan.committed_log_position = snapshot.log_position;
+        }
+        if let Some(log) = log {
+            plan.last_leadership_term_id = log.leadership_term_id;
+            plan.last_term_base_log_position = log.term_base_log_position;
+            plan.appended_log_position = log.stop_position;
+            if log.log_position != NULL_POSITION {
+                plan.committed_log_position = log.log_position;
+            }
+            plan.log = Some(log);
+        }
+        plan.snapshots = snapshots;
+
+        Ok(plan)
+    }
+}
+
+/// `addSnapshots` (`:1300-1340`): the consensus module's snapshot, then one per
+/// service, each looked for immediately before the module's entry.
+fn add_snapshots(
+    snapshots: &mut Vec<Snapshot>,
+    entries: &[Entry],
+    service_count: i32,
+    snapshot_index: usize,
+) -> Result<(), RecordingLogError> {
+    let snapshot = &entries[snapshot_index];
+    snapshots.push(Snapshot {
+        recording_id: snapshot.recording_id,
+        leadership_term_id: snapshot.leadership_term_id,
+        term_base_log_position: snapshot.term_base_log_position,
+        log_position: snapshot.log_position,
+        timestamp: snapshot.timestamp,
+        service_id: snapshot.service_id,
+    });
+
+    for i in 1..=service_count {
+        if i as usize > snapshot_index {
+            return Err(RecordingLogError::SnapshotMissing {
+                service_id: i,
+                snapshot_index,
+            });
+        }
+        let entry = &entries[snapshot_index - i as usize];
+        if entry.entry_type == ENTRY_TYPE_SNAPSHOT
+            && entry.leadership_term_id == snapshot.leadership_term_id
+            && entry.log_position == snapshot.log_position
+        {
+            // `snapshots.add(serviceId + 1, ..)`: the service's id is the slot,
+            // so the list is ordered by service and the module's entry stays
+            // first only because it is appended first.
+            let slot = (entry.service_id + 1).max(0) as usize;
+            let slot = slot.min(snapshots.len());
+            snapshots.insert(
+                slot,
+                Snapshot {
+                    recording_id: entry.recording_id,
+                    leadership_term_id: entry.leadership_term_id,
+                    term_base_log_position: entry.term_base_log_position,
+                    log_position: entry.log_position,
+                    timestamp: entry.timestamp,
+                    service_id: entry.service_id,
+                },
+            );
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

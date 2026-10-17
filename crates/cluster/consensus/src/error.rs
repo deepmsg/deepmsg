@@ -42,6 +42,18 @@ impl ClusterError {
     }
 }
 
+impl From<deepmsg_cluster_common::counters::CounterError> for ClusterError {
+    fn from(error: deepmsg_cluster_common::counters::CounterError) -> Self {
+        Self::Cluster(error.to_string())
+    }
+}
+
+impl From<deepmsg_cluster_common::member::MemberError> for ClusterError {
+    fn from(error: deepmsg_cluster_common::member::MemberError) -> Self {
+        Self::Cluster(error.to_string())
+    }
+}
+
 impl core::fmt::Display for ClusterError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {

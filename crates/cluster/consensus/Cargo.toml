@@ -7,9 +7,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+deepmsg-archive = { path = "../../archive" }
 deepmsg-client = { path = "../../client" }
-deepmsg-core = { path = "../../core" }
+deepmsg-cluster-common = { path = "../common" }
+deepmsg-cnc = { path = "../../cnc" }
+deepmsg-codec = { path = "../../codec" }
+deepmsg-codec-cluster = { path = "../../codec/cluster" }
+deepmsg-codec-cluster-mark = { path = "../../codec/cluster-mark" }
 deepmsg-codec-cluster-node-state = { path = "../../codec/cluster-node-state" }
+deepmsg-core = { path = "../../core" }
+deepmsg-driver = { path = "../../driver" }
 
 [lints]
 workspace = true

@@ -322,6 +322,16 @@ impl Election {
         let mut work = 0;
         self.time_of_last_update_ns = now_ns;
 
+        // `thisMember.logPosition(appendPosition).timeOfLastAppendPositionNs(nowNs)`
+        // (`Election.java:813`). Without this the member's own position stays at
+        // zero, and a node restarting onto a non-empty log never reaches a
+        // quorum at its append position.
+        host.update_member_log_position(
+            self.this_member_id,
+            self.leadership_term_id,
+            self.append_position,
+        );
+
         let quorum_position =
             host.quorum_position_bounded_by_leader_log(self.append_position, now_ns);
         work += self.publish_new_leadership_term_on_interval(host, sender, quorum_position, now_ns);
@@ -353,6 +363,13 @@ impl Election {
                 work += 1;
                 self.is_leader_startup = self.is_node_startup;
                 self.log_position = self.append_position;
+                // The same member update as `leaderLogReplication`
+                // (`Election.java:844-849`).
+                host.update_member_log_position(
+                    self.this_member_id,
+                    self.leadership_term_id,
+                    self.append_position,
+                );
             }
             Some(_) => {
                 // The replay is advanced by the host's own poll (the archive
@@ -431,8 +448,16 @@ impl Election {
                 self.leader_member_id
             };
             let (term, position) = (self.leadership_term_id, self.log_position);
+            let timestamp = host.timestamp_from_nanos(now_ns);
             host.recording_log()
-                .append_term(term, position, position, now_ns, recording_id, service_id)
+                .append_term(
+                    term,
+                    position,
+                    position,
+                    timestamp,
+                    recording_id,
+                    service_id,
+                )
                 .map_err(|error| ClusterError::Cluster(error.to_string()))?;
         }
         Ok(())
@@ -520,7 +545,11 @@ impl Election {
                 host.set_role(crate::state::Role::Leader);
                 // The log publication is created here, which is what fixes the
                 // log session id for the term (`Election.java:1398-1400`).
+                // The reference takes the session id from the call's return
+                // value; the frozen seam returns a work count, so it is read
+                // back through the host accessor.
                 host.add_log_publication(self.append_position)?;
+                self.log_session_id = host.log_session_id();
             }
             ElectionState::Closed => {}
             _ => {}

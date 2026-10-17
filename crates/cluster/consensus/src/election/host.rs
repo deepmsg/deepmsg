@@ -290,6 +290,10 @@ pub trait ElectionHost {
     /// `ctx.epochClock().time()` in epoch milliseconds (`:688`).
     fn epoch_ms(&self) -> i64;
 
+    /// `nanosToTimestamp(ctx, nowNs)` (`:1601-1604`): nanosecond time in the
+    /// cluster clock's own time unit, which is what `RecordingLog` stores.
+    fn timestamp_from_nanos(&self, now_ns: i64) -> i64;
+
     /// `ctx.appointedLeaderId()` (`:715`).
     fn appointed_leader_id(&self) -> i32;
 
@@ -307,6 +311,15 @@ pub trait ElectionHost {
 
     /// `ctx.electionStatusIntervalNs()`.
     fn election_status_interval_ns(&self) -> i64;
+
+    /// The session id of the log publication `add_log_publication` created.
+    ///
+    /// `Election.java:1401` assigns the **return value** of
+    /// `consensusModuleAgent.addLogPublication(..)` to `logSessionId`; the
+    /// frozen [`Self::add_log_publication`] returns a work count instead (it was
+    /// transcribed from the election's other calls), so the election reads the
+    /// same number here. Added after the freeze, by the add-only rule.
+    fn log_session_id(&self) -> i32;
 
     /// `ClusterMember.hasQuorumAtPosition(..)` over the host's member table
     /// (`Election.java:885-887`). A query on the host because the members live
@@ -367,11 +380,13 @@ pub const HOST_CTX_METHODS: &[&str] = &[
     "recording_log",
     "now_ns",
     "epoch_ms",
+    "timestamp_from_nanos",
     "appointed_leader_id",
     "startup_canvass_timeout_ns",
     "leader_heartbeat_timeout_ns",
     "leader_heartbeat_interval_ns",
     "election_timeout_ns",
     "election_status_interval_ns",
+    "log_session_id",
     "has_quorum_at_position",
 ];
