@@ -395,12 +395,17 @@ against each other (`analyse.sh` prints this table directly):
 | 501K | p99 | 0.0005 | 4.57% | M better |
 | 501K | `E[X\|X<p99]` | 0.0020 | 45.61% | M better |
 
-**The shape is the finding.** The media arm's p50 *falls* with the offered rate
-— 30.4 µs at 25K, 18.1 µs at 501K — while the kernel arm's rises from 86.8 to
-2875 µs, and at 501K its p99 is 52.4 ms against the media arm's 23.6 µs. A
-busier media driver sits closer to the steady state of a bounded queue; the
-kernel path, once its socket buffers are full, is describing a queue that is
-not draining.
+**The shape is the finding.** The media arm's p50 *falls* across the tiers —
+30.4 µs at 25K:1344, 18.1 µs at 501K:32 — while the kernel arm's rises from
+86.8 to 2875 µs, and at 501K its p99 is 52.4 ms against the media arm's 23.6 µs.
+**The fall is not the driver.** Those two tiers differ in the frame's length as
+well as in the offered rate, and both of the things that move are on the wire: a
+longer frame costs more to carry, and a link that has carried nothing for about
+8–12 µs has to wake before it can carry anything, which costs **+3.7 µs on that
+crossing**. What this build's driver and clients do with the time is the same at
+both tiers — **2.1 µs**, measured below by cutting a round trip into six
+segments. The kernel arm's rise is the queue it is describing, and that one *is*
+its own.
 
 **Read the 501K row for its stability, not its ratio.** The floor there is
 15.95% on p50 and 45.61% on `E[X|X<p99]`, and it is the *kernel* arm that
@@ -653,3 +658,52 @@ machine, and it is bounded at 0.22 µs at 1 Hz and unmeasurable at 1/minute.
 Nothing in the tables above turns on it: they are p50/p90 with a p99 column,
 and their floors are wider than that
 (`analysis/dpdk/d6-92-cost.md` has both runs).
+
+### What a media round trip is made of
+
+Six sites inside the four processes — the rig, the rig's driver, the node's
+driver and the node — on one host, and so on one clock. Each writes its own
+reading against the key the message itself carries: `AeronUtil`'s timestamp at
+payload offset 0, which the echo node returns unchanged, so the same number is on
+every hop of both directions and no two logs have to be paired up. Two cells per
+tier, one session, and each cell's six segments sum to that cell's round trip by
+construction.
+
+| segment | 25K:32 | 501K:32 |
+|---|---|---|
+| rig offers → its driver hands the frame to the port | 0.61 / 0.60 µs | 0.69 / 0.69 |
+| **the cable, forward** | **12.44 / 12.44** | **8.66 / 8.66** |
+| node's driver takes it off the port → the node offers the reply | 0.60 / 0.59 | 0.59 / 0.56 |
+| the node offers → its driver hands the frame to the port | 0.38 / 0.36 | 0.37 / 0.36 |
+| **the cable, back** | **8.69 / 8.68** | **8.78 / 8.77** |
+| rig's driver takes it off the port → the rig reads the reply | 0.51 / 0.48 | 0.49 / 0.47 |
+| **everything this build does** | **2.10 / 2.03** | **2.14 / 2.08** |
+
+**The cable is ninety per cent of the round trip**, and what is left is 2.1 µs —
+the same 2.1 µs at 25K and at 501K, across all four processes. That is the whole
+of what this build contributes to a media round trip on this machine.
+
+**The two crossings are not symmetric at 25K, and are at 501K** — 12.44 against
+8.69 µs, a **3.75 µs** difference, against 0.12 µs at 501K. A link that has
+carried nothing for about 8–12 µs wakes at a cost of +3.7 µs, and at the lower
+tier it lands on exactly one of the two crossings: the node's port has been idle
+for 40 µs when the frame arrives, and its reply leaves a port whose PHY is
+already awake. A separate instrument gets the same number — one frame, a gap, one
+frame — 3.73 µs, and the two agree to 0.5%. **That, and not the driver, is why
+the media arm's p50 falls with the offered rate.**
+
+**The probe's own price is 24 ns at 25K and 48 ns at 501K**, measured by running
+the same binary armed and unarmed in the same session.
+
+Two boundaries to read it with. The segmented sum is a few hundred nanoseconds
+*larger* than the cell's own histogram — 0.44 µs at 501K, 0.68 µs at 25K —
+because the message's timestamp is taken before the bench's own clock starts;
+that difference is the client's lateness and not a segment. And the 1344-byte
+tiers are absent: `501K:1344` saturates (p90 517 µs), so what it reports is a
+queue and not a round trip.
+
+The instrument is not in this tree. It lives on a branch, with the patch and the
+pre-registration beside the readings in `analysis/dpdk/`
+(`d8-segment-probe.patch`, `d8-end-to-end-segments.md`,
+`d8-end-to-end-segments-record.md`), because an instrument that changes the
+layout of the binary it measures does not belong in the binary.
