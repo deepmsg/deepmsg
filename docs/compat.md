@@ -1318,3 +1318,24 @@ A claim publishes the **unaligned** frame length
 32-byte data header. The aligned length is what the producer's position moves
 by, and writing it into the frame header instead makes the padding part of the
 payload — a difference the session integration test's 96-byte assertion catches.
+
+## The control channel between a module and its services (P3-4c)
+
+The CM-to-service stream (default 104) and the service-to-CM stream (default
+105) on `aeron.cluster.control.channel`. The reference's container is the other
+side; until it is ported (P3-2c) these are pinned by the module's own tests, and
+the acceptance test plays the service with a raw client.
+
+| Contract | Value | Reference source | Pinned by |
+|---|---|---|---|
+| `JoinLog` (40) | `logPosition`, `maxLogPosition`, `memberId`, `logSessionId`, `logStreamId`, `isStartup`, `role`, `logChannel`, `isStandby` (optional since v16) | `ServiceProxy.java:54-101` | `cluster_service.rs` (the fake service decodes it and acks the position) |
+| `ServiceAck` (33) and "reached" | `logPosition`, `timestamp`, `ackId`, `relevantId`, `serviceId`; **every** service's queue head must match `(ackId, logPosition)` exactly, and a mismatch is `ack out of sequence` | `ServiceAck.java:59-79`, `ConsensusModuleAgent.java:1801-1838` | `service_control/ack.rs::every_queue_must_hold_the_exact_head` |
+| Service message in the log | cluster session id = `(serviceId << 56) \| sessionId`; top seven bits are the service id (`serviceIdFromLogMessage`); a message **from** a service uses the service id itself as the session id | `PendingServiceMessageTracker.java:279-299` | `service_control/tracker.rs::the_service_id_packings_are_the_references` |
+| Queued service message | the whole `SessionMessageHeader` frame (32 bytes + payload); the session id is rewritten at offset 16 and the **timestamp field at offset 24 is reused as the log append position**, `i64::MAX` before it has one | `PendingServiceMessageTracker.java:87-105`, `:207-268` | `pending_service_message_tracker.rs` (the seven reference cases read the bytes directly) |
+| Tracker queue | an `ExpandableRingBuffer`: 8-byte frame header, 8-byte alignment, a padding frame before a message that would wrap, and a fixed capacity's `append` returning `false` | `org.agrona.ExpandableRingBuffer` (2.6.1) | `common::collections::ring` tests against `ring-ops.txt` (printed by the jar) |
+| Pending capacity in a snapshot | `pendingMessageCapacity` is the ring's **used bytes** (`size()`), not its allocated capacity | `ConsensusModuleSnapshotTaker.java:150` | `pending_service_message_tracker.rs::snapshot_*` (load then verify) |
+| Timer supplier | `aeron.cluster.timer.service.supplier` is a **byte contract**: the two class names are honoured, anything else is refused with `invalid TimerServiceSupplier: …` | `ConsensusModule.java:935-954`, `:4589-4607` | `timer::tests::an_unknown_supplier_name_is_refused_with_the_reference_words` |
+| Wheel tick | `nextPow2(clock.timeUnit().convert(aeron.cluster.wheel.tick.resolution, NANOSECONDS))` — 8 ms on the millisecond clock, 8_388_608 ns on a nanosecond one | `ConsensusModule.java:4594-4600` | `timer::tests::the_default_tick_is_eight_milliseconds_for_the_millisecond_clock` and the nanosecond case |
+| Snapshot timer record order | the wheel writes in `Long2LongHashMap.entrySet().iterator()` order; the heap writes its array in level order — **the two differ for the same timers** | `WheelTimerService.java:118-131`, `PriorityHeapTimerService.java:179-187` | `tests/timer_snapshot_order.rs` (both orders, and the inequality) |
+| Entry-iterator order | descending slot order with one wrap, not `forEachLong`'s ascending order | `org.agrona.collections.Long2LongHashMap$AbstractIterator` (2.6.1) | `common/tests/agrona_entry_order.rs` against `agrona-entry-order.tsv` (printed by the jar) |
+| `POLL_LIMIT` | 20; a wheel `poll` can return **more** than 20 (it loops while the tick time is behind), a heap `poll` cannot | `TimerService.java:57`, `WheelTimerService.java:57-74` | `priority_heap_timer_service.rs::poll_should_stop_after_poll_limit_is_reached`; the wheel's loop is `timer/wheel.rs::the_service_poll_walks_the_ticks_in_order_within_one_call` |

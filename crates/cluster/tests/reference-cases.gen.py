@@ -87,7 +87,10 @@ UNIT_CLASS = {
     "SessionManagerTest": ("A", "P3-4b"),
     "LogSourceValidatorTest": ("A", "P3-4d"),
     "ConsensusModuleContextCloseTests": ("B", "P3-8"),
-    "ClusterTimerTest": ("A", "P3-4c"),
+    # ClusterTimerTest is three whole-cluster scenarios with a real service
+    # container; P3-4c has no container to start, so they belong to the card
+    # that ships one (P3-4f's LC-2 single node).
+    "ClusterTimerTest": ("A", "P3-4f"),
     "ServiceSnapshotTakerTest": ("B", "P3-2b"),
     "EgressPollerTest": ("B", "P3-3a"),
     "ConsensusModuleConfigurationTest": ("B", "P3-8"),
@@ -478,6 +481,79 @@ OURS = {
      "shouldRetryCreatingResponsePublicationWhenResourceTemporarilyUnavailable"):
         "the_resource_temporarily_unavailable_answer_reissues_the_add "
         "(weakened: the decision over the driver's error, not a driver)",
+    # P3-4c.
+    ("PriorityHeapTimerServiceTest", "throwsNullPointerExceptionIfTimerHandlerIsNull"):
+        "the_constructor_requires_a_handler (type system: a Box<dyn TimerHandler> cannot be null)",
+    ("PriorityHeapTimerServiceTest", "pollIsANoOpWhenNoTimersWhereScheduled"):
+        "poll_is_a_no_op_when_no_timers_where_scheduled",
+    ("PriorityHeapTimerServiceTest", "pollIsANoOpWhenNoScheduledTimersAreExpired"):
+        "poll_is_a_no_op_when_no_scheduled_timers_are_expired",
+    ("PriorityHeapTimerServiceTest", "pollShouldNotExpireTimerIfHandlerReturnsFalse"):
+        "poll_should_not_expire_timer_if_handler_returns_false",
+    ("PriorityHeapTimerServiceTest", "pollShouldExpireSingleTimer"):
+        "poll_should_expire_single_timer",
+    ("PriorityHeapTimerServiceTest", "pollShouldRemovedExpiredTimers"):
+        "poll_should_removed_expired_timers",
+    ("PriorityHeapTimerServiceTest", "pollShouldExpireTimersInOrderOfDeadlineButWithinTheDeadlineOrderIsUndefined"):
+        "poll_should_expire_timers_in_order_of_deadline_but_within_the_deadline_order_is_undefined",
+    ("PriorityHeapTimerServiceTest", "cancelTimerByCorrelationIdIsANoOpIfNoTimersRegistered"):
+        "cancel_timer_by_correlation_id_is_a_no_op_if_no_timers_registered",
+    ("PriorityHeapTimerServiceTest", "cancelTimerByCorrelationIdReturnsFalseForUnknownCorrelationId"):
+        "cancel_timer_by_correlation_id_returns_false_for_unknown_correlation_id",
+    ("PriorityHeapTimerServiceTest", "cancelTimerByCorrelationIdReturnsTrueAfterCancellingTheTimer"):
+        "cancel_timer_by_correlation_id_returns_true_after_cancelling_the_timer",
+    ("PriorityHeapTimerServiceTest", "cancelTimerByCorrelationIdReturnsTrueAfterCancellingTheLastTimer"):
+        "cancel_timer_by_correlation_id_returns_true_after_cancelling_the_last_timer",
+    ("PriorityHeapTimerServiceTest", "cancelTimerByCorrelationIdAfterPoll"):
+        "cancel_timer_by_correlation_id_after_poll",
+    ("PriorityHeapTimerServiceTest", "scheduleTimerForAnExistingCorrelationIdIsANoOpIfDeadlineDoesNotChange"):
+        "schedule_timer_for_an_existing_correlation_id_is_a_no_op_if_deadline_does_not_change",
+    ("PriorityHeapTimerServiceTest", "scheduleTimerForAnExistingCorrelationIdShouldShiftEntryUpWhenDeadlineIsDecreasing"):
+        "schedule_timer_for_an_existing_correlation_id_should_shift_entry_up_when_deadline_is_decreasing",
+    ("PriorityHeapTimerServiceTest", "scheduleTimerForAnExistingCorrelationIdShouldShiftEntryDownWhenDeadlineIsIncreasing"):
+        "schedule_timer_for_an_existing_correlation_id_should_shift_entry_down_when_deadline_is_increasing",
+    ("PriorityHeapTimerServiceTest", "pollShouldStopAfterPollLimitIsReached"):
+        "poll_should_stop_after_poll_limit_is_reached",
+    ("PriorityHeapTimerServiceTest", "snapshotProcessesAllScheduledTimers"):
+        "snapshot_processes_all_scheduled_timers",
+    ("PriorityHeapTimerServiceTest", "expireThanCancelTimer"):
+        "expire_than_cancel_timer",
+    ("PriorityHeapTimerServiceTest", "moveUpAnExistingTimerAndCancelAnotherOne"):
+        "move_up_an_existing_timer_and_cancel_another_one",
+    ("PriorityHeapTimerServiceTest", "moveDownAnExistingTimerAndCancelAnotherOne"):
+        "move_down_an_existing_timer_and_cancel_another_one",
+    ("PriorityHeapTimerServiceTest", "cancelExpiredTimerIsANoOp"):
+        "cancel_expired_timer_is_a_no_op",
+    ("PriorityHeapTimerServiceTest", "scheduleMustRetainOrderBetweenDeadlines"):
+        "schedule_must_retain_order_between_deadlines",
+    ("PriorityHeapTimerServiceTest", "shouldReuseExpiredEntriesFromAFreeList"):
+        "should_reuse_expired_entries_from_a_free_list",
+    ("PriorityHeapTimerServiceTest", "shouldReuseCanceledTimerEntriesFromAFreeList"):
+        "should_reuse_canceled_timer_entries_from_a_free_list",
+    ("PriorityHeapTimerServiceTest", "manyRandomOperations"):
+        "many_random_operations",
+    ("PendingServiceMessageTrackerTest", "snapshotEmpty"):
+        "snapshot_empty",
+    ("PendingServiceMessageTrackerTest", "snapshotAfterEnqueueBeforePollAndSweep"):
+        "snapshot_after_enqueue_before_poll_and_sweep",
+    ("PendingServiceMessageTrackerTest", "snapshotAfterEnqueueAndPollBeforeSweep"):
+        "snapshot_after_enqueue_and_poll_before_sweep",
+    ("PendingServiceMessageTrackerTest", "snapshotAfterEnqueuePollAndSweepForLeader"):
+        "snapshot_after_enqueue_poll_and_sweep_for_leader",
+    ("PendingServiceMessageTrackerTest", "snapshotAfterEnqueuePollAndSweepForFollower"):
+        "snapshot_after_enqueue_poll_and_sweep_for_follower",
+    ("PendingServiceMessageTrackerTest", "loadInvalid"):
+        "load_invalid",
+    ("PendingServiceMessageTrackerTest", "loadValid"):
+        "load_valid",
+    ("ServiceProxyTest", "shouldLogWarningIfClusterMemberResponseFails"):
+        "should_log_warning_if_cluster_member_response_fails",
+    ("ServiceProxyTest", "shouldSendClusterMemberResponse"):
+        "should_send_cluster_member_response",
+    ("ServiceProxyTest", "shouldLogWarningIfClusterMemberExtendedResponseFails"):
+        "should_log_warning_if_cluster_member_extended_response_fails",
+    ("ServiceProxyTest", "shouldSendClusterMemberExtendedResponse"):
+        "should_send_cluster_member_extended_response",
 }
 
 # Rows that cannot be ported even though the class they live in can.
