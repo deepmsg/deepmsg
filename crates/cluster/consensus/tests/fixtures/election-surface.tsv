@@ -1,0 +1,74 @@
+# The reference's call surface for the two election seams, captured so the
+# frozen traits can be checked against something that is not us.
+#
+# Source: aeron-cluster/src/main/java/io/aeron/cluster/Election.java at
+# 664f58e705 (tag 1.53.2). Every row is one *distinct invocation signature* of
+# `consensusModuleAgent.<name>(...)` (side=host) or `consensusPublisher.<name>(...)`
+# (side=sender), with the parameter types as the reference declares them in
+# ConsensusModuleAgent.java / ConsensusPublisher.java and the call sites in
+# Election.java.
+#
+# Why signatures and not names: `grep -o 'consensusModuleAgent\.[a-zA-Z]*(' |
+# sort -u` answers **26 names** — that is where the plan's "26 个方法" comes
+# from — but four of those names are Java overload pairs (a getter and a
+# setter), so there are **30 distinct signatures across 44 calls**. Rust has no
+# overloading, so the trait has 30 methods and the plan's number was a
+# name count, not a method count. The sender side has no overloads: 6 names,
+# 6 signatures, 8 calls.
+#
+# Rust names are the ones the frozen traits use. `set_*` / no-prefix is the
+# getter/setter split, which is the only place the mapping is not mechanical.
+#
+# Columns:
+#   side          host | sender
+#   java_name     the reference's method name
+#   arity         parameter count in the reference (publication included)
+#   rust_name     the method on ElectionHost / ConsensusSender
+#   params_java   parameter list, reference types, in order
+#   returns_java  the reference's return type
+#   calls         how many times Election.java calls it
+#   el_lines      the call sites in Election.java
+#
+# Regenerate by re-running the extraction below and diffing; do not hand-edit:
+#   for name in $(grep -o 'consensusModuleAgent\.[a-zA-Z]*(' Election.java |
+#                 sed 's/.*\.//;s/($//' | sort -u); do ...; done
+# (The extraction is a 30-line script; it is kept out of the repo because the
+#  table changes only with a reference bump, and a bump moves more than this.)
+#
+side	java_name	arity	rust_name	params_java	returns_java	calls	el_lines
+host	addLogPublication	1	add_log_publication	long appendPosition	int	1	1407
+host	appendNewLeadershipTermEvent	1	append_new_leadership_term_event	long nowNs	boolean	1	886
+host	awaitLocalSocketsClosed	1	await_local_sockets_closed	long registrationId	void	1	675
+host	catchupInitiated	1	catchup_initiated	long nowNs	void	1	1047
+host	catchupLogDestination	0	catchup_log_destination		String	1	1103
+host	catchupLogDestination	1	set_catchup_log_destination	String destination	void	1	1348
+host	catchupPoll	2	catchup_poll	long limitPosition, long nowNs	int	1	1091
+host	electionComplete	1	election_complete	long nowNs	void	2	888,1171
+host	isCatchupNearLive	1	is_catchup_near_live	long position	boolean	1	1094
+host	joinLogAsLeader	4	join_log_as_leader	long leadershipTermId, long logPosition, int logSessionId, boolean isStartup	void	1	870
+host	liveLogDestination	0	live_log_destination		String	1	1093
+host	liveLogDestination	1	set_live_log_destination	String destination	void	1	1363
+host	logRecordingId	0	log_recording_id		long	2	1291,1482
+host	logRecordingId	1	set_log_recording_id	long recordingId	void	1	280
+host	newLogReplay	2	new_log_replay	long logPosition, long appendPosition	LogReplay	2	836,981
+host	newLogReplication	5	new_log_replication	String leaderArchiveEndpoint, String responseArchiveEndpoint, long leaderRecordingId, long stopPosition, long nowNs	RecordingReplication	1	905
+host	pollArchiveEvents	0	poll_archive_events		int	1	923
+host	prepareForNewLeadership	2	prepare_for_new_leadership	long logPosition, long nowNs	long	1	1589
+host	publishCommitPosition	2	publish_commit_position	long commitPosition, long leadershipTermId	void	1	1225
+host	quorumPositionBoundedByLeaderLog	2	quorum_position_bounded_by_leader_log	long leaderAppendPosition, long nowNs	long	5	314,369,815,861,879
+host	role	0	role		Cluster.Role	2	308,363
+host	role	1	set_role	Cluster.Role newRole	void	4	1398,1402,1406,1412
+host	state	0	state		ConsensusModule.State	1	1104
+host	stopAllCatchups	0	stop_all_catchups		void	1	1442
+host	timeOfLastLeaderUpdateNs	0	time_of_last_leader_update_ns		long	1	705
+host	trackCatchupCompletion	3	track_catchup_completion	ClusterMember follower, long leadershipTermId, short appendPositionFlags	void	1	552
+host	truncateLogEntry	2	truncate_log_entry	long leadershipTermId, long logPosition	void	1	634
+host	tryJoinLogAsFollower	3	try_join_log_as_follower	Image image, boolean isLeaderStartup, long nowNs	boolean	2	1066,1142
+host	updateLeaderPosition	3	update_leader_position	long nowNs, long appendPosition, long quorumPosition	int	1	880
+host	updateMemberLogPosition	3	update_member_log_position	ClusterMember member, long leadershipTermId, long logPosition	void	3	304,406,551
+sender	appendPosition	5	append_position	ExclusivePublication publication, long leadershipTermId, long logPosition, int followerMemberId, short flags	boolean	3	1168,1306,1323
+sender	canvassPosition	5	canvass_position	ExclusivePublication publication, long logLeadershipTermId, long logPosition, long leadershipTermId, int followerMemberId	void	1	1247
+sender	catchupPosition	5	catchup_position	ExclusivePublication publication, long leadershipTermId, long logPosition, int followerMemberId, String catchupEndpoint	boolean	1	1340
+sender	newLeadershipTerm	15	new_leadership_term	ExclusivePublication publication, long logLeadershipTermId, long nextLeadershipTermId, long nextTermBaseLogPosition, long nextLogPosition, long leadershipTermId, long termBaseLogPosition, long logPosition, long commitPosition, long leaderRecordingId, long timestamp, int leaderMemberId, int logSessionId, int appVersion, boolean isStartup	void	1	1281
+sender	placeVote	7	place_vote	ExclusivePublication publication, long candidateTermId, long logLeadershipTermId, long logPosition, int candidateMemberId, int followerMemberId, boolean vote	void	1	1187
+sender	requestVote	5	request_vote	ExclusivePublication publication, long logLeadershipTermId, long logPosition, long candidateTermId, int candidateMemberId	boolean	1	787

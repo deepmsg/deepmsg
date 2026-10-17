@@ -15,6 +15,7 @@ members = [
     # feature is on, so a machine without DPDK builds and tests it as it is.
     "crates/dpdk",
     "crates/archive",
+    "crates/cluster/consensus",
     "crates/tools",
     "crates/bench",
     "examples",

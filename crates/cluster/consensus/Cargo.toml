@@ -1,0 +1,13 @@
+[package]
+name = "deepmsg-cluster"
+description = "deepmsg cluster: the consensus module, its persistence and the election state machine (P3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+deepmsg-client = { path = "../../client" }
+
+[lints]
+workspace = true
