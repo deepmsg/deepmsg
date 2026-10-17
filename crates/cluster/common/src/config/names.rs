@@ -149,8 +149,8 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ("aeron.cluster.member.id", Disposition::Honoured),
     ("aeron.cluster.members", Disposition::Honoured),
     ("aeron.cluster.message.timeout", Disposition::Pending),
-    ("aeron.cluster.replay.channel", Disposition::Pending),
-    ("aeron.cluster.replay.stream.id", Disposition::Pending),
+    ("aeron.cluster.replay.channel", Disposition::Honoured),
+    ("aeron.cluster.replay.stream.id", Disposition::Honoured),
     ("aeron.cluster.replication.channel", Disposition::Honoured),
     (
         "aeron.cluster.replication.progress.interval",
@@ -184,8 +184,8 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ("aeron.cluster.service.stream.id", Disposition::Honoured),
     ("aeron.cluster.services.dir", Disposition::Pending),
     ("aeron.cluster.session.timeout", Disposition::Honoured),
-    ("aeron.cluster.snapshot.channel", Disposition::Pending),
-    ("aeron.cluster.snapshot.stream.id", Disposition::Pending),
+    ("aeron.cluster.snapshot.channel", Disposition::Honoured),
+    ("aeron.cluster.snapshot.stream.id", Disposition::Honoured),
     (
         "aeron.cluster.standby.snapshot.notification.processing.delay",
         Disposition::Pending,

@@ -63,6 +63,12 @@ impl From<deepmsg_cluster_common::decode::DecodeError> for ClusterError {
     }
 }
 
+impl From<deepmsg_archive::client::archive::ArchiveError> for ClusterError {
+    fn from(error: deepmsg_archive::client::archive::ArchiveError) -> Self {
+        Self::Cluster(error.to_string())
+    }
+}
+
 impl From<deepmsg_client::client::CommandError> for ClusterError {
     fn from(error: deepmsg_client::client::CommandError) -> Self {
         Self::Cluster(error.to_string())

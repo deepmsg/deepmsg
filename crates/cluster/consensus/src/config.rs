@@ -54,6 +54,22 @@ pub const LOG_CHANNEL_PROP_NAME: &str = "aeron.cluster.log.channel";
 pub const LOG_CHANNEL_DEFAULT: &str = "aeron:udp?term-length=64m";
 /// `aeron.cluster.egress.channel` (`AeronCluster.java:1302`).
 pub const EGRESS_CHANNEL_PROP_NAME: &str = "aeron.cluster.egress.channel";
+/// `aeron.cluster.snapshot.channel` (`ClusteredServiceContainer.java:319`).
+pub const SNAPSHOT_CHANNEL_PROP_NAME: &str = "aeron.cluster.snapshot.channel";
+/// `SNAPSHOT_CHANNEL_DEFAULT` (`ConsensusModule.java:568`).
+pub const SNAPSHOT_CHANNEL_DEFAULT: &str = "aeron:ipc?alias=snapshot";
+/// `aeron.cluster.snapshot.stream.id` (`ClusteredServiceContainer.java:331`).
+pub const SNAPSHOT_STREAM_ID_PROP_NAME: &str = "aeron.cluster.snapshot.stream.id";
+/// `SNAPSHOT_STREAM_ID_DEFAULT` (`ConsensusModule.java:573`).
+pub const SNAPSHOT_STREAM_ID_DEFAULT: i32 = 107;
+/// `aeron.cluster.replay.channel` (`ClusteredServiceContainer.java:259`).
+pub const REPLAY_CHANNEL_PROP_NAME: &str = "aeron.cluster.replay.channel";
+/// `REPLAY_CHANNEL_DEFAULT` (`ClusteredServiceContainer.java:265`): IPC.
+pub const REPLAY_CHANNEL_DEFAULT: &str = "aeron:ipc";
+/// `aeron.cluster.replay.stream.id` (`ClusteredServiceContainer.java:271`).
+pub const REPLAY_STREAM_ID_PROP_NAME: &str = "aeron.cluster.replay.stream.id";
+/// `REPLAY_STREAM_ID_DEFAULT` (`ClusteredServiceContainer.java:277`).
+pub const REPLAY_STREAM_ID_DEFAULT: i32 = 103;
 /// `aeron.cluster.replication.channel` (`ConsensusModule.java:620`); **required**.
 pub const REPLICATION_CHANNEL_PROP_NAME: &str = "aeron.cluster.replication.channel";
 /// `aeron.cluster.control.channel` (`ClusteredServiceContainer.java:283`).
@@ -285,6 +301,14 @@ pub struct ConsensusModuleConfig {
     pub authorisation_service_supplier: Option<String>,
     /// Egress stream id.
     pub egress_stream_id: i32,
+    /// `aeron.cluster.snapshot.channel`.
+    pub snapshot_channel: String,
+    /// `aeron.cluster.snapshot.stream.id`.
+    pub snapshot_stream_id: i32,
+    /// `aeron.cluster.replay.channel`.
+    pub replay_channel: String,
+    /// `aeron.cluster.replay.stream.id`.
+    pub replay_stream_id: i32,
     /// Service stream id (CM -> container).
     pub service_stream_id: i32,
     /// Consensus module stream id (container -> CM).
@@ -500,6 +524,16 @@ impl ConsensusModuleConfig {
                 .filter(|name| !name.is_empty())
                 .map(str::to_owned),
             egress_stream_id: int(EGRESS_STREAM_ID_PROP_NAME, EGRESS_STREAM_ID_DEFAULT)?,
+            snapshot_channel: properties
+                .get(SNAPSHOT_CHANNEL_PROP_NAME)
+                .unwrap_or(SNAPSHOT_CHANNEL_DEFAULT)
+                .to_owned(),
+            snapshot_stream_id: int(SNAPSHOT_STREAM_ID_PROP_NAME, SNAPSHOT_STREAM_ID_DEFAULT)?,
+            replay_channel: properties
+                .get(REPLAY_CHANNEL_PROP_NAME)
+                .unwrap_or(REPLAY_CHANNEL_DEFAULT)
+                .to_owned(),
+            replay_stream_id: int(REPLAY_STREAM_ID_PROP_NAME, REPLAY_STREAM_ID_DEFAULT)?,
             service_stream_id: int(SERVICE_STREAM_ID_PROP_NAME, SERVICE_STREAM_ID_DEFAULT)?,
             consensus_module_stream_id: int(
                 CONSENSUS_MODULE_STREAM_ID_PROP_NAME,

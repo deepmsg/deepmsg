@@ -202,8 +202,8 @@ fn a_single_member_module_starts_allocates_its_counters_and_reaches_steady_state
     );
     assert_eq!(
         agent.log_recording_id(),
-        -1,
-        "no recording is started until the election joins the log"
+        plan.log.as_ref().expect("a log").recording_id,
+        "the recovered plan's log recording is adopted (`recoverFromSnapshotAndLog`, :3500-3503)"
     );
     assert_eq!(Some(SEMANTIC_VERSION), agent.mark_file().version());
 
