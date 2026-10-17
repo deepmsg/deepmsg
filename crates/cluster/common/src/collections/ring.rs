@@ -230,6 +230,46 @@ impl ExpandableRingBuffer {
         count
     }
 
+    /// `forEach` from a head offset with the message bytes **mutable**.
+    ///
+    /// Agrona's `MessageConsumer` is handed a `MutableDirectBuffer`; the
+    /// tracker writes a message's append position back into the timestamp
+    /// field of the stored copy (`PendingServiceMessageTracker.java:227`), so
+    /// the mutable form is the one it needs.
+    pub fn for_each_mut<C>(&mut self, head_offset: usize, consumer: &mut C, limit: usize) -> usize
+    where
+        C: FnMut(&mut [u8], usize) -> bool,
+    {
+        assert!(
+            head_offset <= self.size(),
+            "headOffset={head_offset} > size={}",
+            self.size()
+        );
+        assert_eq!(0, head_offset % HEADER_ALIGNMENT, "headOffset not aligned");
+
+        let mut offset = self.head + head_offset;
+        let mut count = 0;
+
+        while count < limit && offset < self.tail {
+            let index = offset & self.mask;
+            let length = self.get_u32(index) as usize;
+            let message_type = self.get_u32(index + 4);
+            let aligned = align(length, HEADER_ALIGNMENT);
+            offset += aligned;
+
+            if message_type != MESSAGE_TYPE_PADDING {
+                let head = offset - self.head;
+                let message = &mut self.buffer[index + HEADER_LENGTH..index + length];
+                if !consumer(message, head) {
+                    break;
+                }
+                count += 1;
+            }
+        }
+
+        count
+    }
+
     /// `consume(consumer, limit)` — walk and advance the head.
     ///
     /// Returns the bytes consumed. A consumer that answers `false` leaves its
