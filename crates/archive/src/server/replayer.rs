@@ -29,8 +29,9 @@ use crate::server::replay_session::{Progress, Publication, ReplaySession, State}
 use crate::server::counters::{
     ARCHIVE_REPLAY_SESSION_COUNT_TYPE_ID, ARCHIVE_REPLAYER_MAX_READ_TIME_TYPE_ID,
     ARCHIVE_REPLAYER_TOTAL_READ_BYTES_TYPE_ID, ARCHIVE_REPLAYER_TOTAL_READ_TIME_TYPE_ID,
-    ArchiveIdCounter, CounterAllocator, CounterKind, REPLAY_SESSIONS_NAME,
-    REPLAYER_MAX_READ_TIME_NAME, REPLAYER_TOTAL_READ_BYTES_NAME, REPLAYER_TOTAL_READ_TIME_NAME,
+    ArchiveIdCounter, CounterAllocator, CounterKind, DEDICATED_MODE, DutyCycleActor,
+    DutyCycleCounters, REPLAY_SESSIONS_NAME, REPLAYER_MAX_READ_TIME_NAME,
+    REPLAYER_TOTAL_READ_BYTES_NAME, REPLAYER_TOTAL_READ_TIME_NAME,
 };
 
 /// One of the replayer's four counters.
@@ -415,6 +416,14 @@ pub struct ReplayerThread {
 /// by the time the session arrives here.
 pub struct ReplayerWorker {
     running: Replays,
+    /// The id its counters are keyed by, which is also what its duty-cycle pair
+    /// is labelled with.
+    archive_id: i64,
+    /// This thread's own 103/104, once the conductor's claim has reached the
+    /// region — see [`DutyCycleCounters::find`].
+    duty: Option<DutyCycleCounters>,
+    /// The threshold its 104 counts against (`Archive.java:1460-1468`).
+    cycle_threshold_ns: i64,
     cnc: deepmsg_cnc::CncFile,
     idle: deepmsg_driver::idle::Strategy,
     commands: std::sync::mpsc::Receiver<ReplayCommand>,
@@ -562,16 +571,26 @@ impl ReplayerThread {
     ///
     /// [`ReplayerWorker::new`]'s, when the counter region will not open.
     pub fn pair(
+        archive_id: i64,
         aeron_dir: &std::path::Path,
         idle: deepmsg_driver::idle::Strategy,
         timeout: std::time::Duration,
+        cycle_threshold_ns: i64,
     ) -> Result<(Self, ReplayerWorker), String> {
         let (commands, from_conductor) = std::sync::mpsc::channel();
         let (to_conductor, notices) = std::sync::mpsc::channel();
 
         Ok((
             Self { commands, notices },
-            ReplayerWorker::new(aeron_dir, idle, timeout, from_conductor, to_conductor)?,
+            ReplayerWorker::new(
+                archive_id,
+                aeron_dir,
+                idle,
+                timeout,
+                cycle_threshold_ns,
+                from_conductor,
+                to_conductor,
+            )?,
         ))
     }
 
@@ -595,9 +614,11 @@ impl ReplayerWorker {
     /// The message from [`deepmsg_cnc::CncFile::open_writable`] when the region
     /// will not open.
     pub fn new(
+        archive_id: i64,
         aeron_dir: &std::path::Path,
         idle: deepmsg_driver::idle::Strategy,
         timeout: std::time::Duration,
+        cycle_threshold_ns: i64,
         commands: std::sync::mpsc::Receiver<ReplayCommand>,
         notices: std::sync::mpsc::Sender<ReplayNotice>,
     ) -> Result<Self, String> {
@@ -606,6 +627,9 @@ impl ReplayerWorker {
 
         Ok(Self {
             running: Replays::new(),
+            archive_id,
+            duty: None,
+            cycle_threshold_ns,
             cnc,
             idle,
             commands,
@@ -620,6 +644,10 @@ impl ReplayerWorker {
     /// two.
     pub fn run(mut self) {
         loop {
+            // The cycle that just ended, before this turn does anything with it
+            // (`DedicatedModeArchiveConductor.java:346`).
+            self.measure_cycle();
+
             let mut work = 0;
 
             loop {
@@ -674,6 +702,40 @@ impl ReplayerWorker {
             self.scratch = notices;
             work += ended;
             self.idle.idle(work);
+        }
+    }
+
+    /// One turn of this thread's duty cycle, into the pair the conductor
+    /// allocated for the replayer (`Archive.java:1460-1468`).
+    fn measure_cycle(&mut self) {
+        let now_ns = deepmsg_core::clock::monotonic_nano_time();
+
+        if self.duty.is_none() {
+            let found = {
+                let Some(counters) = self.cnc.counters_writable() else {
+                    return;
+                };
+                DutyCycleCounters::find(
+                    &counters,
+                    DutyCycleActor::Replayer,
+                    DEDICATED_MODE,
+                    self.archive_id,
+                    self.cycle_threshold_ns,
+                )
+            };
+            if let Some(mut duty) = found {
+                // `onStart`'s baseline, not the conductor's claim time.
+                duty.update(now_ns);
+                self.duty = Some(duty);
+            }
+            return;
+        }
+
+        let Some(counters) = self.cnc.counters_writable() else {
+            return;
+        };
+        if let Some(duty) = self.duty.as_mut() {
+            duty.measure(&counters, now_ns);
         }
     }
 }

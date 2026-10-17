@@ -563,6 +563,7 @@ pub fn run(
             // be refused in the same words.
             archive_config.recorder_idle_strategy.strategy(),
             COMMAND_TIMEOUT,
+            archive_config.recorder_cycle_threshold_ns,
         )?;
 
         (RecorderHalf::threaded(thread), Some(worker))
@@ -592,10 +593,12 @@ pub fn run(
 
     let (replayer, replayer_worker) = if dedicated {
         let (thread, worker) = ReplayerThread::pair(
+            archive_id,
             &aeron_dir,
             // `ctx.replayerIdleStrategy()`, the same rule (`:1433-1440`).
             archive_config.replayer_idle_strategy.strategy(),
             COMMAND_TIMEOUT,
+            archive_config.replayer_cycle_threshold_ns,
         )?;
 
         (ReplayerHalf::threaded(thread), Some(worker))
