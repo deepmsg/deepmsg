@@ -46,6 +46,7 @@ pub mod log_publisher;
 pub mod persist;
 pub mod service_control;
 pub mod session;
+pub mod snapshot;
 pub mod state;
 pub mod timer;
 
