@@ -224,32 +224,32 @@ unit	ConsensusModuleContextTest	shouldAlignMarkFileToTheAeronClientFilePageSize	
 unit	ConsensusModuleContextTest	shouldAlignMarkFileBasedOnTheMediaDriverFilePageSize	B	P3-8	unit			
 unit	ConsensusModuleContextTest	shouldValidateServiceCount	B	P3-8	unit			
 unit	ConsensusModuleContextTest	shouldRejectServiceCountZeroWithoutConsensusModuleExtension	B	P3-8	unit			
-unit	ElectionTest	shouldElectSingleNodeClusterLeader	B	P3-5b	unit			
-unit	ElectionTest	shouldElectAppointedLeader	B	P3-5b	unit			
-unit	ElectionTest	shouldVoteForAppointedLeader	B	P3-5b	unit			
-unit	ElectionTest	shouldCanvassMembersInSuccessfulLeadershipBid	B	P3-5b	unit			
-unit	ElectionTest	shouldVoteForCandidateDuringNomination	B	P3-5b	unit			
-unit	ElectionTest	shouldTimeoutCanvassWithMajority	B	P3-5b	unit			
-unit	ElectionTest	shouldWinCandidateBallotWithMajority	B	P3-5b	unit			
-unit	ElectionTest	shouldBaseStartupValueOnLeader	B	P3-5b	unit			
-unit	ElectionTest	shouldElectCandidateWithFullVote	B	P3-5b	unit			
-unit	ElectionTest	shouldTimeoutCandidateBallotWithoutMajority	B	P3-5b	unit			
-unit	ElectionTest	shouldTimeoutFailedCandidateBallotOnSplitVoteThenSucceedOnRetry	B	P3-5b	unit			
-unit	ElectionTest	shouldTimeoutFollowerBallotWithoutLeaderEmerging	B	P3-5b	unit			
-unit	ElectionTest	shouldBecomeFollowerIfEnteringNewElection	B	P3-5b	unit			
-unit	ElectionTest	followerShouldReplicateLogBeforeReplayDuringElection	B	P3-5b	unit			
-unit	ElectionTest	followerShouldTimeoutLeaderIfReplicateLogPositionIsNotCommittedByLeader	B	P3-5b	unit			
-unit	ElectionTest	followerShouldProgressThroughFailedElectionsTermsImmediatelyPriorToCurrent	B	P3-5b	unit			
-unit	ElectionTest	followerShouldProgressThroughInterimElectionsTerms	B	P3-5b	unit			
-unit	ElectionTest	followerShouldReplayAndCatchupWhenLateJoiningClusterInSameTerm	B	P3-5b	unit			
-unit	ElectionTest	followerShouldReplicateReplayAndCatchupWhenLateJoiningClusterInLaterTerm	B	P3-5b	unit			
-unit	ElectionTest	followerShouldUseInitialLeadershipTermIdAndInitialTermBaseLogPositionWhenRecordingLogIsEmpty	B	P3-5b	unit			
-unit	ElectionTest	followerShouldReplicateAndSendAppendPositionWhenLogReplicationDone	B	P3-5b	unit			
-unit	ElectionTest	leaderShouldMoveToLogReplicationThenWaitForCommitPosition	B	P3-5b	unit			
-unit	ElectionTest	shouldThrowNonZeroLogPositionAndNullRecordingIdSpecified	B	P3-5b	unit			
-unit	ElectionTest	shouldSendCommitPositionAndNewLeadershipTermEventsWithTheSameLeadershipTerm	B	P3-5b	unit			
-unit	ElectionTest	notifiedCommitPositionCannotGoBackwardsUponReceivingCommitPosition	B	P3-5b	unit			
-unit	ElectionTest	notifiedCommitPositionCannotGoBackwardsUponReceivingNewLeadershipTerm	B	P3-5b	unit			
+unit	ElectionTest	shouldElectSingleNodeClusterLeader	B	P3-5b	unit			should_elect_single_node_cluster_leader
+unit	ElectionTest	shouldElectAppointedLeader	B	P3-5b	unit			should_elect_appointed_leader
+unit	ElectionTest	shouldVoteForAppointedLeader	B	P3-5b	unit			(deferred: voting for an appointed leader is on_request_vote's ordinary branch, covered by should_timeout_follower_ballot_without_leader_emerging; the appointment-specific case needs the appointed leader's NLT)
+unit	ElectionTest	shouldCanvassMembersInSuccessfulLeadershipBid	B	P3-5b	unit			should_canvass_members_in_successful_leadership_bid
+unit	ElectionTest	shouldVoteForCandidateDuringNomination	B	P3-5b	unit			should_timeout_follower_ballot_without_leader_emerging (the vote itself: on_request_vote places a yes and enters FOLLOWER_BALLOT)
+unit	ElectionTest	shouldTimeoutCanvassWithMajority	B	P3-5b	unit			should_timeout_canvass_with_majority
+unit	ElectionTest	shouldWinCandidateBallotWithMajority	B	P3-5b	unit			should_win_candidate_ballot_with_majority
+unit	ElectionTest	shouldBaseStartupValueOnLeader	B	P3-5b	unit			(deferred: the parameterised leader-startup case needs a follower in LEADER_REPLAY and the leader's isStartup flag across two nodes)
+unit	ElectionTest	shouldElectCandidateWithFullVote	B	P3-5b	unit			should_win_candidate_ballot_with_majority (the unanimous short circuit)
+unit	ElectionTest	shouldTimeoutCandidateBallotWithoutMajority	B	P3-5b	unit			should_timeout_candidate_ballot_without_majority
+unit	ElectionTest	shouldTimeoutFailedCandidateBallotOnSplitVoteThenSucceedOnRetry	B	P3-5b	unit			should_timeout_failed_candidate_ballot_on_split_vote_then_succeed_on_retry
+unit	ElectionTest	shouldTimeoutFollowerBallotWithoutLeaderEmerging	B	P3-5b	unit			should_timeout_follower_ballot_without_leader_emerging
+unit	ElectionTest	shouldBecomeFollowerIfEnteringNewElection	B	P3-5b	unit			should_become_follower_if_entering_new_election
+unit	ElectionTest	followerShouldReplicateLogBeforeReplayDuringElection	B	P3-5b	unit			on_new_leadership_term_truncates_ahead_of_the_term_base_and_raises, on_new_leadership_term_moves_a_canvassing_member_to_follower_replay, follower_log_replication_completes_and_returns_to_canvass (the three branches; the full scripted history is deferred)
+unit	ElectionTest	followerShouldTimeoutLeaderIfReplicateLogPositionIsNotCommittedByLeader	B	P3-5b	unit			(deferred: needs the replication deadline walk with a scripted commit history)
+unit	ElectionTest	followerShouldProgressThroughFailedElectionsTermsImmediatelyPriorToCurrent	B	P3-5b	unit			(deferred: needs a scripted multi-term recording log)
+unit	ElectionTest	followerShouldProgressThroughInterimElectionsTerms	B	P3-5b	unit			(deferred: needs a scripted multi-term recording log)
+unit	ElectionTest	followerShouldReplayAndCatchupWhenLateJoiningClusterInSameTerm	B	P3-5b	unit			(deferred: the success path needs an Image; `Image` has no test constructor)
+unit	ElectionTest	followerShouldReplicateReplayAndCatchupWhenLateJoiningClusterInLaterTerm	B	P3-5b	unit			(deferred: the success path needs an Image)
+unit	ElectionTest	followerShouldUseInitialLeadershipTermIdAndInitialTermBaseLogPositionWhenRecordingLogIsEmpty	B	P3-5b	unit			should_elect_single_node_cluster_leader + RecordingLog::ensure_coherent (weakened: the coherence rules are tested on RecordingLog, not through the election)
+unit	ElectionTest	followerShouldReplicateAndSendAppendPositionWhenLogReplicationDone	B	P3-5b	unit			follower_log_replication_completes_and_returns_to_canvass
+unit	ElectionTest	leaderShouldMoveToLogReplicationThenWaitForCommitPosition	B	P3-5b	unit			leader_should_move_to_log_replication_then_wait_for_commit_position
+unit	ElectionTest	shouldThrowNonZeroLogPositionAndNullRecordingIdSpecified	B	P3-5b	unit			(deferred: the ensureCoherent refusal is implemented; the reference's exact case needs its scripted recording log)
+unit	ElectionTest	shouldSendCommitPositionAndNewLeadershipTermEventsWithTheSameLeadershipTerm	B	P3-5b	unit			should_send_commit_position_and_new_leadership_term_events_with_the_same_leadership_term
+unit	ElectionTest	notifiedCommitPositionCannotGoBackwardsUponReceivingCommitPosition	B	P3-5b	unit			notified_commit_position_cannot_go_backwards_upon_receiving_commit_position
+unit	ElectionTest	notifiedCommitPositionCannotGoBackwardsUponReceivingNewLeadershipTerm	B	P3-5b	unit			notified_commit_position_cannot_go_backwards_upon_receiving_new_leadership_term
 unit	SessionEventCodecCompatibilityTest	readingVersion12UsingVersion5Codec	B	P3-3b	unit			
 unit	StandbySnapshotReplicatorTest	shouldReplicateStandbySnapshots	-	-	unit		n/a:premium	
 unit	StandbySnapshotReplicatorTest	shouldPassSignalsToRecordingReplication	-	-	unit		n/a:premium	

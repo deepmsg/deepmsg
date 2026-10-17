@@ -127,7 +127,7 @@ impl ElectionHost for Mock {
         _s: i64,
         _n: i64,
     ) -> Result<RecordingReplication, ClusterError> {
-        Ok(RecordingReplication)
+        Ok(RecordingReplication::default())
     }
     fn truncate_log_entry(&mut self, _t: i64, _p: i64) -> Result<(), ClusterError> {
         Ok(())
@@ -188,6 +188,9 @@ impl ElectionHost for Mock {
     fn timestamp_from_nanos(&self, now_ns: i64) -> i64 {
         now_ns / 1_000_000
     }
+    fn nanos_from_timestamp(&self, timestamp: i64) -> i64 {
+        timestamp * 1_000_000
+    }
     fn epoch_ms(&self) -> i64 {
         self.now_ns / 1_000_000
     }
@@ -211,6 +214,91 @@ impl ElectionHost for Mock {
     }
     fn has_quorum_at_position(&mut self, _t: i64, _p: i64, _n: i64, _o: i64) -> bool {
         self.quorum_reached
+    }
+
+    // P3-5b's additions: this walk never leaves the leader path, so the member
+    // table answers vacuously and the log subscription is never made.
+    fn reset_members(&mut self, _t: i64, _p: i64) {}
+    fn become_candidate(&mut self, _t: i64, _m: i32) {}
+    fn member_ballot_sent(&self, _m: i32) -> bool {
+        true
+    }
+    fn set_member_ballot_sent(&mut self, _m: i32, _s: bool) {}
+    fn set_member_vote(&mut self, _m: i32, _t: i64, _v: Option<bool>) {}
+    fn unanimous_candidate(&self, _c: i32, _g: i32) -> bool {
+        true
+    }
+    fn quorum_candidate(&self, _c: i32) -> bool {
+        true
+    }
+    fn unanimous_leader(&self, _t: i64, _g: i32) -> bool {
+        true
+    }
+    fn quorum_leader(&self, _t: i64) -> bool {
+        true
+    }
+    fn member_has_publication(&self, _m: i32) -> bool {
+        true
+    }
+    fn try_add_member_publication(&mut self, _m: i32) -> Result<(), ClusterError> {
+        Ok(())
+    }
+    fn consensus_stream_id(&self) -> i32 {
+        5
+    }
+    fn app_version(&self) -> i32 {
+        0
+    }
+    fn file_sync_level(&self) -> i32 {
+        0
+    }
+    fn log_channel(&self) -> &str {
+        "aeron:ipc"
+    }
+    fn log_stream_id(&self) -> i32 {
+        6
+    }
+    fn log_is_mdc(&self) -> bool {
+        false
+    }
+    fn member_log_endpoint(&self, _m: i32) -> Option<String> {
+        None
+    }
+    fn member_catchup_endpoint(&self, _m: i32) -> Option<String> {
+        None
+    }
+    fn member_archive_endpoint(&self, _m: i32) -> Option<String> {
+        None
+    }
+    fn member_archive_response_endpoint(&self, _m: i32) -> Option<String> {
+        None
+    }
+    fn add_log_subscription(&mut self, _s: i32) -> Result<i64, ClusterError> {
+        Ok(11)
+    }
+    fn remove_log_subscription(&mut self, _r: i64) -> Result<(), ClusterError> {
+        Ok(())
+    }
+    fn add_log_destination(&mut self, _r: i64, _d: &str) -> Result<(), ClusterError> {
+        Ok(())
+    }
+    fn log_subscription_resolved_endpoint(&self, _r: i64) -> Option<String> {
+        None
+    }
+    fn log_subscription_channel_errored(&self, _r: i64) -> bool {
+        false
+    }
+    fn log_image_by_session(&mut self, _r: i64, _s: i32) -> Option<deepmsg_client::image::Image> {
+        None
+    }
+    fn commit_position_value(&self) -> i64 {
+        0
+    }
+    fn set_election_state(&mut self, state: deepmsg_cluster::election::state::ElectionState) {
+        self.calls.push(match state {
+            deepmsg_cluster::election::state::ElectionState::Closed => "state:closed",
+            _ => "state",
+        });
     }
 }
 
@@ -291,8 +379,13 @@ fn a_single_member_election_walks_to_closed() {
     election.do_work(&mut host, &mut sender).unwrap();
     assert_eq!(election.state(), ElectionState::LeaderReady);
     assert!(host.calls.contains(&"join_log_as_leader"));
-    assert_eq!(host.recording_log.entries().len(), 1, "one term entry");
-    assert_eq!(host.recording_log.entries()[0].leadership_term_id, 1);
+    // `ensureCoherent` on an empty log writes every term from the initial one:
+    // term 0, then term 1 (the election's), the second committed at the applied
+    // position (`RecordingLog.java:1382-1393`).
+    assert_eq!(host.recording_log.entries().len(), 2, "terms 0 and 1");
+    assert_eq!(host.recording_log.entries()[0].leadership_term_id, 0);
+    assert_eq!(host.recording_log.entries()[1].leadership_term_id, 1);
+    assert_eq!(host.recording_log.entries()[1].log_position, 0);
 
     // 8 -> 17: the quorum has reached the position, the event is appended, and
     // the election hands control back.
@@ -303,19 +396,34 @@ fn a_single_member_election_walks_to_closed() {
 }
 
 #[test]
-fn a_two_member_election_stops_at_a_state_this_slice_does_not_own() {
+fn a_two_member_election_canvasses_nominates_and_wins_the_ballot() {
     let mut host = Mock::new("canvass");
     let mut sender = MockSender { sent: Vec::new() };
     let mut election = Election::new(0, vec![0, 1], true, -1, 0, 0, 0, 0, 1_000, 42);
 
+    // 0 -> 1.
     election.do_work(&mut host, &mut sender).unwrap();
     assert_eq!(election.state(), ElectionState::Canvass);
     assert_eq!(host.role(), Role::Follower);
 
-    // CANVASS is P3-5b. Saying so is better than guessing.
+    // 1 -> 2: the mock is a unanimous candidate, so canvass nominates at once.
     host.now_ns += 1_000_000_000;
-    let result = election.do_work(&mut host, &mut sender);
-    assert!(matches!(result, Err(ClusterError::Cluster(message)) if message.contains("P3-5b")));
+    election.do_work(&mut host, &mut sender).unwrap();
+    assert_eq!(election.state(), ElectionState::Nominate);
+    assert!(sender.sent.contains(&"canvass_position"));
+
+    // 2 -> 3: the nomination deadline passes and the term is persisted.
+    host.now_ns += 1_000_000_000;
+    election.do_work(&mut host, &mut sender).unwrap();
+    assert_eq!(election.state(), ElectionState::CandidateBallot);
+    assert_eq!(host.role(), Role::Candidate);
+    assert_eq!(host.node_state.candidate_term().candidate_term_id, 1);
+
+    // 3 -> 5: every member voted yes at the candidate's term.
+    host.now_ns += 1_000_000_000;
+    election.do_work(&mut host, &mut sender).unwrap();
+    assert_eq!(election.state(), ElectionState::LeaderLogReplication);
+    assert_eq!(host.role(), Role::Leader);
 }
 
 #[test]

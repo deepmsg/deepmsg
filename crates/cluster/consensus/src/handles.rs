@@ -55,9 +55,120 @@ impl LogReplay {
     }
 }
 
+/// `RecordingSignal` (`aeron-archive/.../RecordingSignal.java`): the signals a
+/// replication consumes. Only the four `RecordingReplication.onSignal` reads
+/// are named here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum RecordingSignal {
+    /// `START(0)`.
+    Start = 0,
+    /// `STOP(1)`.
+    Stop = 1,
+    /// `EXTEND(2)`: the recording is being extended; its position counter is
+    /// looked up again.
+    Extend = 2,
+    /// `SYNC(5)`.
+    Sync = 5,
+    /// `REPLICATE_END(7)`.
+    ReplicateEnd = 7,
+    /// `NULL_VAL`.
+    NullVal = -2_147_483_648,
+}
+
 /// An archive-to-archive replication of a log (reference
 /// `RecordingReplication.java`). Created by `ElectionHost::new_log_replication`
-/// (`ConsensusModuleAgent.java:2951`), advanced by `Election::on_recording_signal`
-/// (`Election.java:269-282`). P3-6b.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct RecordingReplication;
+/// (`ConsensusModuleAgent.java:2951`), advanced by
+/// [`Election::on_recording_signal`](crate::election::Election::on_recording_signal).
+///
+/// **The state machine is here; the work is not.** The reference's `poll`
+/// drives an `AeronArchive` session, and that belongs to `P3-6b`; the handle a
+/// follower election holds is the same four facts either way — the recording
+/// id, its position, and the two flags the state machine waits on.
+#[derive(Clone, Debug)]
+pub struct RecordingReplication {
+    correlation_id: i64,
+    recording_id: Arc<AtomicI64>,
+    position: Arc<AtomicI64>,
+    replication_ended: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+    synced: Arc<AtomicBool>,
+}
+
+impl Default for RecordingReplication {
+    fn default() -> Self {
+        Self::new(-1, -1)
+    }
+}
+
+impl RecordingReplication {
+    /// A replication of `recording_id` started under `correlation_id`, not yet
+    /// ended or stopped.
+    pub fn new(recording_id: i64, correlation_id: i64) -> Self {
+        Self {
+            correlation_id,
+            recording_id: Arc::new(AtomicI64::new(recording_id)),
+            position: Arc::new(AtomicI64::new(0)),
+            replication_ended: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            synced: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// `recordingId()` (`:136-139`).
+    pub fn recording_id(&self) -> i64 {
+        self.recording_id.load(Ordering::Acquire)
+    }
+
+    /// `position()` (`:131-134`).
+    pub fn position(&self) -> i64 {
+        self.position.load(Ordering::Acquire)
+    }
+
+    /// `hasReplicationEnded()` (`:141-144`).
+    pub fn has_replication_ended(&self) -> bool {
+        self.replication_ended.load(Ordering::Acquire)
+    }
+
+    /// `hasStopped()` (`:151-154`).
+    pub fn has_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// `hasSynced()` (`:146-149`).
+    pub fn has_synced(&self) -> bool {
+        self.synced.load(Ordering::Acquire)
+    }
+
+    /// `poll(nowNs)` (`:176`): the reference advances the archive session here.
+    /// The session is `P3-6b`'s; until then this is where it will be called
+    /// from, and a test moves the handle through [`Self::on_signal`].
+    pub fn poll(&self, _now_ns: i64) {}
+
+    /// `onSignal(correlationId, recordingId, position, signal)` (`:176-203`).
+    ///
+    /// `replication_id` is the correlation id the replication was started
+    /// under; the reference matches on it and ignores everyone else's signals.
+    pub fn on_signal(&self, correlation_id: i64, position: i64, signal: RecordingSignal) {
+        if correlation_id != self.correlation_id {
+            return;
+        }
+
+        match signal {
+            // `EXTEND` re-reads the recording position counter; that counter
+            // is the archive client's, so it is `P3-6b`'s half.
+            RecordingSignal::Extend => {}
+            RecordingSignal::Sync => self.synced.store(true, Ordering::Release),
+            RecordingSignal::ReplicateEnd => {
+                self.replication_ended.store(true, Ordering::Release);
+            }
+            RecordingSignal::Stop => {
+                if position != -1 {
+                    self.position.store(position, Ordering::Release);
+                }
+                self.stopped.store(true, Ordering::Release);
+            }
+            _ => {}
+        }
+    }
+}

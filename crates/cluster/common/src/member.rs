@@ -171,6 +171,86 @@ impl ClusterMember {
         }
     }
 
+    /// `ClusterMember.reset()` (`:140-149`): forget everything that belongs to
+    /// a term. The endpoints stay — they name the member, not the term.
+    pub fn reset(&mut self) {
+        self.is_ballot_sent = false;
+        self.is_leader = false;
+        self.has_terminated = false;
+        self.vote = None;
+        self.candidate_term_id = -1;
+        self.leadership_term_id = -1;
+        self.log_position = NULL_POSITION;
+    }
+
+    /// `ClusterMember.reset(members)` (`:932-938`).
+    pub fn reset_all(members: &mut [Self]) {
+        for member in members {
+            member.reset();
+        }
+    }
+
+    /// `ClusterMember.becomeCandidate` (`:947-968`): the candidate votes for
+    /// itself and everyone else's ballot starts from nothing.
+    pub fn become_candidate(
+        members: &mut [Self],
+        candidate_term_id: i64,
+        candidate_member_id: i32,
+    ) {
+        for member in members {
+            if member.id == candidate_member_id {
+                member.vote = Some(true);
+                member.candidate_term_id = candidate_term_id;
+                member.is_ballot_sent = true;
+            } else {
+                member.vote = None;
+                member.candidate_term_id = -1;
+                member.is_ballot_sent = false;
+            }
+        }
+    }
+
+    /// `ClusterMember.isUnanimousLeader` (`:981-1006`): every member that is
+    /// not the gracefully closed leader voted yes at `candidate_term_id`, and
+    /// there are at least a quorum of them.
+    pub fn is_unanimous_leader(
+        members: &[Self],
+        candidate_term_id: i64,
+        graceful_closed_leader_id: i32,
+    ) -> bool {
+        let mut votes = 0;
+        for member in members {
+            if member.id == graceful_closed_leader_id {
+                continue;
+            }
+            if candidate_term_id != member.candidate_term_id || member.vote != Some(true) {
+                return false;
+            }
+            votes += 1;
+        }
+        votes >= quorum_threshold(members.len())
+    }
+
+    /// `ClusterMember.isUnanimousCandidate` (`:1117-1140`): every member that
+    /// is not the gracefully closed leader would vote for `candidate`.
+    pub fn is_unanimous_candidate(
+        members: &[Self],
+        candidate: &Self,
+        graceful_closed_leader_id: i32,
+    ) -> bool {
+        let mut possible_votes = 0;
+        for member in members {
+            if member.id == graceful_closed_leader_id {
+                continue;
+            }
+            if !member.will_vote_for(candidate) {
+                return false;
+            }
+            possible_votes += 1;
+        }
+        possible_votes >= quorum_threshold(members.len())
+    }
+
     /// Whether this member reported an append position within `timeout_ns`.
     /// `isActive` (`:1287`).
     pub fn is_active(&self, now_ns: i64, timeout_ns: i64) -> bool {

@@ -251,6 +251,11 @@ pub struct ConsensusModuleAgent {
     log_recording_id: i64,
     log_recording_stop_position: i64,
     log_subscription_id: i64,
+    /// An image the election asked for and `try_join_log_as_follower` has not
+    /// consumed yet. The reference hands the same `Image` object out every duty
+    /// cycle; here the image is taken out of the subscription once
+    /// (`Client::take_image`) and kept here until an adapter owns it.
+    taken_log_image: Option<deepmsg_client::image::Image>,
     append_position: Option<AppendPosition>,
 
     state: ModuleState,
@@ -555,6 +560,7 @@ impl ConsensusModuleAgent {
             log_recording_id: NULL_VALUE,
             log_recording_stop_position: 0,
             log_subscription_id: NULL_VALUE,
+            taken_log_image: None,
             append_position: None,
             state: ModuleState::Init,
             role: Role::Follower,
@@ -642,6 +648,10 @@ impl ConsensusModuleAgent {
             now_ns as u64,
         );
         self.election = Some(election);
+        // `Election`'s constructor increments the election counter
+        // (`Election.java:148`); the constructor here has no host, so the agent
+        // that makes one counts it.
+        increment_counter(&self.client, self.counters.election, 1);
 
         // `election.doWork(nowNs)` once, before the state is set ACTIVE: the
         // single-member short circuit leaves the election in
@@ -656,14 +666,30 @@ impl ConsensusModuleAgent {
     }
 
     /// One `election.doWork` with the take-out pattern (plan §4.5).
+    ///
+    /// The reference's `doWork` catch (`ConsensusModuleAgent.java:458-465`)
+    /// turns a recoverable error into `election.handleError(nowNs, ex)`, which
+    /// counts it and puts the machine back in `INIT`; only an
+    /// `AgentTerminationException` (or an error with no election running) leaves
+    /// this method as an error.
     fn drive_election_once(&mut self, now_ns: i64) -> Result<usize, ClusterError> {
-        let _ = now_ns;
         let Some(mut election) = self.election.take() else {
             return Ok(0);
         };
         let mut publisher = mem::take(&mut self.publisher);
         let result = election.do_work(self, &mut publisher);
         self.publisher = publisher;
+
+        let result = match result {
+            Err(error) if error.is_election_recoverable() => {
+                self.report_counted_error();
+                let publisher = mem::take(&mut self.publisher);
+                let recovered = election.handle_error(self, now_ns, error);
+                self.publisher = publisher;
+                recovered.map(|()| 1)
+            }
+            other => other,
+        };
 
         if election.state() != ElectionState::Closed {
             self.election = Some(election);
@@ -2129,6 +2155,16 @@ impl ElectionHost for ConsensusModuleAgent {
         self.clock.time_millis()
     }
 
+    fn nanos_from_timestamp(&self, timestamp: i64) -> i64 {
+        match self.clock.time_unit() {
+            ClusterTimeUnit::MILLIS | ClusterTimeUnit::NullVal => {
+                timestamp.saturating_mul(1_000_000)
+            }
+            ClusterTimeUnit::MICROS => timestamp.saturating_mul(1_000),
+            ClusterTimeUnit::NANOS => timestamp,
+        }
+    }
+
     fn timestamp_from_nanos(&self, now_ns: i64) -> i64 {
         self.clock.timestamp_from_nanos(now_ns)
     }
@@ -2171,6 +2207,230 @@ impl ElectionHost for ConsensusModuleAgent {
             now_ns,
             timeout_ns,
         )
+    }
+
+    // ---- P3-5b: the member table and the log subscription ----------------
+
+    fn reset_members(&mut self, leadership_term_id: i64, append_position: i64) {
+        ClusterMember::reset_all(&mut self.members);
+        let index = self.this_member_index;
+        self.members[index].leadership_term_id = leadership_term_id;
+        self.members[index].log_position = append_position;
+    }
+
+    fn become_candidate(&mut self, candidate_term_id: i64, candidate_member_id: i32) {
+        ClusterMember::become_candidate(&mut self.members, candidate_term_id, candidate_member_id);
+    }
+
+    fn member_ballot_sent(&self, member_id: i32) -> bool {
+        self.members
+            .iter()
+            .find(|member| member.id == member_id)
+            .is_some_and(|member| member.is_ballot_sent)
+    }
+
+    fn set_member_ballot_sent(&mut self, member_id: i32, sent: bool) {
+        if let Some(member) = self
+            .members
+            .iter_mut()
+            .find(|member| member.id == member_id)
+        {
+            member.is_ballot_sent = sent;
+        }
+    }
+
+    fn set_member_vote(&mut self, member_id: i32, candidate_term_id: i64, vote: Option<bool>) {
+        if let Some(member) = self
+            .members
+            .iter_mut()
+            .find(|member| member.id == member_id)
+        {
+            member.candidate_term_id = candidate_term_id;
+            member.vote = vote;
+        }
+    }
+
+    fn unanimous_candidate(
+        &self,
+        candidate_member_id: i32,
+        graceful_closed_leader_id: i32,
+    ) -> bool {
+        self.members
+            .iter()
+            .find(|member| member.id == candidate_member_id)
+            .is_some_and(|candidate| {
+                ClusterMember::is_unanimous_candidate(
+                    &self.members,
+                    candidate,
+                    graceful_closed_leader_id,
+                )
+            })
+    }
+
+    fn quorum_candidate(&self, candidate_member_id: i32) -> bool {
+        self.members
+            .iter()
+            .find(|member| member.id == candidate_member_id)
+            .is_some_and(|candidate| member::is_quorum_candidate(&self.members, candidate))
+    }
+
+    fn unanimous_leader(&self, candidate_term_id: i64, graceful_closed_leader_id: i32) -> bool {
+        ClusterMember::is_unanimous_leader(
+            &self.members,
+            candidate_term_id,
+            graceful_closed_leader_id,
+        )
+    }
+
+    fn quorum_leader(&self, candidate_term_id: i64) -> bool {
+        member::is_quorum_leader(&self.members, candidate_term_id)
+    }
+
+    fn member_has_publication(&self, _member_id: i32) -> bool {
+        // One member has nobody to publish to; per-member publications are
+        // P3-6a's.
+        false
+    }
+
+    fn try_add_member_publication(&mut self, _member_id: i32) -> Result<(), ClusterError> {
+        // Per-member consensus publications are P3-6a's; a one-member cluster
+        // has nobody to send to, so it succeeds vacuously.
+        if self.members.len() > 1 {
+            return Err(ClusterError::Cluster(
+                "member consensus publications are P3-6a".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn consensus_stream_id(&self) -> i32 {
+        self.config.consensus_stream_id
+    }
+
+    fn app_version(&self) -> i32 {
+        self.config.app_version
+    }
+
+    fn file_sync_level(&self) -> i32 {
+        self.config.file_sync_level
+    }
+
+    fn log_channel(&self) -> &str {
+        &self.config.log_channel
+    }
+
+    fn log_stream_id(&self) -> i32 {
+        self.config.log_stream_id
+    }
+
+    fn log_is_mdc(&self) -> bool {
+        ChannelUri::parse(&self.config.log_channel)
+            .ok()
+            .and_then(|uri| uri.get("control-mode").map(str::to_owned))
+            .is_some_and(|mode| mode == "manual")
+    }
+
+    fn member_log_endpoint(&self, member_id: i32) -> Option<String> {
+        self.members
+            .iter()
+            .find(|member| member.id == member_id)
+            .map(|member| member.log_endpoint.clone())
+    }
+
+    fn member_catchup_endpoint(&self, member_id: i32) -> Option<String> {
+        self.members
+            .iter()
+            .find(|member| member.id == member_id)
+            .map(|member| member.catchup_endpoint.clone())
+    }
+
+    fn member_archive_endpoint(&self, member_id: i32) -> Option<String> {
+        self.members
+            .iter()
+            .find(|member| member.id == member_id)
+            .map(|member| member.archive_endpoint.clone())
+    }
+
+    fn member_archive_response_endpoint(&self, member_id: i32) -> Option<String> {
+        self.members
+            .iter()
+            .find(|member| member.id == member_id)
+            .and_then(|member| member.archive_response_endpoint.clone())
+    }
+
+    fn add_log_subscription(&mut self, log_session_id: i32) -> Result<i64, ClusterError> {
+        let first = self.client.next_correlation_id().map_err(cluster)?;
+        let second = self.client.next_correlation_id().map_err(cluster)?;
+        // `Election.addFollowerSubscription` (`:1366-1383`): UDP media, manual
+        // control mode, the leader's log session id, one group, no rejoin.
+        let channel = format!(
+            "aeron:udp?tags={first},{second}|control-mode=manual|session-id={log_session_id}|group=true|rejoin=false|alias=log-cm"
+        );
+        self.client
+            .add_subscription(&channel, self.config.log_stream_id, COMMAND_TIMEOUT)
+            .map_err(cluster)
+    }
+
+    fn remove_log_subscription(&mut self, registration_id: i64) -> Result<(), ClusterError> {
+        self.client
+            .remove_subscription(registration_id, COMMAND_TIMEOUT)
+            .map_err(cluster)
+    }
+
+    fn add_log_destination(
+        &mut self,
+        registration_id: i64,
+        destination: &str,
+    ) -> Result<(), ClusterError> {
+        self.client
+            .add_rcv_destination(registration_id, destination, COMMAND_TIMEOUT)
+            .map(|_| ())
+            .map_err(cluster)
+    }
+
+    fn log_subscription_resolved_endpoint(&self, registration_id: i64) -> Option<String> {
+        let counters = self.client.counters_reader()?;
+        self.client
+            .subscription(registration_id)?
+            .resolved_endpoint(&counters)
+    }
+
+    fn log_subscription_channel_errored(&self, registration_id: i64) -> bool {
+        let Some(counters) = self.client.counters_reader() else {
+            return false;
+        };
+        let Some(status_id) = self
+            .client
+            .subscription(registration_id)
+            .and_then(deepmsg_client::subscription::Subscription::channel_status_indicator_id)
+        else {
+            return false;
+        };
+        counters.value(status_id) == Some(-1) // `CHANNEL_ENDPOINT_STATUS_ERRORED`
+    }
+
+    fn log_image_by_session(
+        &mut self,
+        registration_id: i64,
+        session_id: i32,
+    ) -> Option<deepmsg_client::image::Image> {
+        if let Some(image) = self.taken_log_image.take() {
+            return Some(image);
+        }
+        let publication_id = self
+            .client
+            .subscription(registration_id)?
+            .image_by_session_id(session_id)?
+            .registration_id();
+        self.client.take_image(registration_id, publication_id)
+    }
+
+    fn commit_position_value(&self) -> i64 {
+        self.commit_position_value()
+    }
+
+    fn set_election_state(&mut self, state: ElectionState) {
+        self.set_counter_value(self.counters.election_state, i64::from(state.code()));
     }
 }
 

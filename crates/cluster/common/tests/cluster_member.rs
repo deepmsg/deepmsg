@@ -236,3 +236,76 @@ fn find_member_answers_by_id() {
     assert_eq!(member::find_member(&members, 1).map(|m| m.id), Some(1));
     assert!(member::find_member(&members, 9).is_none());
 }
+
+#[test]
+fn a_member_reset_forgets_the_term_but_not_its_endpoints() {
+    let mut member = member(0, 42, 7);
+    member.vote = Some(true);
+    member.candidate_term_id = 5;
+    member.leadership_term_id = 3;
+    member.is_ballot_sent = true;
+    member.is_leader = true;
+
+    member.reset();
+
+    assert_eq!(Some(false), Some(member.is_ballot_sent));
+    assert!(!member.is_leader);
+    assert_eq!(None, member.vote);
+    assert_eq!(-1, member.candidate_term_id);
+    assert_eq!(-1, member.leadership_term_id);
+    assert_eq!(-1, member.log_position);
+    assert_eq!("i0:1", member.ingress_endpoint);
+}
+
+#[test]
+fn a_candidate_votes_for_itself_and_clears_everyone_else() {
+    let mut members = vec![member(0, 0, 0), member(1, 0, 0), member(2, 0, 0)];
+    members[1].vote = Some(true);
+    members[2].vote = Some(false);
+
+    ClusterMember::become_candidate(&mut members, 7, 0);
+
+    assert_eq!(Some(true), members[0].vote);
+    assert_eq!(7, members[0].candidate_term_id);
+    assert!(members[0].is_ballot_sent);
+    for other in &members[1..] {
+        assert_eq!(None, other.vote);
+        assert_eq!(-1, other.candidate_term_id);
+        assert!(!other.is_ballot_sent);
+    }
+}
+
+#[test]
+fn a_unanimous_leader_needs_everyone_but_the_closed_leader_to_say_yes() {
+    let mut members = vec![member(0, 0, 0), member(1, 0, 0), member(2, 0, 0)];
+    ClusterMember::become_candidate(&mut members, 3, 0);
+    members[1].vote = Some(true);
+    members[1].candidate_term_id = 3;
+
+    // Member 2 has not voted yet.
+    assert!(!ClusterMember::is_unanimous_leader(&members, 3, -1));
+
+    members[2].vote = Some(true);
+    members[2].candidate_term_id = 3;
+    assert!(ClusterMember::is_unanimous_leader(&members, 3, -1));
+
+    // A gracefully closed leader is not asked.
+    members[2].vote = None;
+    assert!(ClusterMember::is_unanimous_leader(&members, 3, 2));
+}
+
+#[test]
+fn a_unanimous_candidate_needs_everyone_but_the_closed_leader_to_be_willing() {
+    let members = vec![member(0, 10, 0), member(1, 10, 0), member(2, 20, 0)];
+    let candidate = &members[0];
+
+    // Member 2 is ahead of the candidate and would not vote for it.
+    assert!(!ClusterMember::is_unanimous_candidate(
+        &members, candidate, -1
+    ));
+
+    // Unless it is the gracefully closed leader, which is not asked.
+    assert!(ClusterMember::is_unanimous_candidate(
+        &members, candidate, 2
+    ));
+}

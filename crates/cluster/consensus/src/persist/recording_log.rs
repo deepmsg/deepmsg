@@ -154,6 +154,11 @@ pub enum RecordingLogError {
     UnknownRecording(i64),
     /// A commit position named a leadership term the log has no entry for.
     UnknownLeadershipTerm(i64),
+    /// A term was appended twice (`:959-962`).
+    DuplicateTerm(i64),
+    /// The last term has no committed position and the caller did not give a
+    /// base for it (`:1398-1406`).
+    PriorTermNotCommitted,
     /// A recovery plan found the consensus module's snapshot but not the one
     /// for a service it expects immediately before it.
     SnapshotMissing {
@@ -175,6 +180,18 @@ impl fmt::Display for RecordingLogError {
             }
             Self::UnknownLeadershipTerm(leadership_term_id) => {
                 write!(f, "unknown leadershipTermId={leadership_term_id}")
+            }
+            Self::DuplicateTerm(leadership_term_id) => {
+                write!(
+                    f,
+                    "duplicate TERM entry for leadershipTermId={leadership_term_id}"
+                )
+            }
+            Self::PriorTermNotCommitted => {
+                write!(
+                    f,
+                    "prior term was not committed and termBaseLogPosition was not specified"
+                )
             }
             Self::SnapshotMissing {
                 service_id,
@@ -436,6 +453,136 @@ impl RecordingLog {
             .ok_or(RecordingLogError::UnknownLeadershipTerm(leadership_term_id))?;
 
         self.commit_log_position(index, log_position)
+    }
+
+    /// The term entry for `leadership_term_id`, if the log has one
+    /// (`findTermEntry`, `:714-726`).
+    pub fn find_term_entry(&self, leadership_term_id: i64) -> Option<&Entry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.is_term() && entry.leadership_term_id == leadership_term_id)
+    }
+
+    /// `ensureCoherent` (`:1369-1444`): make the log describe `leadership_term_id`
+    /// before the term is used.
+    ///
+    /// Three shapes, exactly as the reference:
+    /// * no term yet — every term from `initial_log_leadership_term_id` is
+    ///   written, each starting where the previous one ended;
+    /// * the log is behind — a prior term without a committed position is
+    ///   committed at the base the caller supplied (or refused), then the terms
+    ///   in between and the new one are appended;
+    /// * the log already has the term — only the commit position moves.
+    ///
+    /// `None` is the reference's `NULL_VALUE` for the two optional positions.
+    ///
+    /// # Errors
+    ///
+    /// The file system, a duplicate term, or an uncommitted prior term with no
+    /// base to commit it at.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_coherent(
+        &mut self,
+        recording_id: i64,
+        initial_log_leadership_term_id: i64,
+        initial_term_base_log_position: i64,
+        leadership_term_id: i64,
+        term_base_log_position: Option<i64>,
+        log_position: Option<i64>,
+        timestamp: i64,
+        file_sync_level: i32,
+    ) -> Result<(), RecordingLogError> {
+        match self.find_last_term().cloned() {
+            None => {
+                let mut term_id = initial_log_leadership_term_id.max(0);
+                while term_id < leadership_term_id {
+                    self.append_term_entry(
+                        recording_id,
+                        term_id,
+                        initial_term_base_log_position,
+                        timestamp,
+                    )?;
+                    term_id += 1;
+                }
+                self.append_term_entry(
+                    recording_id,
+                    leadership_term_id,
+                    term_base_log_position.unwrap_or(initial_term_base_log_position),
+                    timestamp,
+                )?;
+            }
+            Some(last) if last.leadership_term_id < leadership_term_id => {
+                let mut last = last;
+                if last.log_position == NULL_POSITION {
+                    let base =
+                        term_base_log_position.ok_or(RecordingLogError::PriorTermNotCommitted)?;
+                    self.commit_log_position_for_term(last.leadership_term_id, base)?;
+                    last = self
+                        .find_last_term()
+                        .cloned()
+                        .ok_or(RecordingLogError::PriorTermNotCommitted)?;
+                }
+
+                let mut term_id = last.leadership_term_id + 1;
+                while term_id < leadership_term_id {
+                    self.append_term_entry(recording_id, term_id, last.log_position, timestamp)?;
+                    term_id += 1;
+                }
+                self.append_term_entry(
+                    recording_id,
+                    leadership_term_id,
+                    last.log_position,
+                    timestamp,
+                )?;
+            }
+            Some(_) => {}
+        }
+
+        if let Some(position) = log_position {
+            self.commit_log_position_for_term(leadership_term_id, position)?;
+        }
+
+        self.force(file_sync_level)
+    }
+
+    /// The four-argument `appendTerm` (`:950-988`): the committed position is
+    /// the next term's base when there is a next term, otherwise uncommitted;
+    /// the term before this one is committed at this term's base.
+    fn append_term_entry(
+        &mut self,
+        recording_id: i64,
+        leadership_term_id: i64,
+        term_base_log_position: i64,
+        timestamp: i64,
+    ) -> Result<Entry, RecordingLogError> {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.is_term() && entry.leadership_term_id == leadership_term_id)
+        {
+            return Err(RecordingLogError::DuplicateTerm(leadership_term_id));
+        }
+
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.is_term() && entry.leadership_term_id == leadership_term_id - 1)
+        {
+            self.commit_log_position_for_term(leadership_term_id - 1, term_base_log_position)?;
+        }
+
+        let log_position = self
+            .find_term_entry(leadership_term_id + 1)
+            .map_or(NULL_POSITION, |entry| entry.term_base_log_position);
+
+        self.append_term(
+            leadership_term_id,
+            term_base_log_position,
+            log_position,
+            timestamp,
+            recording_id,
+            -1,
+        )
     }
 
     /// Mark the newest valid snapshot invalid by setting bit 31 of its type

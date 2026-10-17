@@ -38,7 +38,9 @@ pub use host::{ElectionHost, HOST_METHODS};
 pub use sender::{ConsensusSender, SENDER_METHODS};
 pub use state::ElectionState;
 
-use crate::handles::{LogReplay, RecordingReplication};
+use deepmsg_cluster_common::member;
+
+use crate::handles::{LogReplay, RecordingReplication, RecordingSignal};
 
 /// A deterministic source for the canvass backoff.
 ///
@@ -241,6 +243,20 @@ impl Election {
         self.leader_member_id
     }
 
+    /// What the leader last told this member is committed (`:648-651`).
+    pub fn notified_commit_position(&self) -> i64 {
+        self.notified_commit_position
+    }
+
+    /// The archive-to-archive replication this election is waiting on, if any.
+    ///
+    /// The reference reads `logReplication` directly from its own test
+    /// (`ElectionTest.java`'s replication cases); this is the same door, and
+    /// the agent's 6b half will use it to drive the replication.
+    pub fn log_replication(&self) -> Option<&RecordingReplication> {
+        self.log_replication.as_ref()
+    }
+
     /// One duty cycle. `Election.doWork(nowNs)` (`:152-260`).
     ///
     /// # Errors
@@ -255,15 +271,29 @@ impl Election {
         let now_ns = host.now_ns();
         match self.state {
             ElectionState::Init => self.init(host, now_ns),
+            ElectionState::Canvass => self.canvass(host, sender, now_ns),
+            ElectionState::Nominate => self.nominate(host, sender, now_ns),
+            ElectionState::CandidateBallot => self.candidate_ballot(host, sender, now_ns),
+            ElectionState::FollowerBallot => self.follower_ballot(host, now_ns),
             ElectionState::LeaderLogReplication => {
                 self.leader_log_replication(host, sender, now_ns)
             }
             ElectionState::LeaderReplay => self.leader_replay(host, sender, now_ns),
             ElectionState::LeaderInit => self.leader_init(host, now_ns),
             ElectionState::LeaderReady => self.leader_ready(host, sender, now_ns),
-            other => Err(ClusterError::Cluster(format!(
-                "state {other:?} is P3-5b, not implemented yet"
-            ))),
+            ElectionState::FollowerLogReplication => {
+                self.follower_log_replication(host, sender, now_ns)
+            }
+            ElectionState::FollowerReplay => self.follower_replay(host, sender, now_ns),
+            ElectionState::FollowerCatchupInit => self.follower_catchup_init(host, sender, now_ns),
+            ElectionState::FollowerCatchupAwait => {
+                self.follower_catchup_await(host, sender, now_ns)
+            }
+            ElectionState::FollowerCatchup => self.follower_catchup(host, sender, now_ns),
+            ElectionState::FollowerLogInit => self.follower_log_init(host, sender, now_ns),
+            ElectionState::FollowerLogAwait => self.follower_log_await(host, sender, now_ns),
+            ElectionState::FollowerReady => self.follower_ready(host, sender, now_ns),
+            ElectionState::Closed => Ok(0),
         }
     }
 
@@ -275,8 +305,17 @@ impl Election {
                 self.prepare_for_new_leadership(host, now_ns)?;
             }
         } else {
+            self.stop_log_replication();
+            self.stop_catchup(host)?;
+
             self.prepare_for_new_leadership(host, now_ns)?;
             self.log_session_id = -1;
+            self.stop_replay();
+
+            if let Some(registration_id) = self.log_subscription_id.take() {
+                host.remove_log_subscription(registration_id)?;
+                host.await_local_sockets_closed(registration_id)?;
+            }
         }
 
         self.notified_commit_position = 0;
@@ -320,7 +359,6 @@ impl Election {
         now_ns: i64,
     ) -> Result<usize, ClusterError> {
         let mut work = 0;
-        self.time_of_last_update_ns = now_ns;
 
         // `thisMember.logPosition(appendPosition).timeOfLastAppendPositionNs(nowNs)`
         // (`Election.java:813`). Without this the member's own position stays at
@@ -443,30 +481,527 @@ impl Election {
         host: &mut dyn ElectionHost,
         now_ns: i64,
     ) -> Result<(), ClusterError> {
-        let recording_id = host.log_recording_id();
-        if recording_id != -1 {
-            let service_id = if self.leader_member_id == -1 {
-                -1
-            } else {
-                self.leader_member_id
-            };
-            let (term, position) = (self.leadership_term_id, self.log_position);
-            let timestamp = host.timestamp_from_nanos(now_ns);
-            host.recording_log()
-                .append_term(
-                    term,
-                    position,
-                    position,
-                    timestamp,
-                    recording_id,
-                    service_id,
-                )
-                .map_err(|error| ClusterError::Cluster(error.to_string()))?;
-        }
+        let term = self.leadership_term_id;
+        let position = self.log_position;
+        self.ensure_recording_log_coherent(host, term, None, Some(position), now_ns)?;
+        self.log_leadership_term_id = term;
         Ok(())
     }
 
-    /// `publishNewLeadershipTermOnInterval` (`:1198`).
+    /// `updateRecordingLogForReplication` (`:1529-1537`).
+    fn update_recording_log_for_replication(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        leadership_term_id: i64,
+        term_base_log_position: i64,
+        log_position: i64,
+        now_ns: i64,
+    ) -> Result<(), ClusterError> {
+        self.ensure_recording_log_coherent(
+            host,
+            leadership_term_id,
+            Some(term_base_log_position),
+            Some(log_position),
+            now_ns,
+        )?;
+        self.log_leadership_term_id = leadership_term_id;
+        Ok(())
+    }
+
+    /// `ensureRecordingLogCoherent` (`:1474-1521`).
+    fn ensure_recording_log_coherent(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        leadership_term_id: i64,
+        term_base_log_position: Option<i64>,
+        log_position: Option<i64>,
+        now_ns: i64,
+    ) -> Result<(), ClusterError> {
+        let recording_id = host.log_recording_id();
+        if recording_id == -1 {
+            // The reference's early return: a replication can have an initial
+            // append position but no recording of its own yet.
+            return Ok(());
+        }
+
+        let timestamp = host.timestamp_from_nanos(now_ns);
+        let file_sync_level = host.file_sync_level();
+        let initial_term = self.initial_log_leadership_term_id;
+        let initial_base = self.initial_term_base_log_position;
+        let base = term_base_log_position.unwrap_or(initial_base);
+        host.recording_log()
+            .ensure_coherent(
+                recording_id,
+                initial_term,
+                initial_base,
+                leadership_term_id,
+                Some(base),
+                log_position,
+                timestamp,
+                file_sync_level,
+            )
+            .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+        Ok(())
+    }
+
+    /// `canvass` (`:700-730`).
+    fn canvass(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        let mut work = 0;
+        let deadline_ns = if self.is_extended_canvass {
+            self.time_of_last_state_change_ns + host.startup_canvass_timeout_ns()
+        } else {
+            host.time_of_last_leader_update_ns() + host.leader_heartbeat_timeout_ns()
+        };
+
+        if now_ns - self.time_of_last_update_ns >= host.election_status_interval_ns() {
+            self.time_of_last_update_ns = now_ns;
+            self.publish_canvass_position(host, sender)?;
+            work += 1;
+        }
+
+        let appointed = host.appointed_leader_id();
+        if appointed != -1 && appointed != self.this_member_id {
+            return Ok(work);
+        }
+
+        if host.unanimous_candidate(self.this_member_id, self.graceful_closed_leader_id)
+            || (now_ns >= deadline_ns && host.quorum_candidate(self.this_member_id))
+        {
+            let half = host.election_timeout_ns() >> 1;
+            #[allow(clippy::cast_possible_truncation)]
+            let delay_ns = (self.rng.next_f64() * half as f64) as i64;
+            self.nomination_deadline_ns = now_ns + delay_ns;
+            self.transition(ElectionState::Nominate, now_ns, host)?;
+            work += 1;
+        }
+
+        Ok(work)
+    }
+
+    /// `nominate` (`:732-752`).
+    fn nominate(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        if now_ns >= self.nomination_deadline_ns {
+            let next = self.candidate_term_id + 1;
+            let position = self.log_position;
+            let epoch_ms = host.epoch_ms();
+            host.node_state()
+                .propose_max_candidate_term_id(next, position, epoch_ms)
+                .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+            self.candidate_term_id = host.node_state().candidate_term().candidate_term_id;
+            host.become_candidate(self.candidate_term_id, self.this_member_id);
+            self.transition(ElectionState::CandidateBallot, now_ns, host)?;
+            Ok(1)
+        } else if now_ns - self.time_of_last_update_ns >= host.election_status_interval_ns() {
+            self.time_of_last_update_ns = now_ns;
+            self.publish_canvass_position(host, sender)?;
+            Ok(1)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// `candidateBallot` (`:754-794`).
+    fn candidate_ballot(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        let mut work = 0;
+        let candidate_term_id = self.candidate_term_id;
+
+        if host.unanimous_leader(candidate_term_id, self.graceful_closed_leader_id) {
+            self.leader_member_id = self.this_member_id;
+            self.leadership_term_id = candidate_term_id;
+            self.transition(ElectionState::LeaderLogReplication, now_ns, host)?;
+            work += 1;
+        } else if now_ns >= self.time_of_last_state_change_ns + host.election_timeout_ns() {
+            if host.quorum_leader(candidate_term_id) {
+                self.leader_member_id = self.this_member_id;
+                self.leadership_term_id = candidate_term_id;
+                self.transition(ElectionState::LeaderLogReplication, now_ns, host)?;
+            } else {
+                self.transition(ElectionState::Canvass, now_ns, host)?;
+            }
+            work += 1;
+        } else {
+            for index in 0..self.member_ids.len() {
+                let member_id = self.member_ids[index];
+                if !host.member_ballot_sent(member_id) {
+                    work += 1;
+                    let sent = sender.request_vote(
+                        member_id,
+                        self.log_leadership_term_id,
+                        self.append_position,
+                        candidate_term_id,
+                        self.this_member_id,
+                    );
+                    host.set_member_ballot_sent(member_id, sent);
+                }
+            }
+        }
+
+        Ok(work)
+    }
+
+    /// `followerBallot` (`:796-807`).
+    fn follower_ballot(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        if now_ns >= self.time_of_last_state_change_ns + host.election_timeout_ns() {
+            self.transition(ElectionState::Canvass, now_ns, host)?;
+            return Ok(1);
+        }
+        Ok(0)
+    }
+
+    /// `followerLogReplication` (`:897-958`).
+    fn follower_log_replication(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        let mut work = 0;
+
+        if self.log_replication.is_none() {
+            if self.append_position < self.replication_stop_position {
+                let leader = self.leader_member_id;
+                let archive = host.member_archive_endpoint(leader).unwrap_or_default();
+                let response = host.member_archive_response_endpoint(leader);
+                self.log_replication = Some(host.new_log_replication(
+                    &archive,
+                    response.as_deref(),
+                    self.leader_recording_id,
+                    self.replication_stop_position,
+                    now_ns,
+                )?);
+                self.replication_deadline_ns = now_ns + host.leader_heartbeat_timeout_ns();
+                work += 1;
+            } else {
+                let term = self.replication_leadership_term_id;
+                let base = self.replication_term_base_log_position;
+                let stop = self.replication_stop_position;
+                self.update_recording_log_for_replication(host, term, base, stop, now_ns)?;
+                self.transition(ElectionState::Canvass, now_ns, host)?;
+            }
+            return Ok(work);
+        }
+
+        work += host.poll_archive_events();
+        let (replication_done, position) = {
+            let replication = self.log_replication.as_ref().expect("just checked");
+            replication.poll(now_ns);
+            (
+                replication.has_replication_ended() && replication.has_stopped(),
+                replication.position(),
+            )
+        };
+        // The last position of the leadership is published after the completion
+        // check (`Election.java:925-928`), so a replication that ends this turn
+        // still sends it.
+        work += self.publish_follower_replication_position(host, sender, now_ns);
+
+        if replication_done {
+            if self.notified_commit_position >= self.append_position {
+                self.append_position = position;
+                self.stop_log_replication();
+                let term = self.replication_leadership_term_id;
+                let base = self.replication_term_base_log_position;
+                let stop = self.replication_stop_position;
+                self.update_recording_log_for_replication(host, term, base, stop, now_ns)?;
+                self.transition(ElectionState::Canvass, now_ns, host)?;
+                work += 1;
+            } else if now_ns >= self.replication_deadline_ns {
+                return Err(ClusterError::Timeout(
+                    "timeout awaiting commit position".to_owned(),
+                ));
+            }
+        }
+
+        Ok(work)
+    }
+
+    /// `followerReplay` (`:960-1018`).
+    fn follower_replay(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        let mut work = 0;
+
+        if self.log_replay.is_none() {
+            if self.log_position < self.append_position {
+                if self.notified_commit_position == 0 {
+                    return Ok(self.publish_follower_append_position(host, sender, now_ns));
+                }
+                if self.log_position >= self.notified_commit_position {
+                    self.transition(ElectionState::Canvass, now_ns, host)?;
+                    return Ok(work);
+                }
+                let start = self.log_position;
+                let stop = self.append_position.min(self.notified_commit_position);
+                self.log_replay = Some(host.new_log_replay(start, stop)?);
+                work += 1;
+            } else {
+                let next = if self.catchup_join_position != -1 {
+                    ElectionState::FollowerCatchupInit
+                } else {
+                    ElectionState::FollowerLogInit
+                };
+                self.transition(next, now_ns, host)?;
+                work += 1;
+            }
+            return Ok(work);
+        }
+
+        let (done, position) = {
+            let replay = self.log_replay.as_ref().expect("just checked");
+            (replay.is_done(), replay.position())
+        };
+        if done {
+            self.log_position = position;
+            self.stop_replay();
+
+            if self.log_position == self.append_position {
+                let next = if self.catchup_join_position != -1 {
+                    ElectionState::FollowerCatchupInit
+                } else {
+                    ElectionState::FollowerLogInit
+                };
+                self.transition(next, now_ns, host)?;
+            } else {
+                self.transition(ElectionState::Canvass, now_ns, host)?;
+            }
+        }
+
+        Ok(work)
+    }
+
+    /// `followerCatchupInit` (`:1020-1056`).
+    fn follower_catchup_init(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        if self.log_subscription_id.is_none() {
+            let registration_id = host.add_log_subscription(self.log_session_id)?;
+            self.log_subscription_id = Some(registration_id);
+            self.add_catchup_log_destination(host)?;
+        }
+
+        let endpoint = host
+            .member_catchup_endpoint(self.this_member_id)
+            .unwrap_or_default();
+        let catchup_endpoint = if endpoint.ends_with(":0") {
+            match self.log_subscription_id.and_then(|registration_id| {
+                host.log_subscription_resolved_endpoint(registration_id)
+            }) {
+                Some(resolved) => resolved.rfind(':').map(|index| {
+                    format!("{}{}", &endpoint[..endpoint.len() - 2], &resolved[index..])
+                }),
+                None => None,
+            }
+        } else {
+            Some(endpoint)
+        };
+
+        if let Some(endpoint) = catchup_endpoint {
+            if sender.catchup_position(
+                self.leader_member_id,
+                self.leadership_term_id,
+                self.log_position,
+                self.this_member_id,
+                &endpoint,
+            ) {
+                self.time_of_last_update_ns = now_ns;
+                host.catchup_initiated(now_ns)?;
+                self.transition(ElectionState::FollowerCatchupAwait, now_ns, host)?;
+                return Ok(1);
+            }
+        }
+
+        if now_ns >= self.time_of_last_state_change_ns + host.leader_heartbeat_timeout_ns() {
+            return Err(ClusterError::Timeout(
+                "failed to send catchup position".to_owned(),
+            ));
+        }
+
+        Ok(1)
+    }
+
+    /// `followerCatchupAwait` (`:1058-1087`).
+    fn follower_catchup_await(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        let _ = sender;
+        let mut work = 0;
+        let Some(registration_id) = self.log_subscription_id else {
+            return Ok(0);
+        };
+
+        if let Some(image) = host.log_image_by_session(registration_id, self.log_session_id) {
+            self.verify_log_join_position("followerCatchupAwait", image.join_position())?;
+            let startup = self.is_leader_startup;
+            if host.try_join_log_as_follower(image, startup, now_ns)? {
+                self.transition(ElectionState::FollowerCatchup, now_ns, host)?;
+                work += 1;
+            } else if host.log_subscription_channel_errored(registration_id) {
+                return Err(ClusterError::Cluster(
+                    "failed to add catchup log as follower".to_owned(),
+                ));
+            } else if now_ns
+                >= self.time_of_last_state_change_ns + host.leader_heartbeat_timeout_ns()
+            {
+                return Err(ClusterError::Timeout(
+                    "failed to join catchup log as follower".to_owned(),
+                ));
+            }
+        } else if now_ns >= self.time_of_last_state_change_ns + host.leader_heartbeat_timeout_ns() {
+            return Err(ClusterError::Timeout(
+                "failed to join catchup log".to_owned(),
+            ));
+        }
+
+        Ok(work)
+    }
+
+    /// `followerCatchup` (`:1089-1113`).
+    fn follower_catchup(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        let _ = sender;
+        let mut work = host.catchup_poll(self.notified_commit_position, now_ns)?;
+
+        let near_live_position = self
+            .catchup_join_position
+            .max(self.notified_commit_position);
+        if host.live_log_destination().is_empty() && host.is_catchup_near_live(near_live_position) {
+            self.add_live_log_destination(host)?;
+            work += 1;
+        }
+
+        let position = host.commit_position_value();
+        if position >= self.catchup_join_position
+            && position >= self.notified_commit_position
+            && host.catchup_log_destination().is_empty()
+            && host.state() != crate::state::ModuleState::Snapshot
+        {
+            self.append_position = position;
+            self.log_position = position;
+            self.transition(ElectionState::FollowerLogInit, now_ns, host)?;
+            work += 1;
+        }
+
+        Ok(work)
+    }
+
+    /// `followerLogInit` (`:1115-1132`).
+    fn follower_log_init(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        let _ = sender;
+        if self.log_subscription_id.is_none() {
+            if self.log_session_id != -1 {
+                let registration_id = host.add_log_subscription(self.log_session_id)?;
+                self.log_subscription_id = Some(registration_id);
+                self.add_live_log_destination(host)?;
+                self.transition(ElectionState::FollowerLogAwait, now_ns, host)?;
+            }
+        } else {
+            self.transition(ElectionState::FollowerReady, now_ns, host)?;
+        }
+
+        Ok(1)
+    }
+
+    /// `followerLogAwait` (`:1134-1164`).
+    fn follower_log_await(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        let _ = sender;
+        let mut work = 0;
+        let Some(registration_id) = self.log_subscription_id else {
+            return Ok(0);
+        };
+
+        if let Some(image) = host.log_image_by_session(registration_id, self.log_session_id) {
+            self.verify_log_join_position("followerLogAwait", image.join_position())?;
+            let startup = self.is_leader_startup;
+            if host.try_join_log_as_follower(image, startup, now_ns)? {
+                self.update_recording_log(host, now_ns)?;
+                self.transition(ElectionState::FollowerReady, now_ns, host)?;
+                work += 1;
+            } else if now_ns
+                >= self.time_of_last_state_change_ns + host.leader_heartbeat_timeout_ns()
+            {
+                return Err(ClusterError::Timeout(
+                    "failed to join live log as follower".to_owned(),
+                ));
+            }
+        } else if host.log_subscription_channel_errored(registration_id) {
+            return Err(ClusterError::Cluster(
+                "failed to add live log as follower".to_owned(),
+            ));
+        } else if now_ns >= self.time_of_last_state_change_ns + host.leader_heartbeat_timeout_ns() {
+            return Err(ClusterError::Timeout("failed to join live log".to_owned()));
+        }
+
+        Ok(work)
+    }
+
+    /// `followerReady` (`:1166-1180`).
+    fn follower_ready(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        if sender.append_position(
+            self.leader_member_id,
+            self.leadership_term_id,
+            self.log_position,
+            self.this_member_id,
+            APPEND_POSITION_FLAG_NONE,
+        ) {
+            host.election_complete(now_ns)?;
+            self.transition(ElectionState::Closed, now_ns, host)?;
+        } else if now_ns >= self.time_of_last_state_change_ns + host.leader_heartbeat_timeout_ns() {
+            return Err(ClusterError::Timeout(
+                "ready follower failed to notify leader".to_owned(),
+            ));
+        }
+
+        Ok(1)
+    }
+
+    /// `publishNewLeadershipTermOnInterval` (`:1198-1210`).
     fn publish_new_leadership_term_on_interval(
         &mut self,
         host: &mut dyn ElectionHost,
@@ -474,39 +1009,235 @@ impl Election {
         quorum_position: i64,
         now_ns: i64,
     ) -> usize {
-        let interval = host.leader_heartbeat_interval_ns();
-        if now_ns < self.time_of_last_update_ns + interval {
+        if now_ns - self.time_of_last_update_ns < host.leader_heartbeat_interval_ns() {
             return 0;
         }
         self.time_of_last_update_ns = now_ns;
-        let leadership_term_id = self.leadership_term_id;
-        let log_leadership_term_id = self.log_leadership_term_id;
-        let log_position = self.log_position;
-        let leader_id = self.this_member_id;
-        let this_id = self.this_member_id;
-        for member_id in self.member_ids.iter().copied() {
-            if member_id == this_id {
-                continue;
-            }
-            sender.new_leadership_term(
+        let timestamp = host.timestamp_from_nanos(now_ns);
+        self.publish_new_leadership_term(host, sender, quorum_position, timestamp);
+        1
+    }
+
+    /// `publishNewLeadershipTerm(quorumPosition, timestamp)` (`:1253-1259`).
+    fn publish_new_leadership_term(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        quorum_position: i64,
+        timestamp: i64,
+    ) {
+        for index in 0..self.member_ids.len() {
+            let member_id = self.member_ids[index];
+            self.publish_new_leadership_term_to(
+                host,
+                sender,
                 member_id,
-                log_leadership_term_id,
-                leadership_term_id,
-                self.initial_term_base_log_position,
-                log_position,
-                leadership_term_id,
-                self.initial_term_base_log_position,
-                log_position,
+                self.log_leadership_term_id,
                 quorum_position,
-                self.leader_recording_id,
-                now_ns,
-                leader_id,
-                self.log_session_id,
-                0,
-                self.is_node_startup,
+                timestamp,
             );
         }
-        1
+    }
+
+    /// `publishNewLeadershipTerm(member, ..)` (`:1261-1298`).
+    ///
+    /// The `next` triple comes from the recording log's entry for
+    /// `logLeadershipTermId + 1`, when there is one: a follower that is behind
+    /// needs to know where the term after this one starts, or where to stop
+    /// replicating.
+    fn publish_new_leadership_term_to(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        member_id: i32,
+        log_leadership_term_id: i64,
+        quorum_position: i64,
+        timestamp: i64,
+    ) {
+        if member_id == self.this_member_id || self.log_session_id == -1 {
+            return;
+        }
+
+        let next = host
+            .recording_log()
+            .find_term_entry(log_leadership_term_id + 1)
+            .map(|entry| {
+                (
+                    entry.leadership_term_id,
+                    entry.term_base_log_position,
+                    entry.log_position,
+                )
+            });
+
+        let (next_leadership_term_id, next_term_base_log_position, next_log_position) = match next {
+            Some((term, base, position)) => (
+                term,
+                base,
+                if position != -1 {
+                    position
+                } else {
+                    self.append_position
+                },
+            ),
+            None => (self.leadership_term_id, self.append_position, -1),
+        };
+
+        sender.new_leadership_term(
+            member_id,
+            log_leadership_term_id,
+            next_leadership_term_id,
+            next_term_base_log_position,
+            next_log_position,
+            self.leadership_term_id,
+            self.append_position,
+            self.append_position,
+            quorum_position,
+            host.log_recording_id(),
+            timestamp,
+            self.this_member_id,
+            self.log_session_id,
+            host.app_version(),
+            self.is_leader_startup,
+        );
+    }
+
+    /// `publishCanvassPosition` (`:1232-1251`).
+    fn publish_canvass_position(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+    ) -> Result<(), ClusterError> {
+        for index in 0..self.member_ids.len() {
+            let member_id = self.member_ids[index];
+            if member_id == self.this_member_id {
+                continue;
+            }
+
+            if !host.member_has_publication(member_id) {
+                host.try_add_member_publication(member_id)?;
+            }
+
+            sender.canvass_position(
+                member_id,
+                self.log_leadership_term_id,
+                self.append_position,
+                self.leadership_term_id,
+                self.this_member_id,
+            );
+        }
+        Ok(())
+    }
+
+    /// `publishFollowerReplicationPosition` (`:1300-1316`).
+    fn publish_follower_replication_position(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> usize {
+        let Some(position) = self
+            .log_replication
+            .as_ref()
+            .map(RecordingReplication::position)
+        else {
+            return 0;
+        };
+
+        let due = position > self.append_position
+            || (position == self.append_position
+                && now_ns - self.time_of_last_update_ns >= host.leader_heartbeat_interval_ns());
+        if due
+            && sender.append_position(
+                self.leader_member_id,
+                self.leadership_term_id,
+                position,
+                self.this_member_id,
+                APPEND_POSITION_FLAG_NONE,
+            )
+        {
+            self.append_position = position;
+            self.time_of_last_update_ns = now_ns;
+            return 1;
+        }
+        0
+    }
+
+    /// `publishFollowerAppendPosition` (`:1318-1336`).
+    fn publish_follower_append_position(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> usize {
+        let due = self.last_published_append_position != self.append_position
+            || now_ns - self.time_of_last_update_ns >= host.leader_heartbeat_interval_ns();
+        if due
+            && sender.append_position(
+                self.leader_member_id,
+                self.leadership_term_id,
+                self.append_position,
+                self.this_member_id,
+                APPEND_POSITION_FLAG_NONE,
+            )
+        {
+            self.last_published_append_position = self.append_position;
+            self.time_of_last_update_ns = now_ns;
+            return 1;
+        }
+        0
+    }
+
+    /// `addCatchupLogDestination` (`:1344-1349`).
+    fn add_catchup_log_destination(
+        &mut self,
+        host: &mut dyn ElectionHost,
+    ) -> Result<(), ClusterError> {
+        let Some(endpoint) = host.member_catchup_endpoint(self.this_member_id) else {
+            return Ok(());
+        };
+        let destination = destination_uri(host.log_channel(), &endpoint);
+        if let Some(registration_id) = self.log_subscription_id {
+            host.add_log_destination(registration_id, &destination)?;
+        }
+        host.set_catchup_log_destination(&destination)
+    }
+
+    /// `addLiveLogDestination` (`:1351-1364`).
+    fn add_live_log_destination(
+        &mut self,
+        host: &mut dyn ElectionHost,
+    ) -> Result<(), ClusterError> {
+        let destination = if host.log_is_mdc() {
+            let Some(endpoint) = host.member_log_endpoint(self.this_member_id) else {
+                return Ok(());
+            };
+            destination_uri(host.log_channel(), &endpoint)
+        } else {
+            host.log_channel().to_owned()
+        };
+        if let Some(registration_id) = self.log_subscription_id {
+            host.add_log_destination(registration_id, &destination)?;
+        }
+        host.set_live_log_destination(&destination)
+    }
+
+    /// `placeVote` (`:1182-1196`).
+    fn place_vote(
+        &mut self,
+        sender: &mut dyn ConsensusSender,
+        candidate_term_id: i64,
+        candidate_id: i32,
+        vote: bool,
+    ) {
+        sender.place_vote(
+            candidate_id,
+            candidate_term_id,
+            self.log_leadership_term_id,
+            self.append_position,
+            candidate_id,
+            self.this_member_id,
+            vote,
+        );
     }
 
     /// `publishCommitPositionOnInterval` (`:1212`).
@@ -539,23 +1270,543 @@ impl Election {
         now_ns: i64,
         host: &mut dyn ElectionHost,
     ) -> Result<(), ClusterError> {
-        self.state = next;
-        self.time_of_last_state_change_ns = now_ns;
-        match next {
-            ElectionState::Canvass => host.set_role(crate::state::Role::Follower),
-            ElectionState::CandidateBallot => host.set_role(crate::state::Role::Candidate),
-            ElectionState::LeaderLogReplication => {
-                host.set_role(crate::state::Role::Leader);
-                // The log publication is created here, which is what fixes the
-                // log session id for the term (`Election.java:1398-1400`).
-                // The reference takes the session id from the call's return
-                // value; the frozen seam returns a work count, so it is read
-                // back through the host accessor.
-                host.add_log_publication(self.append_position)?;
-                self.log_session_id = host.log_session_id();
+        if next != self.state {
+            if self.state == ElectionState::Canvass {
+                self.is_extended_canvass = false;
             }
-            ElectionState::Closed => {}
-            _ => {}
+
+            match next {
+                ElectionState::Canvass => {
+                    self.reset_members(host);
+                    host.set_role(crate::state::Role::Follower);
+                }
+                ElectionState::CandidateBallot => {
+                    host.set_role(crate::state::Role::Candidate);
+                }
+                ElectionState::LeaderLogReplication => {
+                    host.set_role(crate::state::Role::Leader);
+                    // The log publication is created here, which is what fixes
+                    // the log session id for the term (`Election.java:1398-1400`).
+                    // The reference takes the session id from the call's return
+                    // value; the frozen seam returns a work count, so it is read
+                    // back through the host accessor.
+                    host.add_log_publication(self.append_position)?;
+                    self.log_session_id = host.log_session_id();
+                }
+                ElectionState::FollowerLogReplication | ElectionState::FollowerReplay => {
+                    host.set_role(crate::state::Role::Follower);
+                }
+                _ => {}
+            }
+
+            self.state = next;
+            host.set_election_state(next);
+            self.time_of_last_state_change_ns = now_ns;
+            self.time_of_last_update_ns = self.initial_time_of_last_update_ns;
+            self.time_of_last_commit_position_update_ns = self.initial_time_of_last_update_ns;
+        }
+        Ok(())
+    }
+
+    /// `handleError` (`:262-267`): count (the caller does), put the applied
+    /// position back to the commit counter, and start again.
+    ///
+    /// # Errors
+    ///
+    /// The transition's: only `LEADER_LOG_REPLICATION` can fail, and `INIT`
+    /// never goes there.
+    pub fn handle_error(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        now_ns: i64,
+        _error: ClusterError,
+    ) -> Result<(), ClusterError> {
+        self.log_position = host.commit_position_value();
+        self.transition(ElectionState::Init, now_ns, host)
+    }
+
+    /// `onRecordingSignal` (`:269-282`): replication progress.
+    ///
+    /// # Errors
+    ///
+    /// Never; the signature is `Result` for the caller's uniform dispatch.
+    pub fn on_recording_signal(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        correlation_id: i64,
+        position: i64,
+        signal: RecordingSignal,
+    ) -> Result<(), ClusterError> {
+        if self.state == ElectionState::Init {
+            return Ok(());
+        }
+
+        if let Some(replication) = &self.log_replication {
+            replication.on_signal(correlation_id, position, signal);
+            let recording_id = replication.recording_id();
+            host.set_log_recording_id(recording_id);
+        }
+
+        Ok(())
+    }
+
+    /// `onCanvassPosition` (`:284-332`).
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError::ClusterEvent`] when a leader hears of a newer term.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_canvass_position(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        log_leadership_term_id: i64,
+        log_position: i64,
+        _leadership_term_id: i64,
+        follower_member_id: i32,
+        _protocol_version: i32,
+    ) -> Result<(), ClusterError> {
+        if self.state == ElectionState::Init {
+            return Ok(());
+        }
+
+        if follower_member_id == self.graceful_closed_leader_id {
+            self.graceful_closed_leader_id = -1;
+        }
+
+        if follower_member_id == self.this_member_id
+            || !self.member_ids.contains(&follower_member_id)
+        {
+            return Ok(());
+        }
+
+        host.update_member_log_position(follower_member_id, log_leadership_term_id, log_position);
+
+        if log_leadership_term_id < self.leadership_term_id {
+            if host.role() == crate::state::Role::Leader {
+                let now_ns = host.now_ns();
+                let quorum =
+                    host.quorum_position_bounded_by_leader_log(self.append_position, now_ns);
+                let timestamp = host.timestamp_from_nanos(now_ns);
+                self.publish_new_leadership_term_to(
+                    host,
+                    sender,
+                    follower_member_id,
+                    log_leadership_term_id,
+                    quorum,
+                    timestamp,
+                );
+            }
+        } else if log_leadership_term_id > self.leadership_term_id
+            && matches!(
+                self.state,
+                ElectionState::LeaderLogReplication | ElectionState::LeaderReady
+            )
+        {
+            return Err(ClusterError::ClusterEvent(
+                "potential new election in progress".to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// `onRequestVote` (`:334-381`).
+    ///
+    /// # Errors
+    ///
+    /// The node-state file's; the reference throws out of its
+    /// `proposeMaxCandidateTermId`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_request_vote(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        log_leadership_term_id: i64,
+        log_position: i64,
+        candidate_term_id: i64,
+        candidate_id: i32,
+        _protocol_version: i32,
+    ) -> Result<(), ClusterError> {
+        if self.state == ElectionState::Init || candidate_id == self.this_member_id {
+            return Ok(());
+        }
+
+        if candidate_term_id <= self.candidate_term_id {
+            self.place_vote(sender, candidate_term_id, candidate_id, false);
+        } else if member::compare_log_values(
+            self.log_leadership_term_id,
+            self.append_position,
+            log_leadership_term_id,
+            log_position,
+        ) > 0
+        {
+            let epoch_ms = host.epoch_ms();
+            host.node_state()
+                .propose_max_candidate_term_id(candidate_term_id, log_position, epoch_ms)
+                .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+            self.candidate_term_id = host.node_state().candidate_term().candidate_term_id;
+
+            self.place_vote(sender, candidate_term_id, candidate_id, false);
+
+            if host.role() == crate::state::Role::Leader && self.member_ids.contains(&candidate_id)
+            {
+                let now_ns = host.now_ns();
+                let quorum =
+                    host.quorum_position_bounded_by_leader_log(self.append_position, now_ns);
+                let timestamp = host.timestamp_from_nanos(now_ns);
+                self.publish_new_leadership_term_to(
+                    host,
+                    sender,
+                    candidate_id,
+                    log_leadership_term_id,
+                    quorum,
+                    timestamp,
+                );
+            }
+        } else if matches!(
+            self.state,
+            ElectionState::Canvass
+                | ElectionState::Nominate
+                | ElectionState::CandidateBallot
+                | ElectionState::FollowerBallot
+        ) {
+            let now_ns = host.now_ns();
+            let epoch_ms = host.epoch_ms();
+            host.node_state()
+                .propose_max_candidate_term_id(candidate_term_id, log_position, epoch_ms)
+                .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+            self.candidate_term_id = host.node_state().candidate_term().candidate_term_id;
+
+            self.place_vote(sender, candidate_term_id, candidate_id, true);
+            self.transition(ElectionState::FollowerBallot, now_ns, host)?;
+        }
+
+        Ok(())
+    }
+
+    /// `onVote` (`:383-410`).
+    ///
+    /// # Errors
+    ///
+    /// Never; `Result` for the uniform dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_vote(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        log_leadership_term_id: i64,
+        log_position: i64,
+        candidate_term_id: i64,
+        candidate_id: i32,
+        voter_id: i32,
+        vote: bool,
+    ) -> Result<(), ClusterError> {
+        if self.state == ElectionState::Init {
+            return Ok(());
+        }
+
+        if self.state == ElectionState::CandidateBallot
+            && candidate_term_id == self.candidate_term_id
+            && candidate_id == self.this_member_id
+            && self.member_ids.contains(&voter_id)
+        {
+            host.set_member_vote(voter_id, candidate_term_id, Some(vote));
+            host.update_member_log_position(voter_id, log_leadership_term_id, log_position);
+        }
+
+        Ok(())
+    }
+
+    /// `onNewLeadershipTerm` (`:412-533`).
+    ///
+    /// # Errors
+    ///
+    /// The truncation's [`ClusterError::ClusterEvent`] (the reference throws
+    /// out of `onTruncateLogEntry`), or the invariant failure the reference
+    /// words as `invalid newLeadershipTerm`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_new_leadership_term(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        log_leadership_term_id: i64,
+        next_leadership_term_id: i64,
+        next_term_base_log_position: i64,
+        next_log_position: i64,
+        leadership_term_id: i64,
+        term_base_log_position: i64,
+        log_position: i64,
+        commit_position: i64,
+        leader_recording_id: i64,
+        _timestamp: i64,
+        leader_member_id: i32,
+        log_session_id: i32,
+        is_startup: bool,
+    ) -> Result<(), ClusterError> {
+        if self.state == ElectionState::Init {
+            return Ok(());
+        }
+
+        if !self.member_ids.contains(&leader_member_id)
+            || (leader_member_id == self.this_member_id
+                && leadership_term_id == self.leadership_term_id)
+        {
+            return Ok(());
+        }
+
+        if leader_member_id == self.graceful_closed_leader_id {
+            self.graceful_closed_leader_id = -1;
+        }
+
+        let in_ballot = matches!(
+            self.state,
+            ElectionState::FollowerBallot | ElectionState::CandidateBallot
+        ) && leadership_term_id == self.candidate_term_id;
+
+        if in_ballot || self.state == ElectionState::Canvass {
+            if log_leadership_term_id == self.log_leadership_term_id {
+                if next_term_base_log_position != -1
+                    && next_term_base_log_position < self.append_position
+                {
+                    return self.on_truncate_log_entry(
+                        host,
+                        self.this_member_id,
+                        log_leadership_term_id,
+                        self.leadership_term_id,
+                        self.candidate_term_id,
+                        self.log_position,
+                        self.append_position,
+                        next_term_base_log_position,
+                    );
+                }
+
+                self.leader_member_id = leader_member_id;
+                self.is_leader_startup = is_startup;
+                self.leadership_term_id = leadership_term_id;
+                self.candidate_term_id = self.candidate_term_id.max(leadership_term_id);
+                self.log_session_id = log_session_id;
+                self.leader_recording_id = leader_recording_id;
+                self.catchup_join_position = if self.append_position < log_position {
+                    log_position
+                } else {
+                    -1
+                };
+                self.notified_commit_position = self.notified_commit_position.max(commit_position);
+
+                if self.append_position < term_base_log_position {
+                    if next_leadership_term_id != -1 {
+                        if self.append_position < next_term_base_log_position {
+                            self.replication_leadership_term_id = log_leadership_term_id;
+                            self.replication_stop_position = next_term_base_log_position;
+                            self.replication_term_base_log_position = -1;
+                            let now_ns = host.now_ns();
+                            self.transition(ElectionState::FollowerLogReplication, now_ns, host)?;
+                        } else if self.append_position == next_term_base_log_position
+                            && next_log_position != -1
+                        {
+                            self.replication_leadership_term_id = next_leadership_term_id;
+                            self.replication_stop_position = next_log_position;
+                            self.replication_term_base_log_position = next_term_base_log_position;
+                            let now_ns = host.now_ns();
+                            self.transition(ElectionState::FollowerLogReplication, now_ns, host)?;
+                        }
+                    } else {
+                        return Err(ClusterError::Cluster(format!(
+                            "invalid newLeadershipTerm - this.appendPosition={} < termBaseLogPosition={term_base_log_position} and nextLeadershipTermId={next_leadership_term_id}",
+                            self.append_position
+                        )));
+                    }
+                } else {
+                    let now_ns = host.now_ns();
+                    self.transition(ElectionState::FollowerReplay, now_ns, host)?;
+                }
+            } else {
+                let now_ns = host.now_ns();
+                self.transition(ElectionState::Canvass, now_ns, host)?;
+            }
+        }
+
+        if self.state == ElectionState::FollowerLogReplication
+            && log_leadership_term_id == self.log_leadership_term_id
+            && self.leader_member_id == leader_member_id
+        {
+            let now_ns = host.now_ns();
+            self.replication_deadline_ns = now_ns + host.leader_heartbeat_timeout_ns();
+        }
+
+        Ok(())
+    }
+
+    /// `onAppendPosition` (`:535-555`).
+    ///
+    /// # Errors
+    ///
+    /// The host's, from tracking a catchup completion.
+    pub fn on_append_position(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        leadership_term_id: i64,
+        log_position: i64,
+        follower_member_id: i32,
+        flags: i16,
+    ) -> Result<(), ClusterError> {
+        if self.state == ElectionState::Init {
+            return Ok(());
+        }
+
+        if leadership_term_id <= self.leadership_term_id
+            && self.member_ids.contains(&follower_member_id)
+        {
+            host.update_member_log_position(follower_member_id, leadership_term_id, log_position);
+            host.track_catchup_completion(follower_member_id, leadership_term_id, flags)?;
+        }
+
+        Ok(())
+    }
+
+    /// `onCommitPosition` (`:557-588`).
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError::ClusterEvent`] when a leader sees a newer term in a
+    /// commit.
+    pub fn on_commit_position(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        leadership_term_id: i64,
+        log_position: i64,
+        leader_member_id: i32,
+    ) -> Result<(), ClusterError> {
+        let state = self.state;
+        if state == ElectionState::Init {
+            return Ok(());
+        }
+
+        if self.leader_member_id != -1 && self.leader_member_id == leader_member_id {
+            self.notified_commit_position = self.notified_commit_position.max(log_position);
+            if state == ElectionState::FollowerLogReplication {
+                let now_ns = host.now_ns();
+                self.replication_deadline_ns = now_ns + host.leader_heartbeat_timeout_ns();
+            }
+        } else if leadership_term_id > self.leadership_term_id
+            && state == ElectionState::LeaderReady
+        {
+            return Err(ClusterError::ClusterEvent(format!(
+                "new leader detected due to commit position - memberId={} this.leadershipTermId={}                  newLeadershipTermId={leadership_term_id} newLeaderMemberId={leader_member_id}                  newCommitPosition={log_position}",
+                self.this_member_id, self.leadership_term_id
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// `onReplayNewLeadershipTermEvent` (`:590-608`).
+    ///
+    /// # Errors
+    ///
+    /// The recording log's, from the coherence check.
+    pub fn on_replay_new_leadership_term_event(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        leadership_term_id: i64,
+        log_position: i64,
+        timestamp: i64,
+        term_base_log_position: i64,
+    ) -> Result<(), ClusterError> {
+        if self.state == ElectionState::Init {
+            return Ok(());
+        }
+
+        if matches!(
+            self.state,
+            ElectionState::FollowerCatchup | ElectionState::FollowerReplay
+        ) {
+            let now_ns = host.nanos_from_timestamp(timestamp);
+            self.ensure_recording_log_coherent(
+                host,
+                leadership_term_id,
+                Some(term_base_log_position),
+                None,
+                now_ns,
+            )?;
+            self.log_position = log_position;
+            self.log_leadership_term_id = leadership_term_id;
+        }
+
+        Ok(())
+    }
+
+    /// `onTruncateLogEntry` (`:610-646`): truncate, then **always** raise a
+    /// `ClusterEvent` — the reference's own comment says the exception is how
+    /// the cleanup happens.
+    ///
+    /// # Errors
+    ///
+    /// Always [`ClusterError::ClusterEvent`] after a successful truncation; the
+    /// host's error if the truncation itself fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_truncate_log_entry(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        member_id: i32,
+        log_leadership_term_id: i64,
+        leadership_term_id: i64,
+        candidate_term_id: i64,
+        log_position: i64,
+        old_position: i64,
+        new_position: i64,
+    ) -> Result<(), ClusterError> {
+        host.truncate_log_entry(log_leadership_term_id, new_position)?;
+        self.append_position = new_position;
+
+        Err(ClusterError::ClusterEvent(format!(
+            "Truncating Cluster Log - memberId={member_id} state={:?}              this.logLeadershipTermId={log_leadership_term_id}              this.leadershipTermId={leadership_term_id}              this.candidateTermId={candidate_term_id}              this.logPosition={log_position}              this.appendPosition={} oldPosition={old_position} newPosition={new_position}",
+            self.state, self.append_position
+        )))
+    }
+
+    /// `resetMembers()` (`:1446-1451`).
+    fn reset_members(&mut self, host: &mut dyn ElectionHost) {
+        host.reset_members(self.leadership_term_id, self.append_position);
+        self.leader_member_id = -1;
+    }
+
+    /// `stopCatchup()` (`:1440-1444`).
+    fn stop_catchup(&mut self, host: &mut dyn ElectionHost) -> Result<(), ClusterError> {
+        host.stop_all_catchups()?;
+        self.catchup_join_position = -1;
+        Ok(())
+    }
+
+    /// `stopReplay()` (`:1453-1461`). The agent's own replay poll notices the
+    /// end of its replay; dropping the handle is this side's half.
+    fn stop_replay(&mut self) {
+        self.log_replay = None;
+        self.last_published_append_position = 0;
+    }
+
+    /// `stopLogReplication()` (`:1463-1472`).
+    fn stop_log_replication(&mut self) {
+        self.log_replication = None;
+        self.replication_deadline_ns = 0;
+        self.last_published_commit_position = 0;
+    }
+
+    /// `verifyLogJoinPosition` (`:1539-1547`).
+    fn verify_log_join_position(
+        &self,
+        state: &str,
+        join_position: i64,
+    ) -> Result<(), ClusterError> {
+        if join_position != self.log_position {
+            let inequality = if join_position < self.log_position {
+                " less "
+            } else {
+                " greater "
+            };
+            return Err(ClusterError::ClusterEvent(format!(
+                "{state} - joinPosition={join_position}{inequality}than logPosition={}",
+                self.log_position
+            )));
         }
         Ok(())
     }
@@ -564,4 +1815,25 @@ impl Election {
 /// How long the quorum scratch array must be for `member_count`.
 pub const fn quorum_scratch_len(member_count: usize) -> usize {
     (member_count >> 1) + 1
+}
+
+/// `APPEND_POSITION_FLAG_NONE` (`ConsensusModuleAgent.java:124`).
+pub const APPEND_POSITION_FLAG_NONE: i16 = 0;
+
+/// `ChannelUri.createDestinationUri(channel, endpoint)` (`ChannelUri.java:589-601`):
+/// `aeron:<media>?endpoint=<endpoint>`, plus the channel's interface when it
+/// names one.
+fn destination_uri(channel: &str, endpoint: &str) -> String {
+    match deepmsg_core::uri::ChannelUri::parse(channel) {
+        Ok(uri) => {
+            let media = uri.media();
+            match uri.get("interface") {
+                Some(interface) => {
+                    format!("aeron:{media}?endpoint={endpoint}|interface={interface}")
+                }
+                None => format!("aeron:{media}?endpoint={endpoint}"),
+            }
+        }
+        Err(_) => format!("aeron:udp?endpoint={endpoint}"),
+    }
 }

@@ -343,3 +343,83 @@ fn a_snapshot_missing_for_a_service_is_refused() {
         }
     ));
 }
+
+#[test]
+fn ensure_coherent_on_an_empty_log_writes_every_term_from_the_initial_one() {
+    let path = scratch("ensure-empty");
+    let mut log = open(&path);
+
+    log.ensure_coherent(42, 0, 0, 2, None, Some(120), 7, 0)
+        .unwrap();
+
+    let terms: Vec<(i64, i64, i64)> = log
+        .entries()
+        .iter()
+        .map(|entry| {
+            (
+                entry.leadership_term_id,
+                entry.term_base_log_position,
+                entry.log_position,
+            )
+        })
+        .collect();
+    // Terms 0, 1 and 2; the last one committed at the applied position.
+    assert_eq!(
+        vec![(0, 0, 0), (1, 0, 0), (2, 0, 120)],
+        terms,
+        "each term starts where the previous one ended"
+    );
+}
+
+#[test]
+fn ensure_coherent_commits_an_uncommitted_prior_term_at_the_new_base() {
+    let path = scratch("ensure-prior");
+    let mut log = open(&path);
+    // Term 0 appended uncommitted (log_position stays -1).
+    log.append_term(0, 0, -1, 1, 42, CONSENSUS_MODULE_SERVICE_ID)
+        .unwrap();
+
+    log.ensure_coherent(42, 0, 0, 1, Some(60), Some(90), 2, 0)
+        .unwrap();
+
+    let last = log.find_last_term().unwrap();
+    assert_eq!(1, last.leadership_term_id);
+    assert_eq!(60, last.term_base_log_position);
+    assert_eq!(90, last.log_position);
+    let first = log.find_term_entry(0).unwrap();
+    assert_eq!(
+        60, first.log_position,
+        "term 0 is committed at term 1's base"
+    );
+}
+
+#[test]
+fn ensure_coherent_refuses_an_uncommitted_prior_term_with_no_base() {
+    let path = scratch("ensure-refuse");
+    let mut log = open(&path);
+    log.append_term(0, 0, -1, 1, 42, CONSENSUS_MODULE_SERVICE_ID)
+        .unwrap();
+
+    let error = log
+        .ensure_coherent(42, 0, 0, 1, None, Some(90), 2, 0)
+        .expect_err("a prior term with no committed position needs a base");
+    assert!(matches!(error, RecordingLogError::PriorTermNotCommitted));
+}
+
+#[test]
+fn ensure_coherent_only_moves_the_commit_position_when_the_term_exists() {
+    let path = scratch("ensure-exists");
+    let mut log = open(&path);
+    log.ensure_coherent(42, 0, 0, 0, None, Some(10), 1, 0)
+        .unwrap();
+    let entries = log.entries().len();
+
+    log.ensure_coherent(42, 0, 0, 0, None, Some(50), 2, 0)
+        .unwrap();
+
+    assert_eq!(entries, log.entries().len());
+    assert_eq!(
+        Some(50),
+        log.find_term_entry(0).map(|entry| entry.log_position)
+    );
+}

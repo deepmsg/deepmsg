@@ -67,6 +67,7 @@ use deepmsg_client::image::Image;
 use crate::persist::node_state::NodeStateFile;
 use crate::persist::recording_log::RecordingLog;
 
+use crate::election::state::ElectionState;
 use crate::error::ClusterError;
 use crate::handles::{LogReplay, RecordingReplication};
 use crate::state::{ModuleState, Role};
@@ -294,6 +295,10 @@ pub trait ElectionHost {
     /// cluster clock's own time unit, which is what `RecordingLog` stores.
     fn timestamp_from_nanos(&self, now_ns: i64) -> i64;
 
+    /// `timestampToNanos(ctx, timestamp)` (`:1606-1609`): the inverse, used by
+    /// `onReplayNewLeadershipTermEvent` (`:603`).
+    fn nanos_from_timestamp(&self, timestamp: i64) -> i64;
+
     /// `ctx.appointedLeaderId()` (`:715`).
     fn appointed_leader_id(&self) -> i32;
 
@@ -331,6 +336,137 @@ pub trait ElectionHost {
         now_ns: i64,
         timeout_ns: i64,
     ) -> bool;
+
+    // ---- added by P3-5b: the member table and the log subscription ----
+    //
+    // The election keeps member ids, not members (module docs). Every question
+    // and mutation it made on the array in `Election.java` is one method here.
+    // The log subscription is the client's, so the states that add one ask the
+    // host for a registration id instead of holding a `Subscription`.
+
+    /// `resetMembers()` (`Election.java:1446-1451`): every member back to
+    /// nothing, then this member at the term and append position the election
+    /// holds.
+    fn reset_members(&mut self, leadership_term_id: i64, append_position: i64);
+
+    /// `ClusterMember.becomeCandidate` (`ClusterMember.java:947`).
+    fn become_candidate(&mut self, candidate_term_id: i64, candidate_member_id: i32);
+
+    /// `member.isBallotSent()` (`Election.java:784`).
+    fn member_ballot_sent(&self, member_id: i32) -> bool;
+
+    /// `member.isBallotSent(boolean)` (`Election.java:787`).
+    fn set_member_ballot_sent(&mut self, member_id: i32, sent: bool);
+
+    /// `follower.candidateTermId(..).vote(..)` (`Election.java:403-405`).
+    fn set_member_vote(&mut self, member_id: i32, candidate_term_id: i64, vote: Option<bool>);
+
+    /// `ClusterMember.isUnanimousCandidate` (`ClusterMember.java:1117`).
+    fn unanimous_candidate(&self, candidate_member_id: i32, graceful_closed_leader_id: i32)
+    -> bool;
+
+    /// `ClusterMember.isQuorumCandidate` (`ClusterMember.java:1147`).
+    fn quorum_candidate(&self, candidate_member_id: i32) -> bool;
+
+    /// `ClusterMember.isUnanimousLeader` (`ClusterMember.java:981`).
+    fn unanimous_leader(&self, candidate_term_id: i64, graceful_closed_leader_id: i32) -> bool;
+
+    /// `ClusterMember.isQuorumLeader` (`ClusterMember.java:1015`).
+    fn quorum_leader(&self, candidate_term_id: i64) -> bool;
+
+    /// `null == member.publication()` (`Election.java:1238`).
+    fn member_has_publication(&self, member_id: i32) -> bool;
+
+    /// `ClusterMember.tryAddPublication` (`ClusterMember.java:1073-1098`),
+    /// which `publishCanvassPosition` calls for a member with no publication
+    /// (`Election.java:1238-1245`).
+    ///
+    /// # Errors
+    ///
+    /// The client's, when the publication cannot be made.
+    fn try_add_member_publication(&mut self, member_id: i32) -> Result<(), ClusterError>;
+
+    /// `ctx.consensusStreamId()` (`Election.java:1242`).
+    fn consensus_stream_id(&self) -> i32;
+
+    /// `ctx.appVersion()` (`Election.java:1295`).
+    fn app_version(&self) -> i32;
+
+    /// `ctx.fileSyncLevel()` (`Election.java:1520`).
+    fn file_sync_level(&self) -> i32;
+
+    /// `ctx.logChannel()` (`Election.java:1346`, `:1360`).
+    fn log_channel(&self) -> &str;
+
+    /// `ctx.logStreamId()` (`Election.java:1382`).
+    fn log_stream_id(&self) -> i32;
+
+    /// `ctx.isLogMdc()` (`Election.java:1354`).
+    fn log_is_mdc(&self) -> bool;
+
+    /// `thisMember.logEndpoint()` (`Election.java:1357`).
+    fn member_log_endpoint(&self, member_id: i32) -> Option<String>;
+
+    /// `thisMember.catchupEndpoint()` (`Election.java:1029`).
+    fn member_catchup_endpoint(&self, member_id: i32) -> Option<String>;
+
+    /// `leaderMember.archiveEndpoint()` (`Election.java:906`).
+    fn member_archive_endpoint(&self, member_id: i32) -> Option<String>;
+
+    /// `leaderMember.archiveResponseEndpoint()` (`Election.java:907`).
+    fn member_archive_response_endpoint(&self, member_id: i32) -> Option<String>;
+
+    /// `addFollowerSubscription()` (`Election.java:1366-1383`): create the
+    /// manual-MDC subscription a follower joins the log through. Answers its
+    /// registration id.
+    ///
+    /// # Errors
+    ///
+    /// The client's, when the subscription cannot be made.
+    fn add_log_subscription(&mut self, log_session_id: i32) -> Result<i64, ClusterError>;
+
+    /// `CloseHelper.close(logSubscription)` (`Election.java:674`).
+    ///
+    /// # Errors
+    ///
+    /// The client's.
+    fn remove_log_subscription(&mut self, registration_id: i64) -> Result<(), ClusterError>;
+
+    /// `logSubscription.addDestination(destination)` (`Election.java:1347`,
+    /// `:1362`).
+    ///
+    /// # Errors
+    ///
+    /// The client's.
+    fn add_log_destination(
+        &mut self,
+        registration_id: i64,
+        destination: &str,
+    ) -> Result<(), ClusterError>;
+
+    /// `logSubscription.resolvedEndpoint()` (`Election.java:1032`).
+    fn log_subscription_resolved_endpoint(&self, registration_id: i64) -> Option<String>;
+
+    /// `ChannelEndpointStatus.ERRORED == logSubscription.channelStatus()`
+    /// (`Election.java:1071`, `:1153`).
+    fn log_subscription_channel_errored(&self, registration_id: i64) -> bool;
+
+    /// `logSubscription.imageBySessionId(logSessionId)` (`Election.java:1062`,
+    /// `:1138`).
+    ///
+    /// `&mut self` because the image is **handed over**
+    /// (`Client::take_image`): the adapter that `try_join_log_as_follower`
+    /// builds owns it, and the reference's second call in the same election is
+    /// the same object.
+    fn log_image_by_session(&mut self, registration_id: i64, session_id: i32) -> Option<Image>;
+
+    /// `ctx.commitPositionCounter().getPlain()` (`Election.java:265`,
+    /// `:456`, `:1100`).
+    fn commit_position_value(&self) -> i64;
+
+    /// `ctx.electionStateCounter().setRelease(newState.code())`
+    /// (`Election.java:1433`): counter 207.
+    fn set_election_state(&mut self, state: ElectionState);
 }
 
 /// Every method on [`ElectionHost`], in declaration order.
@@ -375,12 +511,52 @@ pub const HOST_METHODS: &[&str] = &[
 /// surface test can still assert that the **frozen** set is exactly the
 /// reference's `consensusModuleAgent.*` calls, while these are the `ctx`
 /// accessors the reference reaches through a different object.
+/// The methods `P3-5b` added: the member table and the log subscription.
+/// `tests/election_surface.rs` pins the frozen 30 separately; this list exists so
+/// a later slice knows what is 5b's rather than the reference call surface's.
+pub const HOST_5B_METHODS: &[&str] = &[
+    "reset_members",
+    "become_candidate",
+    "member_ballot_sent",
+    "set_member_ballot_sent",
+    "set_member_vote",
+    "unanimous_candidate",
+    "quorum_candidate",
+    "unanimous_leader",
+    "quorum_leader",
+    "member_has_publication",
+    "try_add_member_publication",
+    "consensus_stream_id",
+    "app_version",
+    "file_sync_level",
+    "log_channel",
+    "log_stream_id",
+    "log_is_mdc",
+    "member_log_endpoint",
+    "member_catchup_endpoint",
+    "member_archive_endpoint",
+    "member_archive_response_endpoint",
+    "add_log_subscription",
+    "remove_log_subscription",
+    "add_log_destination",
+    "log_subscription_resolved_endpoint",
+    "log_subscription_channel_errored",
+    "log_image_by_session",
+    "commit_position_value",
+    "set_election_state",
+];
+
+/// The methods `P3-5a-beta` added on top of the frozen 30. Kept separate so the
+/// surface test can still assert that the **frozen** set is exactly the
+/// reference's `consensusModuleAgent.*` calls, while these are the `ctx`
+/// accessors the reference reaches through a different object.
 pub const HOST_CTX_METHODS: &[&str] = &[
     "node_state",
     "recording_log",
     "now_ns",
     "epoch_ms",
     "timestamp_from_nanos",
+    "nanos_from_timestamp",
     "appointed_leader_id",
     "startup_canvass_timeout_ns",
     "leader_heartbeat_timeout_ns",
