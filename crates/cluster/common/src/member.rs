@@ -95,6 +95,14 @@ pub struct ClusterMember {
     pub is_ballot_sent: bool,
     /// The catchup replay session this member is serving, or `-1`.
     pub catchup_replay_session_id: i64,
+    /// Whether this member is the leader of the current term
+    /// (`ClusterMember.isLeader`, `:46`). Set when a term is established
+    /// (`ConsensusModuleAgent.updateMemberDetails` `:2370-2381`).
+    pub is_leader: bool,
+    /// Whether this member has acknowledged a `TerminationPosition`
+    /// (`ClusterMember.hasTerminated`, `:47`). Cleared by the leader before a
+    /// new round of termination positions (`ClusterTermination.java:73`).
+    pub has_terminated: bool,
 }
 
 impl ClusterMember {
@@ -150,7 +158,97 @@ impl ClusterMember {
             vote: None,
             is_ballot_sent: false,
             catchup_replay_session_id: -1,
+            is_leader: false,
+            has_terminated: false,
         })
+    }
+
+    /// `ClusterMember.setIsLeader` (`:1263-1270`): mark every member whose id
+    /// is the leader's.
+    pub fn set_is_leader(members: &mut [Self], leader_member_id: i32) {
+        for member in members {
+            member.is_leader = member.id == leader_member_id;
+        }
+    }
+
+    /// `ClusterMember.reset()` (`:140-149`): forget everything that belongs to
+    /// a term. The endpoints stay — they name the member, not the term.
+    pub fn reset(&mut self) {
+        self.is_ballot_sent = false;
+        self.is_leader = false;
+        self.has_terminated = false;
+        self.vote = None;
+        self.candidate_term_id = -1;
+        self.leadership_term_id = -1;
+        self.log_position = NULL_POSITION;
+    }
+
+    /// `ClusterMember.reset(members)` (`:932-938`).
+    pub fn reset_all(members: &mut [Self]) {
+        for member in members {
+            member.reset();
+        }
+    }
+
+    /// `ClusterMember.becomeCandidate` (`:947-968`): the candidate votes for
+    /// itself and everyone else's ballot starts from nothing.
+    pub fn become_candidate(
+        members: &mut [Self],
+        candidate_term_id: i64,
+        candidate_member_id: i32,
+    ) {
+        for member in members {
+            if member.id == candidate_member_id {
+                member.vote = Some(true);
+                member.candidate_term_id = candidate_term_id;
+                member.is_ballot_sent = true;
+            } else {
+                member.vote = None;
+                member.candidate_term_id = -1;
+                member.is_ballot_sent = false;
+            }
+        }
+    }
+
+    /// `ClusterMember.isUnanimousLeader` (`:981-1006`): every member that is
+    /// not the gracefully closed leader voted yes at `candidate_term_id`, and
+    /// there are at least a quorum of them.
+    pub fn is_unanimous_leader(
+        members: &[Self],
+        candidate_term_id: i64,
+        graceful_closed_leader_id: i32,
+    ) -> bool {
+        let mut votes = 0;
+        for member in members {
+            if member.id == graceful_closed_leader_id {
+                continue;
+            }
+            if candidate_term_id != member.candidate_term_id || member.vote != Some(true) {
+                return false;
+            }
+            votes += 1;
+        }
+        votes >= quorum_threshold(members.len())
+    }
+
+    /// `ClusterMember.isUnanimousCandidate` (`:1117-1140`): every member that
+    /// is not the gracefully closed leader would vote for `candidate`.
+    pub fn is_unanimous_candidate(
+        members: &[Self],
+        candidate: &Self,
+        graceful_closed_leader_id: i32,
+    ) -> bool {
+        let mut possible_votes = 0;
+        for member in members {
+            if member.id == graceful_closed_leader_id {
+                continue;
+            }
+            if !member.will_vote_for(candidate) {
+                return false;
+            }
+            possible_votes += 1;
+        }
+        possible_votes >= quorum_threshold(members.len())
     }
 
     /// Whether this member reported an append position within `timeout_ns`.
@@ -239,6 +337,20 @@ pub fn has_quorum_at_position(
         })
         .count();
     votes >= quorum_threshold(members.len())
+}
+
+/// Is a quorum of members alive? `hasActiveQuorum` (`:900-918`).
+pub fn has_active_quorum(members: &[ClusterMember], now_ns: i64, timeout_ns: i64) -> bool {
+    let mut threshold = quorum_threshold(members.len()) as i32;
+    for member in members {
+        if member.is_active(now_ns, timeout_ns) {
+            threshold -= 1;
+            if threshold <= 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The 4-argument form (`:1173`): positive when the left log is more recent.

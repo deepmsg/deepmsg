@@ -398,6 +398,30 @@ impl<'a> CountersReader<'a, ReadWrite> {
             .store_i64_release(offset + layout::COUNTER_VALUE_OFFSET, value)
     }
 
+    /// Replace a counter's value if it still holds `expected`.
+    ///
+    /// This is the write an operator's toggle makes: `ClusterControl`
+    /// switches the control counter only out of `NEUTRAL`
+    /// (`ClusterControl.java:118-126`, `AtomicCounter.compareAndSet`), so two
+    /// operators racing on one node cannot both win, and a value the module
+    /// has already moved on from is left alone.
+    ///
+    /// The ordering is the reference's `AtomicBuffer.compareAndSetLong` under
+    /// Agrona's `AtomicCounter` — sequentially consistent — because the
+    /// module's next read is what the action depends on.
+    ///
+    /// `None` is a counter id outside the region; `Some(false)` is a value
+    /// that no longer matches.
+    pub fn compare_and_set_value(&self, counter_id: i32, expected: i64, new: i64) -> Option<bool> {
+        if counter_id < 0 || counter_id > self.max_counter_id {
+            return None;
+        }
+
+        let offset = counter_id as usize * layout::COUNTER_VALUE_LENGTH;
+        self.values
+            .compare_exchange_i64(offset + layout::COUNTER_VALUE_OFFSET, expected, new)
+    }
+
     /// Write a counter's `reference_id`.
     ///
     /// Relaxed, matching

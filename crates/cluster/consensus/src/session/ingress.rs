@@ -131,20 +131,33 @@ pub trait IngressHandler {
 }
 
 /// The ingress subscriptions (`IngressAdapter.java:29-41`).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct IngressAdapter {
     udp_subscription_id: Option<i64>,
     ipc_subscription_id: Option<i64>,
     fragment_limit: usize,
+    /// The subscription the two fields below describe, if any.
+    cached_subscription_id: Option<i64>,
+    /// `(registration id, session id)` of each image at the time the map was
+    /// made: a comparison against the current images costs no allocation, and
+    /// the map below is only rebuilt when one of these changed.
+    cached_image_keys: Vec<(i64, i32)>,
+    /// The image identities for `cached_subscription_id`: each image's
+    /// `sourceIdentity`, by the image's session id.
+    cached_image_identities: deepmsg_cluster_common::collections::HashMap<i32, String>,
 }
 
 impl IngressAdapter {
     /// `IngressAdapter(int fragmentPollLimit, ConsensusModuleAgent)`.
-    pub const fn new(fragment_limit: usize) -> Self {
+    #[must_use]
+    pub fn new(fragment_limit: usize) -> Self {
         Self {
             udp_subscription_id: None,
             ipc_subscription_id: None,
             fragment_limit,
+            cached_subscription_id: None,
+            cached_image_keys: Vec::new(),
+            cached_image_identities: deepmsg_cluster_common::collections::HashMap::default(),
         }
     }
 
@@ -173,7 +186,7 @@ impl IngressAdapter {
     /// cannot fail; a handler's error is carried out of the callback and
     /// propagated here, which is what the reference's exception does.
     pub fn poll(
-        &self,
+        &mut self,
         client: &mut Client,
         handler: &mut dyn IngressHandler,
     ) -> Result<usize, ClusterError> {
@@ -182,10 +195,10 @@ impl IngressAdapter {
             .into_iter()
             .flatten()
         {
-            let images = image_identities(client, subscription_id);
+            self.sync_image_identities(client, subscription_id);
             let mut dispatch = Dispatch {
                 handler,
-                images,
+                images: &self.cached_image_identities,
                 error: None,
             };
             work += client.poll_subscription_controlled(
@@ -199,31 +212,57 @@ impl IngressAdapter {
         }
         Ok(work)
     }
-}
 
-/// Every image currently under a subscription, by its session id.
-///
-/// An image's session id is what a message's header carries
-/// (`Image.sessionId()`), so this is the one key both sides share.
-fn image_identities(
-    client: &Client,
-    subscription_id: i64,
-) -> deepmsg_cluster_common::collections::HashMap<i32, String> {
-    let mut identities = deepmsg_cluster_common::collections::HashMap::default();
-    if let Some(subscription) = client.subscription(subscription_id) {
-        for image in subscription.images() {
-            identities
-                .entry(image.session_id())
-                .or_insert_with(|| image.source_identity().to_owned());
+    /// Bring the cached image identities up to date, without allocating when
+    /// nothing changed.
+    ///
+    /// A steady-state poll runs this every duty cycle, so the comparison walks
+    /// the current images against the cached `(registration id, session id)`
+    /// pairs and answers early; only a new or departed image rebuilds the map
+    /// (session establishment is one of the allocation exceptions, performance
+    /// spec §2).
+    fn sync_image_identities(&mut self, client: &Client, subscription_id: i64) {
+        let mut matches = self.cached_subscription_id == Some(subscription_id);
+        let mut count = 0;
+
+        if let Some(subscription) = client.subscription(subscription_id) {
+            for image in subscription.images() {
+                if matches
+                    && self.cached_image_keys.get(count)
+                        != Some(&(image.registration_id(), image.session_id()))
+                {
+                    matches = false;
+                }
+                count += 1;
+            }
+        }
+
+        if matches && count == self.cached_image_keys.len() {
+            return;
+        }
+
+        self.cached_subscription_id = Some(subscription_id);
+        self.cached_image_keys.clear();
+        self.cached_image_identities.clear();
+        if let Some(subscription) = client.subscription(subscription_id) {
+            for image in subscription.images() {
+                self.cached_image_keys
+                    .push((image.registration_id(), image.session_id()));
+                self.cached_image_identities
+                    .entry(image.session_id())
+                    .or_insert_with(|| image.source_identity().to_owned());
+            }
         }
     }
-    identities
 }
 
 /// The controlled-poll callback: decode a whole message and hand it on.
 struct Dispatch<'a> {
     handler: &'a mut dyn IngressHandler,
-    images: deepmsg_cluster_common::collections::HashMap<i32, String>,
+    /// The adapter's cached image identities; read only by a session
+    /// connect, and kept across polls so a steady-state poll allocates nothing
+    /// (performance spec R1).
+    images: &'a deepmsg_cluster_common::collections::HashMap<i32, String>,
     error: Option<ClusterError>,
 }
 
@@ -242,7 +281,7 @@ impl Dispatch<'_> {
         dispatch_message(
             message.payload,
             message.header.session_id,
-            &self.images,
+            self.images,
             self.handler,
         )
     }

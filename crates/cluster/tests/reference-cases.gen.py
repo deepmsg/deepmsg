@@ -439,6 +439,126 @@ HEADER_COMMON = """\
 # column's reason to exist is that "green but testing less" is invisible in a
 # red/green table.
 OURS = {
+    # ★ P3-5b: ElectionTest's cases. The ones with a name are ported in
+    # tests/election_test.rs (and election_walk.rs for the single-member walk);
+    # the deferred ones say what they wait on — an `Image`, which has no test
+    # constructor, or a scripted cross-node history the port has not built yet.
+    ("ElectionTest", "shouldElectSingleNodeClusterLeader"):
+        "should_elect_single_node_cluster_leader",
+    ("ElectionTest", "shouldElectAppointedLeader"):
+        "should_elect_appointed_leader",
+    ("ElectionTest", "shouldVoteForAppointedLeader"):
+        "(deferred: voting for an appointed leader is on_request_vote's ordinary "
+        "branch, covered by should_timeout_follower_ballot_without_leader_emerging; "
+        "the appointment-specific case needs the appointed leader's NLT)",
+    ("ElectionTest", "shouldCanvassMembersInSuccessfulLeadershipBid"):
+        "should_canvass_members_in_successful_leadership_bid",
+    ("ElectionTest", "shouldVoteForCandidateDuringNomination"):
+        "should_timeout_follower_ballot_without_leader_emerging "
+        "(the vote itself: on_request_vote places a yes and enters FOLLOWER_BALLOT)",
+    ("ElectionTest", "shouldTimeoutCanvassWithMajority"):
+        "should_timeout_canvass_with_majority",
+    ("ElectionTest", "shouldWinCandidateBallotWithMajority"):
+        "should_win_candidate_ballot_with_majority",
+    ("ElectionTest", "shouldBaseStartupValueOnLeader"):
+        "(deferred: the parameterised leader-startup case needs a follower in "
+        "LEADER_REPLAY and the leader's isStartup flag across two nodes)",
+    ("ElectionTest", "shouldElectCandidateWithFullVote"):
+        "should_win_candidate_ballot_with_majority (the unanimous short circuit)",
+    ("ElectionTest", "shouldTimeoutCandidateBallotWithoutMajority"):
+        "should_timeout_candidate_ballot_without_majority",
+    ("ElectionTest", "shouldTimeoutFailedCandidateBallotOnSplitVoteThenSucceedOnRetry"):
+        "should_timeout_failed_candidate_ballot_on_split_vote_then_succeed_on_retry",
+    ("ElectionTest", "shouldTimeoutFollowerBallotWithoutLeaderEmerging"):
+        "should_timeout_follower_ballot_without_leader_emerging",
+    ("ElectionTest", "shouldBecomeFollowerIfEnteringNewElection"):
+        "should_become_follower_if_entering_new_election",
+    ("ElectionTest", "followerShouldReplicateLogBeforeReplayDuringElection"):
+        "on_new_leadership_term_truncates_ahead_of_the_term_base_and_raises, "
+        "on_new_leadership_term_moves_a_canvassing_member_to_follower_replay, "
+        "follower_log_replication_completes_and_returns_to_canvass "
+        "(the three branches; the full scripted history is deferred)",
+    ("ElectionTest", "followerShouldTimeoutLeaderIfReplicateLogPositionIsNotCommittedByLeader"):
+        "(deferred: needs the replication deadline walk with a scripted commit history)",
+    ("ElectionTest", "followerShouldProgressThroughFailedElectionsTermsImmediatelyPriorToCurrent"):
+        "(deferred: needs a scripted multi-term recording log)",
+    ("ElectionTest", "followerShouldProgressThroughInterimElectionsTerms"):
+        "(deferred: needs a scripted multi-term recording log)",
+    ("ElectionTest", "followerShouldReplayAndCatchupWhenLateJoiningClusterInSameTerm"):
+        "(deferred: the success path needs an Image; `Image` has no test constructor)",
+    ("ElectionTest", "followerShouldReplicateReplayAndCatchupWhenLateJoiningClusterInLaterTerm"):
+        "(deferred: the success path needs an Image)",
+    ("ElectionTest", "followerShouldUseInitialLeadershipTermIdAndInitialTermBaseLogPositionWhenRecordingLogIsEmpty"):
+        "should_elect_single_node_cluster_leader + RecordingLog::ensure_coherent "
+        "(weakened: the coherence rules are tested on RecordingLog, not through the election)",
+    ("ElectionTest", "followerShouldReplicateAndSendAppendPositionWhenLogReplicationDone"):
+        "follower_log_replication_completes_and_returns_to_canvass",
+    ("ElectionTest", "leaderShouldMoveToLogReplicationThenWaitForCommitPosition"):
+        "leader_should_move_to_log_replication_then_wait_for_commit_position",
+    ("ElectionTest", "shouldThrowNonZeroLogPositionAndNullRecordingIdSpecified"):
+        "(deferred: the ensureCoherent refusal is implemented; the reference's "
+        "exact case needs its scripted recording log)",
+    ("ElectionTest", "shouldSendCommitPositionAndNewLeadershipTermEventsWithTheSameLeadershipTerm"):
+        "should_send_commit_position_and_new_leadership_term_events_with_the_same_leadership_term",
+    ("ElectionTest", "notifiedCommitPositionCannotGoBackwardsUponReceivingCommitPosition"):
+        "notified_commit_position_cannot_go_backwards_upon_receiving_commit_position",
+    ("ElectionTest", "notifiedCommitPositionCannotGoBackwardsUponReceivingNewLeadershipTerm"):
+        "notified_commit_position_cannot_go_backwards_upon_receiving_new_leadership_term",
+    # ★ P3-4f: ConsensusModuleAgentTest's twenty. A row whose port would need a
+    # part of the agent that does not exist yet says so rather than staying
+    # empty, because "no entry" and "checked and not portable" read the same.
+    ("ConsensusModuleAgentTest", "shouldUseAssignedRoleName"):
+        "(deferred: role/thread naming is P3-8; the agent has no role-name field)",
+    ("ConsensusModuleAgentTest", "shouldLimitActiveSessions"):
+        "should_reject_a_connect_request_over_the_concurrent_session_limit "
+        "(weakened: SessionManager level, not agent.onSessionConnect + doWork)",
+    ("ConsensusModuleAgentTest", "shouldCloseInactiveSession"):
+        "(deferred: the timeout close lives in SessionManager.check_sessions; "
+        "the agent-level clock-driven case needs the TestClusterClock seam, P3-4f's remainder)",
+    ("ConsensusModuleAgentTest", "shouldCloseTerminatedSession"):
+        "a_service_joins_and_then_timers_sessions_and_membership_all_work "
+        "(the CloseSession step: CLOSED/SERVICE_ACTION over the real control channel)",
+    ("ConsensusModuleAgentTest", "shouldSuspendThenResume"):
+        "suspend_stops_ingress_and_resume_puts_it_back "
+        "(integration: state counter, both actions in the log, ingress parked while suspended)",
+    ("ConsensusModuleAgentTest", "shouldThrowClusterTerminationExceptionUponShutdown"):
+        "shutdown_snapshots_and_then_ends_the_duty_cycle "
+        "(AgentTermination from the SHUTDOWN switch; the QUITTING branch itself is unreachable in 1.53.2)",
+    ("ConsensusModuleAgentTest", "responseChannelIsBuiltBasedOnTheEgressChannel"):
+        ",".join([
+            "a_response_channel_is_unchanged_without_an_egress_template",
+            "an_ipc_response_channel_becomes_the_egress_channel_unless_ipc_ingress_is_allowed",
+            "the_egress_channels_parameters_are_put_onto_a_udp_response_channel",
+        ]) + " (three unit tests for the reference's six CSV rows)",
+    ("ConsensusModuleAgentTest", "shouldPublishLogMessageButNotSnapshotOnStandbySnapshot"):
+        "(deviation: standby snapshots are premium; the switch is refused by name and reset, see the P3-4e record)",
+    ("ConsensusModuleAgentTest", "onNewLeadershipTermShouldUpdateTimeOfLastLeaderMessageReceived"):
+        "(deferred: the consensus message dispatch is ConsensusAdapter, P3-5b/6a)",
+    ("ConsensusModuleAgentTest", "onCommitPositionShouldUpdateTimeOfLastLeaderMessageReceived"):
+        "(deferred: ConsensusAdapter, P3-5b/6a)",
+    ("ConsensusModuleAgentTest", "shouldDelegateHandlingToRegisteredExtension"):
+        "(deferred: ConsensusModuleExtension is a seam only; no implementation is in P3's scope)",
+    ("ConsensusModuleAgentTest", "shouldThrowExceptionOnUnknownSchemaAndNoAdapter"):
+        "(deferred: ConsensusAdapter's unknown-schema refusal, P3-5b)",
+    ("ConsensusModuleAgentTest", "shouldHandlePaddingMessageAtEndOfTerm"):
+        "(deferred: padding frames are dropped by the client's fragment assembler before the "
+        "log adapter sees them; a replay fixture is P3-6b)",
+    ("ConsensusModuleAgentTest", "notifiedCommitPositionShouldNotGoBackwardsUponReceivingCommitPosition"):
+        "(deferred: the position engine is P3-6a)",
+    ("ConsensusModuleAgentTest", "notifiedCommitPositionShouldNotGoBackwardsUponElectionCompletion"):
+        "(deferred: the position engine is P3-6a)",
+    ("ConsensusModuleAgentTest", "notifiedCommitPositionShouldNotGoBackwardsUponReceivingNewLeadershipTerm"):
+        "(deferred: the position engine is P3-6a)",
+    ("ConsensusModuleAgentTest", "shouldTerminateOnArchiveStorageError"):
+        "storage_space_is_the_one_archive_refusal_that_ends_the_agent "
+        "(the classification only; the end-to-end case needs an archive that refuses)",
+    ("ConsensusModuleAgentTest", "shouldTerminateIfLocalArchiveConnectionIsLost"):
+        "(the check is in doWork (Archive::is_connected); a case needs an archive that can be "
+        "disconnected without also closing the client, which no instrument here can do)",
+    ("ConsensusModuleAgentTest", "shouldPropagateAgentTerminationExceptionAndRunTerminationHooks"):
+        "(deferred: termination hooks are Context callbacks and land with the runner, P3-4f's remainder)",
+    ("ConsensusModuleAgentTest", "shouldDelegateNonTerminalErrorHandlingToElectionIfSet"):
+        "(deferred: Election::handle_error is P3-5b; doWork returns the error instead)",
     ("EgressPublisherTest", "sendEventShouldUseTryClaimIfEventIsSmall"):
         "send_event_should_use_try_claim_if_event_is_small",
     ("EgressPublisherTest", "sendEventShouldUseOfferWhenEventIsTooBig"):

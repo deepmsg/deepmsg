@@ -194,7 +194,7 @@ pub const NAMES: &[(&str, Disposition)] = &[
         "aeron.cluster.startup.canvass.timeout",
         Disposition::Honoured,
     ),
-    ("aeron.cluster.termination.timeout", Disposition::Pending),
+    ("aeron.cluster.termination.timeout", Disposition::Honoured),
     ("aeron.cluster.ticks.per.wheel", Disposition::Honoured),
     (
         "aeron.cluster.timer.service.supplier",

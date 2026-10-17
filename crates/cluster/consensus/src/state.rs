@@ -49,4 +49,19 @@ impl ModuleState {
     pub const fn code(self) -> i32 {
         self as i32
     }
+
+    /// `ConsensusModule.State.get(code)` (`ConsensusModule.java:148-178`):
+    /// the state a code names, or `None` for one outside the table.
+    pub fn from_code(code: i32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Init),
+            1 => Some(Self::Active),
+            2 => Some(Self::Suspended),
+            3 => Some(Self::Snapshot),
+            4 => Some(Self::Quitting),
+            5 => Some(Self::Terminating),
+            6 => Some(Self::Closed),
+            _ => None,
+        }
+    }
 }

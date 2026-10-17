@@ -39,6 +39,8 @@
 pub mod agent;
 pub mod clock;
 pub mod config;
+pub mod consensus;
+pub mod control;
 pub mod election;
 pub mod error;
 pub mod handles;

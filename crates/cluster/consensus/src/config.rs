@@ -146,6 +146,11 @@ pub const LEADER_HEARTBEAT_INTERVAL_DEFAULT_NS: i64 = 200_000_000;
 pub const STARTUP_CANVASS_TIMEOUT_PROP_NAME: &str = "aeron.cluster.startup.canvass.timeout";
 /// `STARTUP_CANVASS_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:777`).
 pub const STARTUP_CANVASS_TIMEOUT_DEFAULT_NS: i64 = 60_000_000_000;
+/// `aeron.cluster.termination.timeout` (`ConsensusModule.java:840`), 10 s: how
+/// long a terminating leader waits for followers that never answer.
+pub const TERMINATION_TIMEOUT_PROP_NAME: &str = "aeron.cluster.termination.timeout";
+/// `TERMINATION_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:886`).
+pub const TERMINATION_TIMEOUT_DEFAULT_NS: i64 = 10_000_000_000;
 /// `aeron.cluster.election.timeout` (`ConsensusModule.java:783`), 1 s.
 pub const ELECTION_TIMEOUT_PROP_NAME: &str = "aeron.cluster.election.timeout";
 /// `ELECTION_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:789`).
@@ -331,6 +336,9 @@ pub struct ConsensusModuleConfig {
     pub leader_heartbeat_interval_ns: i64,
     /// `aeron.cluster.startup.canvass.timeout`.
     pub startup_canvass_timeout_ns: i64,
+    /// `aeron.cluster.termination.timeout`: how long a terminating leader
+    /// waits for followers to acknowledge (`ConsensusModule.java:1254`).
+    pub termination_timeout_ns: i64,
     /// `aeron.cluster.election.timeout`.
     pub election_timeout_ns: i64,
     /// `aeron.cluster.election.status.interval`.
@@ -563,6 +571,10 @@ impl ConsensusModuleConfig {
             leader_heartbeat_timeout_ns,
             leader_heartbeat_interval_ns,
             startup_canvass_timeout_ns,
+            termination_timeout_ns: properties.duration_ns(
+                TERMINATION_TIMEOUT_PROP_NAME,
+                TERMINATION_TIMEOUT_DEFAULT_NS,
+            )?,
             election_timeout_ns: properties
                 .duration_ns(ELECTION_TIMEOUT_PROP_NAME, ELECTION_TIMEOUT_DEFAULT_NS)?,
             election_status_interval_ns: properties.duration_ns(
