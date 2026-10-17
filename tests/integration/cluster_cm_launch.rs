@@ -36,11 +36,11 @@ fn properties(aeron_dir: &std::path::Path, cluster_dir: &std::path::Path) -> Pro
             // slice, and the channel itself is IPC below, so they are
             // placeholders. The member string still has to parse.
             "-Daeron.cluster.members=0,\
-             aeron:udp?endpoint=localhost:0,\
-             aeron:udp?endpoint=localhost:0,\
-             aeron:udp?endpoint=localhost:0,\
-             aeron:udp?endpoint=localhost:0,\
-             aeron:udp?endpoint=localhost:0"
+             localhost:0,\
+             localhost:0,\
+             localhost:0,\
+             localhost:0,\
+             localhost:0"
                 .to_owned(),
             "-Daeron.cluster.ingress.channel=aeron:ipc".to_owned(),
             "-Daeron.cluster.consensus.channel=aeron:ipc".to_owned(),
