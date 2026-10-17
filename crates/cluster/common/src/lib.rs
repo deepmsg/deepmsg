@@ -21,3 +21,4 @@ pub mod collections;
 pub mod config;
 pub mod decode;
 pub mod mark;
+pub mod member;
