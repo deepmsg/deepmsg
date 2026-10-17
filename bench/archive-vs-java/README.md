@@ -17,10 +17,11 @@ two differ by exactly that. `r-java` against `r-attach` is the driver's
 contribution, and `r-rust` against `j` differs by all three layers and is the
 product-level number rather than an attribution.
 
-`j` and `r-rust` run today. `r-attach` and `r-java` need
-`patches/external-archive.patch` — an `ArchiveNode` that connects to an archive
-it does not own — and are **refused by name** until it lands, rather than run as
-something they are not.
+All four arms run. `r-attach` and `r-java` need `patches/external-archive.patch`
+— an `ArchiveNode` that connects to an archive it does not own — which
+`patches/install.sh --apply` puts in and rebuilds the harness jar for:
+`--check` reads the switch out of both the source and the compiled class, so a
+patched source behind a stale jar is visible rather than silently used.
 
 ## One machine or two
 
@@ -53,9 +54,10 @@ cost is microseconds. The full readings are in
 | `read.py` | the readings: latency quantiles from the cells' histograms, the three ratios, the drift floor, the archive's own counters and disk |
 | `self-check.sh` | builds a result tree whose every number is known and checks the table `read.py` prints from it |
 | `../lib/conf/archive.properties` | the archive settings a batch runs on, each with what this build does with it |
+| `patches/external-archive.patch` + `install.sh` | the reference's `ArchiveNode` with "connect to an archive somebody else runs" (`--check` / `--apply` / `--revert`) |
 
-The measurement classes the reference does not have (`external-archive.patch`, the
-S1/S3/S4/S5 scenarios) are the next slices.
+The scenarios the reference does not have (`S1`, `S3`, `S4`, `S5`) are the next
+slices.
 
 ## The tree a batch writes
 

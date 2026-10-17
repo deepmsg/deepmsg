@@ -25,15 +25,18 @@
 # node, the node forwards into a recording, the archive replays it back. Two arms
 # run today:
 #
-#   j        the reference's `archive-node` and `live-replay-client`, both Java,
-#            each launching its own driver
-#   r-rust   this build's driver + `deepmsg-archive` + `archive-node` on this
-#            machine, and this build's driver + `loadtest-rig` on the peer
+#   j         the reference's `archive-node` and `live-replay-client`, both Java,
+#             each launching its own driver
+#   r-attach  the reference's Java driver, **this build's archive** attached to
+#             it, and the reference's clients — the one arm that says anything
+#             about the archive
+#   r-java    the same, with this build's driver under it: the driver's part
+#   r-rust    all of it ours, rig and node included (attributes nothing)
 #
-# `r-attach` and `r-java` need `patches/external-archive.patch` (an `ArchiveNode`
-# that connects to an archive it does not own) and are refused by name until it
-# lands — a cell that silently ran them as `j` would be a number about the wrong
-# thing.
+# `r-attach` and `r-java` need `patches/external-archive.patch`: the reference's
+# `ArchiveNode` launches its own archive, and the switch makes it connect to one
+# it does not own. `patches/install.sh --apply` puts it in and rebuilds the jar;
+# without it those two arms are refused by name rather than run as `j`.
 #
 # ## The tree, which `read.py` reads
 #
@@ -65,7 +68,7 @@ export BENCH_AERON_DIR
 
 scenario=s2
 mode=single
-arms="j,r-rust"
+arms="j,r-attach,r-java,r-rust"
 fsync_levels="0"
 rate=101K
 length=1344
@@ -386,6 +389,52 @@ _start_rust_server() {
     _node_pid=$!
 }
 
+# The `r-attach` / `r-java` server half: a driver, **this build's archive**
+# attached to it, and the reference's node pointed at that archive instead of
+# launching its own (`patches/external-archive.patch`). The node's forwarding loop
+# is the reference's own — the switch only decides who owns the archive.
+_start_attached_server() {
+    local dir=$1 kind=$2
+    if [ "$kind" = java ]; then
+        "$BENCHMARKS_DRIVER_JAVA" "$_java_driver_override" \
+            >"$dir/java-driver.log" 2>&1 &
+        _java_driver_pid=$!
+    else
+        DEEPMSG_DRIVER="$BENCH_DRIVER" BENCH_OUT_DIR="$dir/shims" \
+            "$BENCH_LIB/shims/aeronmd" "$_local_driver_properties" \
+            </dev/null >"$dir/driver.log" 2>&1 &
+        _driver_pid=$!
+    fi
+    _await_file "$BENCH_AERON_DIR/cnc.dat" local || {
+        echo "  the driver never published its CnC file" >&2
+        tail -5 "$dir/driver.log" "$dir/java-driver.log" 2>/dev/null >&2
+        return 1
+    }
+
+    local -a defines=()
+    while IFS= read -r line; do defines+=("$line"); done < <(_archive_defines "$_fsync")
+    taskset -c "$archive_cpus" "$BENCH_ARCHIVE" "${defines[@]}" \
+        </dev/null >"$dir/archive.log" 2>&1 &
+    _archive_pid=$!
+    _await_archive "$dir/archive.log" || {
+        echo "  the archive never said it was running" >&2
+        tail -10 "$dir/archive.log" >&2
+        return 1
+    }
+
+    JVM_OPTS="-Daeron.dir=$BENCH_AERON_DIR \
+-Dio.aeron.benchmarks.aeron.archive.external=true \
+-Dio.aeron.benchmarks.aeron.destination.channel=aeron:udp?endpoint=$_batch_ip:$destination_port|mtu=$mtu \
+-Dio.aeron.benchmarks.aeron.source.channel=aeron:udp?endpoint=$_peer_ip:$source_port|mtu=$mtu \
+-Dio.aeron.benchmarks.aeron.record.channel=aeron:ipc \
+-Daeron.archive.control.channel=aeron:udp?endpoint=$_batch_ip:$control_port \
+-Daeron.archive.control.response.channel=aeron:udp?endpoint=$_batch_ip:0 \
+-Daeron.archive.dir=$archive_dir \
+-Dio.aeron.benchmarks.output.directory=$dir" \
+        "$BENCHMARKS_SCRIPTS_DIR/archive-node" >"$dir/archive-node.log" 2>&1 &
+    _server_pid=$!
+}
+
 _start_peer_client_driver() {
     local dir=$1
     cat >"$dir/peer-driver.sh" <<EOF
@@ -627,6 +676,26 @@ _cell() {
                 _stop_all
                 return 1
             } ;;
+        r-attach|r-java)
+            if [ "$arm" = r-attach ]; then
+                _start_attached_server "$dir" java || { _stop_all; return 1; }
+            else
+                _start_attached_server "$dir" deepmsg || { _stop_all; return 1; }
+            fi
+            _await_recording "$BENCH_AERON_DIR" 30 || {
+                echo "  our archive never started a recording" >&2
+                _stop_all
+                return 1
+            }
+            if [ "$mode" = two ]; then
+                _run_java_client "$dir" "$round/$name/run-$run" "$prefix"
+            else
+                _run_java_client_local "$dir" "$prefix"
+            fi || {
+                echo "  the client exited non-zero" >&2
+                _stop_all
+                return 1
+            } ;;
         r-rust)
             _start_rust_server "$dir" || { _stop_all; return 1; }
             _await_recording "$BENCH_AERON_DIR" 30 || {
@@ -679,8 +748,16 @@ _check() {
         case "$arm" in
             j) need_file "the harness's archive node" "$BENCHMARKS_SCRIPTS_DIR/archive-node" || problem=1
                need_file "the harness's live-replay client" "$BENCHMARKS_SCRIPTS_DIR/live-replay-client" || problem=1 ;;
+            r-attach|r-java)
+                if ! "$here/patches/install.sh" --check >/dev/null 2>&1 ||
+                    ! grep -q ARCHIVE_EXTERNAL_PROP_NAME \
+                        "$BENCHMARKS_DIR/benchmarks-aeron/src/main/java/io/aeron/benchmarks/aeron/ArchiveNode.java"; then
+                    echo "arm '$arm' needs patches/external-archive.patch:" >&2
+                    echo "  bench/archive-vs-java/patches/install.sh --apply" >&2
+                    problem=1
+                fi ;;
             r-rust) ;;
-            *) echo "arm '$arm' needs patches/external-archive.patch; it is not part of this slice" >&2; problem=1 ;;
+            *) echo "unknown arm '$arm'" >&2; problem=1 ;;
         esac
     done
 
