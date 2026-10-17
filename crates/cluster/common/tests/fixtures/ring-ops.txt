@@ -1,0 +1,16 @@
+# ExpandableRingBuffer behaviour of agrona-2.6.1, printed by regen/RingGen.java.
+# Run with: java --add-exports java.base/jdk.internal.misc=ALL-UNNAMED -cp <agrona.jar>:<classes> RingGen
+append3=true
+append8=true
+append9=true
+size=56,capacity=64
+each0=len=3,head=16,data=a0a1a2;len=8,head=32,data=a0a1a2a3a4a5a6a7;len=9,head=56,data=a0a1a2a3a4a5a6a7a8;
+eachFrom16=len=8,head=32,data=a0a1a2a3a4a5a6a7;len=9,head=56,data=a0a1a2a3a4a5a6a7a8;
+consume-one=len=3,head=16
+consume-return=0,size=56
+eachAfter=len=3,head=16,data=a0a1a2;len=8,head=32,data=a0a1a2a3a4a5a6a7;len=9,head=56,data=a0a1a2a3a4a5a6a7a8;
+fixed1=true
+fixed2=true
+fixed3=false
+fixed-size=64,capacity=64
+fixed-each=len=24,head=32,data=a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7;len=24,head=64,data=a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7;
