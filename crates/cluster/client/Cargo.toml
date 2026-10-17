@@ -1,0 +1,15 @@
+[package]
+name = "deepmsg-cluster-client"
+description = "deepmsg cluster: the cluster client (async connect, egress, leader change) (P3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+deepmsg-cluster-common = { path = "../common" }
+deepmsg-client = { path = "../../client" }
+deepmsg-codec = { path = "../../codec" }
+
+[lints]
+workspace = true

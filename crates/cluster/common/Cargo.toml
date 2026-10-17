@@ -1,0 +1,12 @@
+[package]
+name = "deepmsg-cluster-common"
+description = "deepmsg cluster: the parts every cluster crate needs — properties, collections, guarded decoding (P3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

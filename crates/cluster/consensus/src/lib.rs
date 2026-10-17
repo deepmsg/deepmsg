@@ -32,6 +32,9 @@
 //! slice, a placeholder stands in), and everything outside `election`.
 
 #![forbid(unsafe_code)]
+// Performance spec §3: the disallowed-types list lives in clippy.toml; this
+// enables it.
+#![deny(clippy::disallowed_types)]
 
 pub mod election;
 pub mod error;

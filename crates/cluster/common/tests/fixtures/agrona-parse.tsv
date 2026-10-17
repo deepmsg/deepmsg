@@ -1,0 +1,48 @@
+# Agrona 2.6.1's own parse results, read off the jar (agrona-2.6.1.jar) rather
+# than off a reading of its bytecode. One row per probe value:
+#   kind <TAB> value <TAB> duration_ns <TAB> size
+# `throws` means the reference throws (NumberFormatException), so we must
+# reject. Note two traps this pins down:
+#   * `3m` is three *mebibytes* for size and an error for duration — minutes
+#     are not a duration unit in Agrona, `m` belongs to size.
+#   * `h` and `d` are errors for both; only ns/us/ms/s exist for duration.
+# Regenerate: crates/cluster/common/tests/fixtures/regen/Gen6.java with
+#   java -Dprobe=<value> -cp agrona-2.6.1.jar:. Gen6
+kind	value	duration_ns	size
+both	0	0	0
+both	10	10	10
+both	5ns	5	throws
+both	1us	1000	throws
+both	10s	10000000000	throws
+both	200ms	200000000	throws
+both	3m	throws	3145728
+both	1h	throws	throws
+both	2d	throws	throws
+both	10S	10000000000	throws
+both	10MS	10000000	throws
+both	abc	throws	throws
+both	<empty>	throws	throws
+both	64k	throws	65536
+both	8m	throws	8388608
+both	1g	throws	1073741824
+both	1K	throws	1024
+both	1G	throws	1073741824
+both	1.5k	throws	throws
+both	-5s	throws	throws
+both	1us 	throws	throws
+both	 1us	throws	throws
+both	10NS	10	throws
+both	+5s	throws	throws
+both	9999999999999	9999999999999	throws
+both	0s	0	throws
+both	1uS	1000	throws
+both	1Ns	1	throws
+both	1mS	1000000	throws
+both	10nsx	throws	throws
+both	3g	throws	throws
+both	4g	throws	throws
+both	2147483647	2147483647	2147483647
+both	2147483648	2147483648	throws
+both	1M	throws	1048576
+both	1k	throws	1024
+both	2097151k	throws	2147482624

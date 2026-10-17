@@ -1,0 +1,20 @@
+# Performance spec §3/§4: no locks, no channels between agents, and no
+# allocation-shaped containers where a preallocated one belongs. The
+# `disallowed_types` lint is enabled crate-wide in `lib.rs`.
+#
+# `std::collections::HashMap` is disallowed, not because hashing is banned, but
+# because its default hasher is randomly seeded: a map whose iteration order
+# changes per process cannot be part of a byte contract. Use
+# `deepmsg_cluster_common::collections` instead — and read that module before
+# picking a hasher, because for the timer table the hasher is *not* a free
+# choice (plan §7.4, spec-performance §4).
+msrv = "1.85"
+
+disallowed-types = [
+    { path = "std::sync::Mutex", reason = "agents share memory through IPC publications and counters, never a lock (R7)" },
+    { path = "std::sync::RwLock", reason = "same as Mutex: no locks between agents (R7)" },
+    { path = "std::sync::mpsc::Sender", reason = "no channels between agents; only IPC publishers and counters (R7)" },
+    { path = "std::sync::mpsc::Receiver", reason = "no channels between agents; only IPC publishers and counters (R7)" },
+    { path = "std::collections::HashMap", reason = "randomly seeded hasher; use collections:: with an explicit one" },
+    { path = "std::collections::HashSet", reason = "same as HashMap: explicit hasher, or a Vec when small" },
+]
