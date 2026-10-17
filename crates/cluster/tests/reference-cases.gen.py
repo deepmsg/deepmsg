@@ -409,7 +409,9 @@ HEADER_COMMON = """\
 #   n/a:java-injection     needs Java code we cannot hand a Rust node
 #   n/a:fixture-self-test  a test *of* the reference fixture, not of a cluster
 #
-# ★ On `ours`, and why every row is empty. P2 tried exactly this column in
+# ★ `ours` is filled by the OURS table below, which names our test before the
+# reference row is written. A row with no entry is still empty, and that is
+# still not a gate: P2 tried exactly this column in
 # crates/archive/tests/reference-cases.tsv — `status` + `covered_by`, with a
 # rule that a slice flips its rows when it lands a scenario. Four slices
 # passed and not one row was flipped: "which of our tests owns which reference
@@ -426,7 +428,76 @@ HEADER_COMMON = """\
 """
 
 
+# ★ P3-4b: the first rows with a named owner. A name here is the test that
+# closes the row, and the words in parentheses say what the port lost — the
+# column's reason to exist is that "green but testing less" is invisible in a
+# red/green table.
+OURS = {
+    ("EgressPublisherTest", "sendEventShouldUseTryClaimIfEventIsSmall"):
+        "send_event_should_use_try_claim_if_event_is_small",
+    ("EgressPublisherTest", "sendEventShouldUseOfferWhenEventIsTooBig"):
+        "send_event_should_use_offer_when_event_is_too_big",
+    ("EgressPublisherTest", "shouldSendChallengeResponseUsingTryClaimIfSmall"):
+        "should_send_challenge_response_using_try_claim_if_small",
+    ("EgressPublisherTest", "shouldSendChallengeResponseUsingOfferIfLarge"):
+        "should_send_challenge_response_using_offer_if_large",
+    ("EgressPublisherTest", "shouldSendNewLeaderEventUsingTryClaimIfSmall"):
+        "should_send_new_leader_event_using_try_claim_if_small",
+    ("EgressPublisherTest", "shouldSendNewLeaderEventUsingOfferIfTooBig"):
+        "should_send_new_leader_event_using_offer_if_too_big",
+    ("EgressPublisherTest", "shouldSendAdminResponseUsingTryClaimIfSmall"):
+        "should_send_admin_response_using_try_claim_if_small",
+    ("EgressPublisherTest", "shouldSendAdminResponseUsingOfferIfTooBig"):
+        "should_send_admin_response_using_offer_if_too_big",
+    ("IngressAdapterTest", "shouldDelegateToConsensusModuleAgent"):
+        ",".join([
+            "should_delegate_unknown_schema_to_the_extension_hook",
+            "should_delegate_session_message_header_to_on_ingress_message",
+            "should_delegate_session_connect_request_to_on_session_connect",
+            "should_delegate_session_close_request_to_on_session_close",
+            "should_delegate_session_keep_alive_to_on_session_keep_alive",
+            "should_delegate_challenge_response_to_on_ingress_challenge_response",
+            "should_delegate_admin_request_to_on_admin_request",
+        ]) + " (seven parameterised cases, one test each)",
+    ("AuthenticationTest", "shouldAuthenticateOnConnectRequestWithEmptyCredentials"):
+        "should_authenticate_and_reject_a_session_the_authenticator_asks_for "
+        "(weakened: the session state, not the client's SessionEvent)",
+    ("AuthenticationTest", "shouldAuthenticateOnConnectRequestWithCredentials"):
+        "should_hand_an_accepted_connect_request_to_the_authenticator "
+        "(weakened: the credentials reach the authenticator; the client's view "
+        "is a_rejecting_authenticator_produces_an_authentication_rejected_event)",
+    ("AuthenticationTest", "shouldAuthenticateOnChallengeResponse"):
+        "should_route_a_challenge_response_to_the_authenticator_only_when_challenged "
+        "(weakened: routing only, no challenge round trip)",
+    ("AuthenticationTest", "shouldRejectOnConnectRequest"):
+        "a_rejecting_authenticator_produces_an_authentication_rejected_event",
+    ("AuthenticationTest", "shouldRejectOnChallengeResponse"):
+        "should_authenticate_and_reject_a_session_the_authenticator_asks_for "
+        "(weakened: the rejection state, no challenge round trip)",
+    ("SessionManagerTest",
+     "shouldRetryCreatingResponsePublicationWhenResourceTemporarilyUnavailable"):
+        "the_resource_temporarily_unavailable_answer_reissues_the_add "
+        "(weakened: the decision over the driver's error, not a driver)",
+}
+
+# Rows that cannot be ported even though the class they live in can.
+DISPOSITION_OVERRIDE = {
+    ("SessionManagerTest",
+     "shouldProcessPendingStandbySnapshotNotificationsAfterReachingCommitPosition"):
+        "n/a:premium",
+    ("SessionManagerTest",
+     "shouldProcessPendingStandbySnapshotNotificationsAfterProcessingDelay"):
+        "n/a:premium",
+}
+
+
 def write_tsv(path, rows, title, extra):
+    rows = [list(r) for r in rows]
+    for r in rows:
+        override = DISPOSITION_OVERRIDE.get((r[1], r[2]))
+        if override is not None:
+            r[7] = override
+
     sys_counts = {}
     for r in rows:
         if r[0] != "system":
@@ -466,7 +537,8 @@ def write_tsv(path, rows, title, extra):
     with open(path, "w", encoding="utf-8") as fh:
         fh.writelines(parts)
         for r in rows:
-            fh.write("\t".join(list(r) + [""]) + "\n")
+            ours = OURS.get((r[1], r[2]), "")
+            fh.write("\t".join(list(r) + [ours]) + "\n")
 
 
 def main():

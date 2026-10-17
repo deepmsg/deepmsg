@@ -59,7 +59,9 @@
 #   n/a:java-injection     needs Java code we cannot hand a Rust node
 #   n/a:fixture-self-test  a test *of* the reference fixture, not of a cluster
 #
-# ★ On `ours`, and why every row is empty. P2 tried exactly this column in
+# ★ `ours` is filled by the OURS table below, which names our test before the
+# reference row is written. A row with no entry is still empty, and that is
+# still not a gate: P2 tried exactly this column in
 # crates/archive/tests/reference-cases.tsv — `status` + `covered_by`, with a
 # rule that a slice flips its rows when it lands a scenario. Four slices
 # passed and not one row was flipped: "which of our tests owns which reference

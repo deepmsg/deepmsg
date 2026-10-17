@@ -59,7 +59,9 @@
 #   n/a:java-injection     needs Java code we cannot hand a Rust node
 #   n/a:fixture-self-test  a test *of* the reference fixture, not of a cluster
 #
-# ★ On `ours`, and why every row is empty. P2 tried exactly this column in
+# ★ `ours` is filled by the OURS table below, which names our test before the
+# reference row is written. A row with no entry is still empty, and that is
+# still not a gate: P2 tried exactly this column in
 # crates/archive/tests/reference-cases.tsv — `status` + `covered_by`, with a
 # rule that a slice flips its rows when it lands a scenario. Four slices
 # passed and not one row was flipped: "which of our tests owns which reference
@@ -88,7 +90,7 @@
 #   hook:egress-listener         4
 #   hook:service-supplier        1
 #   n/a:java-injection           5
-#   n/a:premium                  1
+#   n/a:premium                  3
 # reference-disabled (in the denominator, not green):
 #   disabled:Intermittent                    1
 #   disabled:Requires sudo to run iptables   6
@@ -222,11 +224,11 @@ system	SingleNodeTest	shouldReplayLogWithPaddingAtEndOfRecording	A	P3-4f	stub-se
 system	SingleNodeTest	shouldReattemptEgressSubscriptionCreationOnTransientError	A	P3-4f	counter,client			
 system	StalledLeaderLogReplicationClusterTest	shouldHandleMultipleElections	A	P3-6b	counter,client			
 system	StartFromTruncatedRecordingLogTest	shouldBeAbleToStartClusterFromTruncatedRecordingLog	A	P3-6b	client			
-unit	AuthenticationTest	shouldAuthenticateOnConnectRequestWithEmptyCredentials	A	P3-4b	unit			
-unit	AuthenticationTest	shouldAuthenticateOnConnectRequestWithCredentials	A	P3-4b	unit			
-unit	AuthenticationTest	shouldAuthenticateOnChallengeResponse	A	P3-4b	unit			
-unit	AuthenticationTest	shouldRejectOnConnectRequest	A	P3-4b	unit			
-unit	AuthenticationTest	shouldRejectOnChallengeResponse	A	P3-4b	unit			
+unit	AuthenticationTest	shouldAuthenticateOnConnectRequestWithEmptyCredentials	A	P3-4b	unit			should_authenticate_and_reject_a_session_the_authenticator_asks_for (weakened: the session state, not the client's SessionEvent)
+unit	AuthenticationTest	shouldAuthenticateOnConnectRequestWithCredentials	A	P3-4b	unit			should_hand_an_accepted_connect_request_to_the_authenticator (weakened: the credentials reach the authenticator; the client's view is a_rejecting_authenticator_produces_an_authentication_rejected_event)
+unit	AuthenticationTest	shouldAuthenticateOnChallengeResponse	A	P3-4b	unit			should_route_a_challenge_response_to_the_authenticator_only_when_challenged (weakened: routing only, no challenge round trip)
+unit	AuthenticationTest	shouldRejectOnConnectRequest	A	P3-4b	unit			a_rejecting_authenticator_produces_an_authentication_rejected_event
+unit	AuthenticationTest	shouldRejectOnChallengeResponse	A	P3-4b	unit			should_authenticate_and_reject_a_session_the_authenticator_asks_for (weakened: the rejection state, no challenge round trip)
 unit	ClusterMemberTest	shouldParseCorrectly	A	P3-1d	unit			
 unit	ClusterMemberTest	shouldParseCorrectlyOptionalArchiveResponse	A	P3-1d	unit			
 unit	ClusterMemberTest	shouldParseCorrectlyOptionalEgressResponseEntry	A	P3-1d	unit			
@@ -307,15 +309,15 @@ unit	ConsensusModuleSnapshotTakerTest	snapshotPendingServiceMessageTrackerWithSe
 unit	ConsensusModuleSnapshotTakerTest	snapshotTimer	A	P3-4d	unit			
 unit	ConsensusModuleSnapshotTakerTest	snapshotSessionShouldUseTryClaimIfDataFitsIntoMaxPayloadSize	A	P3-4d	unit			
 unit	ConsensusModuleSnapshotTakerTest	snapshotSessionShouldUseOfferIfDataDoesNotFitIntoMaxPayloadSize	A	P3-4d	unit			
-unit	EgressPublisherTest	sendEventShouldUseTryClaimIfEventIsSmall	A	P3-4b	unit			
-unit	EgressPublisherTest	sendEventShouldUseOfferWhenEventIsTooBig	A	P3-4b	unit			
-unit	EgressPublisherTest	shouldSendChallengeResponseUsingTryClaimIfSmall	A	P3-4b	unit			
-unit	EgressPublisherTest	shouldSendChallengeResponseUsingOfferIfLarge	A	P3-4b	unit			
-unit	EgressPublisherTest	shouldSendNewLeaderEventUsingTryClaimIfSmall	A	P3-4b	unit			
-unit	EgressPublisherTest	shouldSendNewLeaderEventUsingOfferIfTooBig	A	P3-4b	unit			
-unit	EgressPublisherTest	shouldSendAdminResponseUsingTryClaimIfSmall	A	P3-4b	unit			
-unit	EgressPublisherTest	shouldSendAdminResponseUsingOfferIfTooBig	A	P3-4b	unit			
-unit	IngressAdapterTest	shouldDelegateToConsensusModuleAgent	A	P3-4b	unit			
+unit	EgressPublisherTest	sendEventShouldUseTryClaimIfEventIsSmall	A	P3-4b	unit			send_event_should_use_try_claim_if_event_is_small
+unit	EgressPublisherTest	sendEventShouldUseOfferWhenEventIsTooBig	A	P3-4b	unit			send_event_should_use_offer_when_event_is_too_big
+unit	EgressPublisherTest	shouldSendChallengeResponseUsingTryClaimIfSmall	A	P3-4b	unit			should_send_challenge_response_using_try_claim_if_small
+unit	EgressPublisherTest	shouldSendChallengeResponseUsingOfferIfLarge	A	P3-4b	unit			should_send_challenge_response_using_offer_if_large
+unit	EgressPublisherTest	shouldSendNewLeaderEventUsingTryClaimIfSmall	A	P3-4b	unit			should_send_new_leader_event_using_try_claim_if_small
+unit	EgressPublisherTest	shouldSendNewLeaderEventUsingOfferIfTooBig	A	P3-4b	unit			should_send_new_leader_event_using_offer_if_too_big
+unit	EgressPublisherTest	shouldSendAdminResponseUsingTryClaimIfSmall	A	P3-4b	unit			should_send_admin_response_using_try_claim_if_small
+unit	EgressPublisherTest	shouldSendAdminResponseUsingOfferIfTooBig	A	P3-4b	unit			should_send_admin_response_using_offer_if_too_big
+unit	IngressAdapterTest	shouldDelegateToConsensusModuleAgent	A	P3-4b	unit			should_delegate_unknown_schema_to_the_extension_hook,should_delegate_session_message_header_to_on_ingress_message,should_delegate_session_connect_request_to_on_session_connect,should_delegate_session_close_request_to_on_session_close,should_delegate_session_keep_alive_to_on_session_keep_alive,should_delegate_challenge_response_to_on_ingress_challenge_response,should_delegate_admin_request_to_on_admin_request (seven parameterised cases, one test each)
 unit	LogSourceValidatorTest	leaderLogSourceTypeShouldOnlyAcceptLeader	A	P3-4d	unit			
 unit	LogSourceValidatorTest	followerLogSourceTypeShouldOnlyAcceptFollowerAndUnknown	A	P3-4d	unit			
 unit	LogSourceValidatorTest	anyLogSourceTypeShouldAny	A	P3-4d	unit			
@@ -414,9 +416,9 @@ unit	ServiceProxyTest	shouldLogWarningIfClusterMemberResponseFails	A	P3-4c	unit
 unit	ServiceProxyTest	shouldSendClusterMemberResponse	A	P3-4c	unit			
 unit	ServiceProxyTest	shouldLogWarningIfClusterMemberExtendedResponseFails	A	P3-4c	unit			
 unit	ServiceProxyTest	shouldSendClusterMemberExtendedResponse	A	P3-4c	unit			
-unit	SessionManagerTest	shouldProcessPendingStandbySnapshotNotificationsAfterReachingCommitPosition	A	P3-4b	unit			
-unit	SessionManagerTest	shouldRetryCreatingResponsePublicationWhenResourceTemporarilyUnavailable	A	P3-4b	unit			
-unit	SessionManagerTest	shouldProcessPendingStandbySnapshotNotificationsAfterProcessingDelay	A	P3-4b	unit			
+unit	SessionManagerTest	shouldProcessPendingStandbySnapshotNotificationsAfterReachingCommitPosition	A	P3-4b	unit		n/a:premium	
+unit	SessionManagerTest	shouldRetryCreatingResponsePublicationWhenResourceTemporarilyUnavailable	A	P3-4b	unit			the_resource_temporarily_unavailable_answer_reissues_the_add (weakened: the decision over the driver's error, not a driver)
+unit	SessionManagerTest	shouldProcessPendingStandbySnapshotNotificationsAfterProcessingDelay	A	P3-4b	unit		n/a:premium	
 unit	SnapshotReplicationTest	shouldReplicateTwoSnapshots	A	P3-4d	unit			
 unit	SnapshotReplicationTest	shouldNotBeCompleteIfNotSynced	A	P3-4d	unit			
 unit	SnapshotReplicationTest	closeWillCloseUnderlyingSnapshotReplication	A	P3-4d	unit			
