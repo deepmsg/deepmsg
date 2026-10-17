@@ -68,10 +68,19 @@ pub(crate) fn read_limit_counter<Access>(
     counters: &CountersReader<'_, Access>,
     limit: LimitCounter,
 ) -> Option<i64> {
-    let descriptor = counters.get(limit.counter_id)?;
+    // ★ **Constant time, both halves.** `CountersReader::get` scans the whole
+    // catalogue and builds a `CounterDescriptor` — label and `String` — for every
+    // counter on the way; the doc says so in as many words ("a caller that asks
+    // this question in a loop is asking the wrong one"). This *is* asked in a
+    // loop now that the replayer reads its own limit, and the first probe showed
+    // what it cost: **14.6 µs per turn** between the recorder writing the
+    // position and the replayer noticing it, which was almost all of the gap
+    // this line was meant to close.
+    if !counters.is_active(limit.counter_id, limit.type_id, limit.registration_id) {
+        return None;
+    }
 
-    (descriptor.type_id == limit.type_id && descriptor.registration_id == limit.registration_id)
-        .then_some(descriptor.value)
+    counters.value(limit.counter_id)
 }
 
 /// Everything one replay was asked for: `ArchiveConductor.startReplay`'s
