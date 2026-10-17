@@ -1,55 +1,95 @@
 //! Writing to the cluster log (`LogPublisher.java`).
 //!
-//! P3-4a needs exactly one of the five messages this class writes — the
-//! `NewLeadershipTermEvent` that closes an election (`LogPublisher.java:278-310`)
-//! — because a single-member election cannot reach steady state without it.
-//! `P3-4b` adds the session/destination half (`appendMessage`,
-//! `appendSessionOpen`, `appendSessionClose`, `appendTimer`,
-//! `appendClusterAction`, `addDestination`), which is why the type exists now
-//! with one method rather than being inlined into the agent.
+//! Seven writes, all aimed at one exclusive publication created by the
+//! election (`addLogPublication`, `ConsensusModuleAgent.java:1639-1686`):
+//!
+//! | Here | Reference |
+//! |---|---|
+//! | [`LogPublisher::append_message`] | `appendMessage` (`LogPublisher.java:115-144`) |
+//! | [`LogPublisher::append_session_open`] | `appendSessionOpen` (`:146-178`) |
+//! | [`LogPublisher::append_session_close`] | `appendSessionClose` (`:180-211`) |
+//! | [`LogPublisher::append_timer`] | `appendTimer` (`:213-239`) |
+//! | [`LogPublisher::append_cluster_action`] | `appendClusterAction` (`:241-276`) |
+//! | [`LogPublisher::append_new_leadership_term_event`] | `appendNewLeadershipTermEvent` (`:278-319`) |
+//! | [`LogPublisher::add_destination`] | `addDestination` (`:107-113`) |
 //!
 //! # Where the publication lives
 //!
 //! The log publication is an **exclusive** publication and is taken out of the
 //! [`Client`] at creation (`Client::take_exclusive_publication`). That is
-//! load-bearing rather than stylistic: the ingress handler at `P3-4b` will
-//! borrow `&mut Client` for the poll, and if the publication were still in the
-//! client's table the same turn could not also write to it (plan §4.5).
+//! load-bearing rather than stylistic: the ingress handler borrows `&mut Client`
+//! for the poll, and if the publication were still in the client's table the
+//! same turn could not also write to it (plan §4.5).
 //!
-//! # Encoding
+//! # Encoding and framing
 //!
-//! The reference writes the SBE message **through the claim**
-//! (`LogPublisher.java:288-299`). This build encodes into a stack buffer and
-//! copies it into the claim, because the generated encoder writes through a
-//! `&mut [u8]` and the term is an `AtomicBuffer`, which exposes no mutable
-//! slice. The framing is the same — `try_claim`, then `publish` of the aligned
-//! length — so the bytes on the log are identical; only the one copy differs,
-//! and it is on an election path, not a message path.
+//! The reference writes the SBE message **through the claim**, and shares one
+//! 32-byte buffer for the `SessionMessageHeader` (which is prefixed to every
+//! application message). This build encodes into a reusable buffer and offers
+//! it, because the generated encoder writes through a `&mut [u8]` and the term
+//! is an `AtomicBuffer`, which exposes no mutable slice. `offer` writes the
+//! same frame — one header plus the SBE message, fragmented only if it exceeds
+//! the publication's maximum payload — so the bytes on the log are identical;
+//! what differs is that the reference's claim of a fixed-size message and this
+//! build's offer of it both copy the same bytes once.
+//!
+//! [`append_new_leadership_term_event`](LogPublisher::append_new_leadership_term_event)
+//! keeps its claim because it must know the position the message will occupy
+//! **before** writing it (the message carries it).
 
 use std::time::Duration;
 
+use deepmsg_client::client::Client;
 use deepmsg_client::publication::ExclusivePublication;
 use deepmsg_codec_cluster::WriteBuf;
+use deepmsg_codec_cluster::cluster_action::ClusterAction;
+use deepmsg_codec_cluster::cluster_action_request_codec::{
+    ClusterActionRequestEncoder, SBE_BLOCK_LENGTH as CLUSTER_ACTION_BLOCK_LENGTH,
+};
 use deepmsg_codec_cluster::cluster_time_unit::ClusterTimeUnit;
 use deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH as MESSAGE_HEADER_LENGTH;
 use deepmsg_codec_cluster::new_leadership_term_event_codec::NewLeadershipTermEventEncoder;
+use deepmsg_codec_cluster::session_close_event_codec::{
+    SBE_BLOCK_LENGTH as SESSION_CLOSE_BLOCK_LENGTH, SessionCloseEventEncoder,
+};
+use deepmsg_codec_cluster::session_message_header_codec::{
+    SBE_BLOCK_LENGTH as SESSION_MESSAGE_HEADER_BLOCK_LENGTH, SessionMessageHeaderEncoder,
+};
+use deepmsg_codec_cluster::session_open_event_codec::{
+    SBE_BLOCK_LENGTH as SESSION_OPEN_BLOCK_LENGTH, SessionOpenEventEncoder,
+};
+use deepmsg_codec_cluster::timer_event_codec::{
+    SBE_BLOCK_LENGTH as TIMER_BLOCK_LENGTH, TimerEventEncoder,
+};
+use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_core::logbuffer::descriptor::FRAME_ALIGNMENT;
 use deepmsg_core::logbuffer::frame::DATA_HEADER_LENGTH;
+use deepmsg_core::uri::ChannelUri;
 
 use crate::error::ClusterError;
+use crate::session::cluster_session::ClusterSession;
 
 /// `LogPublisher.SEND_ATTEMPTS`.
 const SEND_ATTEMPTS: usize = 3;
 
-/// The largest SBE message this publisher writes. A `NewLeadershipTermEvent`
-/// has a 48-byte block, plus the 8-byte message header; the bound is the
-/// reference's own generous one for the other four messages, none of which is
-/// longer than this.
+/// The largest SBE message the leadership-term path writes (an encoder buffer
+/// bound, not a protocol constant).
 const MAX_ENCODED_LENGTH: usize = 256;
 
-/// The log publication, and the writes this slice needs from it.
+/// `AeronCluster.SESSION_HEADER_LENGTH`: the SBE header plus
+/// `SessionMessageHeader`'s block (`AeronCluster.java:99-100`).
+pub const SESSION_HEADER_LENGTH: usize =
+    MESSAGE_HEADER_LENGTH + SESSION_MESSAGE_HEADER_BLOCK_LENGTH as usize;
+
+/// Every variable-length field in schema 111 is a 4-byte length and then bytes.
+const VAR_DATA_HEADER_LENGTH: usize = 4;
+
+/// The log publication, and the writes the consensus module needs from it.
 pub struct LogPublisher {
     publication: Option<ExclusivePublication>,
+    /// The reference's shared `UnsafeBuffer`/`ExpandableArrayBuffer` pair,
+    /// collapsed into one reusable buffer (see the module docs).
+    buffer: Vec<u8>,
 }
 
 impl Default for LogPublisher {
@@ -61,13 +101,21 @@ impl Default for LogPublisher {
 impl LogPublisher {
     /// An empty publisher; [`Self::publication`] is set by the agent in
     /// `addLogPublication` (`ConsensusModuleAgent.java:1639-1686`).
-    pub const fn new() -> Self {
-        Self { publication: None }
+    pub fn new() -> Self {
+        Self {
+            publication: None,
+            buffer: vec![0_u8; MAX_ENCODED_LENGTH],
+        }
     }
 
     /// Take the log publication, once, when the election creates it.
     ///
-    /// `LogPublisher.publication(ExclusivePublication)` (`LogPublisher.java:59`).
+    /// `LogPublisher.publication(ExclusivePublication)` (`LogPublisher.java:69`).
+    ///
+    /// # Errors
+    ///
+    /// Nothing; the reference closes a previous publication here and this one
+    /// simply replaces it, because the only caller creates it once per term.
     pub fn set_publication(&mut self, publication: ExclusivePublication) {
         self.publication = Some(publication);
     }
@@ -78,8 +126,7 @@ impl LogPublisher {
         self.publication.as_ref()
     }
 
-    /// Whether a publication has been created (the election's LEADER_LOG_REPLICATION
-    /// transition is what creates it).
+    /// Whether a publication has been created.
     pub fn has_publication(&self) -> bool {
         self.publication.is_some()
     }
@@ -97,6 +144,230 @@ impl LogPublisher {
         self.publication
             .as_ref()
             .map_or(-1, ExclusivePublication::session_id)
+    }
+
+    /// The window limit the publication's counter carries, read through the
+    /// client (`Publication.positionLimit()` in the reference).
+    pub fn position_limit(&self, client: &Client) -> i64 {
+        let Some(publication) = self.publication.as_ref() else {
+            return 0;
+        };
+        let Some(counters) = client.counters_reader() else {
+            return 0;
+        };
+        counters
+            .value(publication.position_limit_counter_id())
+            .unwrap_or(0)
+    }
+
+    /// `LogPublisher.addDestination` (`:107-113`): a follower's log endpoint.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] when the destination URI cannot be built or the driver
+    /// refuses the command.
+    pub fn add_destination(
+        &mut self,
+        client: &mut Client,
+        destination_channel: &str,
+        follower_log_endpoint: &str,
+    ) -> Result<i64, ClusterError> {
+        let Some(publication) = self.publication.as_ref() else {
+            return Ok(0);
+        };
+        let uri =
+            ChannelUri::create_destination_uri(destination_channel, Some(follower_log_endpoint))
+                .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+        let registration_id =
+            client.add_destination(publication.registration_id(), &uri, COMMAND_TIMEOUT)?;
+        Ok(registration_id)
+    }
+
+    /// `LogPublisher.appendMessage` (`:115-144`).
+    ///
+    /// Returns the position the message was written at, or `0` when the three
+    /// attempts were all refused — the caller treats that as `ABORT`.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError::Cluster`] with the reference's words when the publication
+    /// is at its maximum position or does not exist.
+    pub fn append_message(
+        &mut self,
+        position_limit: i64,
+        leadership_term_id: i64,
+        cluster_session_id: i64,
+        timestamp: i64,
+        payload: &[u8],
+    ) -> Result<i64, ClusterError> {
+        if self.publication.is_none() {
+            return Err(ClusterError::Cluster(
+                "log publication has not been created".to_owned(),
+            ));
+        }
+
+        let length = SESSION_HEADER_LENGTH + payload.len();
+        if self.buffer.len() < length {
+            self.buffer.resize(length, 0);
+        }
+        {
+            let encoder = SessionMessageHeaderEncoder::default().wrap(
+                WriteBuf::new(&mut self.buffer[..SESSION_HEADER_LENGTH]),
+                MESSAGE_HEADER_LENGTH,
+            );
+            let mut header = encoder.header(0);
+            let mut message = header.parent().expect("the encoder just wrapped");
+            message
+                .leadership_term_id(leadership_term_id)
+                .cluster_session_id(cluster_session_id)
+                .timestamp(timestamp);
+        }
+        self.buffer[SESSION_HEADER_LENGTH..length].copy_from_slice(payload);
+        self.offer(position_limit, length)
+    }
+
+    /// `LogPublisher.appendSessionOpen` (`:146-178`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::append_message`].
+    pub fn append_session_open(
+        &mut self,
+        client: &Client,
+        session: &ClusterSession,
+        leadership_term_id: i64,
+        timestamp: i64,
+    ) -> Result<i64, ClusterError> {
+        let position_limit = self.position_limit(client);
+        let length = MESSAGE_HEADER_LENGTH
+            + usize::from(SESSION_OPEN_BLOCK_LENGTH)
+            + VAR_DATA_HEADER_LENGTH
+            + session.response_channel().len()
+            + VAR_DATA_HEADER_LENGTH
+            + session.encoded_principal().len();
+        self.size_buffer(length);
+
+        {
+            let encoder = SessionOpenEventEncoder::default().wrap(
+                WriteBuf::new(&mut self.buffer[..length]),
+                MESSAGE_HEADER_LENGTH,
+            );
+            let mut header = encoder.header(0);
+            let mut message = header.parent().expect("the encoder just wrapped");
+            message
+                .leadership_term_id(leadership_term_id)
+                .correlation_id(session.correlation_id())
+                .cluster_session_id(session.id())
+                .timestamp(timestamp)
+                .response_stream_id(session.response_stream_id())
+                .response_channel(session.response_channel().as_bytes())
+                .encoded_principal(session.encoded_principal());
+        }
+
+        self.offer(position_limit, length)
+    }
+
+    /// `LogPublisher.appendSessionClose` (`:180-211`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::append_message`].
+    pub fn append_session_close(
+        &mut self,
+        client: &Client,
+        _member_id: i32,
+        session: &ClusterSession,
+        leadership_term_id: i64,
+        timestamp: i64,
+    ) -> Result<bool, ClusterError> {
+        let position_limit = self.position_limit(client);
+        let length = MESSAGE_HEADER_LENGTH + usize::from(SESSION_CLOSE_BLOCK_LENGTH);
+        self.size_buffer(length);
+
+        {
+            let encoder = SessionCloseEventEncoder::default().wrap(
+                WriteBuf::new(&mut self.buffer[..length]),
+                MESSAGE_HEADER_LENGTH,
+            );
+            let mut header = encoder.header(0);
+            let mut message = header.parent().expect("the encoder just wrapped");
+            message
+                .leadership_term_id(leadership_term_id)
+                .cluster_session_id(session.id())
+                .timestamp(timestamp)
+                .close_reason(session.close_reason());
+        }
+
+        Ok(self.offer(position_limit, length)? > 0)
+    }
+
+    /// `LogPublisher.appendTimer` (`:213-239`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::append_message`].
+    pub fn append_timer(
+        &mut self,
+        client: &Client,
+        correlation_id: i64,
+        leadership_term_id: i64,
+        timestamp: i64,
+    ) -> Result<i64, ClusterError> {
+        let position_limit = self.position_limit(client);
+        let length = MESSAGE_HEADER_LENGTH + usize::from(TIMER_BLOCK_LENGTH);
+        self.size_buffer(length);
+
+        {
+            let encoder = TimerEventEncoder::default().wrap(
+                WriteBuf::new(&mut self.buffer[..length]),
+                MESSAGE_HEADER_LENGTH,
+            );
+            let mut header = encoder.header(0);
+            let mut message = header.parent().expect("the encoder just wrapped");
+            message
+                .leadership_term_id(leadership_term_id)
+                .correlation_id(correlation_id)
+                .timestamp(timestamp);
+        }
+
+        self.offer(position_limit, length)
+    }
+
+    /// `LogPublisher.appendClusterAction` (`:241-276`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::append_message`].
+    pub fn append_cluster_action(
+        &mut self,
+        client: &Client,
+        leadership_term_id: i64,
+        timestamp: i64,
+        action: ClusterAction,
+        flags: i32,
+    ) -> Result<bool, ClusterError> {
+        let position_limit = self.position_limit(client);
+        let length = MESSAGE_HEADER_LENGTH + usize::from(CLUSTER_ACTION_BLOCK_LENGTH);
+        let frame_length = align_up(DATA_HEADER_LENGTH + length, FRAME_ALIGNMENT as usize);
+        let log_position = self.position() + frame_length as i64;
+        self.size_buffer(length);
+
+        {
+            let encoder = ClusterActionRequestEncoder::default().wrap(
+                WriteBuf::new(&mut self.buffer[..length]),
+                MESSAGE_HEADER_LENGTH,
+            );
+            let mut header = encoder.header(0);
+            let mut message = header.parent().expect("the encoder just wrapped");
+            message
+                .leadership_term_id(leadership_term_id)
+                .log_position(log_position)
+                .timestamp(timestamp)
+                .action(action)
+                .flags(flags);
+        }
+
+        Ok(self.offer(position_limit, length)? > 0)
     }
 
     /// `LogPublisher.appendNewLeadershipTermEvent` (`:278-310`).
@@ -173,16 +444,18 @@ impl LogPublisher {
                             "failed to write NewLeadershipTermEvent into the log".to_owned(),
                         ));
                     };
+                    // `publish` takes the unaligned frame length — the one
+                    // `Frame::begin` wrote — so the padding is not payload.
                     #[allow(clippy::cast_possible_truncation)] // bounded by the term length
-                    let frame_length = frame_length as i32;
-                    if claim.frame().publish(frame_length).is_none() {
+                    let unaligned = (DATA_HEADER_LENGTH + message_length) as i32;
+                    if claim.frame().publish(unaligned).is_none() {
                         return Err(ClusterError::Cluster(
                             "failed to publish NewLeadershipTermEvent".to_owned(),
                         ));
                     }
                     return Ok(true);
                 }
-                Err(deepmsg_core::logbuffer::append::Appended::EndOfLog) => {
+                Err(Appended::EndOfLog) => {
                     // The term rotated under the claim; the next attempt reads
                     // the new one, as `LogPublisher`'s retry does.
                 }
@@ -191,6 +464,37 @@ impl LogPublisher {
         }
 
         Ok(false)
+    }
+
+    /// Three offers of the encoded message at `self.buffer[..length]`
+    /// (`LogPublisher.java:124-142`).
+    fn offer(&self, position_limit: i64, length: usize) -> Result<i64, ClusterError> {
+        let Some(publication) = self.publication.as_ref() else {
+            return Err(ClusterError::Cluster(
+                "log publication has not been created".to_owned(),
+            ));
+        };
+
+        for _ in 0..SEND_ATTEMPTS {
+            match publication.offer(position_limit, &self.buffer[..length]) {
+                Appended::Ok { position, .. } => return Ok(position.raw()),
+                Appended::MaxPositionExceeded => {
+                    return Err(ClusterError::Cluster(format!(
+                        "log publication at max position: term-length={}",
+                        publication.term_buffer_length()
+                    )));
+                }
+                Appended::EndOfLog => {}
+                _ => {}
+            }
+        }
+        Ok(0)
+    }
+
+    fn size_buffer(&mut self, length: usize) {
+        if self.buffer.len() < length {
+            self.buffer.resize(length, 0);
+        }
     }
 }
 

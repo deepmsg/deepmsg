@@ -56,10 +56,10 @@ fn every_name_is_classified_or_pending() {
             }
         }
     }
-    // 27 honoured, 3 accepted-not-honoured, 1 refused: the rows P3-4a's
-    // configuration reads. Every other row is still Pending and must be gone by
-    // P3-11.
-    assert_eq!(pending, 49, "the P3-4a rows are classified");
+    // P3-4b honoured five more (the two supplier names, the ingress fragment
+    // limit and IPC switch, the session limit), so 44 rows are still Pending
+    // and must be gone by P3-11.
+    assert_eq!(pending, 44, "the P3-4a and P3-4b rows are classified");
 }
 
 #[test]
