@@ -95,6 +95,14 @@ pub struct ClusterMember {
     pub is_ballot_sent: bool,
     /// The catchup replay session this member is serving, or `-1`.
     pub catchup_replay_session_id: i64,
+    /// Whether this member is the leader of the current term
+    /// (`ClusterMember.isLeader`, `:46`). Set when a term is established
+    /// (`ConsensusModuleAgent.updateMemberDetails` `:2370-2381`).
+    pub is_leader: bool,
+    /// Whether this member has acknowledged a `TerminationPosition`
+    /// (`ClusterMember.hasTerminated`, `:47`). Cleared by the leader before a
+    /// new round of termination positions (`ClusterTermination.java:73`).
+    pub has_terminated: bool,
 }
 
 impl ClusterMember {
@@ -150,7 +158,17 @@ impl ClusterMember {
             vote: None,
             is_ballot_sent: false,
             catchup_replay_session_id: -1,
+            is_leader: false,
+            has_terminated: false,
         })
+    }
+
+    /// `ClusterMember.setIsLeader` (`:1263-1270`): mark every member whose id
+    /// is the leader's.
+    pub fn set_is_leader(members: &mut [Self], leader_member_id: i32) {
+        for member in members {
+            member.is_leader = member.id == leader_member_id;
+        }
     }
 
     /// Whether this member reported an append position within `timeout_ns`.

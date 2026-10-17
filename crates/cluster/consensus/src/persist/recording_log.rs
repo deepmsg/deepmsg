@@ -152,6 +152,8 @@ pub enum RecordingLogError {
     },
     /// A recovery plan named a recording the archive does not know.
     UnknownRecording(i64),
+    /// A commit position named a leadership term the log has no entry for.
+    UnknownLeadershipTerm(i64),
     /// A recovery plan found the consensus module's snapshot but not the one
     /// for a service it expects immediately before it.
     SnapshotMissing {
@@ -170,6 +172,9 @@ impl fmt::Display for RecordingLogError {
             Self::EndpointTooLong { length } => write!(f, "endpoint of {length} bytes is too long"),
             Self::UnknownRecording(recording_id) => {
                 write!(f, "unknown recording id: {recording_id}")
+            }
+            Self::UnknownLeadershipTerm(leadership_term_id) => {
+                write!(f, "unknown leadershipTermId={leadership_term_id}")
             }
             Self::SnapshotMissing {
                 service_id,
@@ -410,6 +415,27 @@ impl RecordingLog {
         )?;
         self.entries[index].log_position = log_position;
         Ok(())
+    }
+
+    /// `commitLogPosition(leadershipTermId, logPosition)` (`:1085-1100`): the
+    /// same in-place rewrite, naming the term.
+    ///
+    /// # Errors
+    ///
+    /// The file system, or [`RecordingLogError::UnknownLeadershipTerm`] — the
+    /// reference's `unknown leadershipTermId`.
+    pub fn commit_log_position_for_term(
+        &mut self,
+        leadership_term_id: i64,
+        log_position: i64,
+    ) -> Result<(), RecordingLogError> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.is_term() && entry.leadership_term_id == leadership_term_id)
+            .ok_or(RecordingLogError::UnknownLeadershipTerm(leadership_term_id))?;
+
+        self.commit_log_position(index, log_position)
     }
 
     /// Mark the newest valid snapshot invalid by setting bit 31 of its type

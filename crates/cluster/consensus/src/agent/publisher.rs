@@ -27,6 +27,43 @@ impl ConsensusPublisher {
             publications: other_members,
         }
     }
+
+    /// `ConsensusPublisher.terminationPosition(publication, ..)`
+    /// (`ConsensusPublisher.java:383-416`).
+    ///
+    /// The reference answers `false` for a publication that is not there
+    /// (`:387-390`), and P3-6a fills in the per-member table that would make
+    /// one exist. A one-member cluster has no other member, so the loop this
+    /// serves sends nothing and never asks.
+    pub fn termination_position(
+        &mut self,
+        member_id: i32,
+        leadership_term_id: i64,
+        log_position: i64,
+    ) -> bool {
+        debug_assert_eq!(0, self.publications, "P3-6a has not created publications");
+        let _ = (member_id, leadership_term_id, log_position);
+        false
+    }
+
+    /// `ConsensusPublisher.terminationAck(publication, ..)`
+    /// (`ConsensusPublisher.java:417-449`): a follower's answer to the leader.
+    pub fn termination_ack(
+        &mut self,
+        member_id: i32,
+        leadership_term_id: i64,
+        log_position: i64,
+        follower_member_id: i32,
+    ) -> bool {
+        debug_assert_eq!(0, self.publications, "P3-6a has not created publications");
+        let _ = (
+            member_id,
+            leadership_term_id,
+            log_position,
+            follower_member_id,
+        );
+        false
+    }
 }
 
 impl ConsensusSender for ConsensusPublisher {

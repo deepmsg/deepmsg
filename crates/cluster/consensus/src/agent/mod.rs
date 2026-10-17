@@ -63,6 +63,7 @@ use deepmsg_cluster_common::mark::{self, ClusterMarkFile};
 use deepmsg_cluster_common::member::{self, ClusterMember};
 use deepmsg_codec_cluster::admin_request_type::AdminRequestType;
 use deepmsg_codec_cluster::admin_response_code::AdminResponseCode;
+use deepmsg_codec_cluster::cluster_action::ClusterAction;
 use deepmsg_codec_cluster::cluster_time_unit::ClusterTimeUnit;
 use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
 use deepmsg_core::clock;
@@ -71,6 +72,9 @@ use deepmsg_driver::idle::Strategy;
 
 use crate::clock::{ClusterClock, MillisecondClusterClock};
 use crate::config::{CLUSTER_IDLE_STRATEGY_PROP_NAME, CLUSTER_TIME_UNIT, ConsensusModuleConfig};
+use crate::control::cluster_control::ToggleState as ClusterControlToggle;
+use crate::control::node_control::ToggleState as NodeControlToggle;
+use crate::control::termination::ClusterTermination;
 use crate::election::{Election, ElectionHost, ElectionState};
 use crate::error::ClusterError;
 use crate::handles::{LogReplay, RecordingReplication};
@@ -127,6 +131,9 @@ const NULL_POSITION: i64 = -1;
 /// `Aeron.NULL_VALUE`, and the `-1` a recording id takes when there is none.
 const NULL_VALUE: i64 = -1;
 
+/// `ConsensusModule.CLUSTER_ACTION_FLAGS_DEFAULT` (`:132`).
+const CLUSTER_ACTION_FLAGS_DEFAULT: i32 = 0;
+
 /// The counters a consensus module allocates (`ConsensusModule.java:1892-2046`).
 ///
 /// They are `Copy` handles: the value lives in the CnC file, and every read and
@@ -181,6 +188,41 @@ impl DutyCycle {
         if duration_ns > self.threshold_ns {
             let exceeded = read_counter(client, self.threshold_exceeded).unwrap_or(0);
             write_counter(client, self.threshold_exceeded, exceeded + 1);
+        }
+    }
+}
+
+/// `SnapshotDurationTracker` (`service/SnapshotDurationTracker.java:25-97`):
+/// the longest snapshot taken, and how many exceeded the configured threshold.
+///
+/// The reference's counter is named "total" but holds the **maximum**
+/// (`proposeMax`, `:95`); the value is nanoseconds.
+struct SnapshotDuration {
+    max_duration: Counter,
+    threshold_exceeded: Counter,
+    threshold_ns: i64,
+    /// `snapshotStartTimeNs`; `None` is the reference's `Long.MIN_VALUE`.
+    start_ns: Option<i64>,
+}
+
+impl SnapshotDuration {
+    /// `onSnapshotBegin` (`:74-77`).
+    fn on_snapshot_begin(&mut self, time_ns: i64) {
+        self.start_ns = Some(time_ns);
+    }
+
+    /// `onSnapshotEnd` (`:84-97`): propose the max, count a threshold breach.
+    fn on_snapshot_end(&mut self, client: &Client, time_ns: i64) {
+        let Some(start_ns) = self.start_ns else {
+            return;
+        };
+
+        let duration_ns = time_ns.saturating_sub(start_ns);
+        if duration_ns > self.threshold_ns {
+            increment_counter(client, self.threshold_exceeded, 1);
+        }
+        if duration_ns > read_counter(client, self.max_duration).unwrap_or(0) {
+            write_counter(client, self.max_duration, duration_ns);
         }
     }
 }
@@ -247,6 +289,24 @@ pub struct ConsensusModuleAgent {
     live_log_destination: String,
     catchup_log_destination: String,
     closed: bool,
+
+    // -- termination and the operator toggles (P3-4e) ----------------------
+    /// `clusterTermination` (`:198`): `Some` while this leader is waiting for
+    /// its services and its followers (`SHUTDOWN` and `ABORT`).
+    cluster_termination: Option<ClusterTermination>,
+    /// `terminationPosition` (`:134`): the log position termination stops at.
+    termination_position: i64,
+    /// `terminationLeadershipTermId` (`:135`): the term that position belongs
+    /// to, so a stale `TerminationAck` cannot end the current one.
+    termination_leadership_term_id: i64,
+    /// `uncommittedPreviousState` (`:182`): the state before each
+    /// `SUSPEND`/`RESUME`/`SNAPSHOT` action, written by
+    /// `offerPositionAndPreviousState` (`:2664-2668`) and rolled back by
+    /// `restoreUncommittedEntries` (`:3020-3057`) when the action turns out not
+    /// to be committed.
+    uncommitted_previous_state: std::collections::VecDeque<(i64, i64)>,
+    /// `totalSnapshotDurationTracker` (`:191`), counters 234 and 235.
+    snapshot_duration: SnapshotDuration,
 }
 
 /// The two objects a deployment names by class and a test supplies in process
@@ -425,6 +485,8 @@ impl ConsensusModuleAgent {
         })?;
         let max_cycle_time = counters.max_cycle_time;
         let cycle_threshold_exceeded = counters.cycle_threshold_exceeded;
+        let total_snapshot_duration = counters.total_snapshot_duration;
+        let total_snapshot_threshold_exceeded = counters.total_snapshot_threshold_exceeded;
         let sessions = SessionManager::new(
             config.member_id,
             config.cluster_id,
@@ -521,7 +583,20 @@ impl ConsensusModuleAgent {
             live_log_destination: String::new(),
             catchup_log_destination: String::new(),
             closed: false,
+            cluster_termination: None,
+            termination_position: NULL_POSITION,
+            termination_leadership_term_id: NULL_VALUE,
+            uncommitted_previous_state: std::collections::VecDeque::new(),
+            snapshot_duration: SnapshotDuration {
+                max_duration: total_snapshot_duration,
+                threshold_exceeded: total_snapshot_threshold_exceeded,
+                threshold_ns: 0,
+                start_ns: None,
+            },
         };
+        // Same shape as the duty-cycle threshold: the value is the configured
+        // one, and both counters already exist.
+        agent.snapshot_duration.threshold_ns = agent.config.snapshot_duration_threshold_ns;
         // The tracker's threshold is the configured one; set after the struct
         // exists because both counters were allocated by `allocate_counters`.
         agent.duty_cycle.threshold_ns = agent.config.cycle_threshold_ns;
@@ -657,15 +732,16 @@ impl ConsensusModuleAgent {
         // the ingress callback (see `session::ingress`).
         self.sessions.drive_async_connects(&mut self.client)?;
 
-        let leadership_term_id = self.leadership_term_id;
-        let member_id = self.config.member_id;
-        let leader_member_id = self.members[self.this_member_index].id;
-        let ingress_endpoints = ingress_endpoints(&self.members);
-        let role = self.role;
-        let state = self.state;
-        let clock = self.clock;
-
+        // `sendRedirects` / `sendRejections` (`:2404-2405`): every role and
+        // state sends them, because a client parked on a node that is not the
+        // leader still has to be told where the leader is.
         {
+            let leadership_term_id = self.leadership_term_id;
+            let member_id = self.config.member_id;
+            let leader_member_id = self.members[self.this_member_index].id;
+            let ingress_endpoints = ingress_endpoints(&self.members);
+            let clock = self.clock;
+
             let Self {
                 client,
                 sessions,
@@ -689,19 +765,483 @@ impl ConsensusModuleAgent {
 
             work += sessions.send_redirects(&mut ctx)?;
             work += sessions.send_rejections(&mut ctx)?;
+        }
 
-            if role == Role::Leader && state == ModuleState::Active {
-                work += sessions.process_all_pending_sessions(&mut ctx)?;
-                work += sessions.check_sessions(&mut ctx)?;
-                // One member has a quorum by definition, so `hasActiveQuorum`
-                // cannot fail here; the check belongs to P3-6b.
+        if self.election.is_none() {
+            if self.role == Role::Leader {
+                // `checkClusterControlToggle` (`:2411`) runs before the
+                // session work: an operator's SUSPEND takes effect this tick.
+                work += self.check_cluster_control_toggle(now_ns)?;
+
+                if self.state == ModuleState::Active {
+                    work += self.process_open_sessions(now_ns)?;
+                    // One member has a quorum by definition, so
+                    // `hasActiveQuorum` cannot fail here; the check belongs to
+                    // P3-6b.
+                } else if self.state == ModuleState::Terminating {
+                    // `:2427-2434`: the leader closes once its services and
+                    // every follower have finished (`SHUTDOWN`), or at the
+                    // deadline.
+                    let can_terminate =
+                        self.cluster_termination
+                            .as_ref()
+                            .is_some_and(|termination| {
+                                termination.can_terminate(&self.members, now_ns)
+                            });
+                    if can_terminate {
+                        self.recording_log
+                            .commit_log_position_for_term(
+                                self.leadership_term_id,
+                                self.termination_position,
+                            )
+                            .map_err(cluster)?;
+                        return Err(self.close_and_terminate());
+                    }
+                }
             }
             // A follower's backup sessions (`processPendingBackupSessions`,
             // `:2440`) are ClusterBackup's (P3-9), and standby snapshot
             // notifications are premium; neither can be produced in this slice.
+
+            if self.state == ModuleState::Active {
+                work += self.check_node_control_toggle()?;
+            }
         }
 
         Ok(work)
+    }
+
+    /// The leader's session work (`:2415-2418`), split out because the control
+    /// toggle has to be read before it.
+    fn process_open_sessions(&mut self, now_ns: i64) -> Result<usize, ClusterError> {
+        let leadership_term_id = self.leadership_term_id;
+        let member_id = self.config.member_id;
+        let leader_member_id = self.members[self.this_member_index].id;
+        let ingress_endpoints = ingress_endpoints(&self.members);
+        let clock = self.clock;
+
+        let Self {
+            client,
+            sessions,
+            egress,
+            log_publisher,
+            counters,
+            ..
+        } = self;
+        let mut ctx = SessionContext {
+            client,
+            log_publisher,
+            egress,
+            clock: &clock,
+            timed_out_counter: counters.timed_out_client,
+            leadership_term_id,
+            member_id,
+            leader_member_id,
+            ingress_endpoints: &ingress_endpoints,
+            now_ns,
+        };
+
+        let mut work = sessions.process_all_pending_sessions(&mut ctx)?;
+        work += sessions.check_sessions(&mut ctx)?;
+        Ok(work)
+    }
+
+    // -- operator toggles and termination (P3-4e) --------------------------
+
+    /// `checkClusterControlToggle` (`:2546-2662`).
+    ///
+    /// Only a leader calls this, and only in a slow tick. The three states the
+    /// module can be in each answer one question: `ACTIVE` may start an action,
+    /// `SNAPSHOT` waits for its own completion, `SUSPENDED` waits for `RESUME`.
+    /// The switch is the operator's; the module resets it when the action is
+    /// complete (`snapshot_on_service_ack`, the `RESUME` case) so the counter
+    /// is `NEUTRAL` again for the next request.
+    ///
+    /// # Errors
+    ///
+    /// An invalid counter value is the reference's `ClusterException`; an
+    /// append failure is the log's.
+    fn check_cluster_control_toggle(&mut self, now_ns: i64) -> Result<usize, ClusterError> {
+        match self.state {
+            ModuleState::Active => {
+                let toggle = ClusterControlToggle::get(&self.client, self.counters.control_toggle)?;
+                match toggle {
+                    ClusterControlToggle::Suspend => {
+                        let timestamp = self.clock.time();
+                        if self.append_action(ClusterAction::SUSPEND, timestamp)? {
+                            self.offer_position_and_previous_state();
+                            self.set_state(ModuleState::Suspended, "ClusterControl.SUSPEND");
+                        }
+                    }
+                    ClusterControlToggle::Snapshot => {
+                        let timestamp = self.clock.time();
+                        if self.append_action(ClusterAction::SNAPSHOT, timestamp)? {
+                            self.offer_position_and_previous_state();
+                            self.set_state(ModuleState::Snapshot, "ClusterControl.SNAPSHOT");
+                            self.snapshot_duration.on_snapshot_begin(now_ns);
+                        }
+                    }
+                    ClusterControlToggle::StandbySnapshot => {
+                        // A standby snapshot is premium's (`ClusterControl.java:80-83`)
+                        // and a consensus module is never a standby: refuse it
+                        // by name, count it, and put the counter back so the
+                        // operator's next action is not shadowed by this one.
+                        ClusterControlToggle::reset(&self.client, self.counters.control_toggle);
+                        self.report_counted_error();
+                    }
+                    ClusterControlToggle::Shutdown => {
+                        let timestamp = self.clock.time();
+                        if self.append_action(ClusterAction::SNAPSHOT, timestamp)? {
+                            let position = self.log_publisher.position();
+                            self.begin_termination(now_ns, position);
+                            self.offer_position_and_previous_state();
+                            self.set_state(ModuleState::Snapshot, "ClusterControl.SHUTDOWN");
+                            self.snapshot_duration.on_snapshot_begin(now_ns);
+                        }
+                    }
+                    ClusterControlToggle::Abort => {
+                        // No snapshot: the position is where the log is now
+                        // (`:2610-2629`).
+                        let position = self.log_publisher.position();
+                        self.begin_termination(now_ns, position);
+                        if self.config.service_count > 0 {
+                            self.send_service_termination_position(true);
+                        } else if let Some(termination) = self.cluster_termination.as_mut() {
+                            termination.on_services_terminated();
+                        }
+                        self.set_state(ModuleState::Terminating, "ClusterControl.ABORT");
+                    }
+                    ClusterControlToggle::Inactive
+                    | ClusterControlToggle::Neutral
+                    | ClusterControlToggle::Resume => return Ok(0),
+                }
+
+                Ok(1)
+            }
+            ModuleState::Snapshot => {
+                // `:2637-2644`: with no services the snapshot set is complete
+                // as soon as the log has caught up with the commit position.
+                // The position handed on is the **commit** position, as in the
+                // reference.
+                if self.config.service_count == 0
+                    && self.log_publisher.position() <= self.commit_position_value()
+                {
+                    let log_position = self.commit_position_value();
+                    let timestamp = self.clock.time();
+                    self.snapshot_on_service_ack(log_position, timestamp, &[])?;
+                }
+
+                Ok(0)
+            }
+            ModuleState::Suspended => {
+                // `:2645-2659`: only `RESUME` can move a suspended cluster, and
+                // it is the one switch that is not a compare-and-set out of
+                // `NEUTRAL` (the suspended module never resets the counter).
+                if ClusterControlToggle::get(&self.client, self.counters.control_toggle)?
+                    == ClusterControlToggle::Resume
+                {
+                    let timestamp = self.clock.time();
+                    if self.append_action(ClusterAction::RESUME, timestamp)? {
+                        self.offer_position_and_previous_state();
+                        self.set_state(ModuleState::Active, "ClusterControl.RESUME");
+                        ClusterControlToggle::reset(&self.client, self.counters.control_toggle);
+                    }
+
+                    return Ok(1);
+                }
+
+                Ok(0)
+            }
+            _ => Ok(0),
+        }
+    }
+
+    /// `checkNodeControlToggle` (`:2670-2708`).
+    ///
+    /// Both OSS values name features this build does not have — the standby
+    /// snapshot replicator (premium, `Q1`) and the recording-log validator
+    /// (`P3-9`) — so each is refused by name: the toggle is reset and the
+    /// refusal is counted, rather than the counter staying armed against a
+    /// module that would never act on it.
+    ///
+    /// # Errors
+    ///
+    /// An invalid counter value, as the reference's `ClusterException`.
+    fn check_node_control_toggle(&mut self) -> Result<usize, ClusterError> {
+        match NodeControlToggle::get(&self.client, self.counters.node_control_toggle)? {
+            NodeControlToggle::ReplicateStandbySnapshot
+            | NodeControlToggle::ValidateRecordingLog => {
+                NodeControlToggle::reset(&self.client, self.counters.node_control_toggle);
+                self.report_counted_error();
+                Ok(1)
+            }
+            NodeControlToggle::Inactive | NodeControlToggle::Neutral => Ok(0),
+        }
+    }
+
+    /// `appendAction` (`:2710-2713`).
+    fn append_action(
+        &mut self,
+        action: ClusterAction,
+        timestamp: i64,
+    ) -> Result<bool, ClusterError> {
+        self.log_publisher.append_cluster_action(
+            &self.client,
+            self.leadership_term_id,
+            timestamp,
+            action,
+            CLUSTER_ACTION_FLAGS_DEFAULT,
+        )
+    }
+
+    /// `offerPositionAndPreviousState` (`:2664-2668`): the state this action is
+    /// leaving, paired with the log position it will be committed at. If the
+    /// action is never committed, `restore_uncommitted_entries` puts the state
+    /// back (`:3056-3060`).
+    fn offer_position_and_previous_state(&mut self) {
+        let position = self.log_publisher.position();
+        self.uncommitted_previous_state
+            .push_back((position, i64::from(self.state.code())));
+    }
+
+    /// `snapshotOnServiceAck` (`:3104-3146`), after the snapshot itself.
+    ///
+    /// When this snapshot is the one a `SHUTDOWN` asked for, the termination
+    /// half starts here: the services are told where to stop (or, with no
+    /// services, are already done), the deadline restarts, and the module moves
+    /// to `TERMINATING`. Otherwise it is an ordinary snapshot and the module
+    /// returns to `ACTIVE`, resetting the operator's toggle.
+    ///
+    /// **Deviation:** the reference catches a snapshot failure, counts it, and
+    /// only ends the agent for a termination or a storage-space error
+    /// (`:3108-3121`). This build has no `ArchiveException.STORAGE_SPACE`
+    /// distinction yet, so the error is propagated (counted by the caller of
+    /// `do_work`) — recorded in the P3-4e delivery record.
+    fn snapshot_on_service_ack(
+        &mut self,
+        log_position: i64,
+        timestamp: i64,
+        service_acks: &[ServiceAck],
+    ) -> Result<(), ClusterError> {
+        self.take_snapshot_with_acks(timestamp, log_position, service_acks)?;
+
+        self.sessions
+            .update_time_of_last_activity(self.clock.time_nanos());
+
+        if self.cluster_termination.is_some() {
+            if self.config.service_count > 0 {
+                self.send_service_termination_position(true);
+            } else if let Some(termination) = self.cluster_termination.as_mut() {
+                termination.on_services_terminated();
+            }
+
+            let deadline_ns = self.clock.time_nanos() + self.config.termination_timeout_ns;
+            if let Some(termination) = self.cluster_termination.as_mut() {
+                termination.set_deadline_ns(deadline_ns);
+            }
+            self.set_state(ModuleState::Terminating, "null != clusterTermination");
+        } else {
+            self.set_state(ModuleState::Active, "snapshot complete");
+            if self.role == Role::Leader {
+                ClusterControlToggle::reset(&self.client, self.counters.control_toggle);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// `terminateOnServiceAck` (`:3309-3317`).
+    fn terminate_on_service_ack(&mut self, log_position: i64) -> Result<(), ClusterError> {
+        if let Some(termination) = self.cluster_termination.as_mut() {
+            termination.on_services_terminated();
+        }
+
+        self.do_termination(log_position)
+    }
+
+    /// `doTermination` (`:3319-3344`).
+    ///
+    /// A follower acknowledges and closes; a leader closes when
+    /// [`ClusterTermination::can_terminate`] says the cluster is ready. Both
+    /// paths record the termination position as the term's commit position
+    /// before stopping the recording, so a restart resumes from there.
+    fn do_termination(&mut self, log_position: i64) -> Result<(), ClusterError> {
+        if self.cluster_termination.is_none() {
+            if self.termination_leadership_term_id == self.leadership_term_id {
+                // The reference ignores `terminationAck`'s result (`:3325`):
+                // this is a best-effort answer from a node about to close.
+                let leader_member_id = self.leader_member_id();
+                let _sent = self.publisher.termination_ack(
+                    leader_member_id,
+                    self.leadership_term_id,
+                    log_position,
+                    self.config.member_id,
+                );
+            } else {
+                // `:3330-3332`: the reference's ERROR `ClusterEvent` for an ack
+                // that belongs to a previous term.
+                self.report_counted_error();
+            }
+
+            self.recording_log
+                .commit_log_position_for_term(self.leadership_term_id, log_position)
+                .map_err(cluster)?;
+            return Err(self.close_and_terminate());
+        }
+
+        let can_terminate = self
+            .cluster_termination
+            .as_ref()
+            .is_some_and(|termination| {
+                termination.can_terminate(&self.members, self.clock.time_nanos())
+            });
+        if can_terminate {
+            self.recording_log
+                .commit_log_position_for_term(self.leadership_term_id, log_position)
+                .map_err(cluster)?;
+            return Err(self.close_and_terminate());
+        }
+
+        Ok(())
+    }
+
+    /// `closeAndTerminate` (`:3290-3295`): stop the recording, mark the state,
+    /// and hand the duty cycle the one error that ends it.
+    ///
+    /// The reference's `tryStopLogRecording` catches its own archive errors and
+    /// reports them (`:3346-3370`); this one returns them, so the failure is
+    /// counted and the close continues — a node being told to stop must still
+    /// stop.
+    fn close_and_terminate(&mut self) -> ClusterError {
+        if self.try_stop_log_recording().is_err() {
+            self.report_counted_error();
+        }
+
+        self.set_state(ModuleState::Closed, "expected termination");
+        ClusterError::AgentTermination("expected termination".to_owned())
+    }
+
+    /// `ClusterTermination.terminationPosition` (`ClusterTermination.java:63-84`)
+    /// wired to this agent's members and publisher, then the three fields a
+    /// leader keeps (`:2592-2601`, `:2614-2618`).
+    fn begin_termination(&mut self, now_ns: i64, position: i64) {
+        let deadline_ns = now_ns + self.config.termination_timeout_ns;
+        let mut termination = ClusterTermination::new(deadline_ns);
+
+        {
+            let Self {
+                members,
+                publisher,
+                client,
+                counters,
+                ..
+            } = self;
+            let this_member_id = self.config.member_id;
+            let error_counter = counters.error;
+            let mut on_send_failure = |_member_id: i32| {
+                increment_counter(client, error_counter, 1);
+            };
+
+            termination.termination_position(
+                members,
+                this_member_id,
+                publisher,
+                &mut on_send_failure,
+                self.leadership_term_id,
+                position,
+            );
+        }
+
+        self.cluster_termination = Some(termination);
+        self.termination_position = position;
+        self.termination_leadership_term_id = self.leadership_term_id;
+    }
+
+    /// `serviceProxy.terminationPosition(terminationPosition, ackRequired)`
+    /// (`:2621`, `:2508`, `:3129`): tell this node's services where to stop.
+    fn send_service_termination_position(&mut self, ack_required: bool) -> bool {
+        let send = PublicationSender {
+            client: &self.client,
+            registration_id: self.service_publication_id,
+        };
+        self.service_proxy
+            .termination_position(&send, self.termination_position, ack_required)
+    }
+
+    /// The member the reference calls `leaderMember` (`:2369-2381`).
+    ///
+    /// A one-member cluster is its own leader once the election completes; a
+    /// follower learns the id from the log replication (`P3-6b`), so until
+    /// then this answers the local id — the only member there is.
+    fn leader_member_id(&self) -> i32 {
+        self.members
+            .iter()
+            .find(|member| member.is_leader)
+            .map_or(self.config.member_id, |member| member.id)
+    }
+
+    /// The reference's `ctx.countedErrorHandler().onError(...)`: one on counter
+    /// 210. The text forms of those events need the error log (`P3-4f`), so
+    /// what is visible here is the count.
+    fn report_counted_error(&self) {
+        increment_counter(&self.client, self.counters.error, 1);
+    }
+
+    /// `onTerminationPosition` (`:1183-1193`): a follower records where the
+    /// leader will stop. The consensus dispatcher that will call this is
+    /// `P3-5b`/`P3-6a`; until it exists a one-member cluster has no leader to
+    /// send one.
+    pub fn on_termination_position(&mut self, leadership_term_id: i64, log_position: i64) {
+        if leadership_term_id == self.leadership_term_id && self.role == Role::Follower {
+            self.termination_position = log_position;
+            self.termination_leadership_term_id = leadership_term_id;
+            self.time_of_last_log_update_ns = self.clock.time_nanos();
+        }
+    }
+
+    /// `onTerminationAck` (`:1195-1216`): the leader marks the follower that
+    /// answered and closes once every one of them has.
+    ///
+    /// # Errors
+    ///
+    /// The recording log's, when the termination position is committed.
+    pub fn on_termination_ack(
+        &mut self,
+        leadership_term_id: i64,
+        log_position: i64,
+        member_id: i32,
+    ) -> Result<(), ClusterError> {
+        if leadership_term_id == self.leadership_term_id
+            && log_position >= self.termination_position
+            && self.role == Role::Leader
+        {
+            let mut found = false;
+            if let Some(member) = self
+                .members
+                .iter_mut()
+                .find(|member| member.id == member_id)
+            {
+                member.has_terminated = true;
+                found = true;
+            }
+
+            if found {
+                let can_terminate = self
+                    .cluster_termination
+                    .as_ref()
+                    .is_some_and(|termination| {
+                        termination.can_terminate(&self.members, self.clock.time_nanos())
+                    });
+                if can_terminate {
+                    self.recording_log
+                        .commit_log_position_for_term(leadership_term_id, self.termination_position)
+                        .map_err(cluster)?;
+                    return Err(self.close_and_terminate());
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// `consensusAdapter.poll()` (`:423`): read the members' consensus
@@ -740,11 +1280,15 @@ impl ConsensusModuleAgent {
         }
 
         let mut work = 0;
-        // The reference's order (`:2489-2497`): timers, then the pending service
-        // message trackers, then ingress, then the leader position.
-        work += self.poll_timers(timestamp)?;
-        work += self.poll_trackers(timestamp)?;
-        work += self.poll_ingress()?;
+        // The reference's order and state gate (`:2487-2497`): timers, then the
+        // pending service message trackers, then ingress — **only while
+        // ACTIVE**, which is what makes `SUSPEND` a suspension — then the
+        // leader position, which every state updates.
+        if self.state == ModuleState::Active {
+            work += self.poll_timers(timestamp)?;
+            work += self.poll_trackers(timestamp)?;
+            work += self.poll_ingress()?;
+        }
         work += self.update_leader_position_internal(now_ns)?;
 
         // Both roles poll the service control channel (`:2535`).
@@ -1372,6 +1916,12 @@ impl ElectionHost for ConsensusModuleAgent {
         self.catchup_log_destination.clear();
         self.last_quorum_backtrack_commit_position = NULL_POSITION;
 
+        // `prepareForNewLeadership` (`:1382`): an operator switch is only
+        // honoured by a leader, so losing leadership disarms it. (The
+        // reference also disconnects the ingress and log adapters here; those
+        // are P3-6b's.)
+        ClusterControlToggle::deactivate(&self.client, self.counters.control_toggle);
+
         let had_recording = self.log_recording_id != NULL_VALUE;
         let last_append_position = self.append_position_value();
         self.try_stop_log_recording()?;
@@ -1454,12 +2004,17 @@ impl ElectionHost for ConsensusModuleAgent {
             for tracker in self.trackers.iter_mut() {
                 tracker.set_leadership_term_id(self.leadership_term_id);
             }
-            activate_toggle(&self.client, self.counters.control_toggle);
+            // `updateMemberDetails` (`:2370-2381`) marks the leader on every
+            // member; `ClusterTermination.canTerminate` reads that flag to know
+            // it is not waiting for itself. A follower learns the leader id
+            // from the log replication (P3-6b) and has nothing to terminate.
+            ClusterMember::set_is_leader(&mut self.members, self.config.member_id);
+            ClusterControlToggle::activate(&self.client, self.counters.control_toggle);
         } else {
             self.time_of_last_log_update_ns = now_ns;
             self.live_log_destination.clear();
         }
-        activate_toggle(&self.client, self.counters.node_control_toggle);
+        NodeControlToggle::activate(&self.client, self.counters.node_control_toggle);
 
         self.recovery_plan = create_recovery_plan(
             &self.recording_log,
@@ -1584,13 +2139,6 @@ fn read_counter(client: &Client, counter: Counter) -> Option<i64> {
 fn write_counter(client: &Client, counter: Counter, value: i64) {
     if let Some(counters) = client.counters_writable() {
         let _ = counter.set_value(&counters, value);
-    }
-}
-
-/// `ClusterControl.ToggleState.activate`: INACTIVE (0) becomes NEUTRAL (1).
-fn activate_toggle(client: &Client, counter: Counter) {
-    if read_counter(client, counter).unwrap_or(0) == 0 {
-        write_counter(client, counter, 1);
     }
 }
 
@@ -2382,6 +2930,13 @@ struct AgentServiceHandler<'a> {
     deferred_queries: Vec<DeferredQuery>,
     /// A snapshot every service has acked, carried out after the poll.
     deferred_snapshot: Option<(i64, i64, Vec<ServiceAck>)>,
+    /// A `TERMINATING` ack: `terminateOnServiceAck(logPosition)`, carried out
+    /// after the poll because it needs the archive and the recording log.
+    deferred_termination: Option<i64>,
+    /// A `QUITTING` ack: `closeAndTerminate()`, after the poll. Nothing in
+    /// 1.53.2 sets `QUITTING` (`ConsensusModule.java:168`), so this branch is
+    /// transcribed and unreachable, as in the reference.
+    deferred_close: bool,
 }
 
 impl ServiceControlHandler for AgentServiceHandler<'_> {
@@ -2486,10 +3041,13 @@ impl ServiceControlHandler for AgentServiceHandler<'_> {
                         self.deferred_snapshot = Some((log_position, _timestamp, acks));
                     }
                 }
-                ModuleState::Quitting | ModuleState::Terminating => {
-                    return Err(ClusterError::Cluster(
-                        "the termination ack path is P3-4e".to_owned(),
-                    ));
+                ModuleState::Quitting => {
+                    self.deferred_close = true;
+                }
+                ModuleState::Terminating => {
+                    // `onServiceAck` (`:1486-1487`): the last service ack for
+                    // this position ends the wait.
+                    self.deferred_termination = Some(log_position);
                 }
                 _ => {}
             }
@@ -2529,6 +3087,16 @@ impl ConsensusModuleAgent {
         }
 
         let _ = self.sessions.sweep_uncommitted_sessions(commit_position);
+
+        // `:3013-3017`: a previous state whose action has now been committed
+        // is no longer a rollback candidate.
+        while let Some(&(append_position, _state)) = self.uncommitted_previous_state.front() {
+            if append_position > commit_position {
+                break;
+            }
+            self.uncommitted_previous_state.pop_front();
+            self.uncommitted_previous_state.pop_front();
+        }
     }
 
     /// `restoreUncommittedEntries` (`ConsensusModuleAgent.java:3020-3052`):
@@ -2548,6 +3116,32 @@ impl ConsensusModuleAgent {
         }
 
         self.sessions.restore_uncommitted_sessions(commit_position);
+
+        // `:3041-3057`: committed previous states are dropped; if one is left,
+        // its action never made it, so the state before it is the committed
+        // one — the reference's "rollback".
+        while let Some(&(append_position, _state)) = self.uncommitted_previous_state.front() {
+            if append_position > commit_position {
+                break;
+            }
+            self.uncommitted_previous_state.pop_front();
+            self.uncommitted_previous_state.pop_front();
+        }
+
+        if !self.uncommitted_previous_state.is_empty() {
+            self.uncommitted_previous_state.pop_front();
+            if let Some(committed_state) = self
+                .uncommitted_previous_state
+                .pop_front()
+                .and_then(|(_, code)| i32::try_from(code).ok())
+                .and_then(ModuleState::from_code)
+            {
+                if self.state != ModuleState::Closed {
+                    self.set_state(committed_state, "rollback");
+                }
+            }
+        }
+        self.uncommitted_previous_state.clear();
     }
 
     /// `awaitServicesReady` (`ConsensusModuleAgent.java:1801-1838`): a no-op
@@ -2655,7 +3249,7 @@ impl ConsensusModuleAgent {
         let clock = self.clock;
         let ingress_endpoints = ingress_endpoints(&self.members);
 
-        let (work, deferred_snapshot) = {
+        let (work, deferred_snapshot, deferred_termination, deferred_close) = {
             let Self {
                 client,
                 service_control,
@@ -2686,12 +3280,16 @@ impl ConsensusModuleAgent {
                 deferred_closes: Vec::new(),
                 deferred_queries: Vec::new(),
                 deferred_snapshot: None,
+                deferred_termination: None,
+                deferred_close: false,
             };
 
             let result = service_control.poll(client, &mut handler);
             let deferred_closes = std::mem::take(&mut handler.deferred_closes);
             let deferred_queries = std::mem::take(&mut handler.deferred_queries);
             let deferred_snapshot = handler.deferred_snapshot.take();
+            let deferred_termination = handler.deferred_termination.take();
+            let deferred_close = handler.deferred_close;
             let work = result?;
             drop(handler);
 
@@ -2745,13 +3343,26 @@ impl ConsensusModuleAgent {
                 }
             }
 
-            (work, deferred_snapshot)
+            (
+                work,
+                deferred_snapshot,
+                deferred_termination,
+                deferred_close,
+            )
         };
 
         if let Some((log_position, timestamp, acks)) = deferred_snapshot {
-            // `snapshotOnServiceAck` (`:3104-3146`): take it, then ACTIVE.
-            self.take_snapshot_with_acks(timestamp, log_position, &acks)?;
-            self.set_state(ModuleState::Active, "snapshot complete");
+            // `snapshotOnServiceAck` (`:3104-3146`): take it, then ACTIVE — or,
+            // for a `SHUTDOWN`'s snapshot, start the termination half.
+            self.snapshot_on_service_ack(log_position, timestamp, &acks)?;
+        }
+
+        if let Some(log_position) = deferred_termination {
+            self.terminate_on_service_ack(log_position)?;
+        }
+
+        if deferred_close {
+            return Err(self.close_and_terminate());
         }
 
         Ok(work)
@@ -3077,6 +3688,11 @@ impl ConsensusModuleAgent {
         let _ = self
             .client
             .remove_publication(registration_id, COMMAND_TIMEOUT);
+        // `takeSnapshot` (`:3189`): the duration the operator sees on counters
+        // 234/235, measured from the trigger (the replayed action or the
+        // toggle), not from this call.
+        let now_ns = self.clock.time_nanos();
+        self.snapshot_duration.on_snapshot_end(&self.client, now_ns);
         increment_counter(&self.client, self.counters.snapshot, 1);
         Ok(())
     }
@@ -3403,6 +4019,9 @@ struct AgentLogReplayHandler<'a> {
     state_change: Option<ModuleState>,
     new_leadership_term_id: Option<i64>,
     deferred_snapshot: Option<(i64, i64)>,
+    /// A `SNAPSHOT` action with default flags was replayed:
+    /// `totalSnapshotDurationTracker.onSnapshotBegin` (`:1584`).
+    snapshot_began: bool,
 }
 
 impl LogReplayHandler for AgentLogReplayHandler<'_> {
@@ -3490,6 +4109,7 @@ impl LogReplayHandler for AgentLogReplayHandler<'_> {
             }
             deepmsg_codec_cluster::cluster_action::ClusterAction::SNAPSHOT if flags == 0 => {
                 self.state_change = Some(ModuleState::Snapshot);
+                self.snapshot_began = true;
                 if self.service_count == 0 {
                     // `onReplayClusterAction` (`:1587`): with no services the
                     // snapshot set is complete immediately.
@@ -3592,6 +4212,7 @@ impl ConsensusModuleAgent {
         let state_change;
         let new_leadership_term_id;
         let deferred_snapshot;
+        let snapshot_began;
         let work;
 
         {
@@ -3644,6 +4265,7 @@ impl ConsensusModuleAgent {
                 state_change: None,
                 new_leadership_term_id: None,
                 deferred_snapshot: None,
+                snapshot_began: false,
             };
 
             work = replay.adapter.poll(
@@ -3655,6 +4277,7 @@ impl ConsensusModuleAgent {
             state_change = handler.state_change;
             new_leadership_term_id = handler.new_leadership_term_id;
             deferred_snapshot = handler.deferred_snapshot;
+            snapshot_began = handler.snapshot_began;
 
             let position = replay.adapter.position();
             let commit_position = counters.commit_position;
@@ -3701,9 +4324,14 @@ impl ConsensusModuleAgent {
                 tracker.set_leadership_term_id(term);
             }
         }
+        if snapshot_began {
+            // `onReplayClusterAction` (`:1584`): the replayed action starts the
+            // snapshot-duration clock, as the live trigger does.
+            self.snapshot_duration
+                .on_snapshot_begin(self.clock.time_nanos());
+        }
         if let Some((log_position, timestamp)) = deferred_snapshot {
-            self.take_snapshot_with_acks(timestamp, log_position, &[])?;
-            self.set_state(ModuleState::Active, "snapshot complete");
+            self.snapshot_on_service_ack(log_position, timestamp, &[])?;
         }
 
         Ok(work.unwrap_or(0))
