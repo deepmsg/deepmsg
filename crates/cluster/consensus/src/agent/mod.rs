@@ -510,7 +510,9 @@ impl ConsensusModuleAgent {
             trackers,
             service_ack_queues,
             service_ack_id: 0,
-            expected_ack_position: NULL_POSITION,
+            // The reference initialises this to 0 (`ConsensusModuleAgent.java:132`):
+            // a fresh cluster's containers ack position 0 at startup.
+            expected_ack_position: 0,
             service_client_ids,
             timer,
             log_replay: None,

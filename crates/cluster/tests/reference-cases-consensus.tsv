@@ -303,12 +303,12 @@ unit	ConsensusModuleAgentTest	shouldTerminateOnArchiveStorageError	A	P3-4f	unit
 unit	ConsensusModuleAgentTest	shouldTerminateIfLocalArchiveConnectionIsLost	A	P3-4f	unit			
 unit	ConsensusModuleAgentTest	shouldPropagateAgentTerminationExceptionAndRunTerminationHooks	A	P3-4f	unit			
 unit	ConsensusModuleAgentTest	shouldDelegateNonTerminalErrorHandlingToElectionIfSet	A	P3-4f	unit			
-unit	ConsensusModuleSnapshotTakerTest	snapshotConsensusModuleState	A	P3-4d	unit			
-unit	ConsensusModuleSnapshotTakerTest	snapshotPendingServiceMessageTracker	A	P3-4d	unit			
-unit	ConsensusModuleSnapshotTakerTest	snapshotPendingServiceMessageTrackerWithServiceMessagesMissedByFollower	A	P3-4d	unit			
-unit	ConsensusModuleSnapshotTakerTest	snapshotTimer	A	P3-4d	unit			
-unit	ConsensusModuleSnapshotTakerTest	snapshotSessionShouldUseTryClaimIfDataFitsIntoMaxPayloadSize	A	P3-4d	unit			
-unit	ConsensusModuleSnapshotTakerTest	snapshotSessionShouldUseOfferIfDataDoesNotFitIntoMaxPayloadSize	A	P3-4d	unit			
+unit	ConsensusModuleSnapshotTakerTest	snapshotConsensusModuleState	A	P3-4d	unit			snapshot_consensus_module_state (weakened: the idle reset/idle interactions are a Mockito assertion with no counterpart here)
+unit	ConsensusModuleSnapshotTakerTest	snapshotPendingServiceMessageTracker	A	P3-4d	unit			snapshot_pending_service_message_tracker
+unit	ConsensusModuleSnapshotTakerTest	snapshotPendingServiceMessageTrackerWithServiceMessagesMissedByFollower	A	P3-4d	unit			snapshot_pending_service_message_tracker_with_service_messages_missed_by_follower
+unit	ConsensusModuleSnapshotTakerTest	snapshotTimer	A	P3-4d	unit			snapshot_timer
+unit	ConsensusModuleSnapshotTakerTest	snapshotSessionShouldUseTryClaimIfDataFitsIntoMaxPayloadSize	A	P3-4d	unit			snapshot_session_should_use_try_claim_if_data_fits_into_max_payload_size
+unit	ConsensusModuleSnapshotTakerTest	snapshotSessionShouldUseOfferIfDataDoesNotFitIntoMaxPayloadSize	A	P3-4d	unit			snapshot_session_should_use_offer_if_data_does_not_fit_into_max_payload_size
 unit	EgressPublisherTest	sendEventShouldUseTryClaimIfEventIsSmall	A	P3-4b	unit			send_event_should_use_try_claim_if_event_is_small
 unit	EgressPublisherTest	sendEventShouldUseOfferWhenEventIsTooBig	A	P3-4b	unit			send_event_should_use_offer_when_event_is_too_big
 unit	EgressPublisherTest	shouldSendChallengeResponseUsingTryClaimIfSmall	A	P3-4b	unit			should_send_challenge_response_using_try_claim_if_small
@@ -318,9 +318,9 @@ unit	EgressPublisherTest	shouldSendNewLeaderEventUsingOfferIfTooBig	A	P3-4b	unit
 unit	EgressPublisherTest	shouldSendAdminResponseUsingTryClaimIfSmall	A	P3-4b	unit			should_send_admin_response_using_try_claim_if_small
 unit	EgressPublisherTest	shouldSendAdminResponseUsingOfferIfTooBig	A	P3-4b	unit			should_send_admin_response_using_offer_if_too_big
 unit	IngressAdapterTest	shouldDelegateToConsensusModuleAgent	A	P3-4b	unit			should_delegate_unknown_schema_to_the_extension_hook,should_delegate_session_message_header_to_on_ingress_message,should_delegate_session_connect_request_to_on_session_connect,should_delegate_session_close_request_to_on_session_close,should_delegate_session_keep_alive_to_on_session_keep_alive,should_delegate_challenge_response_to_on_ingress_challenge_response,should_delegate_admin_request_to_on_admin_request (seven parameterised cases, one test each)
-unit	LogSourceValidatorTest	leaderLogSourceTypeShouldOnlyAcceptLeader	A	P3-4d	unit			
-unit	LogSourceValidatorTest	followerLogSourceTypeShouldOnlyAcceptFollowerAndUnknown	A	P3-4d	unit			
-unit	LogSourceValidatorTest	anyLogSourceTypeShouldAny	A	P3-4d	unit			
+unit	LogSourceValidatorTest	leaderLogSourceTypeShouldOnlyAcceptLeader	A	P3-9	unit			
+unit	LogSourceValidatorTest	followerLogSourceTypeShouldOnlyAcceptFollowerAndUnknown	A	P3-9	unit			
+unit	LogSourceValidatorTest	anyLogSourceTypeShouldAny	A	P3-9	unit			
 unit	NameResolutionClusterNodeTest	shouldConnectAndSendKeepAliveWithBadName	A	P3-6c	unit			
 unit	NodeStateFileTest	shouldFailIfCreateNewFalseAndFileDoesNotExist	A	P3-1f	unit			
 unit	NodeStateFileTest	shouldCreateIfCreateNewTrueAndFileDoesNotExist	A	P3-1f	unit			
@@ -419,9 +419,9 @@ unit	ServiceProxyTest	shouldSendClusterMemberExtendedResponse	A	P3-4c	unit			sho
 unit	SessionManagerTest	shouldProcessPendingStandbySnapshotNotificationsAfterReachingCommitPosition	A	P3-4b	unit		n/a:premium	
 unit	SessionManagerTest	shouldRetryCreatingResponsePublicationWhenResourceTemporarilyUnavailable	A	P3-4b	unit			the_resource_temporarily_unavailable_answer_reissues_the_add (weakened: the decision over the driver's error, not a driver)
 unit	SessionManagerTest	shouldProcessPendingStandbySnapshotNotificationsAfterProcessingDelay	A	P3-4b	unit		n/a:premium	
-unit	SnapshotReplicationTest	shouldReplicateTwoSnapshots	A	P3-4d	unit			
-unit	SnapshotReplicationTest	shouldNotBeCompleteIfNotSynced	A	P3-4d	unit			
-unit	SnapshotReplicationTest	closeWillCloseUnderlyingSnapshotReplication	A	P3-4d	unit			
+unit	SnapshotReplicationTest	shouldReplicateTwoSnapshots	A	P3-6b	unit			
+unit	SnapshotReplicationTest	shouldNotBeCompleteIfNotSynced	A	P3-6b	unit			
+unit	SnapshotReplicationTest	closeWillCloseUnderlyingSnapshotReplication	A	P3-6b	unit			
 unit	ClusterMarkFileTest	throwsExceptionIfErrorBufferLengthIsInvalid	A	P3-1b	unit			
 unit	ClusterMarkFileTest	shouldCallForceIfMarkFileIsNotClosed	A	P3-1b	unit	disabled:jre-range		
 unit	ClusterMarkFileTest	shouldNotCallForceIfMarkFileIsClosed	A	P3-1b	unit	disabled:jre-range		
