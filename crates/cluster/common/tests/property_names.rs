@@ -57,9 +57,9 @@ fn every_name_is_classified_or_pending() {
         }
     }
     // P3-4b honoured five more (the two supplier names, the ingress fragment
-    // limit and IPC switch, the session limit), so 44 rows are still Pending
-    // and must be gone by P3-11.
-    assert_eq!(pending, 44, "the P3-4a and P3-4b rows are classified");
+    // limit and IPC switch, the session limit) and P3-4c the three timer
+    // names, so 41 rows are still Pending and must be gone by P3-11.
+    assert_eq!(pending, 41, "the P3-4a..4c rows are classified");
 }
 
 #[test]

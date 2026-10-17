@@ -46,6 +46,7 @@ pub mod log_publisher;
 pub mod persist;
 pub mod session;
 pub mod state;
+pub mod timer;
 
 pub use agent::{ConsensusModuleAgent, LaunchComponents};
 pub use clock::{ClusterClock, MillisecondClusterClock};

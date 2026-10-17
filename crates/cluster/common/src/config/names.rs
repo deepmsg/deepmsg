@@ -195,8 +195,11 @@ pub const NAMES: &[(&str, Disposition)] = &[
         Disposition::Honoured,
     ),
     ("aeron.cluster.termination.timeout", Disposition::Pending),
-    ("aeron.cluster.ticks.per.wheel", Disposition::Pending),
-    ("aeron.cluster.timer.service.supplier", Disposition::Pending),
+    ("aeron.cluster.ticks.per.wheel", Disposition::Honoured),
+    (
+        "aeron.cluster.timer.service.supplier",
+        Disposition::Honoured,
+    ),
     ("aeron.cluster.tool.delay", Disposition::Pending),
     ("aeron.cluster.tool.replay.channel", Disposition::Pending),
     ("aeron.cluster.tool.replay.stream.id", Disposition::Pending),
@@ -205,6 +208,6 @@ pub const NAMES: &[(&str, Disposition)] = &[
         "aeron.cluster.total.snapshot.threshold",
         Disposition::Honoured,
     ),
-    ("aeron.cluster.wheel.tick.resolution", Disposition::Pending),
+    ("aeron.cluster.wheel.tick.resolution", Disposition::Honoured),
 ];
 // 80 names

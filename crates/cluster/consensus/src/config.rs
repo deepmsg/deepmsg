@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use deepmsg_archive::client::context::ArchiveContext;
 use deepmsg_cluster_common::config::{ConfigError, Properties};
+use deepmsg_codec_cluster::cluster_time_unit::ClusterTimeUnit;
 
 use crate::error::ClusterError;
 
@@ -160,6 +161,10 @@ pub const CLUSTER_IDLE_STRATEGY_PROP_NAME: &str = "aeron.cluster.idle.strategy";
 pub const CLUSTER_IDLE_STRATEGY_DEFAULT: &str = "org.agrona.concurrent.BackoffIdleStrategy";
 /// `Context.appVersion`'s default (`ConsensusModule.java:1610`).
 pub const APP_VERSION_DEFAULT: i32 = 1;
+
+/// The only clock this build has: the millisecond one
+/// (`MillisecondClusterClock`, `ClusterClock.timeUnit()` = milliseconds).
+pub const CLUSTER_TIME_UNIT: ClusterTimeUnit = ClusterTimeUnit::MILLIS;
 
 /// `ClusterSession.MAX_ENCODED_PRINCIPAL_LENGTH` (`ClusterSession.java:49`).
 pub const MAX_ENCODED_PRINCIPAL_LENGTH: usize = 4 * 1024;
@@ -320,6 +325,13 @@ pub struct ConsensusModuleConfig {
     /// `aeron.cluster.idle.strategy` (`ClusteredServiceContainer.java:575`),
     /// default `org.agrona.concurrent.BackoffIdleStrategy` (`:569`).
     pub idle_strategy: String,
+    /// `aeron.cluster.timer.service.supplier` (`ConsensusModule.java:935`).
+    pub timer_service_supplier: String,
+    /// `aeron.cluster.wheel.tick.resolution`, in nanoseconds
+    /// (`ConsensusModule.java:892-898`, default 8 ms).
+    pub wheel_tick_resolution_ns: i64,
+    /// `aeron.cluster.ticks.per.wheel` (`ConsensusModule.java:905-912`).
+    pub ticks_per_wheel: i32,
 }
 
 impl ConsensusModuleConfig {
@@ -522,6 +534,25 @@ impl ConsensusModuleConfig {
             delete_dir_on_start: false,
             app_version: APP_VERSION_DEFAULT,
             idle_strategy: idle_strategy.to_owned(),
+            timer_service_supplier: {
+                let name = properties
+                    .get(crate::timer::TIMER_SERVICE_SUPPLIER_PROP_NAME)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(crate::timer::TIMER_SERVICE_SUPPLIER_DEFAULT);
+                // The reference's own whitelist: two class names, everything
+                // else throws (`ConsensusModule.java:4589-4607`).
+                crate::timer::timer_service_kind(name)
+                    .map_err(|error| ConfigProblem::Invalid(error.to_string()))?;
+                name.to_owned()
+            },
+            wheel_tick_resolution_ns: properties.duration_ns(
+                crate::timer::WHEEL_TICK_RESOLUTION_PROP_NAME,
+                crate::timer::WHEEL_TICK_RESOLUTION_DEFAULT_NS,
+            )?,
+            ticks_per_wheel: int(
+                crate::timer::TICKS_PER_WHEEL_PROP_NAME,
+                crate::timer::TICKS_PER_WHEEL_DEFAULT,
+            )?,
         })
     }
 
