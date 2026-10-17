@@ -207,20 +207,22 @@ fn a_single_member_module_starts_allocates_its_counters_and_reaches_steady_state
     );
     assert_eq!(Some(SEMANTIC_VERSION), agent.mark_file().version());
 
+    // The recovered commit position is behind the appended position, so the
+    // election replays the tail (`P3-4d`) and must reach steady state.
     let deadline = Instant::now() + DEADLINE;
-    let error = loop {
+    while agent.election_state().is_some() || agent.state() != ModuleState::Active {
         assert!(
             Instant::now() < deadline,
-            "the restart did not reach the replay"
+            "the restart did not reach steady state (state={:?}, election={:?})",
+            agent.state(),
+            agent.election_state()
         );
-        if let Err(error) = agent.do_work() {
-            break error;
-        }
-    };
-    assert!(
-        error.to_string().contains("P3-4d"),
-        "the restart stopped for a reason other than the unimplemented replay: {error}"
-    );
+        agent
+            .do_work()
+            .expect("the restart's duty cycle is healthy");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(Role::Leader, agent.role());
 
     agent.close().expect("a clean close");
 }

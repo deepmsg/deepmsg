@@ -42,6 +42,7 @@ pub mod config;
 pub mod election;
 pub mod error;
 pub mod handles;
+pub mod log;
 pub mod log_publisher;
 pub mod persist;
 pub mod service_control;

@@ -102,10 +102,16 @@ pub trait SnapshotIdle {
     fn idle(&mut self);
 }
 
+/// A publication and the idle strategy together: the taker needs both in the
+/// same retry loop, and they both need the client, so they travel as one
+/// borrow.
+pub trait SnapshotSink: SnapshotSend + SnapshotIdle {}
+
+impl<T: SnapshotSend + SnapshotIdle> SnapshotSink for T {}
+
 /// `ConsensusModuleSnapshotTaker` (`ConsensusModuleSnapshotTaker.java:31-193`).
 pub struct ConsensusModuleSnapshotTaker<'a> {
-    send: &'a mut dyn SnapshotSend,
-    idle: &'a mut dyn SnapshotIdle,
+    sink: &'a mut dyn SnapshotSink,
     buffer: Vec<u8>,
     time_unit: ClusterTimeUnit,
     app_version: i32,
@@ -118,14 +124,12 @@ pub struct ConsensusModuleSnapshotTaker<'a> {
 impl<'a> ConsensusModuleSnapshotTaker<'a> {
     /// A taker over a publication, for one snapshot.
     pub fn new(
-        send: &'a mut dyn SnapshotSend,
-        idle: &'a mut dyn SnapshotIdle,
+        sink: &'a mut dyn SnapshotSink,
         time_unit: ClusterTimeUnit,
         app_version: i32,
     ) -> Self {
         Self {
-            send,
-            idle,
+            sink,
             buffer: vec![0_u8; 1024],
             time_unit,
             app_version,
@@ -228,7 +232,7 @@ impl<'a> ConsensusModuleSnapshotTaker<'a> {
                 .response_channel(session.response_channel().as_bytes());
         }
 
-        if length <= self.send.max_payload_length() {
+        if length <= self.sink.max_payload_length() {
             self.claim(length)
         } else {
             self.offer(length)
@@ -295,15 +299,13 @@ impl<'a> ConsensusModuleSnapshotTaker<'a> {
         self.claim(length)?;
 
         let mut error = None;
-        let send = &mut *self.send;
-        let idle = &mut *self.idle;
         tracker.for_each_pending(
             &mut |message: &[u8], _head_offset: usize| {
-                idle.reset();
+                self.sink.reset();
                 loop {
-                    match send.offer(message) {
+                    match self.sink.offer(message) {
                         SnapshotAppend::Ok => return true,
-                        SnapshotAppend::Retry => idle.idle(),
+                        SnapshotAppend::Retry => self.sink.idle(),
                         SnapshotAppend::Fatal(reason) => {
                             error = Some(ClusterError::Cluster(format!(
                                 "failed to offer a pending service message into the snapshot: {reason}"
@@ -352,11 +354,11 @@ impl<'a> ConsensusModuleSnapshotTaker<'a> {
     }
 
     fn claim(&mut self, length: usize) -> Result<(), ClusterError> {
-        self.idle.reset();
+        self.sink.reset();
         loop {
-            match self.send.try_claim(length, &self.buffer[..length]) {
+            match self.sink.try_claim(length, &self.buffer[..length]) {
                 SnapshotAppend::Ok => return Ok(()),
-                SnapshotAppend::Retry => self.idle.idle(),
+                SnapshotAppend::Retry => self.sink.idle(),
                 SnapshotAppend::Fatal(message) => {
                     self.failed = true;
                     return Err(ClusterError::Cluster(format!(
@@ -368,11 +370,11 @@ impl<'a> ConsensusModuleSnapshotTaker<'a> {
     }
 
     fn offer(&mut self, length: usize) -> Result<(), ClusterError> {
-        self.idle.reset();
+        self.sink.reset();
         loop {
-            match self.send.offer(&self.buffer[..length]) {
+            match self.sink.offer(&self.buffer[..length]) {
                 SnapshotAppend::Ok => return Ok(()),
-                SnapshotAppend::Retry => self.idle.idle(),
+                SnapshotAppend::Retry => self.sink.idle(),
                 SnapshotAppend::Fatal(message) => {
                     self.failed = true;
                     return Err(ClusterError::Cluster(format!(

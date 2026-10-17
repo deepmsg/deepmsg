@@ -117,7 +117,7 @@ impl ElectionHost for Mock {
     }
     fn new_log_replay(&mut self, _l: i64, _a: i64) -> Result<LogReplay, ClusterError> {
         self.calls.push("new_log_replay");
-        Ok(LogReplay)
+        Ok(LogReplay::completed())
     }
     fn new_log_replication(
         &mut self,

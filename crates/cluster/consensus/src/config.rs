@@ -70,6 +70,10 @@ pub const REPLAY_CHANNEL_DEFAULT: &str = "aeron:ipc";
 pub const REPLAY_STREAM_ID_PROP_NAME: &str = "aeron.cluster.replay.stream.id";
 /// `REPLAY_STREAM_ID_DEFAULT` (`ClusteredServiceContainer.java:277`).
 pub const REPLAY_STREAM_ID_DEFAULT: i32 = 103;
+/// `aeron.cluster.log.fragment.limit` (`ConsensusModule.java:...`), default 10.
+pub const LOG_FRAGMENT_LIMIT_PROP_NAME: &str = "aeron.cluster.log.fragment.limit";
+/// `LOG_FRAGMENT_LIMIT_DEFAULT` (`ConsensusModule.java:...`).
+pub const LOG_FRAGMENT_LIMIT_DEFAULT: i32 = 10;
 /// `aeron.cluster.replication.channel` (`ConsensusModule.java:620`); **required**.
 pub const REPLICATION_CHANNEL_PROP_NAME: &str = "aeron.cluster.replication.channel";
 /// `aeron.cluster.control.channel` (`ClusteredServiceContainer.java:283`).
@@ -309,6 +313,8 @@ pub struct ConsensusModuleConfig {
     pub replay_channel: String,
     /// `aeron.cluster.replay.stream.id`.
     pub replay_stream_id: i32,
+    /// `aeron.cluster.log.fragment.limit`.
+    pub log_fragment_limit: usize,
     /// Service stream id (CM -> container).
     pub service_stream_id: i32,
     /// Consensus module stream id (container -> CM).
@@ -534,6 +540,17 @@ impl ConsensusModuleConfig {
                 .unwrap_or(REPLAY_CHANNEL_DEFAULT)
                 .to_owned(),
             replay_stream_id: int(REPLAY_STREAM_ID_PROP_NAME, REPLAY_STREAM_ID_DEFAULT)?,
+            log_fragment_limit: usize::try_from(int(
+                LOG_FRAGMENT_LIMIT_PROP_NAME,
+                LOG_FRAGMENT_LIMIT_DEFAULT,
+            )?)
+            .map_err(|_| ConfigProblem::Value {
+                name: LOG_FRAGMENT_LIMIT_PROP_NAME,
+                value: properties
+                    .get(LOG_FRAGMENT_LIMIT_PROP_NAME)
+                    .unwrap_or_default()
+                    .to_owned(),
+            })?,
             service_stream_id: int(SERVICE_STREAM_ID_PROP_NAME, SERVICE_STREAM_ID_DEFAULT)?,
             consensus_module_stream_id: int(
                 CONSENSUS_MODULE_STREAM_ID_PROP_NAME,

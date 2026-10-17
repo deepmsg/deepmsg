@@ -74,6 +74,7 @@ use crate::config::{CLUSTER_IDLE_STRATEGY_PROP_NAME, CLUSTER_TIME_UNIT, Consensu
 use crate::election::{Election, ElectionHost, ElectionState};
 use crate::error::ClusterError;
 use crate::handles::{LogReplay, RecordingReplication};
+use crate::log::{AgentLogReplay, LogReplayHandler};
 use crate::log_publisher::LogPublisher;
 use crate::persist::node_state::NodeStateFile;
 use crate::persist::recording_log::{self, RecordingExtent, RecordingLog, RecoveryPlan};
@@ -102,6 +103,7 @@ use crate::timer::{
     TimerHandler, TimerService, TimerServiceKind, timer_service_kind, wheel_tick_resolution,
 };
 use deepmsg_core::logbuffer::append::Appended;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 
 use publisher::ConsensusPublisher;
 
@@ -212,6 +214,10 @@ pub struct ConsensusModuleAgent {
     state: ModuleState,
     role: Role,
     election: Option<Election>,
+    /// Whether the current (first) election is the node's startup one
+    /// (`Election.isNodeStartup`): sessions recovered from a snapshot are
+    /// closed for TIMEOUT at the end of it (`prepareSessionsForNewTerm`).
+    node_startup_election: bool,
     leadership_term_id: i64,
 
     last_append_position: i64,
@@ -235,6 +241,7 @@ pub struct ConsensusModuleAgent {
     expected_ack_position: i64,
     service_client_ids: Vec<i64>,
     timer: Box<dyn TimerService>,
+    log_replay: Option<AgentLogReplay>,
     uncommitted_timers: std::collections::VecDeque<(i64, i64)>,
     expired_timer_count: deepmsg_cluster_common::collections::HashMap<i64, i64>,
     live_log_destination: String,
@@ -484,6 +491,7 @@ impl ConsensusModuleAgent {
             state: ModuleState::Init,
             role: Role::Follower,
             election: None,
+            node_startup_election: true,
             leadership_term_id: NULL_VALUE,
             last_append_position: NULL_VALUE,
             last_quorum_backtrack_commit_position: NULL_POSITION,
@@ -505,6 +513,7 @@ impl ConsensusModuleAgent {
             expected_ack_position: NULL_POSITION,
             service_client_ids,
             timer,
+            log_replay: None,
             uncommitted_timers: std::collections::VecDeque::new(),
             expired_timer_count: deepmsg_cluster_common::collections::HashMap::default(),
             live_log_destination: String::new(),
@@ -604,6 +613,7 @@ impl ConsensusModuleAgent {
         }
 
         work += self.consensus_adapter_poll()?;
+        work += self.poll_log_replay()?;
 
         if self.election.is_some() {
             work += self.drive_election_once(now_ns)?;
@@ -1047,6 +1057,11 @@ impl ConsensusModuleAgent {
         self.sessions.sessions().len()
     }
 
+    /// Whether a log replay is still in progress (P3-4d).
+    pub fn is_replaying(&self) -> bool {
+        self.log_replay.is_some()
+    }
+
     /// How far the log publication has got, which advances when a message is
     /// appended even before it is committed.
     pub fn log_position(&self) -> i64 {
@@ -1297,10 +1312,10 @@ impl ElectionHost for ConsensusModuleAgent {
 
     fn new_log_replay(
         &mut self,
-        _log_position: i64,
-        _append_position: i64,
+        log_position: i64,
+        append_position: i64,
     ) -> Result<LogReplay, ClusterError> {
-        Err(ClusterError::Cluster("replaying a log is P3-4d".to_owned()))
+        ConsensusModuleAgent::start_log_replay(self, log_position, append_position)
     }
 
     fn new_log_replication(
@@ -1470,7 +1485,10 @@ impl ElectionHost for ConsensusModuleAgent {
         // There are no sessions to prepare before P3-4d loads a snapshot, but
         // the order is kept so that slice has the call where the reference has
         // it.
-        self.sessions.prepare_sessions_for_new_term(false, now_ns);
+        let is_leader_startup = self.node_startup_election;
+        self.node_startup_election = false;
+        self.sessions
+            .prepare_sessions_for_new_term(is_leader_startup, now_ns);
         self.connect_ingress()?;
 
         Ok(())
@@ -3369,6 +3387,324 @@ impl ConsensusModuleAgent {
                 *slot = ack.relevant_id();
             }
         }
+    }
+}
+
+/// The replay's record handlers, borrowing the agent's fields.
+struct AgentLogReplayHandler<'a> {
+    sessions: &'a mut SessionManager,
+    timer: &'a mut dyn TimerService,
+    trackers: &'a mut [PendingServiceMessageTracker],
+    expired_timer_count: &'a mut deepmsg_cluster_common::collections::HashMap<i64, i64>,
+    leadership_term_id: i64,
+    service_count: i32,
+    state_change: Option<ModuleState>,
+    new_leadership_term_id: Option<i64>,
+    deferred_snapshot: Option<(i64, i64)>,
+}
+
+impl LogReplayHandler for AgentLogReplayHandler<'_> {
+    fn on_replay_session_message(
+        &mut self,
+        cluster_session_id: i64,
+        timestamp: i64,
+    ) -> Result<(), ClusterError> {
+        if let Some(session) = self.sessions.find_by_session_id_mut(cluster_session_id) {
+            session.set_time_of_last_activity_ns(timestamp.saturating_mul(1_000_000));
+        } else if cluster_session_id < 0 {
+            // A service's own message: the follower sweeps its tracker.
+            let service_id =
+                crate::service_control::service_id_from_log_message(cluster_session_id);
+            if let Some(tracker) = usize::try_from(service_id)
+                .ok()
+                .and_then(|index| self.trackers.get_mut(index))
+            {
+                tracker.sweep_follower_messages(cluster_session_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn on_replay_timer_event(&mut self, correlation_id: i64) -> Result<(), ClusterError> {
+        if !self.timer.cancel_timer_by_correlation_id(correlation_id) {
+            // The timer was already replayed as expired; a later schedule for
+            // the same id is absorbed (`ConsensusModuleAgent.java:1539-1545`).
+            let count = self
+                .expired_timer_count
+                .get(&correlation_id)
+                .copied()
+                .unwrap_or(0);
+            self.expired_timer_count.insert(correlation_id, count + 1);
+        }
+        Ok(())
+    }
+
+    fn on_replay_session_open(
+        &mut self,
+        log_position: i64,
+        correlation_id: i64,
+        cluster_session_id: i64,
+        timestamp: i64,
+        response_stream_id: i32,
+        response_channel: &str,
+    ) -> Result<(), ClusterError> {
+        self.sessions.on_replay_session_open(
+            log_position,
+            correlation_id,
+            cluster_session_id,
+            timestamp,
+            response_stream_id,
+            response_channel,
+        )
+    }
+
+    fn on_replay_session_close(
+        &mut self,
+        cluster_session_id: i64,
+        close_reason: deepmsg_codec_cluster::close_reason::CloseReason,
+    ) -> Result<(), ClusterError> {
+        self.sessions
+            .on_replay_session_close(cluster_session_id, close_reason);
+        Ok(())
+    }
+
+    fn on_replay_cluster_action(
+        &mut self,
+        leadership_term_id: i64,
+        log_position: i64,
+        timestamp: i64,
+        action: deepmsg_codec_cluster::cluster_action::ClusterAction,
+        flags: i32,
+    ) -> Result<(), ClusterError> {
+        if leadership_term_id != self.leadership_term_id {
+            return Ok(());
+        }
+        match action {
+            deepmsg_codec_cluster::cluster_action::ClusterAction::SUSPEND => {
+                self.state_change = Some(ModuleState::Suspended);
+            }
+            deepmsg_codec_cluster::cluster_action::ClusterAction::RESUME => {
+                self.state_change = Some(ModuleState::Active);
+            }
+            deepmsg_codec_cluster::cluster_action::ClusterAction::SNAPSHOT if flags == 0 => {
+                self.state_change = Some(ModuleState::Snapshot);
+                if self.service_count == 0 {
+                    // `onReplayClusterAction` (`:1587`): with no services the
+                    // snapshot set is complete immediately.
+                    self.deferred_snapshot = Some((log_position, timestamp));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn on_replay_new_leadership_term_event(
+        &mut self,
+        leadership_term_id: i64,
+        _log_position: i64,
+        _timestamp: i64,
+        _term_base_log_position: i64,
+        _time_unit: i32,
+        _app_version: i32,
+    ) -> Result<(), ClusterError> {
+        self.new_leadership_term_id = Some(leadership_term_id);
+        Ok(())
+    }
+
+    fn on_replay_extension_message(
+        &mut self,
+        schema_id: u16,
+        _template_id: u16,
+        _version: u16,
+        _message: &[u8],
+    ) -> Result<(), ClusterError> {
+        Err(ClusterError::Cluster(format!(
+            "expected schemaId={}, actual={schema_id} \
+             (no extension is configured)",
+            deepmsg_codec_cluster::SBE_SCHEMA_ID
+        )))
+    }
+}
+
+impl ConsensusModuleAgent {
+    /// Start replaying our own log tail (`newLogReplay`, `:1840-1843`).
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] when the archive will not start the replay or the
+    /// subscription cannot be made.
+    fn start_log_replay(
+        &mut self,
+        log_position: i64,
+        append_position: i64,
+    ) -> Result<crate::handles::LogReplay, ClusterError> {
+        let replay_channel = self.config.replay_channel.clone();
+        let replay_stream_id = self.config.replay_stream_id;
+        let replay_session_id = self.archive.start_replay(
+            &mut self.client,
+            self.log_recording_id,
+            &replay_channel,
+            replay_stream_id,
+            &deepmsg_archive::client::proxy::ReplayParams {
+                position: log_position,
+                length: append_position - log_position,
+                ..deepmsg_archive::client::proxy::ReplayParams::default()
+            },
+        )?;
+
+        // The subscription must name the replay's session id, which is the low
+        // 32 bits of the replay id (`ArchiveConductor.java:956`).
+        let log_session_id = replay_session_id as i32;
+        let mut channel = ChannelUri::parse(&replay_channel)
+            .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+        channel.put("session-id", log_session_id.to_string());
+        let subscription_id =
+            self.client
+                .add_subscription(&channel.build(), replay_stream_id, COMMAND_TIMEOUT)?;
+
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let position = std::sync::Arc::new(AtomicI64::new(log_position));
+        self.log_replay = Some(AgentLogReplay {
+            subscription_id,
+            replay_session_id,
+            log_session_id,
+            start_position: log_position,
+            stop_position: append_position,
+            adapter: crate::log::LogAdapter::new(),
+            done: std::sync::Arc::clone(&done),
+            position: std::sync::Arc::clone(&position),
+        });
+
+        Ok(crate::handles::LogReplay::shared(done, position))
+    }
+
+    /// The agent's `replayLogPoll` (`:1845-1867`): advance the replay, commit
+    /// what it has reached, and finish it at the stop position.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError::ClusterEvent`] when the image closes before the stop
+    /// position — the reference's "unexpected image close".
+    fn poll_log_replay(&mut self) -> Result<usize, ClusterError> {
+        let state_change;
+        let new_leadership_term_id;
+        let deferred_snapshot;
+        let work;
+
+        {
+            let Self {
+                client,
+                archive,
+                log_replay,
+                sessions,
+                timer,
+                trackers,
+                expired_timer_count,
+                leadership_term_id,
+                config,
+                counters,
+                ..
+            } = self;
+
+            let Some(replay) = log_replay.as_mut() else {
+                return Ok(0);
+            };
+
+            if !replay.adapter.has_image() {
+                let Some(image) =
+                    client
+                        .subscription(replay.subscription_id)
+                        .and_then(|subscription| {
+                            subscription.image_by_session_id(replay.log_session_id)
+                        })
+                else {
+                    return Ok(0);
+                };
+                let join_position = image.join_position();
+                if join_position != replay.start_position {
+                    return Err(ClusterError::Cluster(format!(
+                        "joinPosition={join_position} expected startPosition={}",
+                        replay.start_position
+                    )));
+                }
+                replay.adapter.set_image(image.registration_id());
+                return Ok(1);
+            }
+
+            let mut handler = AgentLogReplayHandler {
+                sessions,
+                timer: &mut **timer,
+                trackers,
+                expired_timer_count,
+                leadership_term_id: *leadership_term_id,
+                service_count: config.service_count,
+                state_change: None,
+                new_leadership_term_id: None,
+                deferred_snapshot: None,
+            };
+
+            work = replay.adapter.poll(
+                client,
+                replay.subscription_id,
+                &mut handler,
+                config.log_fragment_limit,
+            )?;
+            state_change = handler.state_change;
+            new_leadership_term_id = handler.new_leadership_term_id;
+            deferred_snapshot = handler.deferred_snapshot;
+
+            let position = replay.adapter.position();
+            let commit_position = counters.commit_position;
+            let current = read_counter(&*client, commit_position).unwrap_or(0);
+            if position > current {
+                write_counter(&*client, commit_position, position);
+            }
+            replay
+                .position
+                .store(position, std::sync::atomic::Ordering::Release);
+
+            if position >= replay.stop_position {
+                // `LogReplay.close` (`:62-75`): stop the replay and give the
+                // subscription back.
+                let _ = archive.stop_replay(client, replay.replay_session_id);
+                let _ = client.remove_subscription(replay.subscription_id, COMMAND_TIMEOUT);
+                replay
+                    .done
+                    .store(true, std::sync::atomic::Ordering::Release);
+                *log_replay = None;
+            } else {
+                let image_closed = client
+                    .subscription(replay.subscription_id)
+                    .and_then(|subscription| {
+                        subscription.images().iter().find(|image| {
+                            Some(image.registration_id()) == replay.adapter.image_registration_id()
+                        })
+                    })
+                    .is_none_or(deepmsg_client::image::Image::is_closed);
+                if image_closed {
+                    return Err(ClusterError::ClusterEvent(format!(
+                        "unexpected image close when replaying log: position={position}"
+                    )));
+                }
+            }
+        }
+
+        if let Some(state) = state_change {
+            self.set_state(state, "replayed cluster action");
+        }
+        if let Some(term) = new_leadership_term_id {
+            self.leadership_term_id = term;
+            for tracker in self.trackers.iter_mut() {
+                tracker.set_leadership_term_id(term);
+            }
+        }
+        if let Some((log_position, timestamp)) = deferred_snapshot {
+            self.take_snapshot_with_acks(timestamp, log_position, &[])?;
+            self.set_state(ModuleState::Active, "snapshot complete");
+        }
+
+        Ok(work.unwrap_or(0))
     }
 }
 

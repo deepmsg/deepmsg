@@ -29,6 +29,10 @@ use deepmsg_codec_cluster::timer_codec::TimerDecoder;
 
 /// A publication whose two write paths answer from a scripted list.
 struct MockSnapshotSend {
+    /// `reset()` calls, for the reference's idle assertions.
+    resets: Cell<usize>,
+    /// `idle()` calls.
+    idles: Cell<usize>,
     claim_answers: RefCell<Vec<SnapshotAppend>>,
     offer_answers: RefCell<Vec<SnapshotAppend>>,
     claims: RefCell<Vec<Vec<u8>>>,
@@ -41,6 +45,8 @@ struct MockSnapshotSend {
 impl MockSnapshotSend {
     fn answering(claims: &[SnapshotAppend], offers: &[SnapshotAppend]) -> Self {
         Self {
+            resets: Cell::new(0),
+            idles: Cell::new(0),
             claim_answers: RefCell::new(claims.to_vec()),
             offer_answers: RefCell::new(offers.to_vec()),
             claims: RefCell::new(Vec::new()),
@@ -99,14 +105,7 @@ impl SnapshotSend for MockSnapshotSend {
     }
 }
 
-/// The reference asserts `reset()` once and an `idle()` between attempts.
-#[derive(Default)]
-struct MockIdle {
-    resets: Cell<usize>,
-    idles: Cell<usize>,
-}
-
-impl SnapshotIdle for MockIdle {
+impl SnapshotIdle for MockSnapshotSend {
     fn reset(&mut self) {
         self.resets.set(self.resets.get() + 1);
     }
@@ -116,11 +115,8 @@ impl SnapshotIdle for MockIdle {
     }
 }
 
-fn taker<'a>(
-    send: &'a mut MockSnapshotSend,
-    idle: &'a mut MockIdle,
-) -> ConsensusModuleSnapshotTaker<'a> {
-    ConsensusModuleSnapshotTaker::new(send, idle, ClusterTimeUnit::MILLIS, 1)
+fn taker<'a>(send: &'a mut MockSnapshotSend) -> ConsensusModuleSnapshotTaker<'a> {
+    ConsensusModuleSnapshotTaker::new(send, ClusterTimeUnit::MILLIS, 1)
 }
 
 const RETRY: SnapshotAppend = SnapshotAppend::Retry;
@@ -129,8 +125,7 @@ const OK: SnapshotAppend = SnapshotAppend::Ok;
 #[test]
 fn snapshot_consensus_module_state() {
     let mut send = MockSnapshotSend::answering(&[RETRY, OK], &[]);
-    let mut idle = MockIdle::default();
-    let mut taker = taker(&mut send, &mut idle);
+    let mut taker = taker(&mut send);
 
     taker
         .snapshot_consensus_module_state(17, 23, 42, 64)
@@ -160,8 +155,7 @@ fn snapshot_pending_service_message_tracker() {
     let expected_capacity = tracker.size();
 
     let mut send = MockSnapshotSend::answering(&[RETRY, OK], &[RETRY, OK]);
-    let mut idle = MockIdle::default();
-    let mut taker = taker(&mut send, &mut idle);
+    let mut taker = taker(&mut send);
     let correction = taker
         .snapshot_tracker(&tracker)
         .expect("the tracker record and its message go out");
@@ -203,8 +197,7 @@ fn snapshot_pending_service_message_tracker_with_service_messages_missed_by_foll
     assert!(tracker.next_service_session_id() < expected_log_service_session_id + 1);
 
     let mut send = MockSnapshotSend::answering(&[RETRY, OK], &[]);
-    let mut idle = MockIdle::default();
-    let mut taker = taker(&mut send, &mut idle);
+    let mut taker = taker(&mut send);
     let correction = taker
         .snapshot_tracker(&tracker)
         .expect("the tracker record goes out");
@@ -227,8 +220,7 @@ fn snapshot_pending_service_message_tracker_with_service_messages_missed_by_foll
 #[test]
 fn snapshot_timer() {
     let mut send = MockSnapshotSend::answering(&[RETRY, RETRY, OK], &[]);
-    let mut idle = MockIdle::default();
-    let mut taker = taker(&mut send, &mut idle);
+    let mut taker = taker(&mut send);
 
     taker.snapshot_timer(7, 9_000);
     assert!(!taker.failed());
@@ -247,8 +239,7 @@ fn snapshot_session_should_use_try_claim_if_data_fits_into_max_payload_size() {
     let session = snapshot_session();
     let length = 8 + 40 + 4 + session.response_channel().len();
     let mut send = MockSnapshotSend::answering(&[RETRY, OK], &[]).with_max_payload_length(length);
-    let mut idle = MockIdle::default();
-    let mut taker = taker(&mut send, &mut idle);
+    let mut taker = taker(&mut send);
 
     taker
         .snapshot_session(&session)
@@ -265,8 +256,7 @@ fn snapshot_session_should_use_offer_if_data_does_not_fit_into_max_payload_size(
     let length = 8 + 40 + 4 + session.response_channel().len();
     let mut send =
         MockSnapshotSend::answering(&[], &[RETRY, OK]).with_max_payload_length(length - 1);
-    let mut idle = MockIdle::default();
-    let mut taker = taker(&mut send, &mut idle);
+    let mut taker = taker(&mut send);
 
     taker
         .snapshot_session(&session)
@@ -307,8 +297,7 @@ fn verify_session_record(bytes: &[u8]) {
 #[test]
 fn the_snapshot_markers_carry_the_type_and_position() {
     let mut send = MockSnapshotSend::answering(&[OK, OK], &[]);
-    let mut idle = MockIdle::default();
-    let mut taker = taker(&mut send, &mut idle);
+    let mut taker = taker(&mut send);
 
     taker.mark_begin(1_024, 5).expect("BEGIN");
     taker.mark_end(1_024, 5).expect("END");
@@ -371,8 +360,7 @@ fn a_snapshot_only_writes_open_and_closing_sessions() {
     assert_eq!(ClusterSessionState::Closing, manager.sessions()[1].state());
 
     let mut send = MockSnapshotSend::answering(&[OK, OK], &[]);
-    let mut idle = MockIdle::default();
-    let mut taker = taker(&mut send, &mut idle);
+    let mut taker = taker(&mut send);
     manager.snapshot_sessions(&mut taker).expect("two records");
 
     assert_eq!(2, send.claims.borrow().len());
