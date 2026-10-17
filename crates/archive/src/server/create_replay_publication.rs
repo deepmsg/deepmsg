@@ -29,6 +29,7 @@
 //! returns to, because this session has no conductor.
 
 use deepmsg_client::client::{AsyncAddPoll, DEFAULT_TIMEOUT};
+use deepmsg_cnc::counters::CountersReader;
 
 use crate::server::control_session::Publications;
 use crate::server::replay_session::GENERIC;
@@ -50,6 +51,27 @@ pub struct LimitCounter {
     pub type_id: i32,
     /// The registration that must still own it (`:544-578`).
     pub registration_id: i64,
+}
+
+/// Read the counter a replay is bounded by, if the slot is still that counter.
+///
+/// The type and the registration are checked as well as the value: the driver
+/// reuses ids, and a slot that has become somebody else's counter is not this
+/// one (`ReplaySession.notExtended`, `:544-578`, which asks
+/// `countersReader.getCounterRegistrationId`).
+///
+/// ★ It lives here rather than in the conductor because **the replayer reads it
+/// too**: the reference's session reads its `limitPosition` in its own turn, and
+/// a conductor that read it for the session put a turn's delay on every replayed
+/// message (see `LimitUpdate::Follow`).
+pub(crate) fn read_limit_counter<Access>(
+    counters: &CountersReader<'_, Access>,
+    limit: LimitCounter,
+) -> Option<i64> {
+    let descriptor = counters.get(limit.counter_id)?;
+
+    (descriptor.type_id == limit.type_id && descriptor.registration_id == limit.registration_id)
+        .then_some(descriptor.value)
 }
 
 /// Everything one replay was asked for: `ArchiveConductor.startReplay`'s

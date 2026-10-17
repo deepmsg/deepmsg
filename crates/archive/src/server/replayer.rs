@@ -24,6 +24,7 @@ use deepmsg_cnc::counters::CountersReader;
 use deepmsg_core::buffer::ReadWrite;
 
 use crate::mark::NULL_VALUE;
+use crate::server::create_replay_publication::{LimitCounter, read_limit_counter};
 use crate::server::replay_session::{Progress, Publication, ReplaySession, State};
 
 use crate::server::counters::{
@@ -250,15 +251,19 @@ impl Replayer {
 /// and [`LimitUpdate::Gone`] clamps what the replay may still send to where it
 /// has already got to — which is what takes it to `INACTIVE`.
 ///
-/// ★ **The conductor computes it and a session cannot** (P2-9a): the number is a
-/// recording's position, which lives either in the driver's counters or in the
-/// **conductor's own** `recordingSessionByIdMap`, and a replay's thread has
-/// neither. So it crosses — one per live replay per turn, and only when it
-/// moved.
+/// ★ **Which one it is depends on where the number lives.** A counter in the
+/// driver's region is read by the replayer itself ([`LimitUpdate::Follow`]),
+/// which is the reference's shape and saves a conductor turn on every message;
+/// a position the **conductor alone** can see — its own `recordingSessionByIdMap`
+/// for a recording whose session has not published a counter yet — still
+/// crosses as [`LimitUpdate::ExtendTo`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitUpdate {
     /// The counter, or the live recording, says this.
     ExtendTo(i64),
+    /// Read this counter in every turn, from here on: the reference's
+    /// `limitPosition` (`ReplaySession.java:374`, `:546-578`).
+    Follow(LimitCounter),
     /// There is nothing left to read: the counter was closed, or its slot has
     /// been taken by another counter.
     Gone,
@@ -280,6 +285,9 @@ pub struct RunningReplay {
     pub publication: Box<dyn Publication>,
     /// The replay itself.
     pub session: ReplaySession,
+    /// The counter this replay follows, once the conductor has named it. Read in
+    /// this thread's own turn rather than carried across from the conductor.
+    pub follow: Option<LimitCounter>,
 }
 
 /// What the conductor tells a replayer that is on a thread of its own.
@@ -751,6 +759,21 @@ fn drive_one(
     now_ns: u64,
     notices: &mut Vec<ReplayNotice>,
 ) {
+    // ★ The reference's `notExtended` (`ReplaySession.java:374`, `:546-578`),
+    // read **here**, in the turn that is about to read the recording, rather
+    // than in the conductor's turn and carried over. The counter is in the
+    // driver's region, which this thread has a mapping of; a turn between the
+    // recorder writing and the replay reading is a turn of latency on every
+    // message, and it showed as 2.6× on the cell's p50.
+    if let Some(limit) = replay.follow {
+        match read_limit_counter(counters, limit) {
+            Some(position) => replay.session.extend_stop_position(position),
+            // `notExtended`'s closed arm: the publisher is gone, so the limit
+            // freezes where the replay has got to and the reader reaches it.
+            None => replay.session.limit_counter_gone(),
+        }
+    }
+
     let progress = replay
         .session
         .do_work(replay.publication.as_mut(), counters, now_ns);
@@ -797,6 +820,7 @@ fn drive_one(
 fn apply_limit(replay: &mut RunningReplay, update: LimitUpdate) {
     match update {
         LimitUpdate::ExtendTo(position) => replay.session.extend_stop_position(position),
+        LimitUpdate::Follow(limit) => replay.follow = Some(limit),
         LimitUpdate::Gone => replay.session.limit_counter_gone(),
     }
 }
