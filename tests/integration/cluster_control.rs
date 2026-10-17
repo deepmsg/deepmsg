@@ -522,7 +522,7 @@ fn the_node_toggle_values_are_refused_and_reset() {
 /// this slice, so its send answer is the reference's "no publication" one.
 #[test]
 fn a_null_publication_answers_false() {
-    let mut publisher = ConsensusPublisher::new(0);
+    let mut publisher = ConsensusPublisher::new();
     assert!(!publisher.termination_position(1, 0, 0));
     assert!(!publisher.termination_ack(0, 0, 0, 1));
 }

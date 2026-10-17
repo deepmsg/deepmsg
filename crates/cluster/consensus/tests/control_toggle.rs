@@ -210,7 +210,7 @@ fn a_new_termination_round_clears_the_previous_answers() {
     // A publisher with no per-member publications answers `false` for every
     // send, which is the reference's null-publication answer
     // (`ConsensusPublisher.java:387-390`); the callback is what records it.
-    let mut publisher = ConsensusPublisher::new(0);
+    let mut publisher = ConsensusPublisher::new();
     let mut failed = Vec::new();
     let mut termination = ClusterTermination::new(i64::MAX);
     termination.termination_position(

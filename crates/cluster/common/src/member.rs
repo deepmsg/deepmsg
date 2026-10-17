@@ -339,6 +339,20 @@ pub fn has_quorum_at_position(
     votes >= quorum_threshold(members.len())
 }
 
+/// Is a quorum of members alive? `hasActiveQuorum` (`:900-918`).
+pub fn has_active_quorum(members: &[ClusterMember], now_ns: i64, timeout_ns: i64) -> bool {
+    let mut threshold = quorum_threshold(members.len()) as i32;
+    for member in members {
+        if member.is_active(now_ns, timeout_ns) {
+            threshold -= 1;
+            if threshold <= 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The 4-argument form (`:1173`): positive when the left log is more recent.
 pub fn compare_log_values(
     lhs_term: i64,
