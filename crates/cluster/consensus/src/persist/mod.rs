@@ -5,3 +5,4 @@
 //! container and the backup write them too.
 
 pub mod node_state;
+pub mod recording_log;
