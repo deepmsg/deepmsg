@@ -81,6 +81,12 @@ BENCH_ARCHIVE="${BENCH_ARCHIVE:-$DEEPMSG_DIR/target/release/deepmsg-archive}"
 BENCH_ARCHIVE_DRIVER="${BENCH_ARCHIVE_DRIVER:-$DEEPMSG_DIR/target/release/deepmsg-archiving-media-driver}"
 BENCH_ARCHIVE_NODE="${BENCH_ARCHIVE_NODE:-$DEEPMSG_DIR/target/rig/release/archive-node}"
 
+# The counters a cell is explained with are read straight out of the driver's CnC
+# file, because both archives allocate the same type ids under the same labels —
+# so one reader serves both arms, and a cell whose archive was the reference's is
+# read with this build's tool rather than with a different one from each side.
+BENCH_CNC_DUMP="${BENCH_CNC_DUMP:-$DEEPMSG_DIR/target/release/cnc-dump}"
+
 BENCH_AERON_DIR="${BENCH_AERON_DIR:-/dev/shm/aeron}"
 
 # Where the built C driver arms are collected, one directory each. Defined here

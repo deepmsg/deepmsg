@@ -40,6 +40,10 @@ echo "== the driver and the archive (the workspace's release profile) =="
 cargo build --release -p deepmsg-driver -p deepmsg-archive --bins
 
 echo
+echo "== the counters reader (the archive batch explains a cell with it) =="
+cargo build --release -p deepmsg-tools --bin cnc-dump
+
+echo
 echo "== the rig and the two nodes =="
 echo "CARGO_TARGET_DIR=target/rig \\"
 echo "CARGO_PROFILE_RELEASE_LTO=fat \\"
@@ -57,10 +61,10 @@ CARGO_TARGET_DIR=target/rig \
 echo
 echo "== what a batch will use =="
 ls -l target/release/deepmsg-driver target/release/deepmsg-archive \
-    target/release/deepmsg-archiving-media-driver \
+    target/release/deepmsg-archiving-media-driver target/release/cnc-dump \
     target/rig/release/loadtest-rig target/rig/release/echo-node target/rig/release/archive-node
 echo
 echo "== digests (these are what the fingerprint records) =="
 sha256sum target/release/deepmsg-driver target/release/deepmsg-archive \
-    target/release/deepmsg-archiving-media-driver \
+    target/release/deepmsg-archiving-media-driver target/release/cnc-dump \
     target/rig/release/loadtest-rig target/rig/release/echo-node target/rig/release/archive-node
