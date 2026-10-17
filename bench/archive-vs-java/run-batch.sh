@@ -146,10 +146,14 @@ else
     _batch_ip=localhost
     _peer_ip=localhost
 fi
-# The client half's driver. On one machine it cannot share the server's: two
-# drivers in one aeron directory is two drivers writing one CnC file. On two
-# machines each host has its own `/dev/shm`, so the same name means "here".
-_client_aeron_dir="$BENCH_AERON_DIR-client"
+# ★ On one machine there is **one driver** and everything attaches to it: the
+# node, the archive and the client are all its clients. A second driver was the
+# first shape here, copied from the two-machine one, and it is wrong for a
+# measured reason: both drivers read `aeron.{conductor,sender,receiver}.cpu.affinity`
+# from the same properties file, so their six threads would share cores 1/2/3
+# while four other cores sat idle. Measured 2026-10-17, which is why this is a
+# note and not a choice.
+_client_aeron_dir="$BENCH_AERON_DIR"
 _peer_root=/tmp/archive-batch
 _local_driver_properties=""
 _archive_channels=""
@@ -219,9 +223,6 @@ aeron.archive.control.channel=aeron:udp?endpoint=$_batch_ip:$control_port"
     _local_driver_properties="$dir/driver.properties"
     sed "s#^aeron.dir=.*#aeron.dir=$BENCH_AERON_DIR#" \
         "$BENCH_DIR/lib/conf/benchmark.properties" >"$_local_driver_properties"
-    _client_driver_properties="$dir/client-driver.properties"
-    sed "s#^aeron.dir=.*#aeron.dir=$_client_aeron_dir#" \
-        "$BENCH_DIR/lib/conf/benchmark.properties" >"$_client_driver_properties"
 }
 
 # `lib/conf/archive.properties` is a file the reference's own scripts take as a
@@ -493,22 +494,9 @@ EOF
 }
 
 # --- the client half, when it is on this machine -----------------------------
-
-# Its own driver, in its own aeron directory: two drivers cannot share one CnC
-# file, and the point of the single-machine shape is that the client's half is
-# exactly the two-machine client's half with a shorter wire.
-_start_local_client_driver() {
-    local dir=$1
-    DEEPMSG_DRIVER="$BENCH_DRIVER" BENCH_OUT_DIR="$dir/shims" \
-        "$BENCH_LIB/shims/aeronmd" "$_client_driver_properties" \
-        </dev/null >"$dir/client-driver.log" 2>&1 &
-    _client_driver_pid=$!
-    _await_file "$_client_aeron_dir/cnc.dat" local || {
-        echo "  the client's driver never published its CnC file" >&2
-        tail -5 "$dir/client-driver.log" >&2
-        return 1
-    }
-}
+#
+# The client attaches to the same driver the archive and the node do, and the
+# eight cores line up one thread each — see the note on `_client_aeron_dir`.
 
 _run_rust_client_local() {
     local dir=$1 prefix=$2
@@ -532,12 +520,11 @@ _run_rust_client_local() {
 
 _run_java_client_local() {
     local dir=$1 prefix=$2
-    # `embedded.media.driver=true` here and nowhere else: on one machine the
-    # reference's own single-host script lets the client carry its driver, and
-    # this is that shape (`remote-live-replay-benchmarks` starts a driver on each
-    # machine only because there are two of them).
+    # `embedded.media.driver=false`, because the client is a client of the one
+    # driver the server half started — the same driver the node and the archive
+    # are on. See the note on `_client_aeron_dir`.
     JVM_OPTS="-Daeron.dir=$_client_aeron_dir \
--Dio.aeron.benchmarks.aeron.embedded.media.driver=true \
+-Dio.aeron.benchmarks.aeron.embedded.media.driver=false \
 -Dio.aeron.benchmarks.output.directory=$dir \
 -Dio.aeron.benchmarks.output.file=$prefix \
 -Dio.aeron.benchmarks.message.rate=$rate \
@@ -587,14 +574,14 @@ _collect() {
 
 _stop_all() {
     local pid
-    for pid in ${_node_pid:-} ${_archive_pid:-} ${_driver_pid:-} ${_server_pid:-} ${_java_driver_pid:-} ${_client_driver_pid:-}; do
+    for pid in ${_node_pid:-} ${_archive_pid:-} ${_driver_pid:-} ${_server_pid:-} ${_java_driver_pid:-}; do
         [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
     done
     if [ "$mode" = two ]; then
         _peer_kill "$_peer_root/driver.pid"
         _peer_kill "$_peer_root/jdriver.pid"
     fi
-    _node_pid=""; _archive_pid=""; _driver_pid=""; _server_pid=""; _java_driver_pid=""; _client_driver_pid=""
+    _node_pid=""; _archive_pid=""; _driver_pid=""; _server_pid=""; _java_driver_pid=""
 }
 trap _stop_all EXIT
 
@@ -651,7 +638,6 @@ _cell() {
                 _start_peer_client_driver "$dir" || { _stop_all; return 1; }
                 _run_rust_client "$dir" "$round/$name/run-$run" "$prefix"
             else
-                _start_local_client_driver "$dir" || { _stop_all; return 1; }
                 _run_rust_client_local "$dir" "$prefix"
             fi || {
                 echo "  the client exited non-zero" >&2
@@ -743,7 +729,7 @@ if [ "$list_only" = 1 ]; then
     if [ "$mode" = two ]; then
         echo "aeron dir       $BENCH_AERON_DIR (both hosts, their own /dev/shm)"
     else
-        echo "aeron dirs      $BENCH_AERON_DIR (server), $_client_aeron_dir (client)"
+        echo "aeron dir       $BENCH_AERON_DIR (one driver, every process on it)"
     fi
     echo "archive dir     $archive_dir"
     if [ "$mode" = two ]; then
@@ -778,8 +764,13 @@ bench_fingerprint "$out/fingerprint.txt" >/dev/null
         echo "peer            $BENCH_PEER_SSH: driver + rig; cores $peer_rig_cpu"
     else
         echo "network         one machine (loopback); no peer"
-        echo "server          driver + archive + archive node; cores $archive_cpus / $node_cpu"
-        echo "client          driver + rig; core $BENCH_RIG_CPU"
+        echo "server          driver + archive + archive node"
+        echo "client          rig (on the same driver)"
+        # Measured 2026-10-17: seven of these eight saturate their core and the
+        # driver's conductor runs at ~34%, so core 1 is where the kernel and the
+        # softirqs have room. Written down because a table without its cores is
+        # a table you cannot re-run.
+        echo "cores           driver conductor 1, sender 2, receiver 3; archive $archive_cpus (conductor/recorder/replayer); node $node_cpu; rig $BENCH_RIG_CPU"
     fi
     echo "channels        destination $_batch_ip:$destination_port  source $_peer_ip:$source_port"
     echo "                control     $_batch_ip:$control_port  response <each host>:0 (ephemeral)"
