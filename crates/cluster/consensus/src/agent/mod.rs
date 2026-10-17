@@ -269,6 +269,11 @@ pub struct ConsensusModuleAgent {
     notified_commit_position: i64,
     slow_tick_deadline_ns: i64,
     mark_file_update_deadline_ns: i64,
+    /// `ClusterMember.ingressEndpoints(activeMembers)` (`:2380`): the
+    /// `id=endpoint,...` string a redirect, an admin response and a new session
+    /// all carry. The members are fixed for the node's life, so it is made
+    /// once — a steady-state duty cycle must not allocate (performance spec R1).
+    ingress_endpoints: String,
 
     consensus_subscription_id: i64,
     sessions: SessionManager,
@@ -522,6 +527,7 @@ impl ConsensusModuleAgent {
             TimerServiceKind::PriorityHeap => Box::new(PriorityHeapTimerService::new()),
         };
 
+        let endpoints = ingress_endpoints(&members);
         let mut agent = Self {
             config,
             clock,
@@ -562,6 +568,7 @@ impl ConsensusModuleAgent {
             notified_commit_position: 0,
             slow_tick_deadline_ns: 0,
             mark_file_update_deadline_ns: 0,
+            ingress_endpoints: endpoints,
             consensus_subscription_id,
             sessions,
             egress,
@@ -674,6 +681,31 @@ impl ConsensusModuleAgent {
     /// reference calls to retry an election. Returning it here is the visible
     /// answer instead of a duty cycle that pretends to have recovered.
     pub fn do_work(&mut self) -> Result<usize, ClusterError> {
+        let result = self.do_work_inner();
+
+        // `doWork`'s catch block (`:439-466`): a termination passes through; a
+        // storage-space refusal and a lost archive both end the agent with the
+        // reference's counted error first. Anything else is returned, which is
+        // what the reference rethrows when no election is in progress.
+        let Err(error) = result else {
+            return result;
+        };
+        if error.is_termination() {
+            return Err(error);
+        }
+        if storage_space_refusal(&error) {
+            self.report_counted_error();
+            return Err(self.unexpected_termination(&error.to_string()));
+        }
+        if !self.archive.is_connected(&self.client) {
+            self.report_counted_error();
+            return Err(self.unexpected_termination("local archive is not connected"));
+        }
+
+        Err(error)
+    }
+
+    fn do_work_inner(&mut self) -> Result<usize, ClusterError> {
         let timestamp = self.clock.time();
         let now_ns = self.clock.convert_to_nanos(timestamp);
         self.duty_cycle.measure(&self.client, now_ns);
@@ -739,7 +771,7 @@ impl ConsensusModuleAgent {
             let leadership_term_id = self.leadership_term_id;
             let member_id = self.config.member_id;
             let leader_member_id = self.members[self.this_member_index].id;
-            let ingress_endpoints = ingress_endpoints(&self.members);
+            let ingress_endpoints = self.ingress_endpoints.as_str();
             let clock = self.clock;
 
             let Self {
@@ -759,7 +791,7 @@ impl ConsensusModuleAgent {
                 leadership_term_id,
                 member_id,
                 leader_member_id,
-                ingress_endpoints: &ingress_endpoints,
+                ingress_endpoints,
                 now_ns,
             };
 
@@ -817,7 +849,7 @@ impl ConsensusModuleAgent {
         let leadership_term_id = self.leadership_term_id;
         let member_id = self.config.member_id;
         let leader_member_id = self.members[self.this_member_index].id;
-        let ingress_endpoints = ingress_endpoints(&self.members);
+        let ingress_endpoints = self.ingress_endpoints.as_str();
         let clock = self.clock;
 
         let Self {
@@ -837,7 +869,7 @@ impl ConsensusModuleAgent {
             leadership_term_id,
             member_id,
             leader_member_id,
-            ingress_endpoints: &ingress_endpoints,
+            ingress_endpoints,
             now_ns,
         };
 
@@ -1105,6 +1137,20 @@ impl ConsensusModuleAgent {
         Ok(())
     }
 
+    /// `unexpectedTermination` (`:3297-3307`): a counted error has already
+    /// happened; tell this node's services where to stop, stop the recording,
+    /// mark the state closed, and end the duty cycle.
+    fn unexpected_termination(&mut self, reason: &str) -> ClusterError {
+        if self.config.service_count > 0 {
+            self.send_service_termination_position_at(0, true);
+        }
+        if self.try_stop_log_recording().is_err() {
+            self.report_counted_error();
+        }
+        self.set_state(ModuleState::Closed, reason);
+        ClusterError::AgentTermination(reason.to_owned())
+    }
+
     /// `closeAndTerminate` (`:3290-3295`): stop the recording, mark the state,
     /// and hand the duty cycle the one error that ends it.
     ///
@@ -1160,12 +1206,18 @@ impl ConsensusModuleAgent {
     /// `serviceProxy.terminationPosition(terminationPosition, ackRequired)`
     /// (`:2621`, `:2508`, `:3129`): tell this node's services where to stop.
     fn send_service_termination_position(&mut self, ack_required: bool) -> bool {
+        self.send_service_termination_position_at(self.termination_position, ack_required)
+    }
+
+    /// The same at an explicit position: `unexpectedTermination` sends
+    /// **position 0** (`:3302`), not the termination position.
+    fn send_service_termination_position_at(&mut self, position: i64, ack_required: bool) -> bool {
         let send = PublicationSender {
             client: &self.client,
             registration_id: self.service_publication_id,
         };
         self.service_proxy
-            .termination_position(&send, self.termination_position, ack_required)
+            .termination_position(&send, position, ack_required)
     }
 
     /// The member the reference calls `leaderMember` (`:2369-2381`).
@@ -2126,6 +2178,12 @@ impl ElectionHost for ConsensusModuleAgent {
 // Helpers.
 // ---------------------------------------------------------------------------
 
+/// `ArchiveException.STORAGE_SPACE` (`ArchiveException.java:84`): the one
+/// archive refusal `doWork` treats as terminal (`:446-450`).
+fn storage_space_refusal(error: &ClusterError) -> bool {
+    matches!(error, ClusterError::ArchiveRefused { code: 11, .. })
+}
+
 fn cluster(error: impl std::fmt::Display) -> ClusterError {
     ClusterError::Cluster(error.to_string())
 }
@@ -2659,8 +2717,7 @@ impl ConsensusModuleAgent {
 
         let position_limit = self.log_publisher.position_limit(&self.client);
         let now_ns = self.clock.time_nanos();
-        let ingress_endpoints = ingress_endpoints(&self.members);
-        let egress_channel = self.config.egress_channel.clone();
+        let ingress_endpoints = self.ingress_endpoints.as_str();
         let role = self.role;
         let leadership_term_id = self.leadership_term_id;
         let ingress_ipc_allowed = self.config.ingress_ipc_allowed;
@@ -2670,6 +2727,7 @@ impl ConsensusModuleAgent {
             ingress,
             sessions,
             log_publisher,
+            config,
             ..
         } = self;
         let mut handler = AgentIngressHandler {
@@ -2680,8 +2738,8 @@ impl ConsensusModuleAgent {
             position_limit,
             now_ns,
             ingress_ipc_allowed,
-            egress_channel: egress_channel.as_deref(),
-            ingress_endpoints: &ingress_endpoints,
+            egress_channel: config.egress_channel.as_deref(),
+            ingress_endpoints,
             deferred_closes: Vec::new(),
             deferred_admins: Vec::new(),
             extension_messages: 0,
@@ -2730,7 +2788,7 @@ impl ConsensusModuleAgent {
                 leadership_term_id,
                 member_id,
                 leader_member_id,
-                ingress_endpoints: &ingress_endpoints,
+                ingress_endpoints,
                 now_ns,
             };
             for (term, cluster_session_id) in deferred_closes {
@@ -3247,7 +3305,7 @@ impl ConsensusModuleAgent {
         let state = self.state;
         let now_ns = self.clock.time_nanos();
         let clock = self.clock;
-        let ingress_endpoints = ingress_endpoints(&self.members);
+        let ingress_endpoints = self.ingress_endpoints.as_str();
 
         let (work, deferred_snapshot, deferred_termination, deferred_close) = {
             let Self {
@@ -3303,7 +3361,7 @@ impl ConsensusModuleAgent {
                     leadership_term_id,
                     member_id,
                     leader_member_id,
-                    ingress_endpoints: &ingress_endpoints,
+                    ingress_endpoints,
                     now_ns,
                 };
                 for cluster_session_id in deferred_closes {
@@ -4341,6 +4399,27 @@ impl ConsensusModuleAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ConsensusModuleAgentTest.shouldTerminateOnArchiveStorageError`: the
+    /// classification is the part of that case that does not need the driver.
+    #[test]
+    fn storage_space_is_the_one_archive_refusal_that_ends_the_agent() {
+        let storage_space = ClusterError::ArchiveRefused {
+            code: 11,
+            message: "low storage".to_owned(),
+        };
+        assert!(storage_space_refusal(&storage_space));
+
+        for code in [0, 10, 12, 16] {
+            assert!(!storage_space_refusal(&ClusterError::ArchiveRefused {
+                code,
+                message: String::new(),
+            }));
+        }
+        assert!(!storage_space_refusal(&ClusterError::Cluster(
+            "anything else".to_owned()
+        )));
+    }
 
     #[test]
     fn a_response_channel_is_unchanged_without_an_egress_template() {

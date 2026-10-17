@@ -439,6 +439,61 @@ HEADER_COMMON = """\
 # column's reason to exist is that "green but testing less" is invisible in a
 # red/green table.
 OURS = {
+    # ★ P3-4f: ConsensusModuleAgentTest's twenty. A row whose port would need a
+    # part of the agent that does not exist yet says so rather than staying
+    # empty, because "no entry" and "checked and not portable" read the same.
+    ("ConsensusModuleAgentTest", "shouldUseAssignedRoleName"):
+        "(deferred: role/thread naming is P3-8; the agent has no role-name field)",
+    ("ConsensusModuleAgentTest", "shouldLimitActiveSessions"):
+        "should_reject_a_connect_request_over_the_concurrent_session_limit "
+        "(weakened: SessionManager level, not agent.onSessionConnect + doWork)",
+    ("ConsensusModuleAgentTest", "shouldCloseInactiveSession"):
+        "(deferred: the timeout close lives in SessionManager.check_sessions; "
+        "the agent-level clock-driven case needs the TestClusterClock seam, P3-4f's remainder)",
+    ("ConsensusModuleAgentTest", "shouldCloseTerminatedSession"):
+        "a_service_joins_and_then_timers_sessions_and_membership_all_work "
+        "(the CloseSession step: CLOSED/SERVICE_ACTION over the real control channel)",
+    ("ConsensusModuleAgentTest", "shouldSuspendThenResume"):
+        "suspend_stops_ingress_and_resume_puts_it_back "
+        "(integration: state counter, both actions in the log, ingress parked while suspended)",
+    ("ConsensusModuleAgentTest", "shouldThrowClusterTerminationExceptionUponShutdown"):
+        "shutdown_snapshots_and_then_ends_the_duty_cycle "
+        "(AgentTermination from the SHUTDOWN switch; the QUITTING branch itself is unreachable in 1.53.2)",
+    ("ConsensusModuleAgentTest", "responseChannelIsBuiltBasedOnTheEgressChannel"):
+        ",".join([
+            "a_response_channel_is_unchanged_without_an_egress_template",
+            "an_ipc_response_channel_becomes_the_egress_channel_unless_ipc_ingress_is_allowed",
+            "the_egress_channels_parameters_are_put_onto_a_udp_response_channel",
+        ]) + " (three unit tests for the reference's six CSV rows)",
+    ("ConsensusModuleAgentTest", "shouldPublishLogMessageButNotSnapshotOnStandbySnapshot"):
+        "(deviation: standby snapshots are premium; the switch is refused by name and reset, see the P3-4e record)",
+    ("ConsensusModuleAgentTest", "onNewLeadershipTermShouldUpdateTimeOfLastLeaderMessageReceived"):
+        "(deferred: the consensus message dispatch is ConsensusAdapter, P3-5b/6a)",
+    ("ConsensusModuleAgentTest", "onCommitPositionShouldUpdateTimeOfLastLeaderMessageReceived"):
+        "(deferred: ConsensusAdapter, P3-5b/6a)",
+    ("ConsensusModuleAgentTest", "shouldDelegateHandlingToRegisteredExtension"):
+        "(deferred: ConsensusModuleExtension is a seam only; no implementation is in P3's scope)",
+    ("ConsensusModuleAgentTest", "shouldThrowExceptionOnUnknownSchemaAndNoAdapter"):
+        "(deferred: ConsensusAdapter's unknown-schema refusal, P3-5b)",
+    ("ConsensusModuleAgentTest", "shouldHandlePaddingMessageAtEndOfTerm"):
+        "(deferred: padding frames are dropped by the client's fragment assembler before the "
+        "log adapter sees them; a replay fixture is P3-6b)",
+    ("ConsensusModuleAgentTest", "notifiedCommitPositionShouldNotGoBackwardsUponReceivingCommitPosition"):
+        "(deferred: the position engine is P3-6a)",
+    ("ConsensusModuleAgentTest", "notifiedCommitPositionShouldNotGoBackwardsUponElectionCompletion"):
+        "(deferred: the position engine is P3-6a)",
+    ("ConsensusModuleAgentTest", "notifiedCommitPositionShouldNotGoBackwardsUponReceivingNewLeadershipTerm"):
+        "(deferred: the position engine is P3-6a)",
+    ("ConsensusModuleAgentTest", "shouldTerminateOnArchiveStorageError"):
+        "storage_space_is_the_one_archive_refusal_that_ends_the_agent "
+        "(the classification only; the end-to-end case needs an archive that refuses)",
+    ("ConsensusModuleAgentTest", "shouldTerminateIfLocalArchiveConnectionIsLost"):
+        "(the check is in doWork (Archive::is_connected); a case needs an archive that can be "
+        "disconnected without also closing the client, which no instrument here can do)",
+    ("ConsensusModuleAgentTest", "shouldPropagateAgentTerminationExceptionAndRunTerminationHooks"):
+        "(deferred: termination hooks are Context callbacks and land with the runner, P3-4f's remainder)",
+    ("ConsensusModuleAgentTest", "shouldDelegateNonTerminalErrorHandlingToElectionIfSet"):
+        "(deferred: Election::handle_error is P3-5b; doWork returns the error instead)",
     ("EgressPublisherTest", "sendEventShouldUseTryClaimIfEventIsSmall"):
         "send_event_should_use_try_claim_if_event_is_small",
     ("EgressPublisherTest", "sendEventShouldUseOfferWhenEventIsTooBig"):

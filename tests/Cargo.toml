@@ -642,3 +642,12 @@ path = "integration/archive_replay_merge.rs"
 [[test]]
 name = "short_datagram"
 path = "integration/short_datagram.rs"
+
+# P3-4f's LC-4b: our consensus module, the reference's own service container
+# (a Java `ClusteredService` from the fork's `deepmsg-tests/java/`) and the
+# reference's own `AeronCluster` client. Needs the reference jar, a JDK, our
+# cluster-node binary and our archiving media driver binary.
+[[test]]
+name = "cluster_lc4b"
+path = "interop/cluster_lc4b.rs"
+required-features = ["interop"]

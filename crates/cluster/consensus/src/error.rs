@@ -23,6 +23,18 @@ pub enum ClusterError {
     /// An invariant is broken. Counterpart of `ClusterException`.
     Cluster(String),
 
+    /// The archive refused a request with one of its own codes
+    /// (`ArchiveException`). Kept as a variant rather than folded into
+    /// [`ClusterError::Cluster`] because `doWork` classifies one of them:
+    /// storage space (`ArchiveException.STORAGE_SPACE`, code 11) ends the
+    /// agent (`ConsensusModuleAgent.java:446-450`).
+    ArchiveRefused {
+        /// The archive's own code, `0..=16`.
+        code: i64,
+        /// Its reason, as it sent it.
+        message: String,
+    },
+
     /// A deadline passed. During an election this is a WARN, not a failure.
     /// Counterpart of `TimeoutException`.
     Timeout(String),
@@ -65,7 +77,17 @@ impl From<deepmsg_cluster_common::decode::DecodeError> for ClusterError {
 
 impl From<deepmsg_archive::client::archive::ArchiveError> for ClusterError {
     fn from(error: deepmsg_archive::client::archive::ArchiveError) -> Self {
-        Self::Cluster(error.to_string())
+        match error {
+            deepmsg_archive::client::archive::ArchiveError::Refused {
+                archive_error_code,
+                message,
+                ..
+            } => Self::ArchiveRefused {
+                code: archive_error_code,
+                message,
+            },
+            other => Self::Cluster(other.to_string()),
+        }
     }
 }
 
@@ -81,6 +103,9 @@ impl core::fmt::Display for ClusterError {
             Self::AgentTermination(msg) => write!(f, "agent termination: {msg}"),
             Self::ClusterEvent(msg) => write!(f, "cluster event: {msg}"),
             Self::Cluster(msg) => write!(f, "cluster: {msg}"),
+            Self::ArchiveRefused { code, message } => {
+                write!(f, "archive refused (code {code}): {message}")
+            }
             Self::Timeout(msg) => write!(f, "timeout: {msg}"),
         }
     }

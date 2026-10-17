@@ -443,6 +443,20 @@ impl Archive {
         &self.context
     }
 
+    /// Whether the answers' subscription still has an image — the reference's
+    /// `AeronArchive.State.CONNECTED`.
+    ///
+    /// The reference holds a state field it moves from its `Aeron` close and
+    /// unavailable-image handlers. This asks the same question of the
+    /// subscription directly, so there is no second copy of the answer to
+    /// disagree with the images.
+    #[must_use]
+    pub fn is_connected(&self, client: &Client) -> bool {
+        client
+            .subscription(self.subscription)
+            .is_some_and(|subscription| !subscription.images().is_empty())
+    }
+
     /// The subscription the answers arrive on.
     #[must_use]
     pub const fn subscription(&self) -> i64 {
