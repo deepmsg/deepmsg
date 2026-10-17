@@ -1,0 +1,18 @@
+[package]
+name = "deepmsg-cluster-common"
+description = "deepmsg cluster: the parts every cluster crate needs — properties, collections, guarded decoding (P3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+deepmsg-core = { path = "../../core" }
+deepmsg-cnc = { path = "../../cnc" }
+deepmsg-codec-cluster-mark = { path = "../../codec/cluster-mark" }
+
+[dev-dependencies]
+deepmsg-core = { path = "../../core" }
+
+[lints]
+workspace = true
