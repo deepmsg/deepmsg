@@ -156,3 +156,380 @@ pub struct Election {
     /// `:137` — how long a replication may stall before it is a `Timeout`.
     replication_deadline_ns: i64,
 }
+
+// ---------------------------------------------------------------------------
+// P3-5a-beta: INIT, and the leader states 5..8.
+//
+// Only these five states exist so far. Everything else — CANVASS, the two
+// ballots, and every follower state — is P3-5b, and calling `do_work` in
+// `CANVASS` returns an error rather than pretending.
+// ---------------------------------------------------------------------------
+
+use crate::error::ClusterError;
+
+impl Election {
+    /// Start an election. `Election(..)` (`Election.java:110-150`).
+    ///
+    /// The constructor's side effects are kept: the initial deadline is one day
+    /// in the past so the first heartbeat check fires, and `candidate_term_id`
+    /// starts at the term the log is at.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        this_member_id: i32,
+        member_ids: Vec<i32>,
+        is_node_startup: bool,
+        graceful_closed_leader_id: i32,
+        leadership_term_id: i64,
+        term_base_log_position: i64,
+        log_position: i64,
+        append_position: i64,
+        now_ns: i64,
+        rng_seed: u64,
+    ) -> Self {
+        let initial_time_of_last_update_ns = now_ns - 86_400_000_000_000;
+        Self {
+            is_node_startup,
+            is_extended_canvass: is_node_startup,
+            graceful_closed_leader_id,
+            initial_log_leadership_term_id: leadership_term_id,
+            initial_term_base_log_position: term_base_log_position,
+            initial_time_of_last_update_ns,
+            this_member_id,
+            member_ids,
+            rng: ElectionRng::new(rng_seed),
+            leadership_term_id,
+            log_leadership_term_id: leadership_term_id,
+            log_position,
+            append_position,
+            notified_commit_position: 0,
+            state: ElectionState::Init,
+            candidate_term_id: leadership_term_id,
+            is_first_init: true,
+            is_leader_startup: false,
+            leader_member_id: -1,
+            log_session_id: -1,
+            leader_recording_id: -1,
+            catchup_join_position: -1,
+            replication_leadership_term_id: -1,
+            replication_stop_position: -1,
+            replication_term_base_log_position: 0,
+            last_published_commit_position: 0,
+            last_published_append_position: 0,
+            log_subscription_id: None,
+            log_replay: None,
+            log_replication: None,
+            time_of_last_state_change_ns: initial_time_of_last_update_ns,
+            time_of_last_update_ns: initial_time_of_last_update_ns,
+            time_of_last_commit_position_update_ns: initial_time_of_last_update_ns,
+            nomination_deadline_ns: 0,
+            replication_deadline_ns: 0,
+        }
+    }
+
+    /// The state the machine is in.
+    pub fn state(&self) -> ElectionState {
+        self.state
+    }
+
+    /// The term this member is in.
+    pub fn leadership_term_id(&self) -> i64 {
+        self.leadership_term_id
+    }
+
+    /// The leader this election settled on, or `-1`.
+    pub fn leader_member_id(&self) -> i32 {
+        self.leader_member_id
+    }
+
+    /// One duty cycle. `Election.doWork(nowNs)` (`:152-260`).
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError::Cluster`] for a state this slice does not implement —
+    /// returning something plausible would be worse than saying so.
+    pub fn do_work(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+    ) -> Result<usize, ClusterError> {
+        let now_ns = host.now_ns();
+        match self.state {
+            ElectionState::Init => self.init(host, now_ns),
+            ElectionState::LeaderLogReplication => {
+                self.leader_log_replication(host, sender, now_ns)
+            }
+            ElectionState::LeaderReplay => self.leader_replay(host, sender, now_ns),
+            ElectionState::LeaderInit => self.leader_init(host, now_ns),
+            ElectionState::LeaderReady => self.leader_ready(host, sender, now_ns),
+            other => Err(ClusterError::Cluster(format!(
+                "state {other:?} is P3-5b, not implemented yet"
+            ))),
+        }
+    }
+
+    /// `init` (`:653-694`).
+    fn init(&mut self, host: &mut dyn ElectionHost, now_ns: i64) -> Result<usize, ClusterError> {
+        if self.is_first_init {
+            self.is_first_init = false;
+            if !self.is_node_startup {
+                self.prepare_for_new_leadership(host, now_ns)?;
+            }
+        } else {
+            self.prepare_for_new_leadership(host, now_ns)?;
+            self.log_session_id = -1;
+        }
+
+        self.notified_commit_position = 0;
+        let persisted = host.node_state().candidate_term().candidate_term_id;
+        self.candidate_term_id = persisted.max(self.leadership_term_id);
+
+        if self.member_ids.len() == 1 && self.this_member_id == self.member_ids[0] {
+            // The reference's short circuit (`:683-691`): nominate self, win
+            // the ballot, and go straight to LEADER_LOG_REPLICATION.
+            self.candidate_term_id += 1;
+            let term = self.candidate_term_id;
+            let position = self.log_position;
+            let epoch_ms = host.epoch_ms();
+            host.node_state()
+                .update_candidate_term_id(term, position, epoch_ms)
+                .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+            self.leader_member_id = self.this_member_id;
+            self.leadership_term_id = term;
+            self.transition(ElectionState::LeaderLogReplication, now_ns, host)?;
+        } else {
+            self.transition(ElectionState::Canvass, now_ns, host)?;
+        }
+        Ok(1)
+    }
+
+    /// `prepareForNewLeadership` (`Election.java:1360`, on the agent).
+    fn prepare_for_new_leadership(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        now_ns: i64,
+    ) -> Result<(), ClusterError> {
+        self.log_position = host.prepare_for_new_leadership(self.log_position, now_ns)?;
+        Ok(())
+    }
+
+    /// `leaderLogReplication` (`:811-828`).
+    fn leader_log_replication(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        let mut work = 0;
+        self.time_of_last_update_ns = now_ns;
+
+        let quorum_position =
+            host.quorum_position_bounded_by_leader_log(self.append_position, now_ns);
+        work += self.publish_new_leadership_term_on_interval(host, sender, quorum_position, now_ns);
+        work += self.publish_commit_position_on_interval(host, quorum_position, now_ns);
+
+        if quorum_position >= self.append_position {
+            work += 1;
+            self.transition(ElectionState::LeaderReplay, now_ns, host)?;
+        }
+        Ok(work)
+    }
+
+    /// `leaderReplay` (`:830-866`).
+    fn leader_replay(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        let mut work = 0;
+        match self.log_replay {
+            None => {
+                if self.log_position < self.append_position {
+                    self.log_replay =
+                        Some(host.new_log_replay(self.log_position, self.append_position)?);
+                } else {
+                    self.transition(ElectionState::LeaderInit, now_ns, host)?;
+                }
+                work += 1;
+                self.is_leader_startup = self.is_node_startup;
+                self.log_position = self.append_position;
+            }
+            Some(_) => {
+                // The replay is advanced by the host's own poll (the archive
+                // replay poll, `ConsensusModuleAgent.java:1845`); the election
+                // only watches for it being done. P3-5b's `LogReplay` will carry
+                // `is_done`; until then a replay is treated as complete.
+                self.log_replay = None;
+                self.log_position = self.append_position;
+                work += 1;
+                self.transition(ElectionState::LeaderInit, now_ns, host)?;
+            }
+        }
+
+        let quorum_position =
+            host.quorum_position_bounded_by_leader_log(self.append_position, now_ns);
+        work += self.publish_new_leadership_term_on_interval(host, sender, quorum_position, now_ns);
+        work += self.publish_commit_position_on_interval(host, quorum_position, now_ns);
+        Ok(work)
+    }
+
+    /// `leaderInit` (`:868-875`).
+    fn leader_init(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        host.join_log_as_leader(
+            self.leadership_term_id,
+            self.log_position,
+            self.log_session_id,
+            self.is_leader_startup,
+        )?;
+        self.update_recording_log(host, now_ns)?;
+        self.transition(ElectionState::LeaderReady, now_ns, host)?;
+        Ok(1)
+    }
+
+    /// `leaderReady` (`:877-895`).
+    fn leader_ready(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        now_ns: i64,
+    ) -> Result<usize, ClusterError> {
+        let quorum_position =
+            host.quorum_position_bounded_by_leader_log(self.append_position, now_ns);
+        let mut work =
+            host.update_leader_position(now_ns, self.append_position, quorum_position)?;
+        work += self.publish_new_leadership_term_on_interval(host, sender, quorum_position, now_ns);
+
+        let heartbeat_timeout = host.leader_heartbeat_timeout_ns();
+        let log_position = self.log_position;
+        let term = self.leadership_term_id;
+        // The member table lives in the host, so the quorum question is asked
+        // there rather than recomputed here from a partial copy.
+        let has_quorum = host.has_quorum_at_position(term, log_position, now_ns, heartbeat_timeout);
+        if has_quorum && host.append_new_leadership_term_event(now_ns)? {
+            host.election_complete(now_ns)?;
+            self.transition(ElectionState::Closed, now_ns, host)?;
+            work += 1;
+        }
+        Ok(work)
+    }
+
+    /// `updateRecordingLog` (`:1523-1528`).
+    fn update_recording_log(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        now_ns: i64,
+    ) -> Result<(), ClusterError> {
+        let recording_id = host.log_recording_id();
+        if recording_id != -1 {
+            let service_id = if self.leader_member_id == -1 {
+                -1
+            } else {
+                self.leader_member_id
+            };
+            let (term, position) = (self.leadership_term_id, self.log_position);
+            host.recording_log()
+                .append_term(term, position, position, now_ns, recording_id, service_id)
+                .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// `publishNewLeadershipTermOnInterval` (`:1198`).
+    fn publish_new_leadership_term_on_interval(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        sender: &mut dyn ConsensusSender,
+        quorum_position: i64,
+        now_ns: i64,
+    ) -> usize {
+        let interval = host.leader_heartbeat_interval_ns();
+        if now_ns < self.time_of_last_update_ns + interval {
+            return 0;
+        }
+        self.time_of_last_update_ns = now_ns;
+        let leadership_term_id = self.leadership_term_id;
+        let log_leadership_term_id = self.log_leadership_term_id;
+        let log_position = self.log_position;
+        let leader_id = self.this_member_id;
+        let this_id = self.this_member_id;
+        for member_id in self.member_ids.iter().copied() {
+            if member_id == this_id {
+                continue;
+            }
+            sender.new_leadership_term(
+                member_id,
+                log_leadership_term_id,
+                leadership_term_id,
+                self.initial_term_base_log_position,
+                log_position,
+                leadership_term_id,
+                self.initial_term_base_log_position,
+                log_position,
+                quorum_position,
+                self.leader_recording_id,
+                now_ns,
+                leader_id,
+                self.log_session_id,
+                0,
+                self.is_node_startup,
+            );
+        }
+        1
+    }
+
+    /// `publishCommitPositionOnInterval` (`:1212`).
+    fn publish_commit_position_on_interval(
+        &mut self,
+        host: &mut dyn ElectionHost,
+        quorum_position: i64,
+        now_ns: i64,
+    ) -> usize {
+        let interval = host.leader_heartbeat_interval_ns();
+        if now_ns < self.time_of_last_commit_position_update_ns + interval
+            && quorum_position == self.last_published_commit_position
+        {
+            return 0;
+        }
+        let term = self.leadership_term_id;
+        if host.publish_commit_position(quorum_position, term).is_err() {
+            return 0;
+        }
+        self.last_published_commit_position = quorum_position;
+        self.time_of_last_commit_position_update_ns = now_ns;
+        1
+    }
+
+    /// `state(newState, nowNs, reason)` (`:1385-1438`): the transition **and**
+    /// its side effects. The role axis is driven from here and nowhere else.
+    fn transition(
+        &mut self,
+        next: ElectionState,
+        now_ns: i64,
+        host: &mut dyn ElectionHost,
+    ) -> Result<(), ClusterError> {
+        self.state = next;
+        self.time_of_last_state_change_ns = now_ns;
+        match next {
+            ElectionState::Canvass => host.set_role(crate::state::Role::Follower),
+            ElectionState::CandidateBallot => host.set_role(crate::state::Role::Candidate),
+            ElectionState::LeaderLogReplication => {
+                host.set_role(crate::state::Role::Leader);
+                // The log publication is created here, which is what fixes the
+                // log session id for the term (`Election.java:1398-1400`).
+                host.add_log_publication(self.append_position)?;
+            }
+            ElectionState::Closed => {}
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// How long the quorum scratch array must be for `member_count`.
+pub const fn quorum_scratch_len(member_count: usize) -> usize {
+    (member_count >> 1) + 1
+}

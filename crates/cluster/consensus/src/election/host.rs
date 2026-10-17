@@ -64,6 +64,9 @@
 
 use deepmsg_client::image::Image;
 
+use crate::persist::node_state::NodeStateFile;
+use crate::persist::recording_log::RecordingLog;
+
 use crate::error::ClusterError;
 use crate::handles::{LogReplay, RecordingReplication};
 use crate::state::{ModuleState, Role};
@@ -267,6 +270,54 @@ pub trait ElectionHost {
     /// `:2061`. Called from `idle()` and from the slow tick; returns the work
     /// count.
     fn poll_archive_events(&mut self) -> usize;
+
+    // ---- added by P3-5a-beta: the `Context` accessors the election reads ----
+    //
+    // `P3-5a-alpha` deliberately froze the trait without these, because
+    // `NodeStateFile` and `RecordingLog` did not exist yet and alpha existed so
+    // lane M would not wait for them. Both exist now, so they arrive here — by
+    // the add-only rule, not by changing anything above.
+
+    /// `ctx.nodeStateFile()` (`Election.java:681`, `:687`, `:357`, `:376`).
+    fn node_state(&mut self) -> &mut NodeStateFile;
+
+    /// `ctx.recordingLog()` (`:1509`, inside `updateRecordingLog`).
+    fn recording_log(&mut self) -> &mut RecordingLog;
+
+    /// `ctx.clusterClock()` converted to nanoseconds (`:1598-1608`).
+    fn now_ns(&mut self) -> i64;
+
+    /// `ctx.epochClock().time()` in epoch milliseconds (`:688`).
+    fn epoch_ms(&self) -> i64;
+
+    /// `ctx.appointedLeaderId()` (`:715`).
+    fn appointed_leader_id(&self) -> i32;
+
+    /// `ctx.startupCanvassTimeoutNs()` (`:704`).
+    fn startup_canvass_timeout_ns(&self) -> i64;
+
+    /// `ctx.leaderHeartbeatTimeoutNs()`.
+    fn leader_heartbeat_timeout_ns(&self) -> i64;
+
+    /// `ctx.leaderHeartbeatIntervalNs()`.
+    fn leader_heartbeat_interval_ns(&self) -> i64;
+
+    /// `ctx.electionTimeoutNs()`.
+    fn election_timeout_ns(&self) -> i64;
+
+    /// `ctx.electionStatusIntervalNs()`.
+    fn election_status_interval_ns(&self) -> i64;
+
+    /// `ClusterMember.hasQuorumAtPosition(..)` over the host's member table
+    /// (`Election.java:885-887`). A query on the host because the members live
+    /// there.
+    fn has_quorum_at_position(
+        &mut self,
+        leadership_term_id: i64,
+        position: i64,
+        now_ns: i64,
+        timeout_ns: i64,
+    ) -> bool;
 }
 
 /// Every method on [`ElectionHost`], in declaration order.
@@ -305,4 +356,22 @@ pub const HOST_METHODS: &[&str] = &[
     "await_local_sockets_closed",
     "election_complete",
     "poll_archive_events",
+];
+
+/// The methods `P3-5a-beta` added on top of the frozen 30. Kept separate so the
+/// surface test can still assert that the **frozen** set is exactly the
+/// reference's `consensusModuleAgent.*` calls, while these are the `ctx`
+/// accessors the reference reaches through a different object.
+pub const HOST_CTX_METHODS: &[&str] = &[
+    "node_state",
+    "recording_log",
+    "now_ns",
+    "epoch_ms",
+    "appointed_leader_id",
+    "startup_canvass_timeout_ns",
+    "leader_heartbeat_timeout_ns",
+    "leader_heartbeat_interval_ns",
+    "election_timeout_ns",
+    "election_status_interval_ns",
+    "has_quorum_at_position",
 ];
