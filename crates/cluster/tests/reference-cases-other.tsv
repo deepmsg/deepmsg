@@ -1,0 +1,330 @@
+# What the reference's cluster test suite runs, one row per case — the
+# denominator P3-0b owes the rest of P3. Keys are the reference's own case
+# names, read from the tree at 664f58e705 (tag 1.53.2).
+#
+# Why two files: P3 runs two agent lanes (plan §6.2). A lane owns consensus,
+# B owns instruments and periphery. Each lane fills its own `ours` column, so
+# each gets its own file — one shared file is a merge conflict every day.
+#
+# Why a table at all: the reference's cluster tests are a Java
+# dependency-injection harness, not a black-box one (plan §2.3). LC-2/LC-3
+# cannot reuse them, so the cases have to be re-expressed against our own
+# fixture — and the only honest way to say how much of the reference we carry
+# is to name every case and record what it actually asserts.
+#
+# Columns:
+#   kind           system = aeron-system-tests/.../cluster (178 total)
+#                  unit   = aeron-cluster/src/test/java      (396 total)
+#   class          the reference's own class name
+#   method         the reference's own method name
+#   lane           A = consensus critical path, B = instruments/periphery
+#                  `-` = no lane owns it, by decision (see disposition)
+#   card           the P3 work package that ports it (plan §6.1)
+#                  `-` = no card owns it, by decision
+#   assert_surface what the case's assertions actually touch. System cases
+#                  only; unit cases are `unit`, ported by name against our own
+#                  types, with no harness problem.
+#                    client        client-visible behaviour
+#                    counter       a CnC counter read (role 201, state 200,
+#                                  election 207, commit 203, append, snapshot
+#                                  count 205). Readable from an *external* node
+#                                  through its cnc.dat, so OUR members and
+#                                  JAVA members both carry these.
+#                    stub-service  the stub ClusteredService inside the test
+#                                  JVM: messageCount, wasSnapshotTaken,
+#                                  wasSnapshotLoaded, roleChangedTo,
+#                                  awaitServiceMessageCount/Predicate.
+#                                  Only when the node runs in the test process
+#                                  — LC-2 in full, LC-3's Rust half (§7.2).
+#                    cm-object     the ConsensusModule object itself
+#                                  (consensusModule(), hasMemberTerminated()).
+#                                  In-process only.
+#                    java-injection Java code handed to the node:
+#                                  serviceSupplier lambda, timer/auth/
+#                                  authorisation suppliers, egress listeners,
+#                                  ConsensusModuleExtension, the
+#                                  delaySessionMessageProcessing static hook.
+#                  Several may apply; separated by commas, most blocking first.
+#   ref_flags      whether the reference itself runs the case. `disabled:*`
+#                  rows are in the denominator and must NOT be read as green.
+#   disposition    for cases not portable as-is: `n/a:<why>`, or
+#                  `hook:<what>` when an equivalent hook in our binary is the
+#                  plan. Empty = port as a normal case.
+#   ours           the name of our test once it exists, or `n/a:<why>`.
+#
+# n/a vocabulary (closed; add a value deliberately, with a reason):
+#   n/a:premium            Cluster Standby / Transition — out of scope (§1.2)
+#   n/a:logging            the logging package is not ported (§2.1)
+#   n/a:removed-upstream   dynamic join — deprecated upstream
+#   n/a:java-injection     needs Java code we cannot hand a Rust node
+#   n/a:fixture-self-test  a test *of* the reference fixture, not of a cluster
+#
+# ★ On `ours`, and why every row is empty. P2 tried exactly this column in
+# crates/archive/tests/reference-cases.tsv — `status` + `covered_by`, with a
+# rule that a slice flips its rows when it lands a scenario. Four slices
+# passed and not one row was flipped: "which of our tests owns which reference
+# case" is a human judgement no gate can fail on, so P2 deleted the columns
+# and let the acceptance run be the record. This file keeps `ours` because the
+# P3 plan asks for it and because `assert_surface` is new and checkable — but
+# **if it is still empty at P3-11, delete it rather than carry a promise
+# nothing checks.** What this card's DoD actually gates is above: every system
+# row classified, the counts stated below, and every java-injection row given
+# a disposition.
+#
+# Regenerate with crates/cluster/tests/reference-cases.gen.py; re-run after a
+# reference bump and review the diff. Do not hand-edit rows.
+#
+# This file is lane B: instruments and periphery — 5a/5b, 0a, 0d, 2a-2c, 3a-3c, 8, 9, 10, 0e.
+#
+# rows: 233  (system 53, unit 180)
+# system assert_surface, multi-label:
+#   client           44
+#   counter          36
+#   stub-service     24
+#   cm-object        6
+#   java-injection   9
+# dispositions:
+#   hook:egress-listener         1
+#   hook:service-supplier        5
+#   n/a:fixture-self-test        1
+#   n/a:java-injection           3
+#   n/a:logging                  18
+#   n/a:premium                  8
+# reference-disabled (in the denominator, not green):
+#   disabled:no-reason                       1
+# Lane B owns the harness, the container, the client and the tooling.
+#
+# kind	class	method	lane	card	assert_surface	ref_flags	disposition	ours
+system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndEmptyLog	B	P3-9	stub-service,counter			
+system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndNonEmptyLog	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndThenSendMessages	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldBackupClusterWithSnapshot	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldBackupClusterAfterCleanShutdown	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldBackupClusterWithSnapshotAndNonEmptyLog	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldBackupClusterWithSnapshotAndNonEmptyLogWithSimpleAuthentication	B	P3-9	java-injection,stub-service,counter,client		hook:service-supplier	
+system	ClusterBackupTest	shouldBackupClusterWithSnapshotAndNonEmptyLogWithChallengeResponseAuthentication	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldLogErrorWithInvalidCredentials	B	P3-9	counter			
+system	ClusterBackupTest	shouldLogErrorWithInvalidChallengeResponse	B	P3-9	counter			
+system	ClusterBackupTest	shouldBackupClusterWithSnapshotThenSend	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldBackupClusterWithFromLatestSnapshotLogPosition	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldBeAbleToGetTimeOfNextBackupQuery	B	P3-9	counter			
+system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndNonEmptyLogWithReQuery	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndNonEmptyLogAfterFailure	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndNonEmptyLogWithFailure	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldBackupClusterWithInvalidNameResolution	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldBackupClusterAndJoinLive	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldResumeBackupIfStopped	B	P3-9	stub-service,counter,client			
+system	ClusterBackupTest	shouldQueryForSnapshotsWithLogPosition	B	P3-9	counter,client			
+system	ClusterSessionReliabilityTest	sessionShouldGetClosedWhenIngressImageGoesUnavailableToPreventSilentMessageLoss	B	P3-3c	client			
+system	ClusterSessionReliabilityTest	sessionShouldGetClosedWhenMulticastIngressImageGoesUnavailableToPreventSilentMessageLoss	B	P3-3c	client			
+system	ClusterSessionReliabilityTest	sessionShouldGetClosedWhenIngressImageGoesUnavailableAfterFailoverToPreventSilentMessageLoss	B	P3-3c	client			
+system	ClusterSessionReliabilityTest	sessionShouldGetClosedWhenMulticastIngressImageGoesUnavailableAfterFailoverToPreventSilentMessageLoss	B	P3-3c	client			
+system	ClusterSessionReliabilityTest	clientShouldNotRejoinEgressImageFromTheSameNodeToPreventSilentMessageLoss	B	P3-3c	java-injection,client		hook:egress-listener	
+system	ClusterThreadNamingTest	shouldUseCorrectThreadNamesByNamingMode	B	P3-8	counter			
+system	ClusterThreadNamingTest	shouldUseCorrectDefaultClusteredServiceThreadNamesPerMode	B	P3-8	client			
+system	ClusterToolTest	shouldHandleSnapshotOnLeaderOnly	B	P3-8	counter,cm-object,client			
+system	ClusterToolTest	shouldDescribeLatestConsensusModuleSnapshot	B	P3-8	counter,cm-object			
+system	ClusterToolTest	shouldNotSnapshotWhenSuspendedOnly	B	P3-8	counter,cm-object			
+system	ClusterToolTest	shouldSuspendAndResume	B	P3-8	counter,cm-object			
+system	ClusterToolTest	shouldFailIfMarkFileUnavailable	B	P3-8	client			
+system	ClusterToolTest	shouldBeAbleToAccessClusterMarkFilesInANonDefaultLocation	B	P3-8	counter,cm-object,client			
+system	ClusterToolTest	sortRecordingLogIsANoOpIfRecordLogIsEmpty	B	P3-8	client			
+system	ClusterToolTest	sortRecordingLogIsANoOpIfRecordDoesNotExist	B	P3-8	client			
+system	ClusterToolTest	sortRecordingLogIsANoOpIfRecordLogIsAlreadySorted	B	P3-8	client			
+system	ClusterToolTest	sortRecordingLogShouldRearrangeDataOnDisc	B	P3-8	client			
+system	ClusterToolTest	seedRecordingLogFromSnapshotShouldDeleteOriginalRecordingLogFileIfThereAreNoValidSnapshots	B	P3-8	client			
+system	ClusterToolTest	seedRecordingLogFromSnapshotShouldCreateANewRecordingLogFromALatestValidSnapshot	B	P3-8	client			
+system	ClusterToolTest	seedRecordingLogFromSnapshotShouldCreateANewRecordingLogFromALatestValidSnapshotCommandLine	B	P3-8	client			
+system	ClusterToolTest	shouldCheckForLeaderInAnyStateAfterElectionWasClosed	B	P3-8	counter,cm-object			
+system	ClusterToolTest	listMembersShouldReturnFalseIfNoMarkFileExists	B	P3-8	client			
+system	ClusterToolTest	listMembersShouldReturnFalseIfQueryTimesOut	B	P3-8	client			
+system	MultiClusteredServicesTest	shouldSupportMultipleServicesPerNode	B	P3-2c	java-injection,client		n/a:java-injection	
+system	MultiClusteredServicesTest	shouldContinueFromLogIfSnapshotThrowsException	B	P3-2c	java-injection,stub-service,counter,client		n/a:java-injection	
+system	ServiceIpcIngressMessageTest	shouldEchoServiceIpcMessages	B	P3-2c	stub-service,counter,client			
+system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicates	B	P3-2c	java-injection,stub-service,counter,client		hook:service-supplier	
+system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicatesDuringFailoverWithUncommittedPendingServiceMessages	B	P3-2c	java-injection,stub-service,counter,client		hook:service-supplier	
+system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesAndTimersWithoutDuplicatesWhenLeaderServicesAreStopped	B	P3-2c	java-injection,stub-service,counter,client		hook:service-supplier	
+system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicatesAfterAFullClusterRestart	B	P3-2c	java-injection,stub-service,counter,client		hook:service-supplier	
+system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicatesWhenClusterIsRestartedAfterTakingASnapshot	B	P3-2c	java-injection,stub-service,counter,client		n/a:java-injection	
+system	ServiceIpcIngressMessageTest	shouldHandleServiceMessagesMissedOnTheFollowerWhenSnapshot	B	P3-2c	stub-service,counter,client			
+system	TestClusterTest	testCustomAeronDirectory	B	P3-2c	counter,client		n/a:fixture-self-test	
+unit	ClusterBackupAgentTest	shouldReturnReplayStartPositionIfAlreadyExisting	B	P3-9	unit			
+unit	ClusterBackupAgentTest	shouldReturnNullPositionIfLastTermIsNullAndSnapshotsIsEmpty	B	P3-9	unit			
+unit	ClusterBackupAgentTest	shouldLargestPositionLessThanOrEqualToInitialReplayPosition	B	P3-9	unit			
+unit	ClusterBackupAgentTest	shouldRunTerminationHooksOnTermination	B	P3-9	unit			
+unit	ClusterBackupContextTest	throwsIllegalStateExceptionIfThereIsAnActiveMarkFile	B	P3-9	unit			
+unit	ClusterBackupContextTest	clusterDirectoryNameShouldMatchClusterDirWhenClusterDirSet	B	P3-9	unit			
+unit	ClusterBackupContextTest	clusterDirectoryNameShouldMatchClusterDirWhenClusterDirectoryNameSet	B	P3-9	unit			
+unit	ClusterBackupContextTest	concludeShouldCreateMarkFileDirSetViaSystemProperty	B	P3-9	unit	disabled:no-reason		
+unit	ClusterBackupContextTest	concludeShouldCreateMarkFileDirSetDirectly	B	P3-9	unit			
+unit	ClusterBackupContextTest	shouldRemoveLinkIfMarkFileIsInClusterDir	B	P3-9	unit			
+unit	ClusterBackupContextTest	concludeShouldCreateLinkFilePointingToTheParentDirectoryOfTheMarkFile	B	P3-9	unit			
+unit	ClusterBackupContextTest	shouldAlignMarkFileBasedOnTheAeronClientFilePageSize	B	P3-9	unit			
+unit	ClusterBackupContextTest	shouldAlignMarkFileBasedOnTheMediaDriverFilePageSize	B	P3-9	unit			
+unit	ClusterEventEnablementTest	shouldLogConfiguredEvents	-	-	unit		n/a:logging	
+unit	ClusterLoggingAgentTest	logAll	-	-	unit		n/a:logging	
+unit	ConsensusModuleConfigurationTest	shouldUseDenyAllAuthorisationSupplierWhenPropertySet	B	P3-8	unit			
+unit	ConsensusModuleConfigurationTest	shouldUseAllowAllAuthorisationSupplierWhenPropertySet	B	P3-8	unit			
+unit	ConsensusModuleContextCloseTests	ownsAeronClient	B	P3-8	unit			
+unit	ConsensusModuleContextCloseTests	doesNotOwnAeronClientAndClientIsNotClosed	B	P3-8	unit			
+unit	ConsensusModuleContextCloseTests	doesNotOwnAeronClientAndClientIsClosed	B	P3-8	unit			
+unit	ConsensusModuleContextTest	validTimerServiceSupplier	B	P3-8	unit			
+unit	ConsensusModuleContextTest	unknownTimerServiceSupplier	B	P3-8	unit			
+unit	ConsensusModuleContextTest	defaultTimerServiceSupplier	B	P3-8	unit			
+unit	ConsensusModuleContextTest	explicitTimerServiceSupplier	B	P3-8	unit			
+unit	ConsensusModuleContextTest	rejectInvalidLogChannelParameters	B	P3-8	unit			
+unit	ConsensusModuleContextTest	defaultAuthorisationServiceSupplierAllowsBackupAndStandby	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldUseDefaultAuthorisationServiceSupplierIfTheSystemPropertyIsNotSet	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldUseDefaultAuthorisationServiceSupplierIfTheSystemPropertyIsSetToEmptyValue	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldInstantiateAuthorisationServiceSupplierBasedOnTheSystemProperty	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldUseProvidedAuthorisationServiceSupplierInstance	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldUseDefaultAuthenticatorSupplierIfTheSystemPropertyIsSetToEmptyValue	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldInstantiateAuthenticatorSupplierBasedOnTheSystemProperty	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldUseProvidedAAuthenticatorSupplierInstance	B	P3-8	unit			
+unit	ConsensusModuleContextTest	writeAuthenticatorSupplierClassNameIntoTheMarkFile	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldValidateModuleStateCounter	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldValidateElectionStateCounter	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldValidateClusterNodeRoleCounter	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldValidateCommitPositionCounter	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldValidateControlToggleCounter	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldValidateSnapshotCounter	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldValidateTimedOutClientCounter	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldThrowIllegalStateExceptionIfAnActiveMarkFileExists	B	P3-8	unit			
+unit	ConsensusModuleContextTest	startupCanvassTimeoutMustBeMultiplesOfTheLeaderHeartbeatTimeout	B	P3-8	unit			
+unit	ConsensusModuleContextTest	startupCanvassTimeoutMustCanBeSetToBeMultiplesOfTheLeaderHeartbeatTimeout	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldThrowIfConductorInvokerModeIsNotUsed	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldUseCandidateTermIdFromClusterMarkFileIfNodeStateFileIsNew	B	P3-8	unit			
+unit	ConsensusModuleContextTest	clusterDirectoryNameShouldMatchClusterDirWhenClusterDirSet	B	P3-8	unit			
+unit	ConsensusModuleContextTest	clusterDirectoryNameShouldMatchClusterDirWhenClusterDirectoryNameSet	B	P3-8	unit			
+unit	ConsensusModuleContextTest	clusterServiceDirectoryNameShouldBeSetFromClusterDirectoryName	B	P3-8	unit			
+unit	ConsensusModuleContextTest	clusterServiceDirectoryNameShouldBeResolved	B	P3-8	unit			
+unit	ConsensusModuleContextTest	concludeShouldCreateMarkFileDirSetViaSystemProperty	B	P3-8	unit			
+unit	ConsensusModuleContextTest	concludeShouldCreateMarkFileDirSetDirectly	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldRemoveLinkIfMarkFileIsInClusterDir	B	P3-8	unit			
+unit	ConsensusModuleContextTest	concludeShouldCreateLinkPointingToTheParentDirectoryOfTheMarkFile	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldSetClusterClockViaSystemProperty	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldThrowClusterExceptionIfClockCannotBeCreated	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldUseExplicitlyAssignedClockInstance	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldAllowElectionCounterToBeExplicitlySet	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldThrowConfigurationExceptionIfElectionCounterHasWrongType	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldCreateElectionCounter	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldAllowLeadershipTermIdCounterToBeExplicitlySet	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldThrowConfigurationExceptionIfLeadershipTermIdCounterHasWrongType	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldCreateLeadershipTermIdCounter	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldGenerateAgentRoleNameIfNotSet	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldUseSpecifiedAgentRoleName	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldNotSetClientNameOnTheExplicitlyAssignedAeronClient	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldUseExplicitlyAssignArchiveContext	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldCreateArchiveContextUsingLocalChannelConfiguration	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldCreateAliasForControlStreams	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldCreateAliasForControlStreamsEvenWhenArchiveContextAssignedExplicitly	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldAlignMarkFileToTheAeronClientFilePageSize	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldAlignMarkFileBasedOnTheMediaDriverFilePageSize	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldValidateServiceCount	B	P3-8	unit			
+unit	ConsensusModuleContextTest	shouldRejectServiceCountZeroWithoutConsensusModuleExtension	B	P3-8	unit			
+unit	ElectionTest	shouldElectSingleNodeClusterLeader	B	P3-5b	unit			
+unit	ElectionTest	shouldElectAppointedLeader	B	P3-5b	unit			
+unit	ElectionTest	shouldVoteForAppointedLeader	B	P3-5b	unit			
+unit	ElectionTest	shouldCanvassMembersInSuccessfulLeadershipBid	B	P3-5b	unit			
+unit	ElectionTest	shouldVoteForCandidateDuringNomination	B	P3-5b	unit			
+unit	ElectionTest	shouldTimeoutCanvassWithMajority	B	P3-5b	unit			
+unit	ElectionTest	shouldWinCandidateBallotWithMajority	B	P3-5b	unit			
+unit	ElectionTest	shouldBaseStartupValueOnLeader	B	P3-5b	unit			
+unit	ElectionTest	shouldElectCandidateWithFullVote	B	P3-5b	unit			
+unit	ElectionTest	shouldTimeoutCandidateBallotWithoutMajority	B	P3-5b	unit			
+unit	ElectionTest	shouldTimeoutFailedCandidateBallotOnSplitVoteThenSucceedOnRetry	B	P3-5b	unit			
+unit	ElectionTest	shouldTimeoutFollowerBallotWithoutLeaderEmerging	B	P3-5b	unit			
+unit	ElectionTest	shouldBecomeFollowerIfEnteringNewElection	B	P3-5b	unit			
+unit	ElectionTest	followerShouldReplicateLogBeforeReplayDuringElection	B	P3-5b	unit			
+unit	ElectionTest	followerShouldTimeoutLeaderIfReplicateLogPositionIsNotCommittedByLeader	B	P3-5b	unit			
+unit	ElectionTest	followerShouldProgressThroughFailedElectionsTermsImmediatelyPriorToCurrent	B	P3-5b	unit			
+unit	ElectionTest	followerShouldProgressThroughInterimElectionsTerms	B	P3-5b	unit			
+unit	ElectionTest	followerShouldReplayAndCatchupWhenLateJoiningClusterInSameTerm	B	P3-5b	unit			
+unit	ElectionTest	followerShouldReplicateReplayAndCatchupWhenLateJoiningClusterInLaterTerm	B	P3-5b	unit			
+unit	ElectionTest	followerShouldUseInitialLeadershipTermIdAndInitialTermBaseLogPositionWhenRecordingLogIsEmpty	B	P3-5b	unit			
+unit	ElectionTest	followerShouldReplicateAndSendAppendPositionWhenLogReplicationDone	B	P3-5b	unit			
+unit	ElectionTest	leaderShouldMoveToLogReplicationThenWaitForCommitPosition	B	P3-5b	unit			
+unit	ElectionTest	shouldThrowNonZeroLogPositionAndNullRecordingIdSpecified	B	P3-5b	unit			
+unit	ElectionTest	shouldSendCommitPositionAndNewLeadershipTermEventsWithTheSameLeadershipTerm	B	P3-5b	unit			
+unit	ElectionTest	notifiedCommitPositionCannotGoBackwardsUponReceivingCommitPosition	B	P3-5b	unit			
+unit	ElectionTest	notifiedCommitPositionCannotGoBackwardsUponReceivingNewLeadershipTerm	B	P3-5b	unit			
+unit	SessionEventCodecCompatibilityTest	readingVersion12UsingVersion5Codec	B	P3-3b	unit			
+unit	StandbySnapshotReplicatorTest	shouldReplicateStandbySnapshots	-	-	unit		n/a:premium	
+unit	StandbySnapshotReplicatorTest	shouldPassSignalsToRecordingReplication	-	-	unit		n/a:premium	
+unit	StandbySnapshotReplicatorTest	shouldHandleNoStandbySnapshots	-	-	unit		n/a:premium	
+unit	StandbySnapshotReplicatorTest	shouldSwitchEndpointsOnMultipleReplicationException	-	-	unit		n/a:premium	
+unit	StandbySnapshotReplicatorTest	shouldSwitchEndpointsOnArchivePollForSignalsException	-	-	unit		n/a:premium	
+unit	StandbySnapshotReplicatorTest	shouldThrowExceptionIfUnableToReplicateAnySnapshotsDueToClusterExceptions	-	-	unit		n/a:premium	
+unit	StandbySnapshotReplicatorTest	shouldThrowExceptionIfUnableToReplicateAnySnapshotsDueToArchiveExceptions	-	-	unit		n/a:premium	
+unit	StandbySnapshotReplicatorTest	shouldNotRetrieveSnapshotsIfRecordingLogAlreadyHasUpToDateCopies	-	-	unit		n/a:premium	
+unit	AeronClusterAsyncConnectTest	initialState	B	P3-3a	unit			
+unit	AeronClusterAsyncConnectTest	shouldCloseAsyncSubscription	B	P3-3a	unit			
+unit	AeronClusterAsyncConnectTest	shouldCloseEgressSubscription	B	P3-3a	unit			
+unit	AeronClusterAsyncConnectTest	shouldCloseAsyncPublication	B	P3-3a	unit			
+unit	AeronClusterAsyncConnectTest	shouldCloseIngressPublication	B	P3-3a	unit			
+unit	AeronClusterAsyncConnectTest	shouldCloseIngressPublicationsOnMembers	B	P3-3a	unit			
+unit	AeronClusterAsyncConnectTest	shouldRetryMemberIngressPublicationWhenSendChannelEndpointIsClosing	B	P3-3a	unit			
+unit	AeronClusterAsyncConnectTest	shouldConnectViaIngressChannel	B	P3-3a	unit			
+unit	AeronClusterContextTest	concludeThrowsConfigurationExceptionIfIngressChannelIsNotSet	B	P3-3a	unit			
+unit	AeronClusterContextTest	concludeThrowsConfigurationExceptionIfIngressChannelIsSetToIpcAndIngressEndpointsSpecified	B	P3-3a	unit			
+unit	AeronClusterContextTest	concludeThrowsConfigurationExceptionIfEgressChannelIsNotSet	B	P3-3a	unit			
+unit	AeronClusterContextTest	clientNameShouldHandleEmptyValue	B	P3-3a	unit			
+unit	AeronClusterContextTest	clientNameShouldReturnAssignedValue	B	P3-3a	unit			
+unit	AeronClusterContextTest	clientNameCanBeSetViaSystemProperty	B	P3-3a	unit			
+unit	AeronClusterContextTest	clientNameMustNotExceedMaxLength	B	P3-3a	unit			
+unit	AeronClusterTest	shouldStayConnectedAfterSuccessfulFailover	B	P3-3b	unit			
+unit	AeronClusterTest	shouldRetryNewLeaderIngressPublicationWhenSendChannelEndpointIsClosing	B	P3-3b	unit			
+unit	AeronClusterTest	shouldCloseItselfWhenDisconnectedForLongerThanNewLeaderTimeout	B	P3-3b	unit			
+unit	AeronClusterTest	shouldCloseItselfWhenUnableToSendMessageForLongerThanNewLeaderConnectionTimeout	B	P3-3b	unit			
+unit	AeronClusterTest	shouldCloseIngressPublicationWhenEgressImageCloses	B	P3-3b	unit			
+unit	AeronClusterTest	shouldCloseItselfAfterReachingMaxPositionOnTheIngressPublication	B	P3-3b	unit			
+unit	EgressAdapterTest	onFragmentShouldDelegateToEgressListenerOnUnknownSchemaId	B	P3-3b	unit			
+unit	EgressAdapterTest	defaultEgressListenerBehaviourShouldThrowClusterExceptionOnUnknownSchemaId	B	P3-3b	unit			
+unit	EgressAdapterTest	onFragmentShouldInvokeOnMessageCallbackIfSessionIdMatches	B	P3-3b	unit			
+unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnSessionMessage	B	P3-3b	unit			
+unit	EgressAdapterTest	onFragmentShouldInvokeOnSessionEventCallbackIfSessionIdMatches	B	P3-3b	unit			
+unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnSessionEvent	B	P3-3b	unit			
+unit	EgressAdapterTest	onFragmentShouldInvokeOnNewLeaderCallbackIfSessionIdMatches	B	P3-3b	unit			
+unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnNewLeader	B	P3-3b	unit			
+unit	EgressAdapterTest	onFragmentShouldInvokeOnAdminResponseCallbackIfSessionIdMatches	B	P3-3b	unit			
+unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnAdminResponse	B	P3-3b	unit			
+unit	EgressPollerTest	shouldIgnoreUnknownMessageSchema	B	P3-3a	unit			
+unit	EgressPollerTest	shouldHandleSessionMessage	B	P3-3a	unit			
+unit	CborClusterEventCodecTest	encodeDecodeLogElectionStateChange	-	-	unit		n/a:logging	
+unit	CborClusterEventCodecTest	encodeDecodeLogElectionStateChangeWithBoundaryLongValues	-	-	unit		n/a:logging	
+unit	CborClusterEventCodecTest	encodeDecodeLogElectionStateChangeWithBoundaryIntValues	-	-	unit		n/a:logging	
+unit	CborClusterEventCodecTest	encodeDecodeLogElectionStateChangeWithVariousReasonLengths	-	-	unit		n/a:logging	
+unit	CborClusterEventCodecTest	encodeDecodeLogElectionStateChangeTruncatesReasonThatIsTooLong	-	-	unit		n/a:logging	
+unit	ClusterEventCodeTest	getCodeById	-	-	unit		n/a:logging	
+unit	ClusterEventCodeTest	getCodeByIdShouldThrowIllegalArgumentExceptionForUnknownId	-	-	unit		n/a:logging	
+unit	ClusterEventCodeTest	toEventCodeIdComputesEventId	-	-	unit		n/a:logging	
+unit	ClusterEventCodeTest	fromEventCodeIdLooksUpEventCode	-	-	unit		n/a:logging	
+unit	ClusterEventCodeTest	fromEventCodeIdShouldThrowIllegalArgumentExceptionForUnknownCodeId	-	-	unit		n/a:logging	
+unit	ClusterEventLoggerCborImplTest	logElectionStateChangeMatchesTheHandWrittenTemplateShape	-	-	unit		n/a:logging	
+unit	ClusterEventLoggerCborImplTest	logElectionStateChangeTruncatesReasonThatIsTooLong	-	-	unit		n/a:logging	
+unit	ClusterEventLoggerCborImplTest	logAppendSessionCloseEncodesCloseReasonAndTimeUnitAsEnumTag	-	-	unit		n/a:logging	
+unit	ClusterEventLoggerCborImplTest	logOnVoteEncodesBooleanFieldWithNoTagInDeclaredParameterOrder	-	-	unit		n/a:logging	
+unit	ClusterEventLoggerCborImplTest	logStateChangeUsesTheDynamicallyPassedEventCodeForTheHeader	-	-	unit		n/a:logging	
+unit	GenericLoggingTest	shouldRoundTripEveryLoggerMethod	-	-	unit		n/a:logging	
+unit	ClusteredServiceAgentTest	shouldClaimAndWriteToBufferWhenFollower	B	P3-2a	unit			
+unit	ClusteredServiceAgentTest	shouldAbortClusteredServiceIfCommitPositionCounterIsClosed	B	P3-2a	unit			
+unit	ClusteredServiceAgentTest	shouldLogErrorInsteadOfThrowingIfSessionIsNotFoundOnClose	B	P3-2a	unit			
+unit	ClusteredServiceAgentTest	shouldRunTerminationHooksWhenTerminating	B	P3-2a	unit			
+unit	ClusteredServiceContainerContextTest	throwsIllegalStateExceptionIfAnActiveMarkFileExists	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	concludeShouldCreateMarkFileDirSetViaSystemProperty	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	concludeShouldCreateMarkFileDirSetDirectly	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	shouldRemoveLinkIfMarkFileIsInClusterDir	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	concludeShouldCreateMarkFileLinkInTheParentDirectoryOfTheClusterMarkFile	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	shouldInitializeClusterDirectoryNameFromTheAssignedClusterDir	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	shouldInitializeClusterDirectoryFromTheGivenDirectoryName	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	shouldSetServiceNameIfNotSpecified	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	shouldSetServiceNameExplicitly	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	shouldNotSetClientName	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	shouldUseExplicitlyAssignArchiveContext	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	shouldCreateArchiveContextUsingLocalChannelConfiguration	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	shouldCreateAliasForControlStreams	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	shouldCreateAliasForControlStreamsEvenWhenArchiveContextAssignedExplicitly	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	shouldAlignMarkFileToTheAeronClientFilePageSize	B	P3-8	unit			
+unit	ClusteredServiceContainerContextTest	shouldAlignMarkFileBasedOnTheMediaDriverFilePageSize	B	P3-8	unit			
+unit	ServiceSnapshotTakerTest	snapshotSessionUsesTryClaimIfDataFitIntoMaxPayloadSize	B	P3-2b	unit			
+unit	ServiceSnapshotTakerTest	snapshotSessionUsesOfferIfDataDoesNotIntoMaxPayloadSize	B	P3-2b	unit			

@@ -1,0 +1,440 @@
+# What the reference's cluster test suite runs, one row per case — the
+# denominator P3-0b owes the rest of P3. Keys are the reference's own case
+# names, read from the tree at 664f58e705 (tag 1.53.2).
+#
+# Why two files: P3 runs two agent lanes (plan §6.2). A lane owns consensus,
+# B owns instruments and periphery. Each lane fills its own `ours` column, so
+# each gets its own file — one shared file is a merge conflict every day.
+#
+# Why a table at all: the reference's cluster tests are a Java
+# dependency-injection harness, not a black-box one (plan §2.3). LC-2/LC-3
+# cannot reuse them, so the cases have to be re-expressed against our own
+# fixture — and the only honest way to say how much of the reference we carry
+# is to name every case and record what it actually asserts.
+#
+# Columns:
+#   kind           system = aeron-system-tests/.../cluster (178 total)
+#                  unit   = aeron-cluster/src/test/java      (396 total)
+#   class          the reference's own class name
+#   method         the reference's own method name
+#   lane           A = consensus critical path, B = instruments/periphery
+#                  `-` = no lane owns it, by decision (see disposition)
+#   card           the P3 work package that ports it (plan §6.1)
+#                  `-` = no card owns it, by decision
+#   assert_surface what the case's assertions actually touch. System cases
+#                  only; unit cases are `unit`, ported by name against our own
+#                  types, with no harness problem.
+#                    client        client-visible behaviour
+#                    counter       a CnC counter read (role 201, state 200,
+#                                  election 207, commit 203, append, snapshot
+#                                  count 205). Readable from an *external* node
+#                                  through its cnc.dat, so OUR members and
+#                                  JAVA members both carry these.
+#                    stub-service  the stub ClusteredService inside the test
+#                                  JVM: messageCount, wasSnapshotTaken,
+#                                  wasSnapshotLoaded, roleChangedTo,
+#                                  awaitServiceMessageCount/Predicate.
+#                                  Only when the node runs in the test process
+#                                  — LC-2 in full, LC-3's Rust half (§7.2).
+#                    cm-object     the ConsensusModule object itself
+#                                  (consensusModule(), hasMemberTerminated()).
+#                                  In-process only.
+#                    java-injection Java code handed to the node:
+#                                  serviceSupplier lambda, timer/auth/
+#                                  authorisation suppliers, egress listeners,
+#                                  ConsensusModuleExtension, the
+#                                  delaySessionMessageProcessing static hook.
+#                  Several may apply; separated by commas, most blocking first.
+#   ref_flags      whether the reference itself runs the case. `disabled:*`
+#                  rows are in the denominator and must NOT be read as green.
+#   disposition    for cases not portable as-is: `n/a:<why>`, or
+#                  `hook:<what>` when an equivalent hook in our binary is the
+#                  plan. Empty = port as a normal case.
+#   ours           the name of our test once it exists, or `n/a:<why>`.
+#
+# n/a vocabulary (closed; add a value deliberately, with a reason):
+#   n/a:premium            Cluster Standby / Transition — out of scope (§1.2)
+#   n/a:logging            the logging package is not ported (§2.1)
+#   n/a:removed-upstream   dynamic join — deprecated upstream
+#   n/a:java-injection     needs Java code we cannot hand a Rust node
+#   n/a:fixture-self-test  a test *of* the reference fixture, not of a cluster
+#
+# ★ On `ours`, and why every row is empty. P2 tried exactly this column in
+# crates/archive/tests/reference-cases.tsv — `status` + `covered_by`, with a
+# rule that a slice flips its rows when it lands a scenario. Four slices
+# passed and not one row was flipped: "which of our tests owns which reference
+# case" is a human judgement no gate can fail on, so P2 deleted the columns
+# and let the acceptance run be the record. This file keeps `ours` because the
+# P3 plan asks for it and because `assert_surface` is new and checkable — but
+# **if it is still empty at P3-11, delete it rather than carry a promise
+# nothing checks.** What this card's DoD actually gates is above: every system
+# row classified, the counts stated below, and every java-injection row given
+# a disposition.
+#
+# Regenerate with crates/cluster/tests/reference-cases.gen.py; re-run after a
+# reference bump and review the diff. Do not hand-edit rows.
+#
+# This file is lane A: consensus — 0b/0c/1a-1f, 4a-4f, 6a-6c, 7, 11.
+#
+# rows: 341  (system 125, unit 216)
+# system assert_surface, multi-label:
+#   client           99
+#   counter          112
+#   stub-service     45
+#   cm-object        30
+#   java-injection   18
+# dispositions:
+#   hook:cm-extension            8
+#   hook:egress-listener         4
+#   hook:service-supplier        1
+#   n/a:java-injection           5
+#   n/a:premium                  1
+# reference-disabled (in the denominator, not green):
+#   disabled:Intermittent                    1
+#   disabled:Requires sudo to run iptables   6
+#   disabled:jre-range                       2
+#   disabled:no-reason                       1
+# Lane A owns the critical path (plan §6.2).
+#
+# kind	class	method	lane	card	assert_surface	ref_flags	disposition	ours
+system	AppointedLeaderTest	shouldConnectAndSendKeepAlive	A	P3-6c	counter,client			
+system	AppointedLeaderTest	shouldEchoMessagesViaService	A	P3-6c	counter,client			
+system	ClusterNetworkPartitionTest	shouldStartClusterThenElectNewLeaderAfterPartition	A	P3-6c	counter,client	disabled:Requires sudo to run iptables		
+system	ClusterNetworkPartitionTest	shouldRestartClusterWithMajorityOfNodesBeingBehind	A	P3-6c	stub-service,counter,cm-object,client	disabled:Requires sudo to run iptables		
+system	ClusterNetworkPartitionTest	shouldRecoverClusterWithMajorityOfNodesBeingBehind	A	P3-6c	stub-service,counter,cm-object,client	disabled:Requires sudo to run iptables		
+system	ClusterNetworkPartitionTest	shouldNotAllowLogReplayBeyondCommitPosition	A	P3-6c	counter,cm-object,client	disabled:Requires sudo to run iptables		
+system	ClusterNetworkPartitionTest	shouldNotAllowLogReplayBeyondCommitPositionAfterLeadershipTermChange	A	P3-6c	counter,cm-object,client	disabled:Requires sudo to run iptables		
+system	ClusterNetworkPartitionTest	shouldNotStuckInFollowerCatchup	A	P3-6c	counter,cm-object,client	disabled:Requires sudo to run iptables		
+system	ClusterNetworkTopologyTest	shouldGetNetworkInformationFromAgentNodes	A	P3-6c	client			
+system	ClusterNetworkTopologyTest	shouldGetEchoFromCluster	A	P3-6c	client			
+system	ClusterNetworkTopologyTest	shouldLogReplicate	A	P3-6c	client			
+system	ClusterNetworkTopologyTest	shouldMatchPatternSplitAcrossReads	A	P3-6c	client			
+system	ClusterNetworkTopologyTest	shouldMatchPatternSplitAcrossBufferBoundary	A	P3-6c	client			
+system	ClusterTest	shouldStopFollowerAndRestartFollower	A	P3-6c	counter,cm-object			
+system	ClusterTest	shouldStopFollowerAndRestartFollowerGracefully	A	P3-6c	counter,cm-object,client			
+system	ClusterTest	shouldNotifyClientOfNewLeader	A	P3-6c	counter,cm-object,client			
+system	ClusterTest	shouldStopLeaderAndFollowersThenRestartAllWithSnapshot	A	P3-6c	counter,client			
+system	ClusterTest	shouldConnectAndDisconnectClient	A	P3-6c	counter,client			
+system	ClusterTest	shouldNotSnapshotOnPrimaryClusterWhenStandbySnapshotIsRequested	A	P3-6c	counter,client		n/a:premium	
+system	ClusterTest	shouldStartClusterWithExtension	A	P3-6c	java-injection,counter		hook:cm-extension	
+system	ClusterTest	shouldStopClusteredServicesOnAppropriateMessage	A	P3-6c	counter,client			
+system	ClusterTest	shouldShutdownClusterAndRestartWithSnapshots	A	P3-6c	stub-service,counter,cm-object			
+system	ClusterTest	shouldAbortClusterAndRestart	A	P3-6c	stub-service,counter			
+system	ClusterTest	shouldAbortClusterOnTerminationTimeout	A	P3-6c	counter,client			
+system	ClusterTest	shouldEchoMessages	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldHandleLeaderFailOverWhenNameIsNotResolvable	A	P3-6c	counter,client			
+system	ClusterTest	shouldHandleClusterStartWhenANameIsNotResolvable	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldElectSameLeaderAfterLoosingQuorum	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldElectNewLeaderAfterGracefulLeaderClose	A	P3-6c	counter,client			
+system	ClusterTest	shouldHandleClusterStartWhereMostNamesBecomeResolvableDuringElection	A	P3-6c	counter,client			
+system	ClusterTest	shouldEchoMessagesThenContinueOnNewLeader	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldStopLeaderAndRestartAsFollower	A	P3-6c	counter			
+system	ClusterTest	shouldStopLeaderAndRestartAsFollowerWithSendingAfter	A	P3-6c	counter,client			
+system	ClusterTest	shouldStopLeaderAndRestartAsFollowerWithSendingAfterThenStopLeader	A	P3-6c	counter,client			
+system	ClusterTest	shouldAcceptMessagesAfterSingleNodeCleanRestart	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldReplaySnapshotTakenWhileDown	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldTolerateMultipleLeaderFailures	A	P3-6c	counter,client			
+system	ClusterTest	shouldRecoverAfterTwoLeaderNodesFailAndComeBackUpAtSameTime	A	P3-6c	counter,client			
+system	ClusterTest	shouldAcceptMessagesAfterTwoNodeCleanRestart	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldRecoverWithUncommittedMessagesAfterRestartWhenNewCommitPosExceedsPreviousAppendedPos	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldRecoverWithUncommittedMessagesAfterRestartWhenNewCommitPosIsLessThanPreviousAppendedPos	A	P3-6c	counter,client			
+system	ClusterTest	shouldCallOnRoleChangeOnBecomingLeader	A	P3-6c	stub-service,counter			
+system	ClusterTest	shouldCallOnRoleChangeOnBecomingLeaderSingleNodeCluster	A	P3-4f	stub-service,counter			
+system	ClusterTest	shouldLoseLeadershipWhenNoActiveQuorumOfFollowers	A	P3-6c	stub-service,counter			
+system	ClusterTest	shouldTerminateLeaderWhenServiceStops	A	P3-6c	counter,cm-object,client			
+system	ClusterTest	shouldEnterElectionWhenRecordingStopsUnexpectedlyOnLeader	A	P3-6c	counter,client			
+system	ClusterTest	shouldEnterElectionWhenRecordingStopsUnexpectedlyOnLeaderOfSingleNodeCluster	A	P3-4f	counter,client			
+system	ClusterTest	shouldEnterElectionWhenLosesQuorumUnexpectedlyOnLeaderOfSingleNodeCluster	A	P3-4f	counter,cm-object,client			
+system	ClusterTest	shouldCloseClientOnTimeout	A	P3-6c	counter,cm-object,client			
+system	ClusterTest	shouldCloseClientAfterClusterBecomesUnavailable	A	P3-6c	counter,client			
+system	ClusterTest	shouldRecoverWhileMessagesContinue	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldCatchupFromEmptyLog	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldCatchupFromEmptyLogThenSnapshotAfterShutdownAndFollowerCleanStart	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldCatchUpTwoFreshNodesAfterRestart	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldReplayMultipleSnapshotsWithEmptyFollowerLog	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldRecoverQuicklyAfterKillingFollowersThenRestartingOne	A	P3-6c	counter,client			
+system	ClusterTest	shouldRecoverWhenLeaderHasAppendedMoreThanFollower	A	P3-6c	counter,client			
+system	ClusterTest	shouldRecoverWhenFollowerIsMultipleTermsBehind	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldRecoverWhenFollowerIsMultipleTermsBehindFromEmptyLog	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldRecoverWhenFollowerWithInitialSnapshotAndArchivePurgeThenIsMultipleTermsBehind	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldRecoverWhenFollowerArrivesPartWayThroughTerm	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldRecoverWhenFollowerArrivePartWayThroughTermAfterMissingElection	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldRecoverWhenLastSnapshotIsMarkedInvalid	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldRecoverWhenLastSnapshotForShutdownIsMarkedInvalid	A	P3-4f	stub-service,counter,client			
+system	ClusterTest	shouldHandleMultipleElections	A	P3-6c	counter,client			
+system	ClusterTest	shouldRecoverWhenLastSnapshotIsInvalidBetweenTwoElections	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldRecoverWhenLastTwosSnapshotsAreInvalidAfterElection	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldCatchUpAfterFollowerMissesOneMessage	A	P3-6c	client			
+system	ClusterTest	shouldCatchUpAfterFollowerMissesTimerRegistration	A	P3-6c	client			
+system	ClusterTest	shouldAllowChangingTermBufferLengthAndMtuAfterRecordingLogIsTruncatedToTheLatestSnapshot	A	P3-6c	java-injection,stub-service,counter,client		n/a:java-injection	
+system	ClusterTest	shouldRecoverWhenFollowersIsMultipleTermsBehindFromEmptyLogAndPartialLogWithoutCommittedLogEntry	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldRejectTakeSnapshotRequestWithAnAuthorisationError	A	P3-6c	counter,cm-object,client			
+system	ClusterTest	shouldRejectAnInvalidAdminRequest	A	P3-6c	counter,client			
+system	ClusterTest	shouldTakeASnapshotAfterReceivingAdminRequestOfTypeSnapshot	A	P3-6c	counter,client			
+system	ClusterTest	shouldTrackSnapshotDuration	A	P3-6c	java-injection,counter,cm-object,client		n/a:java-injection	
+system	ClusterTest	shouldTakeASnapshotAfterReceivingAdminRequestOfTypeSnapshotAndNotifyViaControlledPoll	A	P3-6c	counter,client			
+system	ClusterTest	shouldHandleTrimmingClusterFromTheFront	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldHandleReusingCorrelationIdsAcrossASnapshot	A	P3-6c	counter,client			
+system	ClusterTest	shouldHandleReplayAfterShutdown	A	P3-4f	counter,cm-object,client			
+system	ClusterTest	shouldRemainStableWhenThereIsASlowFollower	A	P3-6c	stub-service,counter,client			
+system	ClusterTest	shouldCatchupFollowerWithSlowService	A	P3-6c	java-injection,stub-service,counter,client		hook:service-supplier	
+system	ClusterTest	shouldAssembleFragmentedSessionMessages	A	P3-6c	java-injection,counter,cm-object,client		n/a:java-injection	
+system	ClusterTest	shouldCatchupAndJoinAsFollowerWhileSendingBigMessages	A	P3-6c	stub-service,counter,cm-object,client			
+system	ClusterTest	shouldSetClientName	A	P3-4f	counter,cm-object			
+system	ClusterTest	twoClustersCanShareArchiveAndMediaDriver	A	P3-6c	java-injection,stub-service		hook:egress-listener	
+system	ClusterTest	shouldAddCommittedNextSessionIdToTheConsensusModuleSnapshot	A	P3-6c	counter,client			
+system	ClusterTest	clientShouldHandleRedirectResponseDuringConnectPhaseWithASubsetOfNodesConfigured	A	P3-6c	counter			
+system	ClusterTest	clientShouldHandleRedirectResponseWhenInInvokerModeUsingConnect	A	P3-6c	counter			
+system	ClusterTest	clientShouldHandleRedirectResponseWhenInInvokerModeUsingAsyncConnect	A	P3-6c	counter			
+system	ClusterTest	clientShouldHandleLeadershipChangeWhenInInvokerMode	A	P3-6c	java-injection,counter		hook:egress-listener	
+system	ClusterTest	clientShouldReuseLeaderPublicationIfValidDuringRedirectHandling	A	P3-6c	counter,cm-object			
+system	ClusterTest	clusterShouldCreateSessionCounterForEachConnectedClient	A	P3-6c	counter,cm-object			
+system	ClusterTest	shouldSwitchBackToActiveStateIfSnapshotFailsWithException	A	P3-6c	java-injection,counter,cm-object,client		hook:cm-extension	
+system	ClusterTest	shouldContinueTerminationSequenceIfSnapshotFailsWithException	A	P3-6c	java-injection,counter,cm-object,client		hook:cm-extension	
+system	ClusterTest	shouldShutdownClusterIfSnapshotFailsWithTerminalException	A	P3-6c	java-injection,counter,cm-object,client		hook:cm-extension	
+system	ClusterTest	shouldHandleQuorumPositionGoingBackwards	A	P3-6c	stub-service,counter,cm-object,client			
+system	ClusterTest	shouldFormClusterAfterFullPartition	A	P3-6c	counter,cm-object,client			
+system	ClusterTest	shouldTerminateNodeWithInvalidSnapshotAndRecoveryAfterInvalidation	A	P3-6c	java-injection,counter,cm-object,client		n/a:java-injection	
+system	ClusterTest	shouldTerminateNodeWithMultipleServicesWithSingleServiceInvalidSnapshot	A	P3-6c	java-injection,counter,cm-object,client		n/a:java-injection	
+system	ClusterTest	shouldInvalidateSnapshotsThatHaveBeenRemoved	A	P3-6c	counter,client			
+system	ClusterUncommittedStateTest	shouldRollbackUncommittedSuspendControlToggle	A	P3-6a	java-injection,counter		hook:cm-extension	
+system	ClusterUncommittedStateTest	shouldRollbackUncommittedResumeControlToggle	A	P3-6a	java-injection,counter		hook:cm-extension	
+system	ClusterUncommittedStateTest	shouldRollbackUncommittedSnapshotToggle	A	P3-6a	java-injection,counter,cm-object		hook:cm-extension	
+system	ClusterUncommittedStateTest	shouldNextCommittedSessionIdReflectOnlyCommittedSessions	A	P3-6a	java-injection,counter,client		hook:cm-extension	
+system	ClusterUncommittedStateTest	shouldSnapshotWithNoServicesWithUncommittedData	A	P3-6a	counter,cm-object			
+system	FailedFirstElectionClusterTest	shouldRecoverWhenFollowerIsMultipleTermsBehindFromEmptyLog	A	P3-6c	stub-service,counter,client			
+system	InitiateShutdownThenImmediatelyCloseLeaderTest	shouldNotSendTerminationAckToNewLeaderWhenOldLeaderInitiatedShutdownAndImmediatelyClosed	A	P3-4e	counter	disabled:Intermittent		
+system	MultiModuleSharedDriverTest	shouldSupportTwoSingleNodeClusters	A	P3-6c	java-injection		hook:egress-listener	
+system	MultiModuleSharedDriverTest	shouldSupportTwoMultiNodeClusters	A	P3-6c	java-injection		hook:egress-listener	
+system	MultiNodeTest	shouldElectAppointedLeaderWithThreeNodesWithNoReplayNoSnapshot	A	P3-6c	counter			
+system	MultiNodeTest	shouldReplayWithAppointedLeaderWithThreeNodesWithNoSnapshot	A	P3-6c	stub-service,counter,client			
+system	MultiNodeTest	shouldCatchUpWithAppointedLeaderWithThreeNodesWithNoSnapshot	A	P3-6c	stub-service,counter,client			
+system	MultiNodeTest	shouldConnectClientOverIpc	A	P3-6c	counter,client			
+system	MultiNodeTest	shouldConnectClientUsingResolvedResponsePort	A	P3-6c	client			
+system	OffsetMillisecondClusterClockTest	shouldOffsetDelegateTime	A	P3-4a	client			
+system	RacingCatchupClusterTest	shouldCatchupIfLogPositionMovesForwardBeforeFollowersCommitPositionWhenCatchingUpNodeIsOnlyFollower	A	P3-6b	stub-service,counter,client	disabled:no-reason		
+system	RecoverAfterFailedCatchupClusterTest	shouldCatchupFromEmptyLog	A	P3-6b	stub-service,counter,client			
+system	SingleNodeTest	shouldStartCluster	A	P3-4f	counter			
+system	SingleNodeTest	shouldNotConsiderItselfInactiveAndEnterAnElection	A	P3-4f	counter,cm-object			
+system	SingleNodeTest	shouldSendMessagesToCluster	A	P3-4f	stub-service,counter,client			
+system	SingleNodeTest	shouldReplayLog	A	P3-4f	stub-service,counter,client			
+system	SingleNodeTest	shouldReplayLogWithPaddingAtEndOfRecording	A	P3-4f	stub-service,counter,client			
+system	SingleNodeTest	shouldReattemptEgressSubscriptionCreationOnTransientError	A	P3-4f	counter,client			
+system	StalledLeaderLogReplicationClusterTest	shouldHandleMultipleElections	A	P3-6b	counter,client			
+system	StartFromTruncatedRecordingLogTest	shouldBeAbleToStartClusterFromTruncatedRecordingLog	A	P3-6b	client			
+unit	AuthenticationTest	shouldAuthenticateOnConnectRequestWithEmptyCredentials	A	P3-4b	unit			
+unit	AuthenticationTest	shouldAuthenticateOnConnectRequestWithCredentials	A	P3-4b	unit			
+unit	AuthenticationTest	shouldAuthenticateOnChallengeResponse	A	P3-4b	unit			
+unit	AuthenticationTest	shouldRejectOnConnectRequest	A	P3-4b	unit			
+unit	AuthenticationTest	shouldRejectOnChallengeResponse	A	P3-4b	unit			
+unit	ClusterMemberTest	shouldParseCorrectly	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldParseCorrectlyOptionalArchiveResponse	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldParseCorrectlyOptionalEgressResponseEntry	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldDetermineQuorumSize	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldCheckMemberIsActive	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldRankClusterStart	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldDetermineQuorumPosition	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldOnlyConsiderActiveNodesWhenDeterminingQuorumPosition	A	P3-1d	unit			
+unit	ClusterMemberTest	isUnanimousCandidateReturnFalseIfThereIsAMemberWithoutLogPosition	A	P3-1d	unit			
+unit	ClusterMemberTest	isUnanimousCandidateReturnFalseIfThereIsAMemberWithMoreUpToDateLog	A	P3-1d	unit			
+unit	ClusterMemberTest	isUnanimousCandidateReturnFalseIfLeaderClosesGracefully	A	P3-1d	unit			
+unit	ClusterMemberTest	isUnanimousCandidateReturnTrueIfTheCandidateHasTheMostUpToDateLog	A	P3-1d	unit			
+unit	ClusterMemberTest	isQuorumCandidateReturnFalseWhenQuorumIsNotReached	A	P3-1d	unit			
+unit	ClusterMemberTest	isQuorumCandidateReturnTrueWhenQuorumIsReached	A	P3-1d	unit			
+unit	ClusterMemberTest	isQuorumLeaderReturnsTrueWhenQuorumIsReached	A	P3-1d	unit			
+unit	ClusterMemberTest	isQuorumLeaderReturnsFalseIfAtLeastOneNegativeVoteIsDetected	A	P3-1d	unit			
+unit	ClusterMemberTest	isQuorumLeaderReturnsFalseWhenQuorumIsNotReached	A	P3-1d	unit			
+unit	ClusterMemberTest	isUnanimousLeaderReturnsFalseIfThereIsAtLeastOneNegativeVoteForAGivenCandidateTerm	A	P3-1d	unit			
+unit	ClusterMemberTest	isUnanimousLeaderReturnsFalseIfLeaderClosesGracefully	A	P3-1d	unit			
+unit	ClusterMemberTest	isUnanimousLeaderReturnsFalseIfNotAllNodesVotedPositively	A	P3-1d	unit			
+unit	ClusterMemberTest	isUnanimousLeaderReturnsFalseIfNotAllNodesHadTheExpectedCandidateTermId	A	P3-1d	unit			
+unit	ClusterMemberTest	isUnanimousLeaderReturnsTrueIfAllNodesVotedWithTrue	A	P3-1d	unit			
+unit	ClusterMemberTest	compareLogReturnsResult	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldNotVoteIfHasNoPosition	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldNotVoteIfHasMoreLog	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldVoteIfHasLessOrTheSameAmountOfLog	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldReturnFalseIfNotActiveWhenDoingPositionChecks	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldReturnFalseIfLeadershipTermIdDoesNotMatch	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldReturnFalseIfLogPositionIsLessThan	A	P3-1d	unit			
+unit	ClusterMemberTest	shouldReturnTrueIfLogPositionIsEqualOrGreaterThan	A	P3-1d	unit			
+unit	ClusterMemberTest	hasQuorumAtPositionReturnFalseIfNotAQuorum	A	P3-1d	unit			
+unit	ClusterMemberTest	hasQuorumAtPositionReturnTrueIfQuorumIsAtPosition	A	P3-1d	unit			
+unit	ClusterNodeRestartTest	shouldRestartServiceWithReplay	A	P3-4f	unit			
+unit	ClusterNodeRestartTest	shouldRestartServiceWithReplayAndContinue	A	P3-4f	unit			
+unit	ClusterNodeRestartTest	shouldRestartServiceFromEmptySnapshot	A	P3-4f	unit			
+unit	ClusterNodeRestartTest	shouldRestartServiceFromSnapshot	A	P3-4f	unit			
+unit	ClusterNodeRestartTest	shouldRestartServiceFromSnapshotWithFurtherLog	A	P3-4f	unit			
+unit	ClusterNodeRestartTest	shouldTakeMultipleSnapshots	A	P3-4f	unit			
+unit	ClusterNodeRestartTest	shouldRestartServiceWithTimerFromSnapshotWithFurtherLog	A	P3-4f	unit			
+unit	ClusterNodeRestartTest	shouldTriggerRescheduledTimerAfterReplay	A	P3-4f	unit			
+unit	ClusterNodeRestartTest	shouldRestartServiceTwiceWithInvalidSnapshotAndFurtherLog	A	P3-4f	unit			
+unit	ClusterNodeRestartTest	shouldRestartServiceAfterShutdownWithInvalidatedSnapshot	A	P3-4f	unit			
+unit	ClusterNodeTest	shouldConnectAndSendKeepAlive	A	P3-4f	unit			
+unit	ClusterNodeTest	shouldEchoMessageViaServiceUsingDirectOffer	A	P3-4f	unit			
+unit	ClusterNodeTest	shouldEchoMessageViaServiceUsingTryClaim	A	P3-4f	unit			
+unit	ClusterNodeTest	shouldScheduleEventInService	A	P3-4f	unit			
+unit	ClusterNodeTest	shouldSendResponseAfterServiceMessage	A	P3-4f	unit			
+unit	ClusterTimerTest	shouldRestartServiceWithTimerFromSnapshotWithFurtherLog	A	P3-4c	unit			
+unit	ClusterTimerTest	shouldTriggerRescheduledTimerAfterReplay	A	P3-4c	unit			
+unit	ClusterTimerTest	shouldRescheduleTimerWhenSchedulingWithExistingCorrelationId	A	P3-4c	unit			
+unit	ClusterWithNoServicesTest	shouldConnectAndSendKeepAliveWithExtensionLoaded	A	P3-4f	unit			
+unit	ClusterWithNoServicesTest	shouldSnapshotExtensionState	A	P3-4f	unit			
+unit	ClusterWithNoServicesTest	shouldShutdownWithExtension	A	P3-4f	unit			
+unit	ClusterWithNoServicesTest	shouldAbortWithExtension	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldUseAssignedRoleName	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldLimitActiveSessions	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldCloseInactiveSession	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldCloseTerminatedSession	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldSuspendThenResume	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldThrowClusterTerminationExceptionUponShutdown	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	responseChannelIsBuiltBasedOnTheEgressChannel	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldPublishLogMessageButNotSnapshotOnStandbySnapshot	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	onNewLeadershipTermShouldUpdateTimeOfLastLeaderMessageReceived	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	onCommitPositionShouldUpdateTimeOfLastLeaderMessageReceived	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldDelegateHandlingToRegisteredExtension	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldThrowExceptionOnUnknownSchemaAndNoAdapter	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldHandlePaddingMessageAtEndOfTerm	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	notifiedCommitPositionShouldNotGoBackwardsUponReceivingCommitPosition	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	notifiedCommitPositionShouldNotGoBackwardsUponElectionCompletion	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	notifiedCommitPositionShouldNotGoBackwardsUponReceivingNewLeadershipTerm	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldTerminateOnArchiveStorageError	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldTerminateIfLocalArchiveConnectionIsLost	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldPropagateAgentTerminationExceptionAndRunTerminationHooks	A	P3-4f	unit			
+unit	ConsensusModuleAgentTest	shouldDelegateNonTerminalErrorHandlingToElectionIfSet	A	P3-4f	unit			
+unit	ConsensusModuleSnapshotTakerTest	snapshotConsensusModuleState	A	P3-4d	unit			
+unit	ConsensusModuleSnapshotTakerTest	snapshotPendingServiceMessageTracker	A	P3-4d	unit			
+unit	ConsensusModuleSnapshotTakerTest	snapshotPendingServiceMessageTrackerWithServiceMessagesMissedByFollower	A	P3-4d	unit			
+unit	ConsensusModuleSnapshotTakerTest	snapshotTimer	A	P3-4d	unit			
+unit	ConsensusModuleSnapshotTakerTest	snapshotSessionShouldUseTryClaimIfDataFitsIntoMaxPayloadSize	A	P3-4d	unit			
+unit	ConsensusModuleSnapshotTakerTest	snapshotSessionShouldUseOfferIfDataDoesNotFitIntoMaxPayloadSize	A	P3-4d	unit			
+unit	EgressPublisherTest	sendEventShouldUseTryClaimIfEventIsSmall	A	P3-4b	unit			
+unit	EgressPublisherTest	sendEventShouldUseOfferWhenEventIsTooBig	A	P3-4b	unit			
+unit	EgressPublisherTest	shouldSendChallengeResponseUsingTryClaimIfSmall	A	P3-4b	unit			
+unit	EgressPublisherTest	shouldSendChallengeResponseUsingOfferIfLarge	A	P3-4b	unit			
+unit	EgressPublisherTest	shouldSendNewLeaderEventUsingTryClaimIfSmall	A	P3-4b	unit			
+unit	EgressPublisherTest	shouldSendNewLeaderEventUsingOfferIfTooBig	A	P3-4b	unit			
+unit	EgressPublisherTest	shouldSendAdminResponseUsingTryClaimIfSmall	A	P3-4b	unit			
+unit	EgressPublisherTest	shouldSendAdminResponseUsingOfferIfTooBig	A	P3-4b	unit			
+unit	IngressAdapterTest	shouldDelegateToConsensusModuleAgent	A	P3-4b	unit			
+unit	LogSourceValidatorTest	leaderLogSourceTypeShouldOnlyAcceptLeader	A	P3-4d	unit			
+unit	LogSourceValidatorTest	followerLogSourceTypeShouldOnlyAcceptFollowerAndUnknown	A	P3-4d	unit			
+unit	LogSourceValidatorTest	anyLogSourceTypeShouldAny	A	P3-4d	unit			
+unit	NameResolutionClusterNodeTest	shouldConnectAndSendKeepAliveWithBadName	A	P3-6c	unit			
+unit	NodeStateFileTest	shouldFailIfCreateNewFalseAndFileDoesNotExist	A	P3-1f	unit			
+unit	NodeStateFileTest	shouldCreateIfCreateNewTrueAndFileDoesNotExist	A	P3-1f	unit			
+unit	NodeStateFileTest	shouldHaveNullCandidateTermIdOnInitialCreation	A	P3-1f	unit			
+unit	NodeStateFileTest	shouldPersistCandidateTermId	A	P3-1f	unit			
+unit	NodeStateFileTest	shouldThrowIfVersionMismatch	A	P3-1f	unit			
+unit	NodeStateFileTest	shouldProposeNewMaxTermId	A	P3-1f	unit			
+unit	NodeStateFileTest	shouldHandleNodeStateFileCreatedWithEarlierVersion	A	P3-1f	unit			
+unit	PendingServiceMessageTrackerTest	snapshotEmpty	A	P3-4c	unit			
+unit	PendingServiceMessageTrackerTest	snapshotAfterEnqueueBeforePollAndSweep	A	P3-4c	unit			
+unit	PendingServiceMessageTrackerTest	snapshotAfterEnqueueAndPollBeforeSweep	A	P3-4c	unit			
+unit	PendingServiceMessageTrackerTest	snapshotAfterEnqueuePollAndSweepForLeader	A	P3-4c	unit			
+unit	PendingServiceMessageTrackerTest	snapshotAfterEnqueuePollAndSweepForFollower	A	P3-4c	unit			
+unit	PendingServiceMessageTrackerTest	loadInvalid	A	P3-4c	unit			
+unit	PendingServiceMessageTrackerTest	loadValid	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	throwsNullPointerExceptionIfTimerHandlerIsNull	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	pollIsANoOpWhenNoTimersWhereScheduled	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	pollIsANoOpWhenNoScheduledTimersAreExpired	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	pollShouldNotExpireTimerIfHandlerReturnsFalse	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	pollShouldExpireSingleTimer	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	pollShouldRemovedExpiredTimers	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	pollShouldExpireTimersInOrderOfDeadlineButWithinTheDeadlineOrderIsUndefined	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdIsANoOpIfNoTimersRegistered	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdReturnsFalseForUnknownCorrelationId	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdReturnsTrueAfterCancellingTheTimer	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdReturnsTrueAfterCancellingTheLastTimer	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	cancelTimerByCorrelationIdAfterPoll	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	scheduleTimerForAnExistingCorrelationIdIsANoOpIfDeadlineDoesNotChange	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	scheduleTimerForAnExistingCorrelationIdShouldShiftEntryUpWhenDeadlineIsDecreasing	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	scheduleTimerForAnExistingCorrelationIdShouldShiftEntryDownWhenDeadlineIsIncreasing	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	pollShouldStopAfterPollLimitIsReached	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	snapshotProcessesAllScheduledTimers	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	expireThanCancelTimer	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	moveUpAnExistingTimerAndCancelAnotherOne	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	moveDownAnExistingTimerAndCancelAnotherOne	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	cancelExpiredTimerIsANoOp	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	scheduleMustRetainOrderBetweenDeadlines	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	shouldReuseExpiredEntriesFromAFreeList	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	shouldReuseCanceledTimerEntriesFromAFreeList	A	P3-4c	unit			
+unit	PriorityHeapTimerServiceTest	manyRandomOperations	A	P3-4c	unit			
+unit	PublicationGroupTest	shouldUseAllPublicationsInListWhenGettingNextPublication	A	P3-6b	unit			
+unit	PublicationGroupTest	shouldNextPublicationAndReturnSameWithCurrent	A	P3-6b	unit			
+unit	PublicationGroupTest	shouldResultNullWhenCurrentCalledWithoutNext	A	P3-6b	unit			
+unit	PublicationGroupTest	shouldCloseWhenCurrentIsNotNullWhenNextIsCalled	A	P3-6b	unit			
+unit	PublicationGroupTest	shouldExcludeCurrentPublication	A	P3-6b	unit			
+unit	PublicationGroupTest	shouldClearExclusion	A	P3-6b	unit			
+unit	PublicationGroupTest	shouldClosePublicationOnClose	A	P3-6b	unit			
+unit	PublicationGroupTest	shouldEventuallyGetADifferentOrderAfterShuffle	A	P3-6b	unit			
+unit	RecordingLogTest	shouldCreateNewIndex	A	P3-1e	unit			
+unit	RecordingLogTest	shouldAppendAndThenReloadLatestSnapshot	A	P3-1e	unit			
+unit	RecordingLogTest	shouldIgnoreIncompleteSnapshotInRecoveryPlan	A	P3-1e	unit			
+unit	RecordingLogTest	shouldIgnoreInvalidMidSnapshotInRecoveryPlan	A	P3-1e	unit			
+unit	RecordingLogTest	shouldIgnoreInvalidTermInRecoveryPlan	A	P3-1e	unit			
+unit	RecordingLogTest	shouldAppendAndThenCommitTermPosition	A	P3-1e	unit			
+unit	RecordingLogTest	shouldRemoveEntry	A	P3-1e	unit			
+unit	RecordingLogTest	shouldCorrectlyOrderSnapshots	A	P3-1e	unit			
+unit	RecordingLogTest	shouldInvalidateLatestSnapshot	A	P3-1e	unit			
+unit	RecordingLogTest	shouldRecoverSnapshotsMidLogMarkedInvalid	A	P3-1e	unit			
+unit	RecordingLogTest	shouldRecoverSnapshotsLastInLogMarkedWithInvalid	A	P3-1e	unit			
+unit	RecordingLogTest	shouldNotAllowInvalidateOfSnapshotWithoutParentTerm	A	P3-1e	unit			
+unit	RecordingLogTest	shouldFailToRecoverSnapshotsMarkedInvalidIfFieldsDoNotMatchCorrectly	A	P3-1e	unit			
+unit	RecordingLogTest	shouldFindSnapshotAtOrBeforeOrLowest	A	P3-1e	unit			
+unit	RecordingLogTest	shouldAppendTermWithLeadershipTermIdOutOfOrder	A	P3-1e	unit			
+unit	RecordingLogTest	shouldAppendSnapshotWithLeadershipTermIdOutOfOrder	A	P3-1e	unit			
+unit	RecordingLogTest	appendTermShouldRejectNullValueAsRecordingId	A	P3-1e	unit			
+unit	RecordingLogTest	appendSnapshotShouldRejectNullValueAsRecordingId	A	P3-1e	unit			
+unit	RecordingLogTest	appendTermShouldNotAcceptDifferentRecordingIds	A	P3-1e	unit			
+unit	RecordingLogTest	appendTermShouldOnlyAllowASingleValidTermForTheSameLeadershipTermId	A	P3-1e	unit			
+unit	RecordingLogTest	entriesInTheRecordingLogShouldBeSorted	A	P3-1e	unit			
+unit	RecordingLogTest	shouldCreateInitialEmptyTermsWithAnEmptyRecordingLog	A	P3-1e	unit			
+unit	RecordingLogTest	shouldNotCreateInitialTermWithMinusOneTermId	A	P3-1e	unit			
+unit	RecordingLogTest	shouldBackFillEmptyLeadershipTermsInANonemptyRecordingLog	A	P3-1e	unit			
+unit	RecordingLogTest	shouldCompleteExistingTerm	A	P3-1e	unit			
+unit	RecordingLogTest	shouldBackFillPriorTerm	A	P3-1e	unit			
+unit	RecordingLogTest	shouldThrowIfLastTermIsUnfinishedAndTermBaseLogPositionIsNotSpecified	A	P3-1e	unit			
+unit	RecordingLogTest	typeAsString	A	P3-1e	unit			
+unit	RecordingLogTest	entryToString	A	P3-1e	unit			
+unit	RecordingLogTest	shouldDetermineIfSnapshotIsInvalid	A	P3-1e	unit			
+unit	RecordingLogTest	shouldInsertStandbySnapshotInRecordingLog	A	P3-1e	unit			
+unit	RecordingLogTest	shouldInvalidateLatestAnySnapshots	A	P3-1e	unit			
+unit	RecordingLogTest	shouldNotIncludeStandbySnapshotInRecoveryPlan	A	P3-1e	unit			
+unit	RecordingLogTest	shouldGetLatestStandbySnapshotsGroupedByEndpoint	A	P3-1e	unit			
+unit	RecordingLogTest	shouldInvalidateLatestSnapshotIgnoringStandbySnapshots	A	P3-1e	unit			
+unit	RecordingLogTest	shouldHandleEntriesStraddlingPageBoundary	A	P3-1e	unit			
+unit	RecordingLogTest	shouldRejectSnapshotEntryIfEndpointIsTooLong	A	P3-1e	unit			
+unit	RecordingLogValidatorTest	shouldInvalidateSnapshotsWithUnknownRecordings	A	P3-1e	unit			
+unit	RecordingReplicationTest	shouldIndicateAppropriateStatesAsSignalsAreReceived	A	P3-6b	unit			
+unit	RecordingReplicationTest	shouldStopReplicationIfNotAlreadyStopped	A	P3-6b	unit			
+unit	RecordingReplicationTest	shouldNotStopReplicationIfStopSignalled	A	P3-6b	unit			
+unit	RecordingReplicationTest	shouldFailIfRecordingLogIsDeletedDuringReplication	A	P3-6b	unit			
+unit	RecordingReplicationTest	shouldPollForProgressAndFailIfNotProgressing	A	P3-6b	unit			
+unit	ServiceProxyTest	shouldLogWarningIfClusterMemberResponseFails	A	P3-4c	unit			
+unit	ServiceProxyTest	shouldSendClusterMemberResponse	A	P3-4c	unit			
+unit	ServiceProxyTest	shouldLogWarningIfClusterMemberExtendedResponseFails	A	P3-4c	unit			
+unit	ServiceProxyTest	shouldSendClusterMemberExtendedResponse	A	P3-4c	unit			
+unit	SessionManagerTest	shouldProcessPendingStandbySnapshotNotificationsAfterReachingCommitPosition	A	P3-4b	unit			
+unit	SessionManagerTest	shouldRetryCreatingResponsePublicationWhenResourceTemporarilyUnavailable	A	P3-4b	unit			
+unit	SessionManagerTest	shouldProcessPendingStandbySnapshotNotificationsAfterProcessingDelay	A	P3-4b	unit			
+unit	SnapshotReplicationTest	shouldReplicateTwoSnapshots	A	P3-4d	unit			
+unit	SnapshotReplicationTest	shouldNotBeCompleteIfNotSynced	A	P3-4d	unit			
+unit	SnapshotReplicationTest	closeWillCloseUnderlyingSnapshotReplication	A	P3-4d	unit			
+unit	ClusterMarkFileTest	throwsExceptionIfErrorBufferLengthIsInvalid	A	P3-1b	unit			
+unit	ClusterMarkFileTest	shouldCallForceIfMarkFileIsNotClosed	A	P3-1b	unit	disabled:jre-range		
+unit	ClusterMarkFileTest	shouldNotCallForceIfMarkFileIsClosed	A	P3-1b	unit	disabled:jre-range		
+unit	ClusterMarkFileTest	shouldCreateNewMarkFile	A	P3-1b	unit			
+unit	ClusterMarkFileTest	shouldUpdateExistingMarkFile	A	P3-1b	unit			
+unit	ClusterMarkFileTest	shouldHandleExistingMarkFileV0	A	P3-1b	unit			
+unit	ClusterMarkFileTest	shouldUnmapBufferUponClose	A	P3-1b	unit			
+unit	ClusterMarkFileTest	clusterIdAccessors	A	P3-1b	unit			
+unit	ClusterMarkFileTest	memberIdAccessors	A	P3-1b	unit			
+unit	ClusterMarkFileTest	candidateTermIdAccessors	A	P3-1b	unit			
+unit	ClusterMarkFileTest	activityTimestampAccessors	A	P3-1b	unit			
+unit	ClusterMarkFileTest	loadControlPropertiesAccessors	A	P3-1b	unit			
+unit	ClusterMarkFileTest	signalReady	A	P3-1b	unit			
+unit	ClusterMarkFileTest	signalFailedStart	A	P3-1b	unit			
+unit	ClusterMarkFileTest	shouldAlignMarkFileLengthBasedOnTheFilePageSizeFromAeronClient	A	P3-1b	unit			
+unit	ClusterMarkFileTest	shouldRejectFilePageSizeIfNotPowerOf2	A	P3-1b	unit			
+unit	ClusterMarkFileTest	shouldRejectFilePageSizeIfTooSmall	A	P3-1b	unit			
+unit	ClusterMarkFileTest	shouldRejectFilePageSizeIfTooBig	A	P3-1b	unit			
