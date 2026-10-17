@@ -8,6 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 deepmsg-client = { path = "../../client" }
+deepmsg-core = { path = "../../core" }
+deepmsg-codec-cluster-node-state = { path = "../../codec/cluster-node-state" }
 
 [lints]
 workspace = true

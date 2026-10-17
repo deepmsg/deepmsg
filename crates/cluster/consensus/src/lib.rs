@@ -39,6 +39,7 @@
 pub mod election;
 pub mod error;
 pub mod handles;
+pub mod persist;
 pub mod state;
 
 pub use error::ClusterError;

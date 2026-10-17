@@ -256,6 +256,8 @@ name = "deepmsg-cluster"
 version = "0.1.0"
 dependencies = [
  "deepmsg-client",
+ "deepmsg-codec-cluster-node-state",
+ "deepmsg-core",
 ]
 
 [[package]]
