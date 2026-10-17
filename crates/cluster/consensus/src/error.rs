@@ -54,6 +54,21 @@ impl From<deepmsg_cluster_common::member::MemberError> for ClusterError {
     }
 }
 
+impl From<deepmsg_cluster_common::decode::DecodeError> for ClusterError {
+    fn from(error: deepmsg_cluster_common::decode::DecodeError) -> Self {
+        Self::Cluster(format!(
+            "{}: needed {} bytes, {} available",
+            error.what, error.needed, error.available
+        ))
+    }
+}
+
+impl From<deepmsg_client::client::CommandError> for ClusterError {
+    fn from(error: deepmsg_client::client::CommandError) -> Self {
+        Self::Cluster(error.to_string())
+    }
+}
+
 impl core::fmt::Display for ClusterError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {

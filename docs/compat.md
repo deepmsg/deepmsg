@@ -1296,3 +1296,25 @@ tell: `aeron.archive.message.timeout` (10 s, now the sessions' own timeout),
 `aeron.archive.catalog.capacity` was worse than unread: the **default of a
 different name** (`max.catalog.entries`) was being passed as the catalog file's
 starting size, and it is now the capacity's own.
+
+## A cluster session's messages (P3-4b)
+
+The four contracts a client meets on its first exchange with a cluster. Each is
+pinned by a test in this repository; the reference's own cluster suites are the
+next witnesses (LC-1/LC-2, P3-3c/P3-4f), and these rows say what is already
+fixed before them.
+
+| Contract | Value | Reference source | Pinned by |
+|---|---|---|---|
+| Session id | a plain monotonic `i64` from **1**; `-1` for a redirect/backup session. No leadership term is packed into it | `SessionManager.java:247`, `ClusterSession.java:109-112` | `session_manager.rs::should_redirect_a_connect_request_on_a_follower` and `::should_hand_an_accepted_connect_request_to_the_authenticator` |
+| Application message on ingress and in the log | SBE header (8) + `SessionMessageHeader` block (**24**) + payload; `SESSION_HEADER_LENGTH = 32`; one frame, aligned to 32 | `AeronCluster.java:99-100`, `IngressAdapter.java:87-101`, `LogPublisher.java:115-144` | `cluster_session.rs::a_client_connects_opens_a_session_sends_a_message_and_closes` (the log advances by **96** bytes for a 5-byte message: 32 data header + 37 message, aligned) |
+| Session counter | type **241**; key = `clusterId` (4, LE) + `sessionId` (8, LE); label `cluster-session: <sessionInfo> - clusterId=<n>`; value = the session id, reference id = the response publication's registration id | `ClusterSession.java:502-524` | `cluster_session.rs::a_session_id_is_a_plain_long_and_the_counter_key_is_cluster_then_id`; the label text is in the same test |
+| Ingress channel URI | the configured channel, `endpoint=<member ingress endpoint>` when it names none, `rejoin=false`, `reliable-stream=true`; a follower never subscribes to a multicast ingress; an IPC subscription exists only for a **leader** with `aeron.cluster.ingress.ipc.allowed=true` | `ConsensusModuleAgent.java:3387-3415` | `agent::tests::ingress_endpoints_are_id_equals_endpoint_separated_by_commas`, `::an_ipc_response_channel_becomes_the_egress_channel_unless_ipc_ingress_is_allowed`; the end-to-end path is the session integration test |
+| Response channel refinement | `aeron.cluster.egress.channel`'s parameters are put onto a client's response channel; an `aeron:ipc` response channel is replaced **whole** by the egress channel unless IPC ingress is allowed | `ConsensusModuleAgent.java:3459-3475` | `agent::tests::the_egress_channels_parameters_are_put_onto_a_udp_response_channel` and the two tests beside it |
+| Egress message path | a `SessionEvent` that fits the publication's maximum payload is **claimed**; a larger one is encoded into a reusable buffer and **offered**; three attempts each way, and a refusal is retried next slow tick | `EgressPublisher.java:54-109`, `:316-330` | `tests/egress_publisher.rs` (the eight `EgressPublisherTest` cases, one test each) |
+
+A claim publishes the **unaligned** frame length
+(`deepmsg-core::logbuffer::frame::Frame::publish`): the SBE message plus the
+32-byte data header. The aligned length is what the producer's position moves
+by, and writing it into the frame header instead makes the padding part of the
+payload — a difference the session integration test's 96-byte assertion catches.

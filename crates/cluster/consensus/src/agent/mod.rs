@@ -61,6 +61,8 @@ use deepmsg_cluster_common::counters::{
 };
 use deepmsg_cluster_common::mark::{self, ClusterMarkFile};
 use deepmsg_cluster_common::member::{self, ClusterMember};
+use deepmsg_codec_cluster::admin_request_type::AdminRequestType;
+use deepmsg_codec_cluster::admin_response_code::AdminResponseCode;
 use deepmsg_codec_cluster::cluster_time_unit::ClusterTimeUnit;
 use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
 use deepmsg_core::clock;
@@ -75,6 +77,13 @@ use crate::handles::{LogReplay, RecordingReplication};
 use crate::log_publisher::LogPublisher;
 use crate::persist::node_state::NodeStateFile;
 use crate::persist::recording_log::{self, RecordingExtent, RecordingLog, RecoveryPlan};
+use crate::session::authenticator::{
+    Authenticator, AuthorisationService, authenticator_for, authorisation_service_for,
+};
+use crate::session::cluster_session::{ClusterSession, SessionEgress};
+use crate::session::egress::EgressPublisher;
+use crate::session::ingress::{IngressAdapter, IngressHandler};
+use crate::session::manager::{SessionConnectRequest, SessionContext, SessionManager};
 use crate::state::{ModuleState, Role};
 
 use publisher::ConsensusPublisher;
@@ -98,10 +107,6 @@ const NULL_POSITION: i64 = -1;
 
 /// `Aeron.NULL_VALUE`, and the `-1` a recording id takes when there is none.
 const NULL_VALUE: i64 = -1;
-
-/// The default authenticator's class name, which the marker's var-data carries
-/// (`ConsensusModule.java:807`). P3-4b instantiates it; P3-4a only records it.
-const DEFAULT_AUTHENTICATOR: &str = "io.aeron.cluster.DefaultAuthenticatorSupplier";
 
 /// The counters a consensus module allocates (`ConsensusModule.java:1892-2046`).
 ///
@@ -201,9 +206,23 @@ pub struct ConsensusModuleAgent {
     mark_file_update_deadline_ns: i64,
 
     consensus_subscription_id: i64,
+    sessions: SessionManager,
+    egress: EgressPublisher,
+    ingress: IngressAdapter,
     live_log_destination: String,
     catchup_log_destination: String,
     closed: bool,
+}
+
+/// The two objects a deployment names by class and a test supplies in process
+/// (`ConsensusModule.Context.authenticatorSupplier` and
+/// `authorisationServiceSupplier`, `ConsensusModule.java:1683-1690`).
+#[derive(Default)]
+pub struct LaunchComponents {
+    /// `None` means the name in `aeron.cluster.authenticator.supplier`.
+    pub authenticator: Option<Box<dyn Authenticator>>,
+    /// `None` means the name in `aeron.cluster.authorisation.service.supplier`.
+    pub authorisation_service: Option<Box<dyn AuthorisationService>>,
 }
 
 impl ConsensusModuleAgent {
@@ -215,8 +234,34 @@ impl ConsensusModuleAgent {
     /// [`ClusterError`] from any of the opening steps, or a refusal naming the
     /// slice that a configuration asks for and this one does not have (more than
     /// one member, services, a custom clock).
-    pub fn launch(mut config: ConsensusModuleConfig) -> Result<Self, ClusterError> {
+    pub fn launch(config: ConsensusModuleConfig) -> Result<Self, ClusterError> {
+        Self::launch_with_components(config, LaunchComponents::default())
+    }
+
+    /// The same, with the two security objects supplied in process — the
+    /// equivalent of the reference's `Context.authenticatorSupplier` /
+    /// `authorisationServiceSupplier` fields (`ConsensusModule.java:1683-1690`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::launch`], plus a refusal when a configured supplier name is
+    /// one this build cannot make.
+    pub fn launch_with_components(
+        mut config: ConsensusModuleConfig,
+        components: LaunchComponents,
+    ) -> Result<Self, ClusterError> {
         config.conclude()?;
+
+        let authenticator = match components.authenticator {
+            Some(authenticator) => authenticator,
+            None => authenticator_for(&config.authenticator_supplier)
+                .map_err(|error| ClusterError::Cluster(error.to_string()))?,
+        };
+        let authorisation_service = match components.authorisation_service {
+            Some(service) => service,
+            None => authorisation_service_for(config.authorisation_service_supplier.as_deref())
+                .map_err(|error| ClusterError::Cluster(error.to_string()))?,
+        };
 
         let now_ms = clock::epoch_millis();
         let now_ns = MillisecondClusterClock.time_nanos();
@@ -251,7 +296,7 @@ impl ConsensusModuleAgent {
                 &config.control_channel,
                 &config.ingress_channel,
                 "",
-                DEFAULT_AUTHENTICATOR,
+                &config.authenticator_supplier,
                 config.cluster_dir.to_string_lossy().as_ref(),
             ])
             .map_err(cluster)?;
@@ -337,6 +382,17 @@ impl ConsensusModuleAgent {
         })?;
         let max_cycle_time = counters.max_cycle_time;
         let cycle_threshold_exceeded = counters.cycle_threshold_exceeded;
+        let sessions = SessionManager::new(
+            config.member_id,
+            config.cluster_id,
+            config.session_timeout_ns,
+            config.max_concurrent_sessions,
+            authenticator,
+            authorisation_service,
+        );
+        let egress = EgressPublisher::new(config.leader_heartbeat_timeout_ns);
+        let ingress = IngressAdapter::new(config.ingress_fragment_limit);
+
         let mut agent = Self {
             config,
             clock,
@@ -377,6 +433,9 @@ impl ConsensusModuleAgent {
             slow_tick_deadline_ns: 0,
             mark_file_update_deadline_ns: 0,
             consensus_subscription_id,
+            sessions,
+            egress,
+            ingress,
             live_log_destination: String::new(),
             catchup_log_destination: String::new(),
             closed: false,
@@ -507,12 +566,52 @@ impl ConsensusModuleAgent {
 
         work += self.poll_archive_events();
 
-        // Sessions (`SessionManager.sendRedirects/sendRejections/checkSessions`)
-        // are P3-4b; the cluster control toggle is P3-4e.
-        if self.election.is_none() && self.role == Role::Leader && self.state == ModuleState::Active
+        // `ClusterSession.asyncConnect`'s two commands were deferred to here by
+        // the ingress callback (see `session::ingress`).
+        self.sessions.drive_async_connects(&mut self.client)?;
+
+        let leadership_term_id = self.leadership_term_id;
+        let member_id = self.config.member_id;
+        let leader_member_id = self.members[self.this_member_index].id;
+        let ingress_endpoints = ingress_endpoints(&self.members);
+        let role = self.role;
+        let state = self.state;
+        let clock = self.clock;
+
         {
-            // One member has a quorum by definition, so `hasActiveQuorum`
-            // cannot fail here; the check belongs to P3-6b with the member table.
+            let Self {
+                client,
+                sessions,
+                egress,
+                log_publisher,
+                counters,
+                ..
+            } = self;
+            let mut ctx = SessionContext {
+                client,
+                log_publisher,
+                egress,
+                clock: &clock,
+                timed_out_counter: counters.timed_out_client,
+                leadership_term_id,
+                member_id,
+                leader_member_id,
+                ingress_endpoints: &ingress_endpoints,
+                now_ns,
+            };
+
+            work += sessions.send_redirects(&mut ctx)?;
+            work += sessions.send_rejections(&mut ctx)?;
+
+            if role == Role::Leader && state == ModuleState::Active {
+                work += sessions.process_all_pending_sessions(&mut ctx)?;
+                work += sessions.check_sessions(&mut ctx)?;
+                // One member has a quorum by definition, so `hasActiveQuorum`
+                // cannot fail here; the check belongs to P3-6b.
+            }
+            // A follower's backup sessions (`processPendingBackupSessions`,
+            // `:2440`) are ClusterBackup's (P3-9), and standby snapshot
+            // notifications are premium; neither can be produced in this slice.
         }
 
         Ok(work)
@@ -555,7 +654,9 @@ impl ConsensusModuleAgent {
 
         let mut work = 0;
         // Timers are P3-4c; the reference's `timerService.poll(timestamp)` on an
-        // empty table is zero work, which is what a P3-4a node has.
+        // empty table is zero work, which is what this node has. The service
+        // message trackers are P3-4c for the same reason.
+        work += self.poll_ingress()?;
         work += self.update_leader_position_internal(now_ns)?;
 
         Ok(work)
@@ -855,6 +956,22 @@ impl ConsensusModuleAgent {
     /// The log's publication session, or `-1` before the publication exists.
     pub const fn log_publication_session_id(&self) -> i32 {
         self.log_publication_session_id
+    }
+
+    /// The committed sessions (P3-4b).
+    pub fn sessions(&self) -> &[crate::session::ClusterSession] {
+        self.sessions.sessions()
+    }
+
+    /// How many sessions are open right now.
+    pub fn session_count(&self) -> usize {
+        self.sessions.sessions().len()
+    }
+
+    /// How far the log publication has got, which advances when a message is
+    /// appended even before it is committed.
+    pub fn log_position(&self) -> i64 {
+        self.log_publisher.position()
     }
 
     /// The counter ids this module allocated, for a test that checks all of them
@@ -1245,13 +1362,19 @@ impl ElectionHost for ConsensusModuleAgent {
         self.notified_commit_position = self.notified_commit_position.max(log_position);
         write_counter(&self.client, self.counters.commit_position, log_position);
 
-        // `connectIngress()` is P3-4b; the leader member is this one by the
-        // single-member rule.
         self.this_member_index = self
             .members
             .iter()
             .position(|member| member.id == self.config.member_id)
             .unwrap_or(self.this_member_index);
+
+        // `electionComplete` (`ConsensusModuleAgent.java:1905-1944`):
+        // `prepareSessionsForNewTerm(isLeaderStartup)` and then `connectIngress`.
+        // There are no sessions to prepare before P3-4d loads a snapshot, but
+        // the order is kept so that slice has the call where the reference has
+        // it.
+        self.sessions.prepare_sessions_for_new_term(false, now_ns);
+        self.connect_ingress()?;
 
         Ok(())
     }
@@ -1582,4 +1705,508 @@ fn put_initial_position(
     channel.put("term-id", term_id.to_string());
     channel.put("term-offset", term_offset.to_string());
     channel.put("term-length", term_length.to_string());
+}
+
+/// `id=endpoint,...` for the active members (`ClusterMember.ingressEndpoints`,
+/// `ClusterMember.java:1239-1255`), which is what a redirect or a new-leader
+/// event carries.
+fn ingress_endpoints(members: &[ClusterMember]) -> String {
+    let mut out = String::new();
+    for (index, member) in members.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&member.id.to_string());
+        out.push('=');
+        out.push_str(&member.ingress_endpoint);
+    }
+    out
+}
+
+/// `UdpChannel.isMulticastDestinationAddress` for the endpoint a URI names.
+fn is_multicast_endpoint(uri: &ChannelUri) -> bool {
+    let Some(endpoint) = uri.get("endpoint") else {
+        return false;
+    };
+    let host = endpoint
+        .rsplit_once(':')
+        .map_or(endpoint, |(host, _port)| host);
+    host.parse::<std::net::Ipv4Addr>()
+        .map(|address| address.is_multicast())
+        .unwrap_or(false)
+}
+
+/// `ConsensusModuleAgent.refineResponseChannel` (`ConsensusModuleAgent.java:3459-3475`).
+///
+/// `aeron.cluster.egress.channel`, when set, is a template: its parameters are
+/// put onto a client's response channel. An IPC response channel is special —
+/// it is replaced whole by the egress channel unless IPC ingress is allowed.
+fn refine_response_channel(
+    response_channel: &str,
+    ipc_ingress_allowed: bool,
+    egress_channel: Option<&str>,
+) -> String {
+    let Some(template) = egress_channel else {
+        return response_channel.to_owned();
+    };
+
+    if response_channel.starts_with("aeron:ipc") {
+        if ipc_ingress_allowed {
+            response_channel.to_owned()
+        } else {
+            template.to_owned()
+        }
+    } else {
+        let Ok(mut uri) = ChannelUri::parse(response_channel) else {
+            return response_channel.to_owned();
+        };
+        if let Ok(template_uri) = ChannelUri::parse(template) {
+            for (key, value) in template_uri.params() {
+                uri.put(key.as_str(), value.clone());
+            }
+        }
+        uri.build()
+    }
+}
+
+/// An admin request read from ingress, carried out after the poll because the
+/// response goes out on the client ([`AdminRequestType`]).
+struct DeferredAdminRequest {
+    cluster_session_id: i64,
+    correlation_id: i64,
+    request_type: AdminRequestType,
+}
+
+/// The consensus module as the ingress adapter sees it
+/// (`ConsensusModuleAgent.on*`).
+///
+/// It borrows the agent's disjoint fields: the client is held by the poll, so
+/// the two handlers that need it — a session close and an admin request, both of
+/// which answer on the client — are queued and run immediately after the poll,
+/// in the same duty cycle.
+struct AgentIngressHandler<'a> {
+    sessions: &'a mut SessionManager,
+    log_publisher: &'a mut LogPublisher,
+    role: Role,
+    leadership_term_id: i64,
+    position_limit: i64,
+    now_ns: i64,
+    ingress_ipc_allowed: bool,
+    egress_channel: Option<&'a str>,
+    ingress_endpoints: &'a str,
+    deferred_closes: Vec<(i64, i64)>,
+    deferred_admins: Vec<DeferredAdminRequest>,
+    extension_messages: usize,
+}
+
+impl IngressHandler for AgentIngressHandler<'_> {
+    fn on_extension_message(
+        &mut self,
+        _block_length: u16,
+        _template_id: u16,
+        _schema_id: u16,
+        _version: u16,
+        _payload: &[u8],
+    ) -> deepmsg_client::fragment_assembler::Action {
+        // The reference records a `ClusterEvent` and continues
+        // (`ConsensusModuleAgent.java:650-672`); the count is added to counter
+        // 212 after the poll, because writing it needs the client.
+        self.extension_messages += 1;
+        deepmsg_client::fragment_assembler::Action::Continue
+    }
+
+    fn on_ingress_message(
+        &mut self,
+        leadership_term_id: i64,
+        cluster_session_id: i64,
+        payload: &[u8],
+    ) -> Result<deepmsg_client::fragment_assembler::Action, ClusterError> {
+        use deepmsg_client::fragment_assembler::Action;
+
+        if leadership_term_id != self.leadership_term_id || self.role != Role::Leader {
+            return Ok(Action::Continue);
+        }
+        if !self
+            .sessions
+            .find_by_session_id(cluster_session_id)
+            .is_some_and(|session| session.is_open())
+        {
+            return Ok(Action::Continue);
+        }
+
+        let timestamp = MillisecondClusterClock.time();
+        let position = self.log_publisher.append_message(
+            self.position_limit,
+            leadership_term_id,
+            cluster_session_id,
+            timestamp,
+            payload,
+        )?;
+        if position > 0 {
+            if let Some(session) = self.sessions.find_by_session_id_mut(cluster_session_id) {
+                session.set_time_of_last_activity_ns(
+                    MillisecondClusterClock.convert_to_nanos(timestamp),
+                );
+            }
+            Ok(Action::Continue)
+        } else {
+            Ok(Action::Abort)
+        }
+    }
+
+    fn on_session_connect(&mut self, request: SessionConnectRequest) -> Result<(), ClusterError> {
+        let mut request = request;
+        request.response_channel = refine_response_channel(
+            &request.response_channel,
+            self.ingress_ipc_allowed,
+            self.egress_channel,
+        );
+        self.sessions.on_session_connect(
+            request,
+            self.role,
+            self.ingress_endpoints,
+            MillisecondClusterClock.time_nanos(),
+        );
+        Ok(())
+    }
+
+    fn on_session_close(
+        &mut self,
+        leadership_term_id: i64,
+        cluster_session_id: i64,
+    ) -> Result<(), ClusterError> {
+        if leadership_term_id == self.leadership_term_id && self.role == Role::Leader {
+            self.deferred_closes
+                .push((leadership_term_id, cluster_session_id));
+        }
+        Ok(())
+    }
+
+    fn on_session_keep_alive(
+        &mut self,
+        leadership_term_id: i64,
+        cluster_session_id: i64,
+        image_session_id: i32,
+    ) -> Result<(), ClusterError> {
+        if leadership_term_id == self.leadership_term_id && self.role == Role::Leader {
+            if let Some(session) = self.sessions.find_by_session_id_mut(cluster_session_id) {
+                if session.is_open() {
+                    session.link_ingress_image(image_session_id);
+                    session.set_time_of_last_activity_ns(self.now_ns);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn on_challenge_response(
+        &mut self,
+        correlation_id: i64,
+        cluster_session_id: i64,
+        encoded_credentials: &[u8],
+    ) -> Result<(), ClusterError> {
+        if self.role == Role::Leader {
+            self.sessions.on_challenge_response_for_user_session(
+                correlation_id,
+                cluster_session_id,
+                encoded_credentials,
+                self.now_ns,
+            );
+        } else {
+            return Err(ClusterError::Cluster(
+                "sending a challenge response to the leader is P3-6b".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn on_admin_request(
+        &mut self,
+        leadership_term_id: i64,
+        cluster_session_id: i64,
+        correlation_id: i64,
+        request_type: AdminRequestType,
+        _payload: &[u8],
+    ) -> Result<(), ClusterError> {
+        if self.role == Role::Leader && leadership_term_id == self.leadership_term_id {
+            self.deferred_admins.push(DeferredAdminRequest {
+                cluster_session_id,
+                correlation_id,
+                request_type,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ConsensusModuleAgent {
+    /// `connectIngress` (`ConsensusModuleAgent.java:3387-3415`): the ingress
+    /// subscription, and the IPC one when a leader allows IPC ingress.
+    fn connect_ingress(&mut self) -> Result<(), ClusterError> {
+        let this_member = &self.members[self.this_member_index];
+        let mut uri = ChannelUri::parse(&self.config.ingress_channel)
+            .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+        if uri.get("endpoint").is_none() {
+            uri.put("endpoint", this_member.ingress_endpoint.clone());
+        }
+
+        if self.role != Role::Leader && is_multicast_endpoint(&uri) {
+            // The reference does not subscribe a follower to a multicast
+            // ingress channel (`:3395-3398`).
+            return Ok(());
+        }
+
+        uri.put("rejoin", "false");
+        uri.put("reliable-stream", "true");
+
+        let udp = self.client.add_subscription(
+            &uri.build(),
+            self.config.ingress_stream_id,
+            COMMAND_TIMEOUT,
+        )?;
+        let ipc = if self.role == Role::Leader && self.config.ingress_ipc_allowed {
+            Some(self.client.add_subscription(
+                "aeron:ipc",
+                self.config.ingress_stream_id,
+                COMMAND_TIMEOUT,
+            )?)
+        } else {
+            None
+        };
+
+        self.ingress.connect(Some(udp), ipc);
+        Ok(())
+    }
+
+    /// `consensusWork`'s `ingressAdapter.poll()` (`ConsensusModuleAgent.java:2494`):
+    /// the client poll and then the deferred work that needs the client back.
+    fn poll_ingress(&mut self) -> Result<usize, ClusterError> {
+        if !self.ingress.is_connected() {
+            return Ok(0);
+        }
+
+        let position_limit = self.log_publisher.position_limit(&self.client);
+        let now_ns = self.clock.time_nanos();
+        let ingress_endpoints = ingress_endpoints(&self.members);
+        let egress_channel = self.config.egress_channel.clone();
+        let role = self.role;
+        let leadership_term_id = self.leadership_term_id;
+        let ingress_ipc_allowed = self.config.ingress_ipc_allowed;
+
+        let Self {
+            client,
+            ingress,
+            sessions,
+            log_publisher,
+            ..
+        } = self;
+        let mut handler = AgentIngressHandler {
+            sessions,
+            log_publisher,
+            role,
+            leadership_term_id,
+            position_limit,
+            now_ns,
+            ingress_ipc_allowed,
+            egress_channel: egress_channel.as_deref(),
+            ingress_endpoints: &ingress_endpoints,
+            deferred_closes: Vec::new(),
+            deferred_admins: Vec::new(),
+            extension_messages: 0,
+        };
+
+        let result = ingress.poll(client, &mut handler);
+        let work = result?;
+        let deferred_closes = std::mem::take(&mut handler.deferred_closes);
+        let deferred_admins = std::mem::take(&mut handler.deferred_admins);
+        let extension_messages = handler.extension_messages;
+        drop(handler);
+
+        if extension_messages > 0 {
+            let error_counter = self.counters.error;
+            let current = read_counter(&self.client, error_counter).unwrap_or(0);
+            write_counter(
+                &self.client,
+                error_counter,
+                current + i64::try_from(extension_messages).unwrap_or(1),
+            );
+        }
+
+        // The two deferred handlers both need `&mut Client`; they run in the
+        // same duty cycle, right after the poll.
+        self.sessions.drive_async_connects(&mut self.client)?;
+
+        if !deferred_closes.is_empty() || !deferred_admins.is_empty() {
+            let leadership_term_id = self.leadership_term_id;
+            let member_id = self.config.member_id;
+            let leader_member_id = self.members[self.this_member_index].id;
+            let clock = self.clock;
+            let Self {
+                client,
+                sessions,
+                egress,
+                log_publisher,
+                counters,
+                ..
+            } = self;
+            let mut ctx = SessionContext {
+                client,
+                log_publisher,
+                egress,
+                clock: &clock,
+                timed_out_counter: counters.timed_out_client,
+                leadership_term_id,
+                member_id,
+                leader_member_id,
+                ingress_endpoints: &ingress_endpoints,
+                now_ns,
+            };
+            for (term, cluster_session_id) in deferred_closes {
+                sessions.on_session_close(term, cluster_session_id, &mut ctx)?;
+            }
+            for request in deferred_admins {
+                handle_admin_request(&mut ctx, &*sessions, request)?;
+            }
+        }
+
+        Ok(work)
+    }
+}
+
+/// `ConsensusModuleAgent.onAdminRequest` (`ConsensusModuleAgent.java:780-826`).
+fn handle_admin_request(
+    ctx: &mut SessionContext<'_>,
+    sessions: &SessionManager,
+    request: DeferredAdminRequest,
+) -> Result<(), ClusterError> {
+    let Some(session) = sessions
+        .find_by_session_id(request.cluster_session_id)
+        .filter(|session| session.is_open())
+    else {
+        return Ok(());
+    };
+
+    let authorised = sessions.authorisation_service().is_authorised(
+        i32::from(deepmsg_codec_cluster::SBE_SCHEMA_ID),
+        i32::from(deepmsg_codec_cluster::admin_request_codec::SBE_TEMPLATE_ID),
+        Some(i32::from(request.request_type)),
+        session.encoded_principal(),
+    );
+    if !authorised {
+        let message = format!(
+            "Execution of the {} request was not authorised",
+            admin_request_type_name(request.request_type)
+        );
+        return send_admin_response(
+            ctx,
+            session,
+            request.correlation_id,
+            request.request_type,
+            AdminResponseCode::UNAUTHORISED_ACCESS,
+            &message,
+        );
+    }
+
+    if request.request_type == AdminRequestType::SNAPSHOT {
+        // The reference switches the control toggle (`:806-816`); the toggle
+        // is P3-4e, so this answers with the reference's own failure text
+        // instead of pretending the snapshot was scheduled.
+        return send_admin_response(
+            ctx,
+            session,
+            request.correlation_id,
+            request.request_type,
+            AdminResponseCode::ERROR,
+            "Failed to switch ClusterControl to the ToggleState.SNAPSHOT state",
+        );
+    }
+
+    let message = format!(
+        "Unknown request type: {}",
+        admin_request_type_name(request.request_type)
+    );
+    send_admin_response(
+        ctx,
+        session,
+        request.correlation_id,
+        request.request_type,
+        AdminResponseCode::ERROR,
+        &message,
+    )
+}
+
+fn send_admin_response(
+    ctx: &mut SessionContext<'_>,
+    session: &ClusterSession,
+    correlation_id: i64,
+    request_type: AdminRequestType,
+    response_code: AdminResponseCode,
+    message: &str,
+) -> Result<(), ClusterError> {
+    ctx.egress.send_admin_response(
+        &SessionEgress {
+            client: ctx.client,
+            session,
+        },
+        correlation_id,
+        request_type,
+        response_code,
+        message,
+    )?;
+    Ok(())
+}
+
+fn admin_request_type_name(request_type: AdminRequestType) -> &'static str {
+    match request_type {
+        AdminRequestType::SNAPSHOT => "SNAPSHOT",
+        AdminRequestType::NullVal => "NULL_VAL",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_response_channel_is_unchanged_without_an_egress_template() {
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:1234",
+            refine_response_channel("aeron:udp?endpoint=localhost:1234", false, None)
+        );
+    }
+
+    #[test]
+    fn an_ipc_response_channel_becomes_the_egress_channel_unless_ipc_ingress_is_allowed() {
+        let egress = "aeron:udp?endpoint=localhost:20000";
+        assert_eq!(
+            egress,
+            refine_response_channel("aeron:ipc", false, Some(egress))
+        );
+        assert_eq!(
+            "aeron:ipc",
+            refine_response_channel("aeron:ipc", true, Some(egress))
+        );
+    }
+
+    #[test]
+    fn the_egress_channels_parameters_are_put_onto_a_udp_response_channel() {
+        let refined = refine_response_channel(
+            "aeron:udp?endpoint=localhost:1234",
+            false,
+            Some("aeron:udp?interface=127.0.0.1|ttl=3"),
+        );
+        let uri = ChannelUri::parse(&refined).expect("a URI");
+        assert_eq!(Some("127.0.0.1"), uri.get("interface"));
+        assert_eq!(Some("3"), uri.get("ttl"));
+        assert_eq!(Some("localhost:1234"), uri.get("endpoint"));
+    }
+
+    #[test]
+    fn ingress_endpoints_are_id_equals_endpoint_separated_by_commas() {
+        let members = ClusterMember::parse_list(
+            "0,localhost:1000,localhost:2000,localhost:3000,localhost:4000,localhost:5000",
+        )
+        .expect("two members");
+        assert_eq!("0=localhost:1000", ingress_endpoints(&members));
+    }
 }

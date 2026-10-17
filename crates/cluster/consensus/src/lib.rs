@@ -44,9 +44,10 @@ pub mod error;
 pub mod handles;
 pub mod log_publisher;
 pub mod persist;
+pub mod session;
 pub mod state;
 
-pub use agent::ConsensusModuleAgent;
+pub use agent::{ConsensusModuleAgent, LaunchComponents};
 pub use clock::{ClusterClock, MillisecondClusterClock};
 pub use config::ConsensusModuleConfig;
 pub use error::ClusterError;

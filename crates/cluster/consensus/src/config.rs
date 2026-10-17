@@ -89,6 +89,26 @@ pub const SERVICE_COUNT_PROP_NAME: &str = "aeron.cluster.service.count";
 pub const SERVICE_COUNT_DEFAULT: i32 = 1;
 /// `MAX_SERVICE_COUNT` (`ClusteredServiceContainer.java:234`).
 pub const MAX_SERVICE_COUNT: i32 = 10;
+/// `aeron.cluster.ingress.fragment.limit` (`ConsensusModule.java:427`).
+pub const INGRESS_FRAGMENT_LIMIT_PROP_NAME: &str = "aeron.cluster.ingress.fragment.limit";
+/// `CLUSTER_INGRESS_FRAGMENT_LIMIT_DEFAULT` (`ConsensusModule.java:433`).
+pub const INGRESS_FRAGMENT_LIMIT_DEFAULT: i32 = 50;
+/// `aeron.cluster.ingress.ipc.allowed` (`ConsensusModule.java:439`).
+pub const INGRESS_IPC_ALLOWED_PROP_NAME: &str = "aeron.cluster.ingress.ipc.allowed";
+/// `CLUSTER_INGRESS_IPC_ALLOWED_DEFAULT` (`ConsensusModule.java:445`).
+pub const INGRESS_IPC_ALLOWED_DEFAULT: bool = false;
+/// `aeron.cluster.max.sessions` (`ConsensusModule.java:721`).
+pub const MAX_SESSIONS_PROP_NAME: &str = "aeron.cluster.max.sessions";
+/// `MAX_CONCURRENT_SESSIONS_DEFAULT` (`ConsensusModule.java:727`).
+pub const MAX_CONCURRENT_SESSIONS_DEFAULT: i32 = 10;
+/// `aeron.cluster.authenticator.supplier` (`ConsensusModule.java:807`).
+pub const AUTHENTICATOR_SUPPLIER_PROP_NAME: &str = "aeron.cluster.authenticator.supplier";
+/// The class the reference names when the property is unset
+/// (`ConsensusModule.java:804-807`); the mark file records it as well.
+pub const DEFAULT_AUTHENTICATOR_SUPPLIER: &str = "io.aeron.security.DefaultAuthenticatorSupplier";
+/// `aeron.cluster.authorisation.service.supplier` (`ConsensusModule.java:813`).
+pub const AUTHORISATION_SERVICE_SUPPLIER_PROP_NAME: &str =
+    "aeron.cluster.authorisation.service.supplier";
 /// `aeron.cluster.session.timeout` (`ConsensusModule.java:733`), 10 s.
 pub const SESSION_TIMEOUT_PROP_NAME: &str = "aeron.cluster.session.timeout";
 /// `SESSION_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:739`).
@@ -140,6 +160,43 @@ pub const CLUSTER_IDLE_STRATEGY_PROP_NAME: &str = "aeron.cluster.idle.strategy";
 pub const CLUSTER_IDLE_STRATEGY_DEFAULT: &str = "org.agrona.concurrent.BackoffIdleStrategy";
 /// `Context.appVersion`'s default (`ConsensusModule.java:1610`).
 pub const APP_VERSION_DEFAULT: i32 = 1;
+
+/// `ClusterSession.MAX_ENCODED_PRINCIPAL_LENGTH` (`ClusterSession.java:49`).
+pub const MAX_ENCODED_PRINCIPAL_LENGTH: usize = 4 * 1024;
+
+/// `ConsensusModule.Configuration.SESSION_LIMIT_MSG` (`ConsensusModule.java:578`).
+pub const SESSION_LIMIT_MSG: &str = "concurrent session limit";
+
+/// `ConsensusModule.Configuration.SESSION_INVALID_VERSION_MSG`
+/// (`ConsensusModule.java:588`).
+pub const SESSION_INVALID_VERSION_MSG: &str = "invalid client version";
+
+/// `ConsensusModule.Configuration.SESSION_REJECTED_MSG` (`ConsensusModule.java:583`).
+pub const SESSION_REJECTED_MSG: &str = "session failed authentication";
+
+/// `AeronCluster.Configuration.PROTOCOL_MAJOR_VERSION` (`AeronCluster.java:1209`).
+pub const PROTOCOL_MAJOR_VERSION: i32 = 0;
+/// `PROTOCOL_MINOR_VERSION` (`AeronCluster.java:1219`).
+pub const PROTOCOL_MINOR_VERSION: i32 = 3;
+/// `PROTOCOL_PATCH_VERSION` (`AeronCluster.java:1228`).
+pub const PROTOCOL_PATCH_VERSION: i32 = 0;
+/// `PROTOCOL_SEMANTIC_VERSION` (`AeronCluster.java:1228-1229`).
+pub const PROTOCOL_SEMANTIC_VERSION: i32 = compose_semantic_version(
+    PROTOCOL_MAJOR_VERSION,
+    PROTOCOL_MINOR_VERSION,
+    PROTOCOL_PATCH_VERSION,
+);
+
+/// Agrona's `SemanticVersion.compose`: major in the high 16 bits, then minor,
+/// then patch (`SemanticVersion.java`).
+pub const fn compose_semantic_version(major: i32, minor: i32, patch: i32) -> i32 {
+    (major << 16) | (minor << 8) | patch
+}
+
+/// Agrona's `SemanticVersion.major`.
+pub const fn semantic_version_major(version: i32) -> i32 {
+    (version >> 16) & 0xFFFF
+}
 
 /// Why a configuration could not be settled.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,6 +268,16 @@ pub struct ConsensusModuleConfig {
     pub log_stream_id: i32,
     /// Ingress stream id.
     pub ingress_stream_id: i32,
+    /// How many fragments one ingress poll reads (`aeron.cluster.ingress.fragment.limit`).
+    pub ingress_fragment_limit: usize,
+    /// Whether clients may connect over IPC (`aeron.cluster.ingress.ipc.allowed`).
+    pub ingress_ipc_allowed: bool,
+    /// How many sessions may be pending or open at once (`aeron.cluster.max.sessions`).
+    pub max_concurrent_sessions: usize,
+    /// `aeron.cluster.authenticator.supplier`, or the reference's default name.
+    pub authenticator_supplier: String,
+    /// `aeron.cluster.authorisation.service.supplier`, or `None` for the default.
+    pub authorisation_service_supplier: Option<String>,
     /// Egress stream id.
     pub egress_stream_id: i32,
     /// Service stream id (CM -> container).
@@ -278,6 +345,15 @@ impl ConsensusModuleConfig {
                     name,
                     value: text.to_owned(),
                 }),
+            }
+        };
+
+        // `Boolean.parseBoolean`: anything but "true" is false, and the default
+        // applies only when the name is absent (`ConsensusModule.java:439-445`).
+        let boolean = |name: &'static str, default: bool| -> bool {
+            match properties.get(name) {
+                None => default,
+                Some(text) => text.eq_ignore_ascii_case("true"),
             }
         };
 
@@ -376,6 +452,41 @@ impl ConsensusModuleConfig {
             consensus_stream_id: int(CONSENSUS_STREAM_ID_PROP_NAME, CONSENSUS_STREAM_ID_DEFAULT)?,
             log_stream_id: int(LOG_STREAM_ID_PROP_NAME, LOG_STREAM_ID_DEFAULT)?,
             ingress_stream_id: int(INGRESS_STREAM_ID_PROP_NAME, INGRESS_STREAM_ID_DEFAULT)?,
+            ingress_fragment_limit: usize::try_from(int(
+                INGRESS_FRAGMENT_LIMIT_PROP_NAME,
+                INGRESS_FRAGMENT_LIMIT_DEFAULT,
+            )?)
+            .map_err(|_| ConfigProblem::Value {
+                name: INGRESS_FRAGMENT_LIMIT_PROP_NAME,
+                value: properties
+                    .get(INGRESS_FRAGMENT_LIMIT_PROP_NAME)
+                    .unwrap_or_default()
+                    .to_owned(),
+            })?,
+            ingress_ipc_allowed: boolean(
+                INGRESS_IPC_ALLOWED_PROP_NAME,
+                INGRESS_IPC_ALLOWED_DEFAULT,
+            ),
+            max_concurrent_sessions: usize::try_from(int(
+                MAX_SESSIONS_PROP_NAME,
+                MAX_CONCURRENT_SESSIONS_DEFAULT,
+            )?)
+            .map_err(|_| ConfigProblem::Value {
+                name: MAX_SESSIONS_PROP_NAME,
+                value: properties
+                    .get(MAX_SESSIONS_PROP_NAME)
+                    .unwrap_or_default()
+                    .to_owned(),
+            })?,
+            authenticator_supplier: properties
+                .get(AUTHENTICATOR_SUPPLIER_PROP_NAME)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(DEFAULT_AUTHENTICATOR_SUPPLIER)
+                .to_owned(),
+            authorisation_service_supplier: properties
+                .get(AUTHORISATION_SERVICE_SUPPLIER_PROP_NAME)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
             egress_stream_id: int(EGRESS_STREAM_ID_PROP_NAME, EGRESS_STREAM_ID_DEFAULT)?,
             service_stream_id: int(SERVICE_STREAM_ID_PROP_NAME, SERVICE_STREAM_ID_DEFAULT)?,
             consensus_module_stream_id: int(

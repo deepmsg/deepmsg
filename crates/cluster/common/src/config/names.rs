@@ -47,10 +47,13 @@ pub const NAMES: &[(&str, Disposition)] = &[
         Disposition::Pending,
     ),
     ("aeron.cluster.appointed.leader.id", Disposition::Honoured),
-    ("aeron.cluster.authenticator.supplier", Disposition::Pending),
+    (
+        "aeron.cluster.authenticator.supplier",
+        Disposition::Honoured,
+    ),
     (
         "aeron.cluster.authorisation.service.supplier",
-        Disposition::Pending,
+        Disposition::Honoured,
     ),
     ("aeron.cluster.backup.catchup.channel", Disposition::Pending),
     (
@@ -98,10 +101,7 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ("aeron.cluster.control.channel", Disposition::Honoured),
     ("aeron.cluster.cycle.threshold", Disposition::Honoured),
     ("aeron.cluster.dir", Disposition::Honoured),
-    (
-        "aeron.cluster.egress.channel",
-        Disposition::AcceptedNotHonoured("read and kept; the egress publisher is P3-4b"),
-    ),
+    ("aeron.cluster.egress.channel", Disposition::Honoured),
     ("aeron.cluster.egress.stream.id", Disposition::Honoured),
     (
         "aeron.cluster.election.status.interval",
@@ -121,8 +121,11 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ("aeron.cluster.idle.strategy", Disposition::Honoured),
     ("aeron.cluster.ingress.channel", Disposition::Honoured),
     ("aeron.cluster.ingress.endpoints", Disposition::Pending),
-    ("aeron.cluster.ingress.fragment.limit", Disposition::Pending),
-    ("aeron.cluster.ingress.ipc.allowed", Disposition::Pending),
+    (
+        "aeron.cluster.ingress.fragment.limit",
+        Disposition::Honoured,
+    ),
+    ("aeron.cluster.ingress.ipc.allowed", Disposition::Honoured),
     ("aeron.cluster.ingress.stream.id", Disposition::Honoured),
     (
         "aeron.cluster.leader.archive.control.channel",
@@ -141,7 +144,7 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ("aeron.cluster.log.fragment.limit", Disposition::Pending),
     ("aeron.cluster.log.stream.id", Disposition::Honoured),
     ("aeron.cluster.mark.file.dir", Disposition::Honoured),
-    ("aeron.cluster.max.sessions", Disposition::Pending),
+    ("aeron.cluster.max.sessions", Disposition::Honoured),
     ("aeron.cluster.member.endpoints", Disposition::Pending),
     ("aeron.cluster.member.id", Disposition::Honoured),
     ("aeron.cluster.members", Disposition::Honoured),
@@ -180,10 +183,7 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ),
     ("aeron.cluster.service.stream.id", Disposition::Honoured),
     ("aeron.cluster.services.dir", Disposition::Pending),
-    (
-        "aeron.cluster.session.timeout",
-        Disposition::AcceptedNotHonoured("read and kept; sessions are P3-4b"),
-    ),
+    ("aeron.cluster.session.timeout", Disposition::Honoured),
     ("aeron.cluster.snapshot.channel", Disposition::Pending),
     ("aeron.cluster.snapshot.stream.id", Disposition::Pending),
     (
