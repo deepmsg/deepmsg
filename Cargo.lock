@@ -273,6 +273,7 @@ dependencies = [
 name = "deepmsg-cluster-common"
 version = "0.1.0"
 dependencies = [
+ "deepmsg-cnc",
  "deepmsg-codec-cluster-mark",
  "deepmsg-core",
 ]
