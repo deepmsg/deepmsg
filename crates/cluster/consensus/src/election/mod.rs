@@ -352,7 +352,7 @@ impl Election {
         now_ns: i64,
     ) -> Result<usize, ClusterError> {
         let mut work = 0;
-        match self.log_replay {
+        match self.log_replay.take() {
             None => {
                 if self.log_position < self.append_position {
                     self.log_replay =
@@ -371,15 +371,18 @@ impl Election {
                     self.append_position,
                 );
             }
-            Some(_) => {
-                // The replay is advanced by the host's own poll (the archive
-                // replay poll, `ConsensusModuleAgent.java:1845`); the election
-                // only watches for it being done. P3-5b's `LogReplay` will carry
-                // `is_done`; until then a replay is treated as complete.
-                self.log_replay = None;
-                self.log_position = self.append_position;
-                work += 1;
-                self.transition(ElectionState::LeaderInit, now_ns, host)?;
+            Some(replay) => {
+                // The replay is advanced by the host's own poll (the agent's
+                // `poll_log_replay`, `ConsensusModuleAgent.java:1845`); the
+                // election watches `isDone` (`Election.java:855-866`).
+                if replay.is_done() {
+                    self.log_position = self.append_position;
+                    work += 1;
+                    self.transition(ElectionState::LeaderInit, now_ns, host)?;
+                } else {
+                    self.log_replay = Some(replay);
+                    work += 1;
+                }
             }
         }
 

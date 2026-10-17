@@ -143,11 +143,34 @@ fn a_service_joins_and_then_timers_sessions_and_membership_all_work() {
         let _ = agent.close();
     });
 
-    // Answer the JoinLog: the module is parked in `awaitServicesReady`.
+    // What a real container does at startup (`ClusteredServiceAgent
+    // .recoverState`): ack the recovery-state counter's position with a
+    // non-null relevant id, before it ever sees a JoinLog. The module's
+    // `recoverFromSnapshotAndLog` is parked on exactly that.
+    let mut recovery_acked = false;
     let mut joined = false;
     let deadline = Instant::now() + DEADLINE;
     while Instant::now() < deadline && !joined {
         service.poll();
+
+        if !recovery_acked {
+            let mut buffer = vec![0_u8; 64];
+            let encoder = ServiceAckEncoder::default()
+                .wrap(WriteBuf::new(&mut buffer), MESSAGE_HEADER_LENGTH);
+            let mut header = encoder.header(0);
+            let mut ack = header.parent().expect("the encoder just wrapped");
+            ack.log_position(0)
+                .timestamp(0)
+                .ack_id(0)
+                .relevant_id(42)
+                .service_id(0);
+            let length = MESSAGE_HEADER_LENGTH + ack.encoded_length();
+            recovery_acked = offer(&service, service_publication, &buffer[..length]);
+            if recovery_acked {
+                continue;
+            }
+        }
+
         let mut join_position = None;
         service.poll_subscription(service_subscription, 10, |message| {
             let payload = message.payload;
@@ -169,10 +192,12 @@ fn a_service_joins_and_then_timers_sessions_and_membership_all_work() {
                 .wrap(WriteBuf::new(&mut buffer), MESSAGE_HEADER_LENGTH);
             let mut header = encoder.header(0);
             let mut ack = header.parent().expect("the encoder just wrapped");
+            // `ackId` is 1: the recovery ack above was id 0
+            // (`recoverFromSnapshotAndLog` increments it).
             ack.log_position(log_position)
                 .timestamp(0)
-                .ack_id(0)
-                .relevant_id(0)
+                .ack_id(1)
+                .relevant_id(42)
                 .service_id(0);
             let length = MESSAGE_HEADER_LENGTH + ack.encoded_length();
             wait_for("the service publication to accept the ack", || {
@@ -182,7 +207,11 @@ fn a_service_joins_and_then_timers_sessions_and_membership_all_work() {
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(joined, "the module never sent JoinLog");
+    assert!(
+        joined,
+        "the module never sent JoinLog; failure: {:?}",
+        failure.lock().expect("the lock")
+    );
     wait_for("the module to finish launching", || {
         launched.load(Ordering::SeqCst)
     });

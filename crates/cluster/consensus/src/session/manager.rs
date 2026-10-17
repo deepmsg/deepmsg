@@ -718,6 +718,128 @@ impl SessionManager {
         {}
     }
 
+    /// `snapshotSessions` (`SessionManager.java:1107-1119`).
+    ///
+    /// **The container is `sessions`, the id-sorted `Vec`** — not a map — and
+    /// only `OPEN` and `CLOSING` sessions are written. The taker writes each
+    /// session's activity stamp as `Aeron.NULL_VALUE`; see
+    /// [`crate::snapshot::taker`].
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] when the publication refuses a record.
+    pub fn snapshot_sessions(
+        &self,
+        taker: &mut crate::snapshot::ConsensusModuleSnapshotTaker<'_>,
+    ) -> Result<(), ClusterError> {
+        for session in self.sessions.iter() {
+            if matches!(
+                session.state(),
+                ClusterSessionState::Open | ClusterSessionState::Closing
+            ) {
+                taker.snapshot_session(session)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `onLoadClusterSession` (`SessionManager.java:540-562`).
+    ///
+    /// `session_info` is not serialised, so the response channel stands in for
+    /// it, as in the reference.
+    ///
+    /// # Errors
+    ///
+    /// Nothing today; the shape matches the loader's `?`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_load_cluster_session(
+        &mut self,
+        cluster_session_id: i64,
+        correlation_id: i64,
+        opened_log_position: i64,
+        time_of_last_activity: i64,
+        close_reason: CloseReason,
+        response_stream_id: i32,
+        response_channel: &str,
+    ) -> Result<(), ClusterError> {
+        let mut session = ClusterSession::new(
+            self.cluster_member_id,
+            cluster_session_id,
+            response_stream_id,
+            response_channel,
+            response_channel.to_owned(),
+        );
+        session.load_snapshot_state(
+            correlation_id,
+            opened_log_position,
+            time_of_last_activity,
+            close_reason,
+        );
+        self.add_session(session);
+
+        if cluster_session_id >= self.next_session_id {
+            self.next_session_id = cluster_session_id + 1;
+            self.next_committed_session_id = self.next_session_id;
+        }
+        Ok(())
+    }
+
+    /// `onReplaySessionOpen` (`SessionManager.java:478-505`): a session the
+    /// replayed log says was opened.
+    ///
+    /// # Errors
+    ///
+    /// Nothing today; the shape matches the replay handler's `?`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_replay_session_open(
+        &mut self,
+        log_position: i64,
+        correlation_id: i64,
+        cluster_session_id: i64,
+        timestamp: i64,
+        response_stream_id: i32,
+        response_channel: &str,
+    ) -> Result<(), ClusterError> {
+        let mut session = ClusterSession::new(
+            self.cluster_member_id,
+            cluster_session_id,
+            response_stream_id,
+            response_channel,
+            response_channel.to_owned(),
+        );
+        session.load_snapshot_state(
+            correlation_id,
+            log_position,
+            timestamp.saturating_mul(1_000_000),
+            CloseReason::NullVal,
+        );
+        self.add_session(session);
+
+        if cluster_session_id >= self.next_session_id {
+            self.next_session_id = cluster_session_id + 1;
+            self.next_committed_session_id = self.next_session_id;
+        }
+        Ok(())
+    }
+
+    /// `onReplaySessionClose` (`SessionManager.java:507-515`).
+    pub fn on_replay_session_close(&mut self, cluster_session_id: i64, close_reason: CloseReason) {
+        if let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.id() == cluster_session_id)
+        {
+            self.sessions[index].closing(close_reason);
+            self.sessions.remove(index);
+        }
+    }
+
+    /// `loadNextSessionId` (`SessionManager.java:563-567`).
+    pub fn load_next_session_id(&mut self, next_session_id: i64) {
+        self.next_session_id = next_session_id;
+        self.next_committed_session_id = next_session_id;
+    }
+
     /// `updateTimeOfLastActivity` (`SessionManager.java:1098-1105`).
     pub fn update_time_of_last_activity(&mut self, now_ns: i64) {
         for session in self.sessions.iter_mut() {

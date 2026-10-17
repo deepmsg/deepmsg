@@ -74,6 +74,7 @@ use crate::config::{CLUSTER_IDLE_STRATEGY_PROP_NAME, CLUSTER_TIME_UNIT, Consensu
 use crate::election::{Election, ElectionHost, ElectionState};
 use crate::error::ClusterError;
 use crate::handles::{LogReplay, RecordingReplication};
+use crate::log::{AgentLogReplay, LogReplayHandler};
 use crate::log_publisher::LogPublisher;
 use crate::persist::node_state::NodeStateFile;
 use crate::persist::recording_log::{self, RecordingExtent, RecordingLog, RecoveryPlan};
@@ -93,12 +94,16 @@ use crate::session::cluster_session::{ClusterSession, SessionEgress};
 use crate::session::egress::EgressPublisher;
 use crate::session::ingress::{IngressAdapter, IngressHandler};
 use crate::session::manager::{SessionConnectRequest, SessionContext, SessionManager};
+use crate::snapshot::taker::{SnapshotAppend, SnapshotIdle, SnapshotSend};
+use crate::snapshot::{ConsensusModuleSnapshotAdapter, SnapshotLoadHandler};
 use crate::state::{ModuleState, Role};
 use crate::timer::priority_heap::PriorityHeapTimerService;
 use crate::timer::wheel::WheelTimerService;
 use crate::timer::{
     TimerHandler, TimerService, TimerServiceKind, timer_service_kind, wheel_tick_resolution,
 };
+use deepmsg_core::logbuffer::append::Appended;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 
 use publisher::ConsensusPublisher;
 
@@ -209,6 +214,10 @@ pub struct ConsensusModuleAgent {
     state: ModuleState,
     role: Role,
     election: Option<Election>,
+    /// Whether the current (first) election is the node's startup one
+    /// (`Election.isNodeStartup`): sessions recovered from a snapshot are
+    /// closed for TIMEOUT at the end of it (`prepareSessionsForNewTerm`).
+    node_startup_election: bool,
     leadership_term_id: i64,
 
     last_append_position: i64,
@@ -232,6 +241,7 @@ pub struct ConsensusModuleAgent {
     expected_ack_position: i64,
     service_client_ids: Vec<i64>,
     timer: Box<dyn TimerService>,
+    log_replay: Option<AgentLogReplay>,
     uncommitted_timers: std::collections::VecDeque<(i64, i64)>,
     expired_timer_count: deepmsg_cluster_common::collections::HashMap<i64, i64>,
     live_log_destination: String,
@@ -481,6 +491,7 @@ impl ConsensusModuleAgent {
             state: ModuleState::Init,
             role: Role::Follower,
             election: None,
+            node_startup_election: true,
             leadership_term_id: NULL_VALUE,
             last_append_position: NULL_VALUE,
             last_quorum_backtrack_commit_position: NULL_POSITION,
@@ -499,9 +510,12 @@ impl ConsensusModuleAgent {
             trackers,
             service_ack_queues,
             service_ack_id: 0,
-            expected_ack_position: NULL_POSITION,
+            // The reference initialises this to 0 (`ConsensusModuleAgent.java:132`):
+            // a fresh cluster's containers ack position 0 at startup.
+            expected_ack_position: 0,
             service_client_ids,
             timer,
+            log_replay: None,
             uncommitted_timers: std::collections::VecDeque::new(),
             expired_timer_count: deepmsg_cluster_common::collections::HashMap::default(),
             live_log_destination: String::new(),
@@ -511,6 +525,10 @@ impl ConsensusModuleAgent {
         // The tracker's threshold is the configured one; set after the struct
         // exists because both counters were allocated by `allocate_counters`.
         agent.duty_cycle.threshold_ns = agent.config.cycle_threshold_ns;
+
+        // `onStart`'s `recoverFromSnapshotAndLog` (`:342-346`), before the
+        // election is built from the plan it returns.
+        agent.recover_from_snapshot_and_log()?;
 
         agent.on_start(now_ns)?;
         Ok(agent)
@@ -597,6 +615,7 @@ impl ConsensusModuleAgent {
         }
 
         work += self.consensus_adapter_poll()?;
+        work += self.poll_log_replay()?;
 
         if self.election.is_some() {
             work += self.drive_election_once(now_ns)?;
@@ -1040,6 +1059,11 @@ impl ConsensusModuleAgent {
         self.sessions.sessions().len()
     }
 
+    /// Whether a log replay is still in progress (P3-4d).
+    pub fn is_replaying(&self) -> bool {
+        self.log_replay.is_some()
+    }
+
     /// How far the log publication has got, which advances when a message is
     /// appended even before it is committed.
     pub fn log_position(&self) -> i64 {
@@ -1290,10 +1314,10 @@ impl ElectionHost for ConsensusModuleAgent {
 
     fn new_log_replay(
         &mut self,
-        _log_position: i64,
-        _append_position: i64,
+        log_position: i64,
+        append_position: i64,
     ) -> Result<LogReplay, ClusterError> {
-        Err(ClusterError::Cluster("replaying a log is P3-4d".to_owned()))
+        ConsensusModuleAgent::start_log_replay(self, log_position, append_position)
     }
 
     fn new_log_replication(
@@ -1463,7 +1487,10 @@ impl ElectionHost for ConsensusModuleAgent {
         // There are no sessions to prepare before P3-4d loads a snapshot, but
         // the order is kept so that slice has the call where the reference has
         // it.
-        self.sessions.prepare_sessions_for_new_term(false, now_ns);
+        let is_leader_startup = self.node_startup_election;
+        self.node_startup_election = false;
+        self.sessions
+            .prepare_sessions_for_new_term(is_leader_startup, now_ns);
         self.connect_ingress()?;
 
         Ok(())
@@ -1800,6 +1827,13 @@ fn put_initial_position(
 /// `id=endpoint,...` for the active members (`ClusterMember.ingressEndpoints`,
 /// `ClusterMember.java:1239-1255`), which is what a redirect or a new-leader
 /// event carries.
+fn increment_counter(client: &Client, counter: Counter, delta: i64) {
+    if let Some(counters) = client.counters_writable() {
+        let value = counters.value(counter.counter_id()).unwrap_or(0);
+        counters.set_value(counter.counter_id(), value + delta);
+    }
+}
+
 fn ingress_endpoints(members: &[ClusterMember]) -> String {
     let mut out = String::new();
     for (index, member) in members.iter().enumerate() {
@@ -2340,12 +2374,14 @@ struct AgentServiceHandler<'a> {
     trackers: &'a mut [PendingServiceMessageTracker],
     timer: &'a mut dyn TimerService,
     service_ack_queues: &'a mut ServiceAckQueues,
-    service_ack_id: i64,
+    service_ack_id: &'a mut i64,
     service_client_ids: &'a [i64],
     state: ModuleState,
     expired_timer_count: &'a mut deepmsg_cluster_common::collections::HashMap<i64, i64>,
     deferred_closes: Vec<i64>,
     deferred_queries: Vec<DeferredQuery>,
+    /// A snapshot every service has acked, carried out after the poll.
+    deferred_snapshot: Option<(i64, i64, Vec<ServiceAck>)>,
 }
 
 impl ServiceControlHandler for AgentServiceHandler<'_> {
@@ -2429,13 +2465,26 @@ impl ServiceControlHandler for AgentServiceHandler<'_> {
         }
         queue.push_back(ServiceAck::new(ack_id, log_position, relevant_id));
 
-        if has_reached(log_position, self.service_ack_id, self.service_ack_queues)? {
+        if has_reached(log_position, *self.service_ack_id, self.service_ack_queues)? {
             match self.state {
                 ModuleState::Active => {}
                 ModuleState::Snapshot => {
-                    return Err(ClusterError::Cluster(
-                        "the snapshot ack path is P3-4d".to_owned(),
-                    ));
+                    // `onServiceAck` (`:1472-1480`): the next ack id, then the
+                    // collected acks; a null relevant id is reported and the
+                    // snapshot is not taken.
+                    *self.service_ack_id += 1;
+                    let acks = crate::service_control::ack::poll_service_acks_at(
+                        log_position,
+                        service_id as usize,
+                        self.service_ack_queues,
+                    )?;
+                    let null_ids = crate::service_control::ack::null_relevant_ids(
+                        "failed to take snapshot",
+                        &acks,
+                    );
+                    if null_ids.is_empty() {
+                        self.deferred_snapshot = Some((log_position, _timestamp, acks));
+                    }
                 }
                 ModuleState::Quitting | ModuleState::Terminating => {
                     return Err(ClusterError::Cluster(
@@ -2606,93 +2655,1058 @@ impl ConsensusModuleAgent {
         let clock = self.clock;
         let ingress_endpoints = ingress_endpoints(&self.members);
 
-        let Self {
-            client,
-            service_control,
-            trackers,
-            timer,
-            service_ack_queues,
-            service_ack_id,
-            service_client_ids,
-            expired_timer_count,
-            sessions,
-            egress,
-            log_publisher,
-            counters,
-            service_proxy,
-            service_publication_id,
-            members,
-            ..
-        } = self;
+        let (work, deferred_snapshot) = {
+            let Self {
+                client,
+                service_control,
+                trackers,
+                timer,
+                service_ack_queues,
+                service_ack_id,
+                service_client_ids,
+                expired_timer_count,
+                sessions,
+                egress,
+                log_publisher,
+                counters,
+                service_proxy,
+                service_publication_id,
+                members,
+                ..
+            } = self;
 
-        let mut handler = AgentServiceHandler {
-            trackers,
-            timer: &mut **timer,
-            service_ack_queues,
-            service_ack_id: *service_ack_id,
-            service_client_ids,
-            state,
-            expired_timer_count,
-            deferred_closes: Vec::new(),
-            deferred_queries: Vec::new(),
+            let mut handler = AgentServiceHandler {
+                trackers,
+                timer: &mut **timer,
+                service_ack_queues,
+                service_ack_id,
+                service_client_ids,
+                state,
+                expired_timer_count,
+                deferred_closes: Vec::new(),
+                deferred_queries: Vec::new(),
+                deferred_snapshot: None,
+            };
+
+            let result = service_control.poll(client, &mut handler);
+            let deferred_closes = std::mem::take(&mut handler.deferred_closes);
+            let deferred_queries = std::mem::take(&mut handler.deferred_queries);
+            let deferred_snapshot = handler.deferred_snapshot.take();
+            let work = result?;
+            drop(handler);
+
+            if !deferred_closes.is_empty() {
+                let mut ctx = SessionContext {
+                    client,
+                    log_publisher,
+                    egress,
+                    clock: &clock,
+                    timed_out_counter: counters.timed_out_client,
+                    leadership_term_id,
+                    member_id,
+                    leader_member_id,
+                    ingress_endpoints: &ingress_endpoints,
+                    now_ns,
+                };
+                for cluster_session_id in deferred_closes {
+                    sessions.on_session_close(leadership_term_id, cluster_session_id, &mut ctx)?;
+                }
+            }
+
+            if !deferred_queries.is_empty() {
+                let send = PublicationSender {
+                    client,
+                    registration_id: *service_publication_id,
+                };
+                let members = &*members;
+                for query in deferred_queries {
+                    let sent = if query.extended {
+                        service_proxy.cluster_members_extended_response(
+                            &send,
+                            query.correlation_id,
+                            now_ns,
+                            leader_member_id,
+                            member_id,
+                            members,
+                        )
+                    } else {
+                        service_proxy.cluster_members_response(
+                            &send,
+                            query.correlation_id,
+                            leader_member_id,
+                            &member::encode_as_string(members),
+                        )
+                    };
+                    if !sent {
+                        let error_counter = counters.error;
+                        let current = read_counter(&*client, error_counter).unwrap_or(0);
+                        write_counter(&*client, error_counter, current + 1);
+                    }
+                }
+            }
+
+            (work, deferred_snapshot)
         };
 
-        let result = service_control.poll(client, &mut handler);
-        let deferred_closes = std::mem::take(&mut handler.deferred_closes);
-        let deferred_queries = std::mem::take(&mut handler.deferred_queries);
-        let work = result?;
-        drop(handler);
-
-        if !deferred_closes.is_empty() {
-            let mut ctx = SessionContext {
-                client,
-                log_publisher,
-                egress,
-                clock: &clock,
-                timed_out_counter: counters.timed_out_client,
-                leadership_term_id,
-                member_id,
-                leader_member_id,
-                ingress_endpoints: &ingress_endpoints,
-                now_ns,
-            };
-            for cluster_session_id in deferred_closes {
-                sessions.on_session_close(leadership_term_id, cluster_session_id, &mut ctx)?;
-            }
+        if let Some((log_position, timestamp, acks)) = deferred_snapshot {
+            // `snapshotOnServiceAck` (`:3104-3146`): take it, then ACTIVE.
+            self.take_snapshot_with_acks(timestamp, log_position, &acks)?;
+            self.set_state(ModuleState::Active, "snapshot complete");
         }
 
-        if !deferred_queries.is_empty() {
-            let send = PublicationSender {
-                client,
-                registration_id: *service_publication_id,
-            };
-            for query in deferred_queries {
-                let sent = if query.extended {
-                    service_proxy.cluster_members_extended_response(
-                        &send,
-                        query.correlation_id,
-                        now_ns,
-                        leader_member_id,
-                        member_id,
-                        members,
-                    )
+        Ok(work)
+    }
+}
+
+/// The snapshot publication and the idle that drives the client between
+/// retries, as one borrow (`ConsensusModuleSnapshotTaker`'s publication +
+/// `IdleStrategy` + agent invoker).
+struct ExclusivePublicationSink<'a> {
+    client: &'a mut Client,
+    publication: &'a ExclusivePublication,
+    idle_strategy: &'a mut Strategy,
+}
+
+impl SnapshotSend for ExclusivePublicationSink<'_> {
+    fn try_claim(&self, length: usize, bytes: &[u8]) -> SnapshotAppend {
+        let limit = self.client.counters_reader().map_or(0, |counters| {
+            counters
+                .value(self.publication.position_limit_counter_id())
+                .unwrap_or(0)
+        });
+        match self.publication.try_claim(limit, length) {
+            Ok(claim) => {
+                let frame = claim.frame();
+                if frame.write_payload(bytes).is_none() {
+                    return SnapshotAppend::Fatal("failed to write into the claim".to_owned());
+                }
+                let frame_length = deepmsg_core::logbuffer::frame::DATA_HEADER_LENGTH + length;
+                #[allow(clippy::cast_possible_truncation)] // bounded by the payload maximum
+                let frame_length = frame_length as i32;
+                if frame.publish(frame_length).is_some() {
+                    SnapshotAppend::Ok
                 } else {
-                    service_proxy.cluster_members_response(
-                        &send,
-                        query.correlation_id,
-                        leader_member_id,
-                        &member::encode_as_string(members),
+                    SnapshotAppend::Fatal("failed to publish the claim".to_owned())
+                }
+            }
+            Err(Appended::BackPressured | Appended::EndOfLog | Appended::MidRotation) => {
+                SnapshotAppend::Retry
+            }
+            Err(Appended::NotConnected) => {
+                SnapshotAppend::Fatal("publication is not connected".to_owned())
+            }
+            Err(Appended::MaxPositionExceeded) => SnapshotAppend::Fatal(format!(
+                "publication at max position: term-length={}",
+                self.publication.term_buffer_length()
+            )),
+            Err(other) => SnapshotAppend::Fatal(format!("{other:?}")),
+        }
+    }
+
+    fn offer(&self, bytes: &[u8]) -> SnapshotAppend {
+        let limit = self.client.counters_reader().map_or(0, |counters| {
+            counters
+                .value(self.publication.position_limit_counter_id())
+                .unwrap_or(0)
+        });
+        match self.publication.offer(limit, bytes) {
+            Appended::Ok { .. } => SnapshotAppend::Ok,
+            Appended::BackPressured | Appended::EndOfLog | Appended::MidRotation => {
+                SnapshotAppend::Retry
+            }
+            Appended::NotConnected => {
+                SnapshotAppend::Fatal("publication is not connected".to_owned())
+            }
+            Appended::MaxPositionExceeded => SnapshotAppend::Fatal(format!(
+                "publication at max position: term-length={}",
+                self.publication.term_buffer_length()
+            )),
+            other => SnapshotAppend::Fatal(format!("{other:?}")),
+        }
+    }
+
+    fn max_payload_length(&self) -> usize {
+        self.publication.max_payload_length().unwrap_or(0)
+    }
+}
+
+impl SnapshotIdle for ExclusivePublicationSink<'_> {
+    fn reset(&mut self) {
+        // The strategy in this build has no separate reset; `idle(0)` after
+        // work does what the reference's `reset` does for backoff.
+    }
+
+    fn idle(&mut self) {
+        let _ = self.client.poll();
+        self.idle_strategy.idle(0);
+    }
+}
+
+/// The agent as the snapshot loader's listener (`ConsensusModuleAgent.onLoad*`).
+struct AgentSnapshotLoadHandler<'a> {
+    sessions: &'a mut SessionManager,
+    trackers: &'a mut [PendingServiceMessageTracker],
+    timer: &'a mut dyn TimerService,
+}
+
+impl SnapshotLoadHandler for AgentSnapshotLoadHandler<'_> {
+    fn on_load_begin_snapshot(
+        &mut self,
+        app_version: i32,
+        time_unit: ClusterTimeUnit,
+    ) -> Result<(), ClusterError> {
+        // `onLoadBeginSnapshot` (`:632-647`): an incompatible app version or a
+        // time unit this build does not have is fatal in the reference.
+        if app_version != crate::config::APP_VERSION_DEFAULT {
+            return Err(ClusterError::AgentTermination(format!(
+                "incompatible appVersion={app_version}, expected={}",
+                crate::config::APP_VERSION_DEFAULT
+            )));
+        }
+        if time_unit != CLUSTER_TIME_UNIT {
+            return Err(ClusterError::AgentTermination(format!(
+                "timeUnit={time_unit:?} does not match {CLUSTER_TIME_UNIT:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn on_load_end_snapshot(&mut self) -> Result<(), ClusterError> {
+        Ok(())
+    }
+
+    fn on_load_cluster_session(
+        &mut self,
+        session: crate::snapshot::SnapshotSession,
+    ) -> Result<(), ClusterError> {
+        self.sessions.on_load_cluster_session(
+            session.cluster_session_id,
+            session.correlation_id,
+            session.opened_log_position,
+            session.time_of_last_activity,
+            session.close_reason,
+            session.response_stream_id,
+            &session.response_channel,
+        )
+    }
+
+    fn on_load_timer(&mut self, correlation_id: i64, deadline: i64) -> Result<(), ClusterError> {
+        // `onLoadTimer` (`:744-748`) delegates to `onScheduleTimer`.
+        self.timer
+            .schedule_timer_for_correlation_id(correlation_id, deadline);
+        Ok(())
+    }
+
+    fn on_load_consensus_module_state(
+        &mut self,
+        next_session_id: i64,
+        next_service_session_id: i64,
+        log_service_session_id: i64,
+        pending_message_capacity: i32,
+    ) -> Result<(), ClusterError> {
+        self.sessions.load_next_session_id(next_session_id);
+        if let Some(tracker) = self.trackers.first_mut() {
+            #[allow(clippy::cast_sign_loss)] // a capacity from a snapshot
+            let capacity = pending_message_capacity as usize;
+            tracker.load_state(next_service_session_id, log_service_session_id, capacity);
+        }
+        Ok(())
+    }
+
+    fn on_load_pending_message_tracker(
+        &mut self,
+        next_service_session_id: i64,
+        log_service_session_id: i64,
+        pending_message_capacity: i32,
+        service_id: i32,
+    ) -> Result<(), ClusterError> {
+        let Some(tracker) = usize::try_from(service_id)
+            .ok()
+            .and_then(|index| self.trackers.get_mut(index))
+        else {
+            return Err(ClusterError::Cluster(format!(
+                "snapshot has a tracker for unknown serviceId={service_id}"
+            )));
+        };
+        #[allow(clippy::cast_sign_loss)] // a capacity from a snapshot
+        let capacity = pending_message_capacity as usize;
+        tracker.load_state(next_service_session_id, log_service_session_id, capacity);
+        Ok(())
+    }
+
+    fn on_load_pending_message(
+        &mut self,
+        cluster_session_id: i64,
+        message: &[u8],
+    ) -> Result<(), ClusterError> {
+        let service_id = crate::service_control::service_id_from_log_message(cluster_session_id);
+        let Some(tracker) = usize::try_from(service_id)
+            .ok()
+            .and_then(|index| self.trackers.get_mut(index))
+        else {
+            return Err(ClusterError::Cluster(format!(
+                "pending service message for unknown serviceId={service_id}"
+            )));
+        };
+        if !tracker.append_message(message) {
+            return Err(ClusterError::Cluster(
+                "pending service message ring is at capacity during load".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ConsensusModuleAgent {
+    /// `takeSnapshot` (`ConsensusModuleAgent.java:3153-3191`), with no service
+    /// snapshots (the 0-service path). The trigger itself — ClusterControl and
+    /// admin requests — is P3-4e; this is the seam it will call.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] from the archive, a refused record, or a recording that
+    /// stops early.
+    pub fn take_snapshot(&mut self, timestamp: i64) -> Result<(), ClusterError> {
+        if self.config.service_count > 0 {
+            return Err(ClusterError::Cluster(
+                "taking a snapshot with services needs their acks (P3-4f)".to_owned(),
+            ));
+        }
+        let log_position = read_counter(&self.client, self.counters.commit_position).unwrap_or(0);
+        self.take_snapshot_with_acks(timestamp, log_position, &[])
+    }
+
+    /// The same with the service acks whose `relevantId`s name their snapshot
+    /// recordings (`:3177-3185`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::take_snapshot`].
+    pub fn take_snapshot_with_acks(
+        &mut self,
+        timestamp: i64,
+        log_position: i64,
+        service_acks: &[ServiceAck],
+    ) -> Result<(), ClusterError> {
+        let registration_id = self.client.add_exclusive_publication(
+            &self.config.snapshot_channel,
+            self.config.snapshot_stream_id,
+            COMMAND_TIMEOUT,
+        )?;
+        let publication = self
+            .client
+            .take_exclusive_publication(registration_id)
+            .ok_or_else(|| {
+                ClusterError::Cluster("the snapshot publication did not arrive".to_owned())
+            })?;
+        let log_session_id = publication.session_id();
+
+        let mut channel_uri = ChannelUri::parse(&self.config.snapshot_channel)
+            .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+        channel_uri.put("session-id", log_session_id.to_string());
+        self.archive.start_recording(
+            &mut self.client,
+            &channel_uri.build(),
+            self.config.snapshot_stream_id,
+            true,
+            true,
+        )?;
+
+        let counter_id = self.await_recording_counter(log_session_id)?;
+        let recording_id = {
+            let identity = self
+                .client
+                .counters_reader()
+                .and_then(|counters| counters.key(counter_id))
+                .and_then(|key| deepmsg_archive::server::recording_pos::parse_key(&key))
+                .ok_or_else(|| {
+                    ClusterError::Cluster("the snapshot recording has no identity".to_owned())
+                })?;
+            identity.recording_id
+        };
+
+        self.snapshot_state(&publication, log_position)?;
+        let position = publication.position().unwrap_or(0);
+        self.await_recording_complete(recording_id, position, counter_id)?;
+
+        let term_base_log_position = self
+            .recording_log
+            .entries()
+            .iter()
+            .find(|entry| {
+                entry.leadership_term_id == self.leadership_term_id
+                    && entry.entry_type == recording_log::ENTRY_TYPE_TERM
+            })
+            .map_or(0, |entry| entry.term_base_log_position);
+
+        for (service_id, ack) in service_acks.iter().enumerate().rev() {
+            #[allow(clippy::cast_possible_truncation)] // bounded by MAX_SERVICE_COUNT
+            let service_id = service_id as i32;
+            self.recording_log
+                .append_snapshot(
+                    self.leadership_term_id,
+                    term_base_log_position,
+                    log_position,
+                    timestamp,
+                    ack.relevant_id(),
+                    service_id,
+                )
+                .map_err(cluster)?;
+        }
+        self.recording_log
+            .append_snapshot(
+                self.leadership_term_id,
+                term_base_log_position,
+                log_position,
+                timestamp,
+                recording_id,
+                -1,
+            )
+            .map_err(cluster)?;
+        self.recording_log
+            .force(self.config.file_sync_level)
+            .map_err(cluster)?;
+        self.recovery_plan = create_recovery_plan(
+            &self.recording_log,
+            &mut self.archive,
+            &mut self.client,
+            self.config.service_count,
+            -1,
+        )?;
+
+        let _ = self
+            .client
+            .remove_publication(registration_id, COMMAND_TIMEOUT);
+        increment_counter(&self.client, self.counters.snapshot, 1);
+        Ok(())
+    }
+
+    /// `snapshotState` (`:3221-3253`): the record order and the iteration
+    /// containers are documented in [`crate::snapshot`].
+    fn snapshot_state(
+        &mut self,
+        publication: &ExclusivePublication,
+        log_position: i64,
+    ) -> Result<(), ClusterError> {
+        let Self {
+            client,
+            idle_strategy,
+            sessions,
+            timer,
+            trackers,
+            leadership_term_id,
+            config,
+            counters,
+            ..
+        } = self;
+        let mut sink = ExclusivePublicationSink {
+            client,
+            publication,
+            idle_strategy,
+        };
+        let mut taker = crate::snapshot::ConsensusModuleSnapshotTaker::new(
+            &mut sink,
+            CLUSTER_TIME_UNIT,
+            config.app_version,
+        );
+
+        taker.mark_begin(log_position, *leadership_term_id)?;
+        let (next_service_session_id, log_service_session_id, pending_message_capacity) =
+            match trackers.first() {
+                Some(tracker) => (
+                    tracker.next_service_session_id(),
+                    tracker.log_service_session_id(),
+                    #[allow(clippy::cast_possible_truncation)]
+                    {
+                        tracker.size() as i32
+                    },
+                ),
+                None => (0, 0, 0),
+            };
+        taker.snapshot_consensus_module_state(
+            sessions.next_committed_session_id(),
+            next_service_session_id,
+            log_service_session_id,
+            pending_message_capacity,
+        )?;
+        sessions.snapshot_sessions(&mut taker)?;
+        timer.snapshot(&mut taker);
+        if taker.failed() {
+            return Err(ClusterError::Cluster(
+                "a timer record was refused by the snapshot publication".to_owned(),
+            ));
+        }
+        let mut corrections = 0usize;
+        for tracker in trackers.iter() {
+            if taker.snapshot_tracker(tracker)?.is_some() {
+                corrections += 1;
+            }
+        }
+        taker.mark_end(log_position, *leadership_term_id)?;
+        drop(taker);
+
+        // The reference reports each missed-message correction through its
+        // counted error handler; the module error counter is the same fact.
+        if corrections > 0 {
+            let error_counter = counters.error;
+            let current = read_counter(&*client, error_counter).unwrap_or(0);
+            #[allow(clippy::cast_possible_wrap)]
+            write_counter(&*client, error_counter, current + corrections as i64);
+        }
+        Ok(())
+    }
+
+    /// `awaitRecordingCounter` (`:3208-3219`).
+    fn await_recording_counter(&mut self, session_id: i32) -> Result<i32, ClusterError> {
+        let archive_id = self.archive.archive_id();
+        loop {
+            if let Some(counters) = self.client.counters_reader() {
+                if let Some(counter_id) =
+                    deepmsg_archive::server::recording_pos::find_counter_id_by_session(
+                        &counters, session_id, archive_id,
                     )
-                };
-                if !sent {
-                    let error_counter = counters.error;
-                    let current = read_counter(client, error_counter).unwrap_or(0);
-                    write_counter(client, error_counter, current + 1);
+                {
+                    return Ok(counter_id);
+                }
+            }
+            self.idle()?;
+        }
+    }
+
+    /// `awaitRecordingComplete` (`:3193-3206`).
+    fn await_recording_complete(
+        &mut self,
+        recording_id: i64,
+        position: i64,
+        counter_id: i32,
+    ) -> Result<(), ClusterError> {
+        loop {
+            let value = self
+                .client
+                .counters_reader()
+                .and_then(|counters| counters.value(counter_id))
+                .unwrap_or(0);
+            if value >= position {
+                return Ok(());
+            }
+            let active = self
+                .client
+                .counters_reader()
+                .and_then(|counters| counters.key(counter_id))
+                .and_then(|key| deepmsg_archive::server::recording_pos::parse_key(&key))
+                .is_some_and(|identity| identity.recording_id == recording_id);
+            if !active {
+                return Err(ClusterError::Cluster(format!(
+                    "recording has stopped unexpectedly: {recording_id}"
+                )));
+            }
+            self.idle()?;
+        }
+    }
+
+    /// `loadSnapshot` (`:2787-2836`).
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] when the replay cannot start, the image closes before
+    /// the END marker, or a record is inconsistent.
+    fn load_snapshot(&mut self, snapshot: &recording_log::Snapshot) -> Result<(), ClusterError> {
+        let replay_channel = self.config.replay_channel.clone();
+        let replay_stream_id = self.config.replay_stream_id;
+        let subscription_id = self.archive.replay(
+            &mut self.client,
+            snapshot.recording_id,
+            &replay_channel,
+            replay_stream_id,
+            &deepmsg_archive::client::proxy::ReplayParams {
+                position: 0,
+                // Replay the whole recording and stop at its end (the shape the
+                // archive suite uses for a bounded replay).
+                length: -2,
+                ..deepmsg_archive::client::proxy::ReplayParams::default()
+            },
+        )?;
+
+        let image_registration_id = self.await_replay_image(subscription_id)?;
+        let mut adapter = ConsensusModuleSnapshotAdapter::new();
+
+        loop {
+            let mut handler = AgentSnapshotLoadHandler {
+                sessions: &mut self.sessions,
+                trackers: &mut self.trackers,
+                timer: &mut *self.timer,
+            };
+            let work = adapter.poll(
+                &mut self.client,
+                subscription_id,
+                image_registration_id,
+                &mut handler,
+            )?;
+            if adapter.is_done() {
+                break;
+            }
+            match work {
+                Some(0) | None => {
+                    self.poll_archive_events();
+                    self.idle()?;
+                }
+                Some(_) => {
+                    self.idle()?;
                 }
             }
         }
 
-        Ok(work)
+        for tracker in self.trackers.iter_mut() {
+            tracker.verify()?;
+            tracker.reset();
+        }
+        self.timer.current_time(self.clock.time());
+        write_counter(
+            &self.client,
+            self.counters.commit_position,
+            snapshot.log_position,
+        );
+        self.leadership_term_id = snapshot.leadership_term_id;
+        for tracker in self.trackers.iter_mut() {
+            tracker.set_leadership_term_id(snapshot.leadership_term_id);
+        }
+        self.expected_ack_position = snapshot.log_position;
+        let _ = self
+            .client
+            .remove_subscription(subscription_id, COMMAND_TIMEOUT);
+        Ok(())
+    }
+
+    fn await_replay_image(&mut self, subscription_id: i64) -> Result<i64, ClusterError> {
+        loop {
+            if let Some(subscription) = self.client.subscription(subscription_id) {
+                if let Some(image) = subscription.images().first() {
+                    return Ok(image.registration_id());
+                }
+            }
+            self.idle()?;
+        }
+    }
+
+    /// `recoverFromSnapshotAndLog` (`:3495-3533`) for a module with no
+    /// extension and (in this slice) no services.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] from the plan, the snapshot load, or an ack that is
+    /// missing its relevant id.
+    fn recover_from_snapshot_and_log(&mut self) -> Result<(), ClusterError> {
+        let plan = create_recovery_plan(
+            &self.recording_log,
+            &mut self.archive,
+            &mut self.client,
+            self.config.service_count,
+            self.log_recording_id,
+        )?;
+        if let Some(log) = &plan.log {
+            self.log_recording_id = log.recording_id;
+        }
+        self.recovery_plan = plan;
+
+        let recovery_counter = self.add_recovery_state_counter();
+
+        if let Some(snapshot) = self.recovery_plan.snapshots.first().copied() {
+            self.load_snapshot(&snapshot)?;
+        }
+
+        // `recoverFromSnapshotAndLog`'s ack wait: vacuous at zero services.
+        while !has_reached(
+            self.expected_ack_position,
+            self.service_ack_id,
+            &self.service_ack_queues,
+        )? {
+            self.poll_service_control()?;
+            self.idle()?;
+        }
+        let acks = crate::service_control::ack::poll_service_acks(&mut self.service_ack_queues)?;
+        let null_ids = crate::service_control::ack::null_relevant_ids(
+            "failed to start clustered service",
+            &acks,
+        );
+        if !null_ids.is_empty() {
+            return Err(ClusterError::AgentTermination(
+                "failed to start clustered service(s)".to_owned(),
+            ));
+        }
+        self.capture_service_client_ids(&acks);
+        self.service_ack_id += 1;
+
+        if let Some(counter) = recovery_counter {
+            let _ = self.client.remove_counter(&counter, COMMAND_TIMEOUT);
+        }
+        Ok(())
+    }
+
+    /// `addRecoveryStateCounter` (`:2850-2875`): a counter the container finds
+    /// its snapshot ids through, alive only for the recovery.
+    fn add_recovery_state_counter(&mut self) -> Option<Counter> {
+        let snapshot = self.recovery_plan.snapshots.first();
+        let (term, log_position, timestamp) = snapshot.map_or(
+            (self.recovery_plan.last_leadership_term_id, 0, 0),
+            |snapshot| {
+                (
+                    snapshot.leadership_term_id,
+                    snapshot.log_position,
+                    snapshot.timestamp,
+                )
+            },
+        );
+        let snapshot_recording_ids = self
+            .recovery_plan
+            .snapshots
+            .iter()
+            .filter(|snapshot| snapshot.service_id >= 0)
+            .map(|snapshot| snapshot.recording_id)
+            .collect();
+        let key = deepmsg_cluster_common::counters::RecoveryStateKey::new(
+            term,
+            log_position,
+            timestamp,
+            self.config.cluster_id,
+            snapshot_recording_ids,
+        )
+        .ok()?;
+        let spec = key.encode().ok()?;
+        self.client
+            .add_counter(
+                deepmsg_cluster_common::counters::CLUSTER_RECOVERY_STATE_TYPE_ID,
+                spec.key(),
+                spec.label(),
+                COMMAND_TIMEOUT,
+            )
+            .ok()
+    }
+
+    /// `captureServiceClientIds` (`:2877-2883`).
+    fn capture_service_client_ids(&mut self, acks: &[ServiceAck]) {
+        for (index, ack) in acks.iter().enumerate() {
+            if let Some(slot) = self.service_client_ids.get_mut(index) {
+                *slot = ack.relevant_id();
+            }
+        }
+    }
+}
+
+/// The replay's record handlers, borrowing the agent's fields.
+struct AgentLogReplayHandler<'a> {
+    sessions: &'a mut SessionManager,
+    timer: &'a mut dyn TimerService,
+    trackers: &'a mut [PendingServiceMessageTracker],
+    expired_timer_count: &'a mut deepmsg_cluster_common::collections::HashMap<i64, i64>,
+    leadership_term_id: i64,
+    service_count: i32,
+    state_change: Option<ModuleState>,
+    new_leadership_term_id: Option<i64>,
+    deferred_snapshot: Option<(i64, i64)>,
+}
+
+impl LogReplayHandler for AgentLogReplayHandler<'_> {
+    fn on_replay_session_message(
+        &mut self,
+        cluster_session_id: i64,
+        timestamp: i64,
+    ) -> Result<(), ClusterError> {
+        if let Some(session) = self.sessions.find_by_session_id_mut(cluster_session_id) {
+            session.set_time_of_last_activity_ns(timestamp.saturating_mul(1_000_000));
+        } else if cluster_session_id < 0 {
+            // A service's own message: the follower sweeps its tracker.
+            let service_id =
+                crate::service_control::service_id_from_log_message(cluster_session_id);
+            if let Some(tracker) = usize::try_from(service_id)
+                .ok()
+                .and_then(|index| self.trackers.get_mut(index))
+            {
+                tracker.sweep_follower_messages(cluster_session_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn on_replay_timer_event(&mut self, correlation_id: i64) -> Result<(), ClusterError> {
+        if !self.timer.cancel_timer_by_correlation_id(correlation_id) {
+            // The timer was already replayed as expired; a later schedule for
+            // the same id is absorbed (`ConsensusModuleAgent.java:1539-1545`).
+            let count = self
+                .expired_timer_count
+                .get(&correlation_id)
+                .copied()
+                .unwrap_or(0);
+            self.expired_timer_count.insert(correlation_id, count + 1);
+        }
+        Ok(())
+    }
+
+    fn on_replay_session_open(
+        &mut self,
+        log_position: i64,
+        correlation_id: i64,
+        cluster_session_id: i64,
+        timestamp: i64,
+        response_stream_id: i32,
+        response_channel: &str,
+    ) -> Result<(), ClusterError> {
+        self.sessions.on_replay_session_open(
+            log_position,
+            correlation_id,
+            cluster_session_id,
+            timestamp,
+            response_stream_id,
+            response_channel,
+        )
+    }
+
+    fn on_replay_session_close(
+        &mut self,
+        cluster_session_id: i64,
+        close_reason: deepmsg_codec_cluster::close_reason::CloseReason,
+    ) -> Result<(), ClusterError> {
+        self.sessions
+            .on_replay_session_close(cluster_session_id, close_reason);
+        Ok(())
+    }
+
+    fn on_replay_cluster_action(
+        &mut self,
+        leadership_term_id: i64,
+        log_position: i64,
+        timestamp: i64,
+        action: deepmsg_codec_cluster::cluster_action::ClusterAction,
+        flags: i32,
+    ) -> Result<(), ClusterError> {
+        if leadership_term_id != self.leadership_term_id {
+            return Ok(());
+        }
+        match action {
+            deepmsg_codec_cluster::cluster_action::ClusterAction::SUSPEND => {
+                self.state_change = Some(ModuleState::Suspended);
+            }
+            deepmsg_codec_cluster::cluster_action::ClusterAction::RESUME => {
+                self.state_change = Some(ModuleState::Active);
+            }
+            deepmsg_codec_cluster::cluster_action::ClusterAction::SNAPSHOT if flags == 0 => {
+                self.state_change = Some(ModuleState::Snapshot);
+                if self.service_count == 0 {
+                    // `onReplayClusterAction` (`:1587`): with no services the
+                    // snapshot set is complete immediately.
+                    self.deferred_snapshot = Some((log_position, timestamp));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn on_replay_new_leadership_term_event(
+        &mut self,
+        leadership_term_id: i64,
+        _log_position: i64,
+        _timestamp: i64,
+        _term_base_log_position: i64,
+        _time_unit: i32,
+        _app_version: i32,
+    ) -> Result<(), ClusterError> {
+        self.new_leadership_term_id = Some(leadership_term_id);
+        Ok(())
+    }
+
+    fn on_replay_extension_message(
+        &mut self,
+        schema_id: u16,
+        _template_id: u16,
+        _version: u16,
+        _message: &[u8],
+    ) -> Result<(), ClusterError> {
+        Err(ClusterError::Cluster(format!(
+            "expected schemaId={}, actual={schema_id} \
+             (no extension is configured)",
+            deepmsg_codec_cluster::SBE_SCHEMA_ID
+        )))
+    }
+}
+
+impl ConsensusModuleAgent {
+    /// Start replaying our own log tail (`newLogReplay`, `:1840-1843`).
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] when the archive will not start the replay or the
+    /// subscription cannot be made.
+    fn start_log_replay(
+        &mut self,
+        log_position: i64,
+        append_position: i64,
+    ) -> Result<crate::handles::LogReplay, ClusterError> {
+        let replay_channel = self.config.replay_channel.clone();
+        let replay_stream_id = self.config.replay_stream_id;
+        let replay_session_id = self.archive.start_replay(
+            &mut self.client,
+            self.log_recording_id,
+            &replay_channel,
+            replay_stream_id,
+            &deepmsg_archive::client::proxy::ReplayParams {
+                position: log_position,
+                length: append_position - log_position,
+                ..deepmsg_archive::client::proxy::ReplayParams::default()
+            },
+        )?;
+
+        // The subscription must name the replay's session id, which is the low
+        // 32 bits of the replay id (`ArchiveConductor.java:956`).
+        let log_session_id = replay_session_id as i32;
+        let mut channel = ChannelUri::parse(&replay_channel)
+            .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+        channel.put("session-id", log_session_id.to_string());
+        let subscription_id =
+            self.client
+                .add_subscription(&channel.build(), replay_stream_id, COMMAND_TIMEOUT)?;
+
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let position = std::sync::Arc::new(AtomicI64::new(log_position));
+        self.log_replay = Some(AgentLogReplay {
+            subscription_id,
+            replay_session_id,
+            log_session_id,
+            start_position: log_position,
+            stop_position: append_position,
+            adapter: crate::log::LogAdapter::new(),
+            done: std::sync::Arc::clone(&done),
+            position: std::sync::Arc::clone(&position),
+        });
+
+        Ok(crate::handles::LogReplay::shared(done, position))
+    }
+
+    /// The agent's `replayLogPoll` (`:1845-1867`): advance the replay, commit
+    /// what it has reached, and finish it at the stop position.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError::ClusterEvent`] when the image closes before the stop
+    /// position — the reference's "unexpected image close".
+    fn poll_log_replay(&mut self) -> Result<usize, ClusterError> {
+        let state_change;
+        let new_leadership_term_id;
+        let deferred_snapshot;
+        let work;
+
+        {
+            let Self {
+                client,
+                archive,
+                log_replay,
+                sessions,
+                timer,
+                trackers,
+                expired_timer_count,
+                leadership_term_id,
+                config,
+                counters,
+                ..
+            } = self;
+
+            let Some(replay) = log_replay.as_mut() else {
+                return Ok(0);
+            };
+
+            if !replay.adapter.has_image() {
+                let Some(image) =
+                    client
+                        .subscription(replay.subscription_id)
+                        .and_then(|subscription| {
+                            subscription.image_by_session_id(replay.log_session_id)
+                        })
+                else {
+                    return Ok(0);
+                };
+                let join_position = image.join_position();
+                if join_position != replay.start_position {
+                    return Err(ClusterError::Cluster(format!(
+                        "joinPosition={join_position} expected startPosition={}",
+                        replay.start_position
+                    )));
+                }
+                replay.adapter.set_image(image.registration_id());
+                return Ok(1);
+            }
+
+            let mut handler = AgentLogReplayHandler {
+                sessions,
+                timer: &mut **timer,
+                trackers,
+                expired_timer_count,
+                leadership_term_id: *leadership_term_id,
+                service_count: config.service_count,
+                state_change: None,
+                new_leadership_term_id: None,
+                deferred_snapshot: None,
+            };
+
+            work = replay.adapter.poll(
+                client,
+                replay.subscription_id,
+                &mut handler,
+                config.log_fragment_limit,
+            )?;
+            state_change = handler.state_change;
+            new_leadership_term_id = handler.new_leadership_term_id;
+            deferred_snapshot = handler.deferred_snapshot;
+
+            let position = replay.adapter.position();
+            let commit_position = counters.commit_position;
+            let current = read_counter(&*client, commit_position).unwrap_or(0);
+            if position > current {
+                write_counter(&*client, commit_position, position);
+            }
+            replay
+                .position
+                .store(position, std::sync::atomic::Ordering::Release);
+
+            if position >= replay.stop_position {
+                // `LogReplay.close` (`:62-75`): stop the replay and give the
+                // subscription back.
+                let _ = archive.stop_replay(client, replay.replay_session_id);
+                let _ = client.remove_subscription(replay.subscription_id, COMMAND_TIMEOUT);
+                replay
+                    .done
+                    .store(true, std::sync::atomic::Ordering::Release);
+                *log_replay = None;
+            } else {
+                let image_closed = client
+                    .subscription(replay.subscription_id)
+                    .and_then(|subscription| {
+                        subscription.images().iter().find(|image| {
+                            Some(image.registration_id()) == replay.adapter.image_registration_id()
+                        })
+                    })
+                    .is_none_or(deepmsg_client::image::Image::is_closed);
+                if image_closed {
+                    return Err(ClusterError::ClusterEvent(format!(
+                        "unexpected image close when replaying log: position={position}"
+                    )));
+                }
+            }
+        }
+
+        if let Some(state) = state_change {
+            self.set_state(state, "replayed cluster action");
+        }
+        if let Some(term) = new_leadership_term_id {
+            self.leadership_term_id = term;
+            for tracker in self.trackers.iter_mut() {
+                tracker.set_leadership_term_id(term);
+            }
+        }
+        if let Some((log_position, timestamp)) = deferred_snapshot {
+            self.take_snapshot_with_acks(timestamp, log_position, &[])?;
+            self.set_state(ModuleState::Active, "snapshot complete");
+        }
+
+        Ok(work.unwrap_or(0))
     }
 }
 

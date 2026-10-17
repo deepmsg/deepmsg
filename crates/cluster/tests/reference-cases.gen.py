@@ -83,9 +83,12 @@ UNIT_CLASS = {
     "ClusteredServiceAgentTest": ("B", "P3-2a"),
     "ClusterWithNoServicesTest": ("A", "P3-4f"),
     "ClusterBackupAgentTest": ("B", "P3-9"),
-    "SnapshotReplicationTest": ("A", "P3-4d"),
+    # Snapshot replication is the archive-to-archive leg of a follower's
+    # catch-up, which is P3-6b; P3-4d only takes and loads a local snapshot.
+    "SnapshotReplicationTest": ("A", "P3-6b"),
     "SessionManagerTest": ("A", "P3-4b"),
-    "LogSourceValidatorTest": ("A", "P3-4d"),
+    # LogSourceValidator is ClusterBackup's source-type check (P3-9).
+    "LogSourceValidatorTest": ("A", "P3-9"),
     "ConsensusModuleContextCloseTests": ("B", "P3-8"),
     # ClusterTimerTest is three whole-cluster scenarios with a real service
     # container; P3-4c has no container to start, so they belong to the card
@@ -554,6 +557,23 @@ OURS = {
         "should_log_warning_if_cluster_member_extended_response_fails",
     ("ServiceProxyTest", "shouldSendClusterMemberExtendedResponse"):
         "should_send_cluster_member_extended_response",
+    # P3-4d.
+    ("ConsensusModuleSnapshotTakerTest", "snapshotConsensusModuleState"):
+        "snapshot_consensus_module_state (weakened: the idle reset/idle "
+        "interactions are a Mockito assertion with no counterpart here)",
+    ("ConsensusModuleSnapshotTakerTest", "snapshotPendingServiceMessageTracker"):
+        "snapshot_pending_service_message_tracker",
+    ("ConsensusModuleSnapshotTakerTest",
+     "snapshotPendingServiceMessageTrackerWithServiceMessagesMissedByFollower"):
+        "snapshot_pending_service_message_tracker_with_service_messages_missed_by_follower",
+    ("ConsensusModuleSnapshotTakerTest", "snapshotTimer"):
+        "snapshot_timer",
+    ("ConsensusModuleSnapshotTakerTest",
+     "snapshotSessionShouldUseTryClaimIfDataFitsIntoMaxPayloadSize"):
+        "snapshot_session_should_use_try_claim_if_data_fits_into_max_payload_size",
+    ("ConsensusModuleSnapshotTakerTest",
+     "snapshotSessionShouldUseOfferIfDataDoesNotFitIntoMaxPayloadSize"):
+        "snapshot_session_should_use_offer_if_data_does_not_fit_into_max_payload_size",
 }
 
 # Rows that cannot be ported even though the class they live in can.

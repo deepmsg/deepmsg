@@ -44,6 +44,10 @@ name = "cluster_service"
 path = "integration/cluster_service.rs"
 
 [[test]]
+name = "cluster_snapshot"
+path = "integration/cluster_snapshot.rs"
+
+[[test]]
 name = "forwarding_poll"
 path = "integration/forwarding_poll.rs"
 
