@@ -81,7 +81,11 @@ where
 /// `TimerService.java`.
 pub trait TimerService {
     /// Expire everything due at `now`, up to `POLL_LIMIT`.
-    fn poll(&mut self, now: i64) -> usize;
+    ///
+    /// The handler arrives per call rather than at construction: the reference's
+    /// handler is the agent itself, which owns the log publisher the expiry has
+    /// to write through, and Rust cannot store that borrow in the service.
+    fn poll(&mut self, now: i64, handler: &mut dyn TimerHandler) -> usize;
 
     /// Schedule `correlation_id` for `deadline`; a second schedule for the same
     /// id replaces the first.

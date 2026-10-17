@@ -23,11 +23,11 @@ use deepmsg_codec_cluster::cluster_time_unit::ClusterTimeUnit;
 const TIMERS: [(i64, i64); 5] = [(1, 10), (2, 14), (3, 30), (4, 29), (5, 15)];
 
 fn wheel() -> WheelTimerService {
-    WheelTimerService::new(Box::new(|_: i64| true), ClusterTimeUnit::MILLIS, 0, 8, 128)
+    WheelTimerService::new(ClusterTimeUnit::MILLIS, 0, 8, 128)
 }
 
 fn heap() -> PriorityHeapTimerService {
-    PriorityHeapTimerService::new(Box::new(|_: i64| true))
+    PriorityHeapTimerService::new()
 }
 
 #[derive(Default)]
@@ -85,7 +85,7 @@ fn the_heap_snapshot_is_the_level_order_of_its_array() {
     // Expire the two earliest, as `PriorityHeapTimerServiceTest
     // .snapshotProcessesAllScheduledTimers` does, so the array has the shape
     // that test asserts: 5 at the root, 4 and 3 below it.
-    assert_eq!(2, service.poll(14));
+    assert_eq!(2, service.poll(14, &mut |_: i64| true));
 
     let mut recorder = Recorder::default();
     service.snapshot(&mut recorder);

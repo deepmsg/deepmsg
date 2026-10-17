@@ -43,7 +43,6 @@ impl HeapTimer {
 
 /// The heap (`PriorityHeapTimerService.java:37-47`).
 pub struct PriorityHeapTimerService {
-    handler: Box<dyn TimerHandler>,
     /// `timerByCorrelationId`: correlation id → heap index.
     timer_by_correlation_id: HashMap<i64, usize>,
     timers: Vec<Option<HeapTimer>>,
@@ -54,11 +53,17 @@ pub struct PriorityHeapTimerService {
     allocated: usize,
 }
 
+impl Default for PriorityHeapTimerService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PriorityHeapTimerService {
-    /// `new PriorityHeapTimerService(TimerHandler)`.
-    pub fn new(handler: Box<dyn TimerHandler>) -> Self {
+    /// `new PriorityHeapTimerService(TimerHandler)`; the handler is passed to
+    /// [`TimerService::poll`] here.
+    pub fn new() -> Self {
         Self {
-            handler,
             timer_by_correlation_id: HashMap::default(),
             timers: Vec::new(),
             free_timers: Vec::new(),
@@ -169,7 +174,7 @@ impl PriorityHeapTimerService {
 
 impl TimerService for PriorityHeapTimerService {
     /// `poll(now)` (`:66-100`).
-    fn poll(&mut self, now: i64) -> usize {
+    fn poll(&mut self, now: i64, handler: &mut dyn TimerHandler) -> usize {
         let mut expired_timers = 0;
 
         while self.size > 0 && expired_timers < POLL_LIMIT {
@@ -178,7 +183,7 @@ impl TimerService for PriorityHeapTimerService {
                 break;
             }
 
-            if !self.handler.on_timer_event(timer.correlation_id) {
+            if !handler.on_timer_event(timer.correlation_id) {
                 break;
             }
 
@@ -297,15 +302,16 @@ mod tests {
     fn equal_deadlines_all_expire_and_their_order_is_the_heaps() {
         let expired = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let recorder = std::rc::Rc::clone(&expired);
-        let mut service = PriorityHeapTimerService::new(Box::new(move |correlation_id: i64| {
-            recorder.borrow_mut().push(correlation_id);
-            true
-        }));
+        let mut service = PriorityHeapTimerService::new();
         service.schedule_timer_for_correlation_id(1, 10);
         service.schedule_timer_for_correlation_id(2, 10);
         service.schedule_timer_for_correlation_id(3, 10);
 
-        assert_eq!(3, service.poll(10));
+        let mut handler = |correlation_id: i64| {
+            recorder.borrow_mut().push(correlation_id);
+            true
+        };
+        assert_eq!(3, service.poll(10, &mut handler));
         let mut order = expired.borrow().clone();
         order.sort_unstable();
         assert_eq!(vec![1, 2, 3], order);
@@ -313,7 +319,9 @@ mod tests {
 
     #[test]
     fn a_cancelled_entry_is_reused_not_reallocated() {
-        let mut service = PriorityHeapTimerService::new(Box::new(|_: i64| true));
+        let mut service = PriorityHeapTimerService::new();
+        let mut handler = |_: i64| true;
+        let _ = &mut handler;
         service.schedule_timer_for_correlation_id(1, 10);
         service.schedule_timer_for_correlation_id(2, 20);
         assert_eq!(2, service.allocated_timer_count());

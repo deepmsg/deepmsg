@@ -37,12 +37,16 @@ impl Recorder {
     }
 }
 
-fn service(recorder: &Rc<Recorder>) -> PriorityHeapTimerService {
+fn service(_recorder: &Rc<Recorder>) -> PriorityHeapTimerService {
+    PriorityHeapTimerService::new()
+}
+
+fn poll(service: &mut PriorityHeapTimerService, recorder: &Rc<Recorder>, now: i64) -> usize {
     let events = Rc::clone(recorder);
-    PriorityHeapTimerService::new(Box::new(move |correlation_id: i64| {
+    service.poll(now, &mut move |correlation_id: i64| {
         events.events.borrow_mut().push(correlation_id);
         events.answer
-    }))
+    })
 }
 
 fn snapshot(service: &PriorityHeapTimerService, recorder: &Rc<Recorder>) {
@@ -63,7 +67,7 @@ fn the_constructor_requires_a_handler() {
     let recorder = Recorder::answering(true);
     let mut service = service(&recorder);
     service.schedule_timer_for_correlation_id(1, 1);
-    assert_eq!(1, service.poll(1));
+    assert_eq!(1, poll(&mut service, &recorder, 1));
 }
 
 #[test]
@@ -71,7 +75,7 @@ fn poll_is_a_no_op_when_no_timers_where_scheduled() {
     let recorder = Recorder::answering(true);
     let mut service = service(&recorder);
 
-    assert_eq!(0, service.poll(i64::MIN));
+    assert_eq!(0, poll(&mut service, &recorder, i64::MIN));
     assert!(recorder.events().is_empty());
 }
 
@@ -81,7 +85,7 @@ fn poll_is_a_no_op_when_no_scheduled_timers_are_expired() {
     let mut service = service(&recorder);
     service.schedule_timer_for_correlation_id(1, 100);
 
-    assert_eq!(0, service.poll(7));
+    assert_eq!(0, poll(&mut service, &recorder, 7));
     assert!(recorder.events().is_empty());
 }
 
@@ -91,7 +95,7 @@ fn poll_should_not_expire_timer_if_handler_returns_false() {
     let mut service = service(&recorder);
     service.schedule_timer_for_correlation_id(1, 100);
 
-    assert_eq!(0, service.poll(i64::MAX));
+    assert_eq!(0, poll(&mut service, &recorder, i64::MAX));
     assert_eq!(vec![1], recorder.events());
 
     // The timer is still there.
@@ -104,8 +108,8 @@ fn poll_should_expire_single_timer() {
     let mut service = service(&recorder);
     service.schedule_timer_for_correlation_id(1, 100);
 
-    assert_eq!(1, service.poll(200));
-    assert_eq!(0, service.poll(200));
+    assert_eq!(1, poll(&mut service, &recorder, 200));
+    assert_eq!(0, poll(&mut service, &recorder, 200));
     assert_eq!(vec![1], recorder.events());
 }
 
@@ -117,8 +121,8 @@ fn poll_should_removed_expired_timers() {
         service.schedule_timer_for_correlation_id(correlation_id, deadline);
     }
 
-    assert_eq!(2, service.poll(200));
-    assert_eq!(3, service.poll(500));
+    assert_eq!(2, poll(&mut service, &recorder, 200));
+    assert_eq!(3, poll(&mut service, &recorder, 500));
     assert_eq!(vec![1, 2, 3, 4, 5], recorder.events());
 }
 
@@ -130,7 +134,7 @@ fn poll_should_expire_timers_in_order_of_deadline_but_within_the_deadline_order_
         service.schedule_timer_for_correlation_id(correlation_id, deadline);
     }
 
-    assert_eq!(5, service.poll(10));
+    assert_eq!(5, poll(&mut service, &recorder, 10));
     assert_eq!(vec![2, 5, 3, 4, 1], recorder.events());
 }
 
@@ -160,7 +164,7 @@ fn cancel_timer_by_correlation_id_returns_true_after_cancelling_the_timer() {
     service.schedule_timer_for_correlation_id(2, 90);
 
     assert!(service.cancel_timer_by_correlation_id(7));
-    assert_eq!(2, service.poll(111));
+    assert_eq!(2, poll(&mut service, &recorder, 111));
     assert_eq!(vec![2, 1], recorder.events());
 }
 
@@ -173,7 +177,7 @@ fn cancel_timer_by_correlation_id_returns_true_after_cancelling_the_last_timer()
     service.schedule_timer_for_correlation_id(2, 90);
 
     assert!(service.cancel_timer_by_correlation_id(1));
-    assert_eq!(2, service.poll(111));
+    assert_eq!(2, poll(&mut service, &recorder, 111));
     assert_eq!(vec![7, 2], recorder.events());
 }
 
@@ -186,9 +190,9 @@ fn cancel_timer_by_correlation_id_after_poll() {
     service.schedule_timer_for_correlation_id(2, 20);
     service.schedule_timer_for_correlation_id(4, 40);
 
-    assert_eq!(1, service.poll(19));
+    assert_eq!(1, poll(&mut service, &recorder, 19));
     assert!(service.cancel_timer_by_correlation_id(1));
-    assert_eq!(2, service.poll(40));
+    assert_eq!(2, poll(&mut service, &recorder, 40));
     assert_eq!(vec![5, 2, 4], recorder.events());
 }
 
@@ -201,7 +205,7 @@ fn schedule_timer_for_an_existing_correlation_id_is_a_no_op_if_deadline_does_not
     service.schedule_timer_for_correlation_id(7, 70);
 
     service.schedule_timer_for_correlation_id(5, 50);
-    assert_eq!(3, service.poll(70));
+    assert_eq!(3, poll(&mut service, &recorder, 70));
     assert_eq!(vec![3, 5, 7], recorder.events());
 }
 
@@ -217,7 +221,7 @@ fn schedule_timer_for_an_existing_correlation_id_should_shift_entry_up_when_dead
     service.schedule_timer_for_correlation_id(5, 50);
 
     service.schedule_timer_for_correlation_id(5, 10);
-    assert_eq!(3, service.poll(10));
+    assert_eq!(3, poll(&mut service, &recorder, 10));
     assert_eq!(vec![1, 2, 5], recorder.events());
 }
 
@@ -233,7 +237,7 @@ fn schedule_timer_for_an_existing_correlation_id_should_shift_entry_down_when_de
     service.schedule_timer_for_correlation_id(5, 50);
 
     service.schedule_timer_for_correlation_id(1, 30);
-    assert_eq!(4, service.poll(30));
+    assert_eq!(4, poll(&mut service, &recorder, 30));
     assert_eq!(vec![2, 4, 1, 3], recorder.events());
 }
 
@@ -246,7 +250,7 @@ fn poll_should_stop_after_poll_limit_is_reached() {
         service.schedule_timer_for_correlation_id(i as i64, i as i64);
     }
 
-    assert_eq!(POLL_LIMIT, service.poll(i64::MAX));
+    assert_eq!(POLL_LIMIT, poll(&mut service, &recorder, i64::MAX));
     assert_eq!(POLL_LIMIT, recorder.events().len());
 }
 
@@ -260,7 +264,7 @@ fn snapshot_processes_all_scheduled_timers() {
     service.schedule_timer_for_correlation_id(4, 29);
     service.schedule_timer_for_correlation_id(5, 15);
 
-    assert_eq!(2, service.poll(14));
+    assert_eq!(2, poll(&mut service, &recorder, 14));
     snapshot(&service, &recorder);
 
     assert_eq!(vec![1, 2], recorder.events());
@@ -275,9 +279,9 @@ fn expire_than_cancel_timer() {
         service.schedule_timer_for_correlation_id(correlation_id, deadline);
     }
 
-    assert_eq!(2, service.poll(5));
+    assert_eq!(2, poll(&mut service, &recorder, 5));
     assert!(service.cancel_timer_by_correlation_id(1));
-    assert_eq!(2, service.poll(1000));
+    assert_eq!(2, poll(&mut service, &recorder, 1000));
     assert_eq!(vec![2, 4, 3, 5], recorder.events());
 }
 
@@ -290,7 +294,7 @@ fn move_up_an_existing_timer_and_cancel_another_one() {
     }
 
     assert!(service.cancel_timer_by_correlation_id(3));
-    assert_eq!(4, service.poll(5));
+    assert_eq!(4, poll(&mut service, &recorder, 5));
     assert_eq!(vec![1, 2, 5, 4], recorder.events());
 }
 
@@ -303,7 +307,7 @@ fn move_down_an_existing_timer_and_cancel_another_one() {
     }
 
     assert!(service.cancel_timer_by_correlation_id(3));
-    assert_eq!(4, service.poll(5));
+    assert_eq!(4, poll(&mut service, &recorder, 5));
     assert_eq!(vec![2, 4, 1, 5], recorder.events());
 }
 
@@ -315,7 +319,7 @@ fn cancel_expired_timer_is_a_no_op() {
     service.schedule_timer_for_correlation_id(2, 1);
     service.schedule_timer_for_correlation_id(3, 3);
 
-    assert_eq!(2, service.poll(1));
+    assert_eq!(2, poll(&mut service, &recorder, 1));
     assert!(!service.cancel_timer_by_correlation_id(1));
     assert!(!service.cancel_timer_by_correlation_id(2));
 }
@@ -329,7 +333,7 @@ fn schedule_must_retain_order_between_deadlines() {
     service.schedule_timer_for_correlation_id(5, 5);
     service.schedule_timer_for_correlation_id(6, 0);
 
-    assert_eq!(4, service.poll(5));
+    assert_eq!(4, poll(&mut service, &recorder, 5));
     assert_eq!(vec![6, 3, 4, 5], recorder.events());
 }
 
@@ -342,7 +346,7 @@ fn should_reuse_expired_entries_from_a_free_list() {
     service.schedule_timer_for_correlation_id(3, 3);
     assert_eq!(3, service.allocated_timer_count());
 
-    assert_eq!(2, service.poll(2));
+    assert_eq!(2, poll(&mut service, &recorder, 2));
 
     service.schedule_timer_for_correlation_id(4, 4);
     service.schedule_timer_for_correlation_id(5, 5);
@@ -350,7 +354,7 @@ fn should_reuse_expired_entries_from_a_free_list() {
     // The two expired entries came back off the free list.
     assert_eq!(4, service.allocated_timer_count());
 
-    assert_eq!(4, service.poll(5));
+    assert_eq!(4, poll(&mut service, &recorder, 5));
     // The first poll's expiries came first; the four the reference verifies
     // in order follow them.
     assert_eq!(vec![1, 2, 6, 3, 4, 5], recorder.events());
@@ -373,7 +377,7 @@ fn should_reuse_canceled_timer_entries_from_a_free_list() {
     service.schedule_timer_for_correlation_id(6, 0);
     assert_eq!(4, service.allocated_timer_count());
 
-    assert_eq!(4, service.poll(5));
+    assert_eq!(4, poll(&mut service, &recorder, 5));
     assert_eq!(vec![6, 1, 3, 5], recorder.events());
 }
 
@@ -399,16 +403,9 @@ impl Harness {
         let time = Rc::new(std::cell::Cell::new(1000));
         let checked_deadlines = Rc::clone(&deadlines);
         let checked_time = Rc::clone(&time);
+        let _ = (&checked_deadlines, &checked_time);
         Self {
-            service: PriorityHeapTimerService::new(Box::new(move |correlation_id: i64| {
-                let mut deadlines = checked_deadlines.borrow_mut();
-                let deadline = deadlines
-                    .remove(&correlation_id)
-                    .expect("a scheduled timer");
-                assert!(deadline >= 1000, "deadline={deadline}");
-                assert!(deadline <= checked_time.get(), "deadline={deadline}");
-                true
-            })),
+            service: PriorityHeapTimerService::new(),
             deadlines,
             time,
             state: 1,
@@ -486,7 +483,18 @@ impl Harness {
     fn increment_time_and_poll(&mut self) {
         let time = self.time.get() + self.random(2) as i64;
         self.time.set(time);
-        self.service.poll(time);
+
+        let deadlines = Rc::clone(&self.deadlines);
+        let checked_time = Rc::clone(&self.time);
+        self.service.poll(time, &mut move |correlation_id: i64| {
+            let mut deadlines = deadlines.borrow_mut();
+            let deadline = deadlines
+                .remove(&correlation_id)
+                .expect("a scheduled timer");
+            assert!(deadline >= 1000, "deadline={deadline}");
+            assert!(deadline <= checked_time.get(), "deadline={deadline}");
+            true
+        });
     }
 
     fn validate_ordering(&mut self) {

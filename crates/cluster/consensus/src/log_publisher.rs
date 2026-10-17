@@ -308,12 +308,11 @@ impl LogPublisher {
     /// As [`Self::append_message`].
     pub fn append_timer(
         &mut self,
-        client: &Client,
+        position_limit: i64,
         correlation_id: i64,
         leadership_term_id: i64,
         timestamp: i64,
     ) -> Result<i64, ClusterError> {
-        let position_limit = self.position_limit(client);
         let length = MESSAGE_HEADER_LENGTH + usize::from(TIMER_BLOCK_LENGTH);
         self.size_buffer(length);
 

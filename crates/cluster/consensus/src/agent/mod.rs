@@ -70,13 +70,22 @@ use deepmsg_core::uri::ChannelUri;
 use deepmsg_driver::idle::Strategy;
 
 use crate::clock::{ClusterClock, MillisecondClusterClock};
-use crate::config::{CLUSTER_IDLE_STRATEGY_PROP_NAME, ConsensusModuleConfig};
+use crate::config::{CLUSTER_IDLE_STRATEGY_PROP_NAME, CLUSTER_TIME_UNIT, ConsensusModuleConfig};
 use crate::election::{Election, ElectionHost, ElectionState};
 use crate::error::ClusterError;
 use crate::handles::{LogReplay, RecordingReplication};
 use crate::log_publisher::LogPublisher;
 use crate::persist::node_state::NodeStateFile;
 use crate::persist::recording_log::{self, RecordingExtent, RecordingLog, RecoveryPlan};
+use crate::service_control::ack::{
+    NULL_VALUE as ACK_NULL_VALUE, ServiceAck, ServiceAckQueues, has_reached, new_array_of_queues,
+    remove_head,
+};
+use crate::service_control::adapter::{ServiceControlAdapter, ServiceControlHandler};
+use crate::service_control::proxy::{ServiceProxy, ServiceSend};
+use crate::service_control::tracker::{
+    PendingServiceMessageTracker, service_id_from_service_message,
+};
 use crate::session::authenticator::{
     Authenticator, AuthorisationService, authenticator_for, authorisation_service_for,
 };
@@ -85,6 +94,11 @@ use crate::session::egress::EgressPublisher;
 use crate::session::ingress::{IngressAdapter, IngressHandler};
 use crate::session::manager::{SessionConnectRequest, SessionContext, SessionManager};
 use crate::state::{ModuleState, Role};
+use crate::timer::priority_heap::PriorityHeapTimerService;
+use crate::timer::wheel::WheelTimerService;
+use crate::timer::{
+    TimerHandler, TimerService, TimerServiceKind, timer_service_kind, wheel_tick_resolution,
+};
 
 use publisher::ConsensusPublisher;
 
@@ -209,6 +223,17 @@ pub struct ConsensusModuleAgent {
     sessions: SessionManager,
     egress: EgressPublisher,
     ingress: IngressAdapter,
+    service_proxy: ServiceProxy,
+    service_publication_id: i64,
+    service_control: ServiceControlAdapter,
+    trackers: Vec<PendingServiceMessageTracker>,
+    service_ack_queues: ServiceAckQueues,
+    service_ack_id: i64,
+    expected_ack_position: i64,
+    service_client_ids: Vec<i64>,
+    timer: Box<dyn TimerService>,
+    uncommitted_timers: std::collections::VecDeque<(i64, i64)>,
+    expired_timer_count: deepmsg_cluster_common::collections::HashMap<i64, i64>,
     live_log_destination: String,
     catchup_log_destination: String,
     closed: bool,
@@ -337,12 +362,6 @@ impl ConsensusModuleAgent {
                 ))
             })?;
 
-        if config.service_count > 0 {
-            return Err(ClusterError::Cluster(
-                "service_count > 0 needs the service proxy (P3-4c)".to_owned(),
-            ));
-        }
-
         let counters = allocate_counters(&mut client, &config)?;
 
         let mut archive = Archive::connect(
@@ -373,6 +392,20 @@ impl ConsensusModuleAgent {
         let consensus_subscription_id =
             add_consensus_subscription(&mut client, &config, &members[this_member_index])?;
 
+        // The service control channel (`ConsensusModuleAgent.java:263-266`):
+        // one publication the CM writes JoinLog and the rest through, and one
+        // subscription it reads the services' answers and requests from.
+        let service_publication_id = client.add_publication(
+            &config.control_channel,
+            config.service_stream_id,
+            COMMAND_TIMEOUT,
+        )?;
+        let service_control_subscription_id = client.add_subscription(
+            &config.control_channel,
+            config.consensus_module_stream_id,
+            COMMAND_TIMEOUT,
+        )?;
+
         let clock = MillisecondClusterClock;
         let idle_strategy = Strategy::by_agrona_name(&config.idle_strategy).ok_or_else(|| {
             ClusterError::Cluster(format!(
@@ -392,6 +425,30 @@ impl ConsensusModuleAgent {
         );
         let egress = EgressPublisher::new(config.leader_heartbeat_timeout_ns);
         let ingress = IngressAdapter::new(config.ingress_fragment_limit);
+
+        #[allow(clippy::cast_sign_loss)] // the reference validates [0, MAX_SERVICE_COUNT]
+        let service_count = config.service_count as usize;
+        let trackers = (0..service_count)
+            .map(|service_id| {
+                #[allow(clippy::cast_possible_truncation)] // bounded by MAX_SERVICE_COUNT
+                let service_id = service_id as i32;
+                PendingServiceMessageTracker::new(service_id)
+            })
+            .collect();
+        let service_ack_queues = new_array_of_queues(service_count);
+        let service_client_ids = vec![ACK_NULL_VALUE; service_count];
+
+        let timer: Box<dyn TimerService> = match timer_service_kind(&config.timer_service_supplier)
+            .map_err(|error| ClusterError::Cluster(error.to_string()))?
+        {
+            TimerServiceKind::Wheel => Box::new(WheelTimerService::new(
+                CLUSTER_TIME_UNIT,
+                0,
+                wheel_tick_resolution(config.wheel_tick_resolution_ns, CLUSTER_TIME_UNIT),
+                usize::try_from(config.ticks_per_wheel).unwrap_or(128),
+            )),
+            TimerServiceKind::PriorityHeap => Box::new(PriorityHeapTimerService::new()),
+        };
 
         let mut agent = Self {
             config,
@@ -436,6 +493,17 @@ impl ConsensusModuleAgent {
             sessions,
             egress,
             ingress,
+            service_proxy: ServiceProxy::new(),
+            service_publication_id,
+            service_control: ServiceControlAdapter::new(Some(service_control_subscription_id)),
+            trackers,
+            service_ack_queues,
+            service_ack_id: 0,
+            expected_ack_position: NULL_POSITION,
+            service_client_ids,
+            timer,
+            uncommitted_timers: std::collections::VecDeque::new(),
+            expired_timer_count: deepmsg_cluster_common::collections::HashMap::default(),
             live_log_destination: String::new(),
             catchup_log_destination: String::new(),
             closed: false,
@@ -653,11 +721,15 @@ impl ConsensusModuleAgent {
         }
 
         let mut work = 0;
-        // Timers are P3-4c; the reference's `timerService.poll(timestamp)` on an
-        // empty table is zero work, which is what this node has. The service
-        // message trackers are P3-4c for the same reason.
+        // The reference's order (`:2489-2497`): timers, then the pending service
+        // message trackers, then ingress, then the leader position.
+        work += self.poll_timers(timestamp)?;
+        work += self.poll_trackers(timestamp)?;
         work += self.poll_ingress()?;
         work += self.update_leader_position_internal(now_ns)?;
+
+        // Both roles poll the service control channel (`:2535`).
+        work += self.poll_service_control()?;
 
         Ok(work)
     }
@@ -1129,6 +1201,7 @@ impl ElectionHost for ConsensusModuleAgent {
         if quorum_position > current {
             write_counter(&self.client, commit_position, quorum_position);
         }
+        self.sweep_uncommitted_entries_to(quorum_position);
         self.time_of_last_log_update_ns = now_ns;
         self.time_of_last_leader_update_ns = now_ns;
         Ok(1)
@@ -1152,10 +1225,13 @@ impl ElectionHost for ConsensusModuleAgent {
         leadership_term_id: i64,
         log_position: i64,
         log_session_id: i32,
-        _is_startup: bool,
+        is_startup: bool,
     ) -> Result<(), ClusterError> {
         self.leadership_term_id = leadership_term_id;
         self.set_counter_value(self.counters.leadership_term, leadership_term_id);
+        for tracker in self.trackers.iter_mut() {
+            tracker.set_leadership_term_id(leadership_term_id);
+        }
 
         let is_ipc = self.config.log_channel.starts_with("aeron:ipc");
         let channel = format!(
@@ -1171,11 +1247,17 @@ impl ElectionHost for ConsensusModuleAgent {
             self.idle()?;
         }
 
-        if self.config.service_count > 0 {
-            return Err(ClusterError::Cluster(
-                "waiting for service acks needs the service proxy (P3-4c)".to_owned(),
-            ));
-        }
+        // `awaitServicesReady` (`:1801-1838`): tell the services where the log
+        // is and wait for every one of them to answer at that position.
+        self.await_services_ready(
+            &channel,
+            self.config.log_stream_id,
+            log_session_id,
+            log_position,
+            i64::MAX,
+            is_startup,
+            Role::Leader,
+        )?;
 
         self.live_log_destination = if is_ipc {
             channel
@@ -1283,6 +1365,8 @@ impl ElectionHost for ConsensusModuleAgent {
             self.time_of_last_leader_update_ns = now_ns;
         }
 
+        self.restore_uncommitted_entries(log_position);
+
         Ok(self.last_append_position)
     }
 
@@ -1340,6 +1424,12 @@ impl ElectionHost for ConsensusModuleAgent {
 
         if self.role == Role::Leader {
             self.time_of_last_log_update_ns = now_ns - self.config.leader_heartbeat_interval_ns;
+            // `electionComplete` (`:1909`): the wheel's tick moves to the
+            // cluster's clock in one step, not one tick per poll.
+            self.timer.current_time(self.clock.time());
+            for tracker in self.trackers.iter_mut() {
+                tracker.set_leadership_term_id(self.leadership_term_id);
+            }
             activate_toggle(&self.client, self.counters.control_toggle);
         } else {
             self.time_of_last_log_update_ns = now_ns;
@@ -2160,6 +2250,449 @@ fn admin_request_type_name(request_type: AdminRequestType) -> &'static str {
     match request_type {
         AdminRequestType::SNAPSHOT => "SNAPSHOT",
         AdminRequestType::NullVal => "NULL_VAL",
+    }
+}
+
+/// The service publication seen through a client, for [`ServiceProxy`].
+struct PublicationSender<'a> {
+    client: &'a Client,
+    registration_id: i64,
+}
+
+impl ServiceSend for PublicationSender<'_> {
+    fn try_claim(&self, length: usize, bytes: &[u8]) -> bool {
+        let Some(publication) = self.client.publication(self.registration_id) else {
+            return false;
+        };
+        let Some(counters) = self.client.counters_reader() else {
+            return false;
+        };
+        let limit = counters
+            .value(publication.position_limit_counter_id())
+            .unwrap_or(0);
+        let Ok(claim) = publication.try_claim(limit, length) else {
+            return false;
+        };
+        let frame = claim.frame();
+        if frame.write_payload(bytes).is_none() {
+            return false;
+        }
+        let frame_length = deepmsg_core::logbuffer::frame::DATA_HEADER_LENGTH + length;
+        #[allow(clippy::cast_possible_truncation)] // bounded by the payload maximum
+        let frame_length = frame_length as i32;
+        frame.publish(frame_length).is_some()
+    }
+
+    fn offer(&self, bytes: &[u8]) -> bool {
+        matches!(
+            self.client.offer(self.registration_id, bytes),
+            Some(deepmsg_core::logbuffer::append::Appended::Ok { .. })
+        )
+    }
+
+    fn is_closed(&self) -> bool {
+        self.client.publication(self.registration_id).is_none()
+    }
+
+    fn term_buffer_length(&self) -> i32 {
+        self.client.publication(self.registration_id).map_or(
+            0,
+            deepmsg_client::publication::Publication::term_buffer_length,
+        )
+    }
+}
+
+/// The agent as the timer service's expiry callback (`onTimerEvent`,
+/// `ConsensusModuleAgent.java:889-900`).
+struct AgentTimerHandler<'a> {
+    log_publisher: &'a mut LogPublisher,
+    leadership_term_id: i64,
+    position_limit: i64,
+    timestamp: i64,
+    uncommitted_timers: &'a mut std::collections::VecDeque<(i64, i64)>,
+}
+
+impl TimerHandler for AgentTimerHandler<'_> {
+    fn on_timer_event(&mut self, correlation_id: i64) -> bool {
+        match self.log_publisher.append_timer(
+            self.position_limit,
+            correlation_id,
+            self.leadership_term_id,
+            self.timestamp,
+        ) {
+            Ok(position) if position > 0 => {
+                self.uncommitted_timers
+                    .push_back((position, correlation_id));
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A timer control handler for the service channel.
+struct DeferredQuery {
+    correlation_id: i64,
+    extended: bool,
+}
+
+struct AgentServiceHandler<'a> {
+    trackers: &'a mut [PendingServiceMessageTracker],
+    timer: &'a mut dyn TimerService,
+    service_ack_queues: &'a mut ServiceAckQueues,
+    service_ack_id: i64,
+    service_client_ids: &'a [i64],
+    state: ModuleState,
+    expired_timer_count: &'a mut deepmsg_cluster_common::collections::HashMap<i64, i64>,
+    deferred_closes: Vec<i64>,
+    deferred_queries: Vec<DeferredQuery>,
+}
+
+impl ServiceControlHandler for AgentServiceHandler<'_> {
+    fn on_service_message(
+        &mut self,
+        cluster_session_id: i64,
+        message: &[u8],
+    ) -> Result<(), ClusterError> {
+        let service_id = service_id_from_service_message(cluster_session_id);
+        let Some(tracker) = usize::try_from(service_id)
+            .ok()
+            .and_then(|index| self.trackers.get_mut(index))
+        else {
+            return Err(ClusterError::Cluster(format!(
+                "service message for unknown serviceId={service_id}"
+            )));
+        };
+        tracker.enqueue_message(message)
+    }
+
+    fn on_service_close_session(&mut self, cluster_session_id: i64) -> Result<(), ClusterError> {
+        self.deferred_closes.push(cluster_session_id);
+        Ok(())
+    }
+
+    fn on_schedule_timer(
+        &mut self,
+        correlation_id: i64,
+        deadline: i64,
+    ) -> Result<(), ClusterError> {
+        // A timer the replayed log already expired is not scheduled again; the
+        // count is what `onReplayTimerEvent` left behind
+        // (`ConsensusModuleAgent.java:1449-1459`).
+        let expired = self
+            .expired_timer_count
+            .get(&correlation_id)
+            .copied()
+            .unwrap_or(0);
+        if expired == 0 {
+            self.timer
+                .schedule_timer_for_correlation_id(correlation_id, deadline);
+        } else {
+            self.expired_timer_count.insert(correlation_id, expired - 1);
+        }
+        Ok(())
+    }
+
+    fn on_cancel_timer(&mut self, correlation_id: i64) -> Result<(), ClusterError> {
+        self.timer.cancel_timer_by_correlation_id(correlation_id);
+        Ok(())
+    }
+
+    fn on_service_ack(
+        &mut self,
+        log_position: i64,
+        _timestamp: i64,
+        ack_id: i64,
+        relevant_id: i64,
+        service_id: i32,
+    ) -> Result<deepmsg_client::fragment_assembler::Action, ClusterError> {
+        let Some(queue) = usize::try_from(service_id)
+            .ok()
+            .and_then(|index| self.service_ack_queues.get_mut(index))
+        else {
+            return Err(ClusterError::Cluster(format!(
+                "ack for unknown serviceId={service_id}"
+            )));
+        };
+
+        // `captureServiceAck` (`:2715-2723`).
+        if ack_id == 0 {
+            let already_received = self
+                .service_client_ids
+                .get(service_id as usize)
+                .is_some_and(|client_id| *client_id != ACK_NULL_VALUE);
+            if already_received {
+                return Err(ClusterError::Cluster(format!(
+                    "initial ack already received from service: possible duplicate serviceId={service_id}"
+                )));
+            }
+        }
+        queue.push_back(ServiceAck::new(ack_id, log_position, relevant_id));
+
+        if has_reached(log_position, self.service_ack_id, self.service_ack_queues)? {
+            match self.state {
+                ModuleState::Active => {}
+                ModuleState::Snapshot => {
+                    return Err(ClusterError::Cluster(
+                        "the snapshot ack path is P3-4d".to_owned(),
+                    ));
+                }
+                ModuleState::Quitting | ModuleState::Terminating => {
+                    return Err(ClusterError::Cluster(
+                        "the termination ack path is P3-4e".to_owned(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        // `ConsensusModuleAdapter` always breaks after a `ServiceAck`.
+        Ok(deepmsg_client::fragment_assembler::Action::Break)
+    }
+
+    fn on_cluster_members_query(
+        &mut self,
+        correlation_id: i64,
+        is_extended_request: bool,
+    ) -> Result<(), ClusterError> {
+        self.deferred_queries.push(DeferredQuery {
+            correlation_id,
+            extended: is_extended_request,
+        });
+        Ok(())
+    }
+}
+
+impl ConsensusModuleAgent {
+    /// `sweepUncommittedEntriesTo` (`ConsensusModuleAgent.java:2998-3018`):
+    /// timers, then the pending service messages, then the sessions.
+    fn sweep_uncommitted_entries_to(&mut self, commit_position: i64) {
+        while let Some(&(append_position, _correlation_id)) = self.uncommitted_timers.front() {
+            if append_position > commit_position {
+                break;
+            }
+            self.uncommitted_timers.pop_front();
+            self.uncommitted_timers.pop_front();
+        }
+
+        for tracker in self.trackers.iter_mut() {
+            tracker.sweep_leader_messages(commit_position);
+        }
+
+        let _ = self.sessions.sweep_uncommitted_sessions(commit_position);
+    }
+
+    /// `restoreUncommittedEntries` (`ConsensusModuleAgent.java:3020-3052`):
+    /// timers the commit position did not reach expire at once (the replay
+    /// will produce their events again), and the service messages go back to
+    /// "not appended".
+    fn restore_uncommitted_entries(&mut self, commit_position: i64) {
+        while let Some((append_position, correlation_id)) = self.uncommitted_timers.pop_front() {
+            if append_position > commit_position {
+                self.timer
+                    .schedule_timer_for_correlation_id(correlation_id, 0);
+            }
+        }
+
+        for tracker in self.trackers.iter_mut() {
+            tracker.restore_uncommitted_messages(commit_position);
+        }
+
+        self.sessions.restore_uncommitted_sessions(commit_position);
+    }
+
+    /// `awaitServicesReady` (`ConsensusModuleAgent.java:1801-1838`): a no-op
+    /// without services, otherwise send `JoinLog` and wait for every service's
+    /// ack at `log_position`.
+    #[allow(clippy::too_many_arguments)]
+    fn await_services_ready(
+        &mut self,
+        log_channel: &str,
+        stream_id: i32,
+        log_session_id: i32,
+        log_position: i64,
+        max_log_position: i64,
+        is_startup: bool,
+        role: Role,
+    ) -> Result<(), ClusterError> {
+        if self.config.service_count <= 0 {
+            return Ok(());
+        }
+
+        {
+            let send = PublicationSender {
+                client: &self.client,
+                registration_id: self.service_publication_id,
+            };
+            self.service_proxy.join_log(
+                &send,
+                log_position,
+                max_log_position,
+                self.config.member_id,
+                log_session_id,
+                stream_id,
+                is_startup,
+                role.code(),
+                log_channel,
+                false,
+            )?;
+        }
+
+        self.expected_ack_position = log_position;
+        while !has_reached(log_position, self.service_ack_id, &self.service_ack_queues)? {
+            self.poll_service_control()?;
+            self.idle()?;
+            if self.state == ModuleState::Closed {
+                return Err(ClusterError::AgentTermination(
+                    "State.CLOSED == state".to_owned(),
+                ));
+            }
+        }
+        remove_head(&mut self.service_ack_queues);
+        self.service_ack_id += 1;
+        Ok(())
+    }
+
+    /// `timerService.poll(timestamp)` (`:2489`).
+    fn poll_timers(&mut self, timestamp: i64) -> Result<usize, ClusterError> {
+        let position_limit = self.log_publisher.position_limit(&self.client);
+        let leadership_term_id = self.leadership_term_id;
+        let Self {
+            timer,
+            log_publisher,
+            uncommitted_timers,
+            ..
+        } = self;
+        let mut handler = AgentTimerHandler {
+            log_publisher,
+            leadership_term_id,
+            position_limit,
+            timestamp,
+            uncommitted_timers,
+        };
+        Ok(timer.poll(timestamp, &mut handler))
+    }
+
+    /// Each `PendingServiceMessageTracker.poll()` (`:2490-2493`).
+    fn poll_trackers(&mut self, timestamp: i64) -> Result<usize, ClusterError> {
+        if self.trackers.is_empty() {
+            return Ok(0);
+        }
+        let position_limit = self.log_publisher.position_limit(&self.client);
+        let Self {
+            trackers,
+            log_publisher,
+            ..
+        } = self;
+        let mut work = 0;
+        for tracker in trackers.iter_mut() {
+            work += tracker.poll(log_publisher, position_limit, timestamp)?;
+        }
+        Ok(work)
+    }
+
+    /// `consensusModuleAdapter.poll()` (`:2535`) and the deferred work that
+    /// needs the client and the sessions back.
+    fn poll_service_control(&mut self) -> Result<usize, ClusterError> {
+        if !self.service_control.is_connected() {
+            return Ok(0);
+        }
+
+        let leadership_term_id = self.leadership_term_id;
+        let member_id = self.config.member_id;
+        let leader_member_id = self.members[self.this_member_index].id;
+        let state = self.state;
+        let now_ns = self.clock.time_nanos();
+        let clock = self.clock;
+        let ingress_endpoints = ingress_endpoints(&self.members);
+
+        let Self {
+            client,
+            service_control,
+            trackers,
+            timer,
+            service_ack_queues,
+            service_ack_id,
+            service_client_ids,
+            expired_timer_count,
+            sessions,
+            egress,
+            log_publisher,
+            counters,
+            service_proxy,
+            service_publication_id,
+            members,
+            ..
+        } = self;
+
+        let mut handler = AgentServiceHandler {
+            trackers,
+            timer: &mut **timer,
+            service_ack_queues,
+            service_ack_id: *service_ack_id,
+            service_client_ids,
+            state,
+            expired_timer_count,
+            deferred_closes: Vec::new(),
+            deferred_queries: Vec::new(),
+        };
+
+        let result = service_control.poll(client, &mut handler);
+        let deferred_closes = std::mem::take(&mut handler.deferred_closes);
+        let deferred_queries = std::mem::take(&mut handler.deferred_queries);
+        let work = result?;
+        drop(handler);
+
+        if !deferred_closes.is_empty() {
+            let mut ctx = SessionContext {
+                client,
+                log_publisher,
+                egress,
+                clock: &clock,
+                timed_out_counter: counters.timed_out_client,
+                leadership_term_id,
+                member_id,
+                leader_member_id,
+                ingress_endpoints: &ingress_endpoints,
+                now_ns,
+            };
+            for cluster_session_id in deferred_closes {
+                sessions.on_session_close(leadership_term_id, cluster_session_id, &mut ctx)?;
+            }
+        }
+
+        if !deferred_queries.is_empty() {
+            let send = PublicationSender {
+                client,
+                registration_id: *service_publication_id,
+            };
+            for query in deferred_queries {
+                let sent = if query.extended {
+                    service_proxy.cluster_members_extended_response(
+                        &send,
+                        query.correlation_id,
+                        now_ns,
+                        leader_member_id,
+                        member_id,
+                        members,
+                    )
+                } else {
+                    service_proxy.cluster_members_response(
+                        &send,
+                        query.correlation_id,
+                        leader_member_id,
+                        &member::encode_as_string(members),
+                    )
+                };
+                if !sent {
+                    let error_counter = counters.error;
+                    let current = read_counter(client, error_counter).unwrap_or(0);
+                    write_counter(client, error_counter, current + 1);
+                }
+            }
+        }
+
+        Ok(work)
     }
 }
 

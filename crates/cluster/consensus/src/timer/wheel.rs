@@ -274,18 +274,16 @@ pub struct WheelTimerService {
     timer_id_by_correlation_id: Long2LongHashMap,
     /// `correlationIdByTimerIdMap`.
     correlation_id_by_timer_id: Long2LongHashMap,
-    handler: Box<dyn TimerHandler>,
     abort: bool,
 }
 
 impl WheelTimerService {
     /// `new WheelTimerService(handler, timeUnit, startTime, tickResolution,
-    /// ticksPerWheel)`.
+    /// ticksPerWheel)`; the handler is passed to [`TimerService::poll`] here.
     ///
     /// `time_unit` is kept for the signature the reference has; every tick and
     /// deadline here is already in that unit.
     pub fn new(
-        handler: Box<dyn TimerHandler>,
         _time_unit: ClusterTimeUnit,
         start_time: i64,
         tick_resolution: i64,
@@ -295,7 +293,6 @@ impl WheelTimerService {
             wheel: DeadlineTimerWheel::new(start_time, tick_resolution, ticks_per_wheel),
             timer_id_by_correlation_id: Long2LongHashMap::new(NULL_DEADLINE),
             correlation_id_by_timer_id: Long2LongHashMap::new(NULL_DEADLINE),
-            handler,
             abort: false,
         }
     }
@@ -318,7 +315,7 @@ impl TimerService for WheelTimerService {
     /// The outer loop can make the total exceed `POLL_LIMIT` (19 then 20), which
     /// is the reference's own behaviour and the reason the wheel's expiry count
     /// differs from the heap's.
-    fn poll(&mut self, now: i64) -> usize {
+    fn poll(&mut self, now: i64, handler: &mut dyn TimerHandler) -> usize {
         let mut expired = 0;
         self.abort = false;
 
@@ -327,7 +324,6 @@ impl TimerService for WheelTimerService {
                 wheel,
                 timer_id_by_correlation_id,
                 correlation_id_by_timer_id,
-                handler,
                 abort,
             } = self;
 
@@ -426,29 +422,23 @@ mod tests {
     fn the_service_poll_walks_the_ticks_in_order_within_one_call() {
         let expired = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let recorder = std::rc::Rc::clone(&expired);
-        let mut service = WheelTimerService::new(
-            Box::new(move |correlation_id: i64| {
-                recorder.borrow_mut().push(correlation_id);
-                true
-            }),
-            ClusterTimeUnit::MILLIS,
-            0,
-            8,
-            128,
-        );
+        let mut service = WheelTimerService::new(ClusterTimeUnit::MILLIS, 0, 8, 128);
         service.schedule_timer_for_correlation_id(1, 10);
         service.schedule_timer_for_correlation_id(2, 10);
         service.schedule_timer_for_correlation_id(3, 20);
 
-        assert_eq!(3, service.poll(25));
+        let mut handler = |correlation_id: i64| {
+            recorder.borrow_mut().push(correlation_id);
+            true
+        };
+        assert_eq!(3, service.poll(25, &mut handler));
         assert_eq!(vec![1, 2, 3], *expired.borrow());
-        assert_eq!(0, service.poll(25));
+        assert_eq!(0, service.poll(25, &mut handler));
     }
 
     #[test]
     fn a_reschedule_is_a_remove_and_reinsert() {
-        let mut service =
-            WheelTimerService::new(Box::new(|_: i64| true), ClusterTimeUnit::MILLIS, 0, 8, 128);
+        let mut service = WheelTimerService::new(ClusterTimeUnit::MILLIS, 0, 8, 128);
         service.schedule_timer_for_correlation_id(7, 100);
         let first = service.timer_id_by_correlation_id.get(7);
         service.schedule_timer_for_correlation_id(7, 100);

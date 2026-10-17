@@ -297,6 +297,22 @@ pub fn is_quorum_candidate(members: &[ClusterMember], candidate: &ClusterMember)
 }
 
 /// Find a member by id (`:1225`).
+/// `ClusterMember.encodeAsString(members)` (`ClusterMember.java:644-669`):
+/// `id,endpoints` per member, joined by `|` — the string a
+/// `ClusterMembersResponse` carries.
+pub fn encode_as_string(members: &[ClusterMember]) -> String {
+    let mut out = String::new();
+    for (index, member) in members.iter().enumerate() {
+        if index > 0 {
+            out.push('|');
+        }
+        out.push_str(&member.id.to_string());
+        out.push(',');
+        out.push_str(&member.endpoints);
+    }
+    out
+}
+
 pub fn find_member(members: &[ClusterMember], member_id: i32) -> Option<&ClusterMember> {
     members.iter().find(|member| member.id == member_id)
 }
