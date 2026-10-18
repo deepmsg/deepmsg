@@ -262,6 +262,20 @@ pub trait ElectionHost {
     /// is why a follower can rebind a UDP port without racing the old image.
     fn await_local_sockets_closed(&mut self, registration_id: i64) -> Result<(), ClusterError>;
 
+    /// Record the leader the election settled on, and mark it on the member
+    /// table. The reference does this in `electionComplete` through
+    /// `updateMemberDetails(election.leader())` (`ConsensusModuleAgent.java:1930`,
+    /// `:2370-2381`) — every member's `isLeader` is what the steady state's
+    /// position engine addresses its publications by.
+    fn set_leader_member_id(&mut self, leader_member_id: i32);
+
+    /// Record the term the election settled on. The first line of the
+    /// reference's `electionComplete` — `leadershipTermId(election.leadershipTermId())`
+    /// (`ConsensusModuleAgent.java:1907`) — which runs for a follower as well
+    /// as a leader. The term is the election's, and the caller is the election,
+    /// so it is handed over before [`Self::election_complete`] runs.
+    fn set_leadership_term_id(&mut self, leadership_term_id: i64);
+
     /// Hand control back to the steady state. `electionComplete(long)` at
     /// `:1905`. The reference nulls `election` from inside this call; here the
     /// outer take-and-put-back drops the `Election` instead (plan §4.5).
@@ -545,6 +559,14 @@ pub const HOST_5B_METHODS: &[&str] = &[
     "commit_position_value",
     "set_election_state",
 ];
+
+/// The methods `P3-5a-beta` added on top of the frozen 30. Kept separate so the
+/// surface test can still assert that the **frozen** set is exactly the
+/// reference's `consensusModuleAgent.*` calls, while these are the `ctx`
+/// accessors the reference reaches through a different object.
+/// The methods `P3-6a` added: the term the election settles on, which the
+/// reference writes at the top of `electionComplete` (`:1907`).
+pub const HOST_6A_METHODS: &[&str] = &["set_leadership_term_id", "set_leader_member_id"];
 
 /// The methods `P3-5a-beta` added on top of the frozen 30. Kept separate so the
 /// surface test can still assert that the **frozen** set is exactly the

@@ -468,6 +468,8 @@ impl Election {
         // there rather than recomputed here from a partial copy.
         let has_quorum = host.has_quorum_at_position(term, log_position, now_ns, heartbeat_timeout);
         if has_quorum && host.append_new_leadership_term_event(now_ns)? {
+            host.set_leadership_term_id(self.leadership_term_id);
+            host.set_leader_member_id(self.this_member_id);
             host.election_complete(now_ns)?;
             self.transition(ElectionState::Closed, now_ns, host)?;
             work += 1;
@@ -990,6 +992,8 @@ impl Election {
             self.this_member_id,
             APPEND_POSITION_FLAG_NONE,
         ) {
+            host.set_leadership_term_id(self.leadership_term_id);
+            host.set_leader_member_id(self.leader_member_id);
             host.election_complete(now_ns)?;
             self.transition(ElectionState::Closed, now_ns, host)?;
         } else if now_ns >= self.time_of_last_state_change_ns + host.leader_heartbeat_timeout_ns() {
@@ -1817,8 +1821,10 @@ pub const fn quorum_scratch_len(member_count: usize) -> usize {
     (member_count >> 1) + 1
 }
 
-/// `APPEND_POSITION_FLAG_NONE` (`ConsensusModuleAgent.java:124`).
+/// `APPEND_POSITION_FLAG_NONE` (`ConsensusModuleAgent.java:125`).
 pub const APPEND_POSITION_FLAG_NONE: i16 = 0;
+/// `APPEND_POSITION_FLAG_CATCHUP` (`ConsensusModuleAgent.java:126`).
+pub const APPEND_POSITION_FLAG_CATCHUP: i16 = 1;
 
 /// `ChannelUri.createDestinationUri(channel, endpoint)` (`ChannelUri.java:589-601`):
 /// `aeron:<media>?endpoint=<endpoint>`, plus the channel's interface when it

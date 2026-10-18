@@ -54,6 +54,10 @@ impl Mock {
 }
 
 impl ElectionHost for Mock {
+    fn set_leader_member_id(&mut self, _leader_member_id: i32) {}
+
+    fn set_leadership_term_id(&mut self, _leadership_term_id: i64) {}
+
     fn set_role(&mut self, new_role: Role) {
         self.role = new_role;
         self.calls.push("set_role");
