@@ -2144,8 +2144,19 @@ impl ConsensusModuleAgent {
             } => self
                 .on_termination_ack(leadership_term_id, log_position, member_id)
                 .map(|()| 1),
+            ConsensusMessage::ChallengeResponse {
+                correlation_id,
+                cluster_session_id,
+                encoded_credentials,
+            } => {
+                self.on_consensus_challenge_response(
+                    correlation_id,
+                    cluster_session_id,
+                    &encoded_credentials,
+                );
+                Ok(0)
+            }
             ConsensusMessage::BackupQuery { .. }
-            | ConsensusMessage::ChallengeResponse { .. }
             | ConsensusMessage::HeartbeatRequest { .. }
             | ConsensusMessage::StandbySnapshot { .. } => {
                 // Backup queries, the challenge response and the standby
@@ -2346,6 +2357,23 @@ impl ConsensusModuleAgent {
         } else {
             Ok(0)
         }
+    }
+
+    /// `onConsensusChallengeResponse` (`CMA:880-884`): the leader's half of a
+    /// follower's forward of a client's challenge answer.
+    ///
+    /// The reference hands it to
+    /// `SessionManager.onChallengeResponseForBackupSession`, which answers
+    /// **backup sessions** — `ClusterBackup`'s, P3-9's (plan §8). This build has
+    /// no backup sessions, so the call finds nothing and says nothing, exactly
+    /// as the reference's does for a user session's id.
+    fn on_consensus_challenge_response(
+        &mut self,
+        correlation_id: i64,
+        cluster_session_id: i64,
+        encoded_credentials: &[u8],
+    ) {
+        let _ = (correlation_id, cluster_session_id, encoded_credentials);
     }
 
     /// `onVote` (`:982-997`).
@@ -3166,8 +3194,7 @@ impl ElectionHost for ConsensusModuleAgent {
         self.ingress.close(&mut self.client);
 
         // `:1365-1375`: the log's extra destinations are given up and the image
-        // is let go. The subscription itself belongs to the election, which
-        // closes it and waits for its sockets (`Election.java:672-676`).
+        // is let go.
         for destination in [
             std::mem::take(&mut self.catchup_log_destination),
             std::mem::take(&mut self.live_log_destination),
@@ -3177,6 +3204,21 @@ impl ElectionHost for ConsensusModuleAgent {
             }
         }
         self.log_adapter.disconnect(i64::MAX);
+
+        // `logAdapter.disconnect(errorHandler, maxLogPosition)`
+        // (`LogAdapter.java:70-74`): the image's subscription is closed **and
+        // its local sockets are waited for**. The wait is what a re-election
+        // depends on — the live log destination binds this member's fixed log
+        // port, and the next term adds it again; without the wait the driver
+        // still holds the old socket and answers `Address already in use`
+        // (98) on every attempt, which leaves the follower looping
+        // `FOLLOWER_LOG_INIT -> INIT`.
+        if self.live_log_subscription_id != NULL_VALUE {
+            let registration_id = self.live_log_subscription_id;
+            self.live_log_subscription_id = NULL_VALUE;
+            self.remove_log_subscription(registration_id)?;
+            self.await_local_sockets_closed(registration_id)?;
+        }
 
         self.last_quorum_backtrack_commit_position = NULL_POSITION;
 
@@ -3763,6 +3805,13 @@ impl ElectionHost for ConsensusModuleAgent {
     }
 
     fn remove_log_subscription(&mut self, registration_id: i64) -> Result<(), ClusterError> {
+        // A subscription this client no longer holds is already gone: the
+        // agent's `prepare_for_new_leadership` and the election's `INIT` can
+        // both name the same registration (they are the same subscription),
+        // and the second close must not turn into a driver refusal.
+        if self.client.subscription(registration_id).is_none() {
+            return Ok(());
+        }
         self.client
             .remove_subscription(registration_id, COMMAND_TIMEOUT)
             .map_err(cluster)
@@ -4197,6 +4246,9 @@ struct AgentIngressHandler<'a> {
     ingress_endpoints: &'a str,
     deferred_closes: Vec<(i64, i64)>,
     deferred_admins: Vec<DeferredAdminRequest>,
+    /// A follower's forwards for the leader (`CMA:870-880`), sent after the
+    /// poll: the handler has no consensus publisher to send through.
+    deferred_challenge_responses: Vec<(i64, i64, Vec<u8>)>,
     extension_messages: usize,
 }
 
@@ -4314,8 +4366,15 @@ impl IngressHandler for AgentIngressHandler<'_> {
                 self.now_ns,
             );
         } else {
-            return Err(ClusterError::Cluster(
-                "sending a challenge response to the leader is P3-6b".to_owned(),
+            // `:876-879`: a follower forwards the answer to the leader over the
+            // consensus publication and ignores whether the offer landed — the
+            // client will answer the challenge again, and the reference does
+            // not count a failed forward either. The handler holds no
+            // publisher, so the send is deferred to the duty cycle.
+            self.deferred_challenge_responses.push((
+                correlation_id,
+                cluster_session_id,
+                encoded_credentials.to_vec(),
             ));
         }
         Ok(())
@@ -4510,6 +4569,7 @@ impl ConsensusModuleAgent {
             ingress_endpoints,
             deferred_closes: Vec::new(),
             deferred_admins: Vec::new(),
+            deferred_challenge_responses: Vec::new(),
             extension_messages: 0,
         };
 
@@ -4517,8 +4577,22 @@ impl ConsensusModuleAgent {
         let work = result?;
         let deferred_closes = std::mem::take(&mut handler.deferred_closes);
         let deferred_admins = std::mem::take(&mut handler.deferred_admins);
+        let deferred_challenge_responses =
+            std::mem::take(&mut handler.deferred_challenge_responses);
         let extension_messages = handler.extension_messages;
         drop(handler);
+
+        for (correlation_id, cluster_session_id, encoded_credentials) in
+            deferred_challenge_responses
+        {
+            let leader_member_id = self.leader_member_id();
+            let _ = self.publisher.challenge_response(
+                leader_member_id,
+                correlation_id,
+                cluster_session_id,
+                &encoded_credentials,
+            );
+        }
 
         if extension_messages > 0 {
             let error_counter = self.counters.error;

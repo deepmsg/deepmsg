@@ -218,6 +218,10 @@ pub struct Node {
     args: Vec<String>,
     faults: Faults,
     stop: Arc<AtomicBool>,
+    /// Set by the module's own thread when it ends — a clean `SHUTDOWN`/`ABORT`
+    /// ends the duty cycle from the inside, which [`Self::stop`] cannot tell
+    /// from a module still running.
+    finished: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -283,6 +287,7 @@ impl Node {
             args,
             faults: faults.clone(),
             stop: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
             thread: None,
         };
         node.launch_thread(launched);
@@ -302,6 +307,8 @@ impl Node {
         let id = self.id;
         let stop = Arc::new(AtomicBool::new(false));
         self.stop = Arc::clone(&stop);
+        let finished = Arc::new(AtomicBool::new(false));
+        self.finished = Arc::clone(&finished);
         let faults = self.faults.clone();
         let sender = launched.clone();
 
@@ -322,9 +329,13 @@ impl Node {
             };
             let _ = sender.send((id, Ok(())));
 
+            // An `AgentTermination` is how an orderly `SHUTDOWN`/`ABORT` ends a
+            // module (`CMA:403-478`): the duty cycle returns it and the node is
+            // meant to stop. Anything else is the fault the harness records.
             while !stop.load(Ordering::Relaxed) {
                 match agent.do_work() {
                     Ok(work) => idle.idle(work),
+                    Err(error) if error.is_termination() => break,
                     Err(error) => {
                         faults.record(format!("node {id}: the duty cycle: {error}"));
                         break;
@@ -335,6 +346,8 @@ impl Node {
             if let Err(error) = agent.close() {
                 faults.record(format!("node {id}: close: {error}"));
             }
+
+            finished.store(true, Ordering::Relaxed);
         }));
     }
 
@@ -372,6 +385,13 @@ impl Node {
     pub fn is_stopped(&self) -> bool {
         self.thread.is_none()
     }
+
+    /// Whether the module's thread has ended on its own — a `SHUTDOWN`/`ABORT`
+    /// rather than [`Self::stop`].
+    #[must_use]
+    pub fn has_finished(&self) -> bool {
+        self.finished.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for Node {
@@ -383,12 +403,14 @@ impl Drop for Node {
 /// The cluster counters this harness reads from a member's driver.
 pub struct NodeCounters {
     cnc: CncFile,
+    aeron_dir: std::path::PathBuf,
 }
 
 impl NodeCounters {
     pub fn open(aeron_dir: &std::path::Path) -> Self {
         Self {
             cnc: CncFile::open(aeron_dir, DEADLINE).expect("the node's CnC file"),
+            aeron_dir: aeron_dir.to_path_buf(),
         }
     }
 
@@ -396,6 +418,22 @@ impl NodeCounters {
         let counters = self.cnc.counters()?;
         let id = find_cluster_counter(&counters, type_id, CLUSTER_ID)?;
         counters.value(id)
+    }
+
+    /// Write one of the module's counters — how an operator drives the cluster
+    /// without an operator tool: the control toggle is a counter, and a
+    /// `SHUTDOWN` is that counter set to its code (`ClusterControl`).
+    pub fn set(&self, type_id: i32, value: i64) {
+        let id = {
+            let counters = self.cnc.counters().expect("counters");
+            find_cluster_counter(&counters, type_id, CLUSTER_ID).expect("the counter")
+        };
+        CncFile::open_writable(&self.aeron_dir, DEADLINE)
+            .expect("the node's CnC file, writable")
+            .counters_writable()
+            .expect("writable counters")
+            .set_value(id, value)
+            .expect("the counter is written");
     }
 
     pub fn role(&self) -> Option<i64> {

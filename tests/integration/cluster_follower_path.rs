@@ -431,3 +431,254 @@ fn a_member_that_missed_a_term_is_caught_up_by_replication() {
         node.stop();
     }
 }
+
+/// H2 — the leader dies and the survivors elect a new term.
+///
+/// The two followers must form a quorum of their own (`Election`), open a new
+/// term, and take a client's messages on the new leader's ingress. The dead
+/// leader's counters go with its module: `close` gives them back, which is what
+/// makes them the evidence that the old term really ended there.
+#[test]
+fn the_surviving_members_elect_a_new_leader_and_keep_committing() {
+    let ports = Ports::new();
+    let member_string = members(&ports);
+    let faults = Faults::default();
+    let (launched_tx, launched_rx) = mpsc::channel();
+
+    let mut nodes = Vec::new();
+    for id in 0..MEMBER_COUNT {
+        let Some(node) = Node::start(id, &ports, &member_string, &faults, &launched_tx) else {
+            announce_skip();
+            return;
+        };
+        nodes.push(node);
+    }
+    await_launched(&faults, &launched_rx, MEMBER_COUNT);
+
+    let counters: Vec<NodeCounters> = nodes
+        .iter()
+        .map(|node| NodeCounters::open(node.aeron_dir()))
+        .collect();
+
+    wait_until("the first election to close", &faults, || {
+        counters.iter().all(|node| {
+            node.election_state() == Some(deepmsg_tests::cluster_harness::ELECTION_CLOSED)
+        })
+    });
+
+    let first_leader = (0..MEMBER_COUNT)
+        .find(|id| {
+            counters[*id as usize].role() == Some(deepmsg_tests::cluster_harness::ROLE_LEADER)
+        })
+        .expect("a leader");
+    let first_term = counters[first_leader as usize]
+        .leadership_term_id()
+        .expect("the first term");
+
+    // A session through the first leader, so the old term has committed
+    // something a client asked for.
+    {
+        let Some(mut client) = ClientSide::start(&ports, first_leader) else {
+            announce_skip();
+            return;
+        };
+        let connect = connect_request(1, &client.egress_channel);
+        offer_message(&client, &faults, &connect);
+
+        let mut open_event = None;
+        wait_until("the session open event", &faults, || {
+            for event in client.poll_events() {
+                if event.correlation_id == 1 && event.code == EventCode::OK {
+                    open_event = Some(event);
+                }
+            }
+            open_event.is_some()
+        });
+        let open_event = open_event.expect("the session opened");
+
+        let before = counters[first_leader as usize]
+            .commit_position()
+            .expect("the leader's commit");
+        let message = ingress_message(
+            open_event.leadership_term_id,
+            open_event.cluster_session_id,
+            b"before the leader died",
+        );
+        offer_message(&client, &faults, &message);
+
+        wait_until("the first leader to commit a message", &faults, || {
+            client.poll_events();
+            counters[first_leader as usize]
+                .commit_position()
+                .is_some_and(|position| position > before)
+        });
+    }
+
+    // ---- the leader dies ---------------------------------------------------
+    nodes[first_leader as usize].stop();
+    let survivors: Vec<i32> = (0..MEMBER_COUNT).filter(|id| *id != first_leader).collect();
+
+    wait_until("the survivors to elect a new term", &faults, || {
+        survivors.iter().all(|id| {
+            counters[*id as usize].election_state()
+                == Some(deepmsg_tests::cluster_harness::ELECTION_CLOSED)
+                && counters[*id as usize]
+                    .leadership_term_id()
+                    .is_some_and(|term| term > first_term)
+        })
+    });
+
+    let new_leader = survivors
+        .iter()
+        .copied()
+        .find(|id| {
+            counters[*id as usize].role() == Some(deepmsg_tests::cluster_harness::ROLE_LEADER)
+        })
+        .expect("a new leader among the survivors");
+    assert_eq!(
+        1,
+        survivors
+            .iter()
+            .filter(|id| {
+                counters[**id as usize].role() == Some(deepmsg_tests::cluster_harness::ROLE_LEADER)
+            })
+            .count(),
+        "exactly one new leader"
+    );
+    let new_term = counters[new_leader as usize]
+        .leadership_term_id()
+        .expect("the new term");
+    assert!(
+        new_term > first_term,
+        "a new term: {new_term} <= {first_term}"
+    );
+
+    // The old module's counters are gone, which is what `close` does; the
+    // commit position it had published is no longer anywhere in that driver.
+    assert!(
+        counters[first_leader as usize].commit_position().is_none(),
+        "the dead leader's commit counter went with its module"
+    );
+
+    // ---- a client commits on the new leader -------------------------------
+    let Some(mut client) = ClientSide::start(&ports, new_leader) else {
+        announce_skip();
+        return;
+    };
+    let connect = connect_request(2, &client.egress_channel);
+    offer_message(&client, &faults, &connect);
+
+    let mut open_event = None;
+    wait_until("the session on the new leader", &faults, || {
+        for event in client.poll_events() {
+            if event.correlation_id == 2 && event.code == EventCode::OK {
+                open_event = Some(event);
+            }
+        }
+        open_event.is_some()
+    });
+    let open_event = open_event.expect("the session opened on the new leader");
+    assert_eq!(
+        new_term, open_event.leadership_term_id,
+        "the session was opened in the new term"
+    );
+
+    let before = counters[new_leader as usize]
+        .commit_position()
+        .expect("the new leader's commit");
+    let message = ingress_message(
+        open_event.leadership_term_id,
+        open_event.cluster_session_id,
+        b"after the election",
+    );
+    offer_message(&client, &faults, &message);
+
+    wait_until("the new leader to commit", &faults, || {
+        client.poll_events();
+        counters[new_leader as usize]
+            .commit_position()
+            .is_some_and(|position| position > before)
+    });
+    wait_until("the surviving follower to commit", &faults, || {
+        client.poll_events();
+        survivors.iter().filter(|id| **id != new_leader).all(|id| {
+            counters[*id as usize]
+                .commit_position()
+                .is_some_and(|position| position > before)
+        })
+    });
+
+    for node in &mut nodes {
+        node.stop();
+    }
+}
+
+/// H6 — an orderly `SHUTDOWN` ends the followers too.
+///
+/// The operator's shutdown is a counter: the leader's cluster control toggle
+/// set to `SHUTDOWN(5)` (`ClusterControl.ToggleState`, `:43-180`). The leader
+/// snapshots, publishes the termination position, and every member that
+/// reaches it acknowledges and ends its duty cycle
+/// (`CMA:2502-2512`, `:3319-3336`) — P3-4e's leader half and this slice's
+/// follower half.
+#[test]
+fn an_orderly_shutdown_ends_every_members_duty_cycle() {
+    let ports = Ports::new();
+    let member_string = members(&ports);
+    let faults = Faults::default();
+    let (launched_tx, launched_rx) = mpsc::channel();
+
+    let mut nodes = Vec::new();
+    for id in 0..MEMBER_COUNT {
+        let Some(node) = Node::start(id, &ports, &member_string, &faults, &launched_tx) else {
+            announce_skip();
+            return;
+        };
+        nodes.push(node);
+    }
+    await_launched(&faults, &launched_rx, MEMBER_COUNT);
+
+    let counters: Vec<NodeCounters> = nodes
+        .iter()
+        .map(|node| NodeCounters::open(node.aeron_dir()))
+        .collect();
+
+    wait_until("the first election to close", &faults, || {
+        counters.iter().all(|node| {
+            node.election_state() == Some(deepmsg_tests::cluster_harness::ELECTION_CLOSED)
+        })
+    });
+
+    let leader = (0..MEMBER_COUNT)
+        .find(|id| {
+            counters[*id as usize].role() == Some(deepmsg_tests::cluster_harness::ROLE_LEADER)
+        })
+        .expect("a leader");
+    counters[leader as usize].set(
+        deepmsg_cluster_common::counters::CLUSTER_CONTROL_TOGGLE_TYPE_ID,
+        i64::from(deepmsg_cluster::control::cluster_control::ToggleState::Shutdown.code()),
+    );
+
+    // Every member's duty cycle ends by itself — a follower that does not
+    // reach the termination position keeps running, and the wait then reports
+    // which ones did not.
+    wait_with_state(
+        "every member's duty cycle to end",
+        &faults,
+        || nodes.iter().all(Node::has_finished),
+        || {
+            format!(
+                "finished={:?} states={:?}",
+                nodes.iter().map(Node::has_finished).collect::<Vec<_>>(),
+                counters
+                    .iter()
+                    .map(NodeCounters::election_state)
+                    .collect::<Vec<_>>(),
+            )
+        },
+    );
+
+    for node in &mut nodes {
+        node.stop();
+    }
+}

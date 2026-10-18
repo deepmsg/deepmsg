@@ -316,3 +316,31 @@ fn an_unknown_template_is_ignored_and_a_wrong_schema_is_an_error() {
     buffer[4..6].copy_from_slice(&999_u16.to_le_bytes());
     assert!(decode_consensus_message(&buffer).is_err());
 }
+
+/// A follower forwards the client's challenge answer to the leader
+/// (`CMA:870-880`): the credentials are opaque bytes and have to survive the
+/// round trip exactly.
+#[test]
+fn a_challenge_response_carries_its_credentials() {
+    let credentials: Vec<u8> = (0..=63_u8).chain(0..=63_u8).collect();
+    let message = decode_after(|buffer| {
+        let encoder =
+            deepmsg_codec_cluster::challenge_response_codec::ChallengeResponseEncoder::default()
+                .wrap(WriteBuf::new(buffer), MESSAGE_HEADER_LENGTH);
+        let mut header = encoder.header(0);
+        let mut body = header.parent().expect("just wrapped");
+        body.correlation_id(17)
+            .cluster_session_id(23)
+            .encoded_credentials(&credentials);
+        let length = MESSAGE_HEADER_LENGTH + body.encoded_length();
+        buffer.truncate(length);
+    });
+    assert_eq!(
+        ConsensusMessage::ChallengeResponse {
+            correlation_id: 17,
+            cluster_session_id: 23,
+            encoded_credentials: credentials,
+        },
+        message
+    );
+}

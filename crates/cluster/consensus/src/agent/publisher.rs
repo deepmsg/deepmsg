@@ -36,6 +36,7 @@ use deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH as MESSAGE_HEADE
 use deepmsg_codec_cluster::{
     WriteBuf, append_position_codec::AppendPositionEncoder,
     canvass_position_codec::CanvassPositionEncoder, catchup_position_codec::CatchupPositionEncoder,
+    challenge_response_codec::ChallengeResponseEncoder,
     commit_position_codec::CommitPositionEncoder,
     new_leadership_term_codec::NewLeadershipTermEncoder, request_vote_codec::RequestVoteEncoder,
     stop_catchup_codec::StopCatchupEncoder, termination_ack_codec::TerminationAckEncoder,
@@ -227,20 +228,31 @@ impl ConsensusPublisher {
     where
         F: FnOnce(&mut Vec<u8>) -> usize,
     {
+        self.send_sized(member_id, SCRATCH_LENGTH, encode)
+    }
+
+    /// [`Self::send`] for a message whose length the caller can bound: the
+    /// challenge response carries the client's credentials, which are opaque
+    /// and can be longer than every fixed message put together. The reference's
+    /// encoder writes into an `ExpandableArrayBuffer` that grows; here the
+    /// buffer is sized once, by the caller, before the encoder sees it.
+    fn send_sized<F>(&mut self, member_id: i32, capacity: usize, encode: F) -> bool
+    where
+        F: FnOnce(&mut Vec<u8>) -> usize,
+    {
         let mut state = self.state.borrow_mut();
         if state.publication(member_id).is_none() {
             return false;
         }
         // The buffer is moved out so the claim can borrow the rest of the table
-        // while the encoder writes into it. It is sized before the encoder sees
-        // it: `WriteBuf` indexes, it does not grow.
+        // while the encoder writes into it.
         let mut buffer = std::mem::take(&mut state.buffer);
         buffer.clear();
-        buffer.resize(SCRATCH_LENGTH, 0);
+        buffer.resize(capacity.max(SCRATCH_LENGTH), 0);
         let length = encode(&mut buffer);
         debug_assert!(
-            length <= SCRATCH_LENGTH,
-            "a consensus message outgrew {SCRATCH_LENGTH}"
+            length <= capacity.max(SCRATCH_LENGTH),
+            "a consensus message outgrew its buffer"
         );
         let published = state.claim_and_publish(member_id, &buffer[..length]);
         state.buffer = buffer;
@@ -493,6 +505,30 @@ impl ConsensusPublisher {
                 .leadership_term_id(leadership_term_id)
                 .log_position(log_position)
                 .member_id(follower_member_id);
+            MESSAGE_HEADER_LENGTH + message.encoded_length()
+        })
+    }
+
+    /// `challengeResponse` (`:558-573`): a follower's forward of the client's
+    /// answer to the leader (`CMA:870-880`).
+    pub fn challenge_response(
+        &mut self,
+        member_id: i32,
+        correlation_id: i64,
+        cluster_session_id: i64,
+        encoded_credentials: &[u8],
+    ) -> bool {
+        // Header, the fixed block, the credentials' length word and the bytes.
+        let capacity = MESSAGE_HEADER_LENGTH + 16 + 4 + encoded_credentials.len();
+        self.send_sized(member_id, capacity, |buffer| {
+            let encoder = ChallengeResponseEncoder::default()
+                .wrap(WriteBuf::new(buffer), MESSAGE_HEADER_LENGTH);
+            let mut header = encoder.header(0);
+            let mut message = header.parent().expect("the encoder just wrapped");
+            message
+                .correlation_id(correlation_id)
+                .cluster_session_id(cluster_session_id)
+                .encoded_credentials(encoded_credentials);
             MESSAGE_HEADER_LENGTH + message.encoded_length()
         })
     }

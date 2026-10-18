@@ -108,6 +108,10 @@ pub enum ConsensusMessage {
     ChallengeResponse {
         correlation_id: i64,
         cluster_session_id: i64,
+        /// The client's challenge answer, opaque to the cluster
+        /// (`ChallengeResponse.encodedCredentials`): a follower forwards it to
+        /// the leader unchanged (`CMA:870-880`).
+        encoded_credentials: Vec<u8>,
     },
     HeartbeatRequest {
         correlation_id: i64,
@@ -256,10 +260,13 @@ pub fn decode_consensus_message(payload: &[u8]) -> Result<Option<ConsensusMessag
             })
         }
         deepmsg_codec_cluster::challenge_response_codec::SBE_TEMPLATE_ID => {
-            let decoder = ChallengeResponseDecoder::default().header(header, 0);
+            let mut decoder = ChallengeResponseDecoder::default().header(header, 0);
+            let coordinates = decoder.encoded_credentials_decoder();
+            let encoded_credentials = decoder.encoded_credentials_slice(coordinates).to_vec();
             Some(ConsensusMessage::ChallengeResponse {
                 correlation_id: decoder.correlation_id(),
                 cluster_session_id: decoder.cluster_session_id(),
+                encoded_credentials,
             })
         }
         deepmsg_codec_cluster::heartbeat_request_codec::SBE_TEMPLATE_ID => {
