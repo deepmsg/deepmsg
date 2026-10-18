@@ -76,7 +76,9 @@ use crate::consensus::{ConsensusMessage, decode_consensus_message};
 use crate::control::cluster_control::ToggleState as ClusterControlToggle;
 use crate::control::node_control::ToggleState as NodeControlToggle;
 use crate::control::termination::ClusterTermination;
-use crate::election::{APPEND_POSITION_FLAG_CATCHUP, Election, ElectionHost, ElectionState};
+use crate::election::{
+    APPEND_POSITION_FLAG_CATCHUP, APPEND_POSITION_FLAG_NONE, Election, ElectionHost, ElectionState,
+};
 use crate::error::ClusterError;
 use crate::handles::{LogReplay, RecordingReplication};
 use crate::log::{AgentLogReplay, LogReplayHandler};
@@ -282,6 +284,10 @@ pub struct ConsensusModuleAgent {
     last_append_position: i64,
     /// `timeOfLastAppendPositionSendNs` (`:152`): the follower's heartbeat.
     time_of_last_append_position_send_ns: i64,
+    /// `timeOfLastAppendPositionUpdateNs` (`:151`): when the append position
+    /// last moved, which is what tells a catchup that has stalled
+    /// (`:1999-2010`).
+    time_of_last_append_position_update_ns: i64,
     last_quorum_backtrack_commit_position: i64,
     time_of_last_log_update_ns: i64,
     time_of_last_leader_update_ns: i64,
@@ -583,6 +589,7 @@ impl ConsensusModuleAgent {
             leadership_term_id: NULL_VALUE,
             last_append_position: NULL_VALUE,
             time_of_last_append_position_send_ns: now_ns,
+            time_of_last_append_position_update_ns: now_ns,
             last_quorum_backtrack_commit_position: NULL_POSITION,
             time_of_last_log_update_ns: now_ns,
             time_of_last_leader_update_ns: now_ns,
@@ -1483,68 +1490,9 @@ impl ConsensusModuleAgent {
         };
         let bound = self.notified_commit_position.min(limit);
 
-        let (count, state_change, new_leadership_term_id, deferred_snapshot, snapshot_began) = {
-            let Self {
-                client,
-                log_adapter,
-                live_log_subscription_id,
-                sessions,
-                timer,
-                trackers,
-                expired_timer_count,
-                leadership_term_id,
-                config,
-                ..
-            } = self;
-
-            let mut handler = AgentLogReplayHandler {
-                sessions,
-                timer: &mut **timer,
-                trackers,
-                expired_timer_count,
-                leadership_term_id: *leadership_term_id,
-                service_count: config.service_count,
-                state_change: None,
-                new_leadership_term_id: None,
-                deferred_snapshot: None,
-                snapshot_began: false,
-            };
-
-            let count = log_adapter
-                .poll(
-                    client,
-                    *live_log_subscription_id,
-                    bound,
-                    &mut handler,
-                    config.log_fragment_limit,
-                )?
-                .unwrap_or(0);
-
-            (
-                count,
-                handler.state_change,
-                handler.new_leadership_term_id,
-                handler.deferred_snapshot,
-                handler.snapshot_began,
-            )
-        };
-
-        if let Some(state) = state_change {
-            self.set_state(state, "replayed cluster action");
-        }
-        if let Some(term) = new_leadership_term_id {
-            self.leadership_term_id = term;
-            for tracker in self.trackers.iter_mut() {
-                tracker.set_leadership_term_id(term);
-            }
-        }
-        if snapshot_began {
-            self.snapshot_duration
-                .on_snapshot_begin(self.clock.time_nanos());
-        }
-        if let Some((log_position, timestamp)) = deferred_snapshot {
-            self.snapshot_on_service_ack(log_position, timestamp, &[])?;
-        }
+        let outcome = self.poll_log_adapter(bound)?;
+        let count = outcome.count;
+        self.apply_log_apply_outcome(outcome)?;
 
         // `:2526-2530`: a quiet log whose image is gone is a leader that left;
         // an end of stream means it left gracefully.
@@ -1606,6 +1554,47 @@ impl ConsensusModuleAgent {
         self.closed = true;
 
         let stop_result = self.try_stop_log_recording();
+
+        // The log subscription and the destinations on it hold sockets at this
+        // member's **log** and catchup endpoints; the consensus subscription
+        // below holds one at its consensus endpoint. The reference gives none
+        // of them back here — a Java restart takes the media driver with it, so
+        // the ports are free anyway — but a module restarted in the same
+        // process (the harness's shape, and a driver shared between members in
+        // production) has to be able to bind them again.
+        if self.live_log_subscription_id != NULL_VALUE {
+            for destination in [
+                std::mem::take(&mut self.catchup_log_destination),
+                std::mem::take(&mut self.live_log_destination),
+            ] {
+                if !destination.is_empty() {
+                    self.remove_log_destination(&destination);
+                }
+            }
+            let registration_id = self.live_log_subscription_id;
+            self.live_log_subscription_id = NULL_VALUE;
+            let _ = self
+                .client
+                .remove_subscription(registration_id, COMMAND_TIMEOUT);
+            let _ = self.await_local_sockets_closed(registration_id);
+        }
+
+        // The consensus subscription holds this member's **consensus
+        // endpoint**. The reference does not give it back here — a Java
+        // restart takes the media driver with it, so the port is free anyway —
+        // but a module restarted in the same process (the harness's shape, and
+        // a driver shared between members in production) has to be able to
+        // bind it again. Removing it and waiting for its local sockets is the
+        // same primitive the election uses after closing its log subscription
+        // (`Election.java:672-676`), used here for the same reason.
+        if self.consensus_subscription_id != NULL_VALUE {
+            let registration_id = self.consensus_subscription_id;
+            self.consensus_subscription_id = NULL_VALUE;
+            let _ = self
+                .client
+                .remove_subscription(registration_id, COMMAND_TIMEOUT);
+            let _ = self.await_local_sockets_closed(registration_id);
+        }
 
         // A client's counters are its own to give back: `Aeron.close()` closes
         // every `AtomicCounter` it owns (`ClientConductor.java:184`), which is
@@ -2204,64 +2193,94 @@ impl ConsensusModuleAgent {
         }
 
         self.update_member_log_position(follower_member_id, log_leadership_term_id, log_position);
-        // `stopExistingCatchupReplay` is the catchup path (P3-6b).
+        self.stop_existing_catchup_replay(follower_member_id);
 
-        if log_leadership_term_id < self.leadership_term_id {
-            let term_base_log_position = self
-                .recording_log
-                .find_term_entry(self.leadership_term_id)
-                .map_or(0, |entry| entry.term_base_log_position);
-            let next = self
-                .recording_log
-                .find_term_entry(log_leadership_term_id + 1)
-                .map(|entry| {
-                    (
+        let term_base_log_position = self
+            .recording_log
+            .find_term_entry(self.leadership_term_id)
+            .map_or(0, |entry| entry.term_base_log_position);
+        // `:932-940`: when the canvassing member is already in this term there
+        // is no next term to name, and the answer is still sent — a member that
+        // restarted in the same term has to be told the leadership term and
+        // the log session before it can join anything.
+        let (next_leadership_term_id, next_term_base, next_log_position) =
+            if log_leadership_term_id < self.leadership_term_id {
+                match self
+                    .recording_log
+                    .find_term_entry(log_leadership_term_id + 1)
+                {
+                    Some(entry) => (
                         entry.leadership_term_id,
                         entry.term_base_log_position,
                         entry.log_position,
-                    )
-                });
-            let (next_leadership_term_id, next_term_base, next_log_position) = match next {
-                Some((term, base, position)) => (term, base, position),
-                None => (
-                    self.leadership_term_id,
-                    term_base_log_position,
-                    NULL_POSITION,
-                ),
+                    ),
+                    None => (
+                        self.leadership_term_id,
+                        term_base_log_position,
+                        NULL_POSITION,
+                    ),
+                }
+            } else {
+                (NULL_VALUE, NULL_POSITION, NULL_POSITION)
             };
-            let log_position_now = self.log_publisher.position();
-            let commit_position = self.commit_position_value();
-            let leadership_term_id = self.leadership_term_id;
-            let member_id = self.config.member_id;
-            let timestamp = self.clock.time();
-            let log_session_id = self.log_publication_session_id;
-            let log_recording_id = self.log_recording_id;
-            let app_version = self.config.app_version;
 
-            self.publisher.refresh_position_limits(&self.client);
-            self.publisher.new_leadership_term(
-                follower_member_id,
-                log_leadership_term_id,
-                next_leadership_term_id,
-                next_term_base,
-                next_log_position,
-                leadership_term_id,
-                term_base_log_position,
-                log_position_now,
-                commit_position,
-                log_recording_id,
-                timestamp,
-                member_id,
-                log_session_id,
-                app_version,
-                false,
-            );
-            if let Some(error) = self.publisher.take_error() {
-                return Err(error);
-            }
+        let log_position_now = self.log_publisher.position();
+        let commit_position = self.commit_position_value();
+        let leadership_term_id = self.leadership_term_id;
+        let member_id = self.config.member_id;
+        let timestamp = self.clock.time();
+        let log_session_id = self.log_publication_session_id;
+        let log_recording_id = self.log_recording_id;
+        let app_version = self.config.app_version;
+
+        self.publisher.refresh_position_limits(&self.client);
+        self.publisher.new_leadership_term(
+            follower_member_id,
+            log_leadership_term_id,
+            next_leadership_term_id,
+            next_term_base,
+            next_log_position,
+            leadership_term_id,
+            term_base_log_position,
+            log_position_now,
+            commit_position,
+            log_recording_id,
+            timestamp,
+            member_id,
+            log_session_id,
+            app_version,
+            false,
+        );
+        if let Some(error) = self.publisher.take_error() {
+            return Err(error);
         }
 
         Ok(1)
+    }
+
+    /// `stopExistingCatchupReplay` (`:3477-3490`): a member that canvasses
+    /// again is not being caught up any more by whatever replay it had.
+    fn stop_existing_catchup_replay(&mut self, follower_member_id: i32) {
+        let Some(index) = self
+            .members
+            .iter()
+            .position(|member| member.id == follower_member_id)
+        else {
+            return;
+        };
+        if self.members[index].catchup_replay_session_id == NULL_VALUE {
+            return;
+        }
+
+        let replay_session_id = self.members[index].catchup_replay_session_id;
+        if self
+            .archive
+            .stop_replay(&mut self.client, replay_session_id)
+            .is_ok()
+        {
+            self.members[index].catchup_replay_session_id = NULL_VALUE;
+            self.members[index].catchup_replay_correlation_id = NULL_VALUE;
+        }
     }
 
     /// `onRequestVote` (`:962-980`).
@@ -2473,30 +2492,79 @@ impl ConsensusModuleAgent {
         }
     }
 
-    /// `onCatchupPosition` (`:1147-1168`): the leader starts an archive replay
-    /// for the follower. That replay stream is the catchup path, `P3-6b`;
-    /// hearing the message is counted rather than silently assumed.
+    /// `onCatchupPosition` (`:1147-1168`): the leader replays its log into the
+    /// follower's catchup endpoint, through the follower's own archive.
+    ///
+    /// The replay channel is `aeron.cluster.follower.catchup.channel` with the
+    /// follower's endpoint, **the leader's log publication session id**, no
+    /// linger and no end-of-stream marker substituted into it — the shape is
+    /// what lets the follower's log subscription recognise the image as its
+    /// log rather than as a stranger on the channel.
     fn on_catchup_position(
         &mut self,
         leadership_term_id: i64,
-        _log_position: i64,
-        _follower_member_id: i32,
-        _catchup_endpoint: &str,
+        log_position: i64,
+        follower_member_id: i32,
+        catchup_endpoint: &str,
     ) -> Result<usize, ClusterError> {
-        if leadership_term_id <= self.leadership_term_id && self.role == Role::Leader {
-            self.report_counted_error();
+        if leadership_term_id > self.leadership_term_id || self.role != Role::Leader {
             return Ok(0);
         }
-        Ok(0)
+
+        let Some(index) = self
+            .members
+            .iter()
+            .position(|member| member.id == follower_member_id)
+        else {
+            return Ok(0);
+        };
+        if self.members[index].catchup_replay_session_id != NULL_VALUE {
+            return Ok(0);
+        }
+
+        let mut channel = ChannelUri::parse(&self.config.follower_catchup_channel)
+            .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+        channel.put("endpoint", catchup_endpoint.to_owned());
+        channel.put("session-id", self.log_publication_session_id.to_string());
+        channel.put("linger", "0".to_owned());
+        channel.put("eos", "false".to_owned());
+        channel.put("alias", format!("catchup-followerId-{follower_member_id}"));
+
+        let replay_session_id = self.archive.start_replay(
+            &mut self.client,
+            self.log_recording_id,
+            &channel.build(),
+            self.config.log_stream_id,
+            &deepmsg_archive::client::proxy::ReplayParams {
+                position: log_position,
+                length: i64::MAX,
+                ..deepmsg_archive::client::proxy::ReplayParams::default()
+            },
+        )?;
+        let correlation_id = self.archive.last_correlation_id();
+
+        self.members[index].catchup_replay_session_id = replay_session_id;
+        self.members[index].catchup_replay_correlation_id = correlation_id;
+
+        Ok(1)
     }
 
-    /// `onStopCatchup` (`:1170-1181`): removing a catchup destination is
-    /// `P3-6b`'s.
+    /// `onStopCatchup` (`:1170-1181`): this follower's catchup replay is over,
+    /// so the destination the leader was replaying to comes off the log
+    /// subscription.
     fn on_stop_catchup(
         &mut self,
-        _leadership_term_id: i64,
-        _follower_member_id: i32,
+        leadership_term_id: i64,
+        follower_member_id: i32,
     ) -> Result<usize, ClusterError> {
+        if leadership_term_id == self.leadership_term_id
+            && follower_member_id == self.config.member_id
+            && !self.catchup_log_destination.is_empty()
+        {
+            let destination = std::mem::take(&mut self.catchup_log_destination);
+            self.remove_log_destination(&destination);
+            return Ok(1);
+        }
         Ok(0)
     }
 
@@ -2507,7 +2575,19 @@ impl ConsensusModuleAgent {
             Some(_) => self.append_position_value(),
             None => self.log_recording_stop_position,
         };
-        let position = recorded_position.max(self.last_append_position);
+        self.update_follower_position(now_ns, recorded_position, APPEND_POSITION_FLAG_NONE)
+    }
+
+    /// The five-argument form (`:2763-2785`): catchup sends the same heartbeat
+    /// with `APPEND_POSITION_FLAG_CATCHUP`, which is what tells the leader the
+    /// position came from a replay.
+    fn update_follower_position(
+        &mut self,
+        now_ns: i64,
+        append_position: i64,
+        flags: i16,
+    ) -> Result<usize, ClusterError> {
+        let position = append_position.max(self.last_append_position);
 
         if position > self.last_append_position
             || now_ns
@@ -2521,7 +2601,7 @@ impl ConsensusModuleAgent {
                 self.leadership_term_id,
                 position,
                 self.config.member_id,
-                0,
+                flags,
             );
             if let Some(error) = self.publisher.take_error() {
                 return Err(error);
@@ -2529,6 +2609,7 @@ impl ConsensusModuleAgent {
             if sent {
                 if position > self.last_append_position {
                     self.last_append_position = position;
+                    self.time_of_last_append_position_update_ns = now_ns;
                 }
                 self.time_of_last_append_position_send_ns = now_ns;
                 return Ok(1);
@@ -2875,6 +2956,7 @@ impl ElectionHost for ConsensusModuleAgent {
                 .set_image(image.registration_id(), join_position);
             self.last_append_position = join_position;
             self.time_of_last_append_position_send_ns = now_ns;
+            self.time_of_last_append_position_update_ns = now_ns;
 
             let channel = self.log_subscription_channel.clone();
             let stream_id = self.config.log_stream_id;
@@ -3003,49 +3085,175 @@ impl ElectionHost for ConsensusModuleAgent {
         Ok(self.last_append_position)
     }
 
-    fn catchup_initiated(&mut self, _now_ns: i64) -> Result<(), ClusterError> {
-        Err(ClusterError::Cluster("catchup is P3-6b".to_owned()))
+    fn catchup_initiated(&mut self, now_ns: i64) -> Result<(), ClusterError> {
+        // `:1964-1968`: a catchup that has just been asked for starts its
+        // progress clock now, so the first heartbeat is not already late.
+        self.time_of_last_append_position_update_ns = now_ns;
+        self.time_of_last_append_position_send_ns = now_ns;
+        Ok(())
     }
 
-    fn catchup_poll(&mut self, _limit_position: i64, _now_ns: i64) -> Result<usize, ClusterError> {
-        Err(ClusterError::Cluster("catchup is P3-6b".to_owned()))
+    fn catchup_poll(&mut self, limit_position: i64, now_ns: i64) -> Result<usize, ClusterError> {
+        let mut work = 0;
+
+        if self.state == ModuleState::Active || self.state == ModuleState::Suspended {
+            if self.append_position.is_none() {
+                // `:1974-1977`: the recording stopped under the catchup, which
+                // is a `ClusterEvent` rather than a quiet zero.
+                return Err(ClusterError::ClusterEvent(format!(
+                    "unexpected recording stop during catchup: position={}",
+                    self.log_adapter.position()
+                )));
+            }
+
+            let current_append_position = self.append_position_value();
+            let bound = current_append_position.min(limit_position);
+
+            let outcome = self.poll_log_adapter(bound)?;
+            work += outcome.count;
+
+            // `:1980-1987`: the replay's image closing mid-catchup is a
+            // `ClusterEvent`; the leader's archive has gone.
+            if outcome.count == 0
+                && self
+                    .log_adapter
+                    .is_image_closed(&self.client, self.live_log_subscription_id)
+            {
+                return Err(ClusterError::ClusterEvent(format!(
+                    "unexpected image close during catchup: position={}",
+                    self.log_adapter.position()
+                )));
+            }
+            self.apply_log_apply_outcome(outcome)?;
+
+            work += self.update_follower_position(
+                now_ns,
+                current_append_position,
+                APPEND_POSITION_FLAG_CATCHUP,
+            )?;
+            propose_max_counter(
+                &self.client,
+                self.counters.commit_position,
+                self.log_adapter.position(),
+            );
+        }
+
+        // `:1999-2010`: no append position has moved within a heartbeat
+        // timeout. Only while ACTIVE — a SUSPEND is allowed to be quiet.
+        if now_ns
+            > self.time_of_last_append_position_update_ns + self.config.leader_heartbeat_timeout_ns
+            && self.state == ModuleState::Active
+        {
+            let log_position = self
+                .election
+                .as_ref()
+                .map_or(NULL_POSITION, |election| election.log_position());
+            return Err(ClusterError::ClusterEvent(format!(
+                "no catchup progress: commitPosition={} limitPosition={limit_position} \
+                 lastAppendPosition={} appendPosition={} logPosition={log_position}",
+                self.commit_position_value(),
+                self.last_append_position,
+                self.append_position_value(),
+            )));
+        }
+
+        work += self.poll_service_control()?;
+
+        Ok(work)
     }
 
-    fn is_catchup_near_live(&mut self, _position: i64) -> bool {
-        false
+    fn is_catchup_near_live(&mut self, position: i64) -> bool {
+        // `:2026-2038`: within a window of the leader, where the window is a
+        // quarter of an image's term or the live-add limit, whichever is
+        // smaller — the same arithmetic `ReplayMerge` uses to decide a replay
+        // may be joined to a live stream.
+        let Some(image) = self
+            .log_adapter
+            .image(&self.client, self.live_log_subscription_id)
+        else {
+            return false;
+        };
+
+        let window = i64::from(image.term_buffer_length() >> 2)
+            .min(deepmsg_archive::client::replay_merge::LIVE_ADD_MAX_WINDOW);
+
+        image.position() >= position - window
     }
 
     fn track_catchup_completion(
         &mut self,
         member_id: i32,
-        _leadership_term_id: i64,
+        leadership_term_id: i64,
         append_position_flags: i16,
     ) -> Result<(), ClusterError> {
-        // `trackCatchupCompletion` (`ConsensusModuleAgent.java:1946-1949`) is a
-        // no-op unless this follower has a replay in progress or its append
-        // position carries the catchup flag — every ordinary heartbeat goes
-        // through here, so an unconditional refusal would fail the steady
-        // state. Starting and stopping the replay is P3-6b.
-        let has_catchup_session = self
+        // `:1946-1962`. Every ordinary heartbeat comes through here, so the
+        // gate is the first thing the reference does.
+        let Some(index) = self
             .members
             .iter()
-            .any(|member| member.id == member_id && member.catchup_replay_session_id != NULL_VALUE);
+            .position(|member| member.id == member_id)
+        else {
+            return Ok(());
+        };
+        let has_session = self.members[index].catchup_replay_session_id != NULL_VALUE;
         let is_catchup = 0 != (APPEND_POSITION_FLAG_CATCHUP & append_position_flags);
 
-        if has_catchup_session || is_catchup {
-            return Err(ClusterError::Cluster("catchup is P3-6b".to_owned()));
+        if !(has_session || is_catchup) {
+            return Ok(());
+        }
+
+        if self.members[index].log_position < self.log_publisher.position() {
+            return Ok(());
+        }
+
+        if self.members[index].catchup_replay_correlation_id != NULL_VALUE {
+            let replay_session_id = self.members[index].catchup_replay_session_id;
+            // The reference clears the correlation id only when the stop
+            // landed (`:1955-1963`); a failed stop leaves it for the next
+            // heartbeat to try again.
+            if self
+                .archive
+                .stop_replay(&mut self.client, replay_session_id)
+                .is_ok()
+            {
+                self.members[index].catchup_replay_correlation_id = NULL_VALUE;
+            }
+        }
+
+        // `consensusPublisher.stopCatchup(follower.publication(), ...)` — a
+        // send that did not land leaves the session id for the next attempt.
+        if self
+            .publisher
+            .stop_catchup(member_id, leadership_term_id, member_id)
+        {
+            self.members[index].catchup_replay_session_id = NULL_VALUE;
         }
 
         Ok(())
     }
 
     fn stop_all_catchups(&mut self) -> Result<(), ClusterError> {
-        // `stopAllCatchups` (`ConsensusModuleAgent.java:1900-1912`): stop the
-        // replay for every member that has one. Nothing starts one until
-        // P3-6b, so the list is empty; the members' fields are cleared so a
-        // later slice starts from the reference's state.
-        for member in &mut self.members {
-            member.catchup_replay_session_id = NULL_VALUE;
+        // `:2037-2058`: stop every replay this leader is serving. A stop that
+        // fails is counted and the member's fields are cleared anyway — the
+        // cluster is leaving the term these replays belong to.
+        for index in 0..self.members.len() {
+            if self.members[index].catchup_replay_session_id == NULL_VALUE {
+                continue;
+            }
+
+            if self.members[index].catchup_replay_correlation_id != NULL_VALUE {
+                let replay_session_id = self.members[index].catchup_replay_session_id;
+                if self
+                    .archive
+                    .stop_replay(&mut self.client, replay_session_id)
+                    .is_err()
+                {
+                    self.report_counted_error();
+                }
+            }
+
+            self.members[index].catchup_replay_session_id = NULL_VALUE;
+            self.members[index].catchup_replay_correlation_id = NULL_VALUE;
         }
         Ok(())
     }
@@ -3068,10 +3276,30 @@ impl ElectionHost for ConsensusModuleAgent {
         Ok(())
     }
 
-    fn await_local_sockets_closed(&mut self, _registration_id: i64) -> Result<(), ClusterError> {
-        Err(ClusterError::Cluster(
-            "waiting for local sockets to close is P3-6b".to_owned(),
-        ))
+    fn await_local_sockets_closed(&mut self, registration_id: i64) -> Result<(), ClusterError> {
+        // `:2988-3000`: idle until the driver has let go of every local socket
+        // the closed registration held. This is the wait that makes a rebound
+        // port possible — `LocalSocketAddressStatus.findNumberOfAddressesByRegistrationId`
+        // counts the `LOCAL_SOCKADDR` counters that still name the id.
+        loop {
+            self.idle()?;
+
+            let open = self.client.counters_reader().map_or(0, |counters| {
+                let mut open = 0;
+                counters.for_each(|descriptor| {
+                    if descriptor.type_id == deepmsg_cnc::counters::LOCAL_SOCKADDR_TYPE_ID
+                        && descriptor.registration_id == registration_id
+                    {
+                        open += 1;
+                    }
+                });
+                open
+            });
+
+            if open == 0 {
+                return Ok(());
+            }
+        }
     }
 
     fn set_leader_member_id(&mut self, leader_member_id: i32) {
@@ -5721,6 +5949,103 @@ impl ConsensusModuleAgent {
         }
 
         Ok(work.unwrap_or(0))
+    }
+}
+
+/// What one poll of the live log applied.
+///
+/// The handler's record callbacks write into its own fields rather than the
+/// agent's — the borrow that lets `sessions`, `timer` and the trackers be
+/// mutated together — so what they decided is applied once the poll is over.
+struct LogApplyOutcome {
+    count: usize,
+    state_change: Option<ModuleState>,
+    new_leadership_term_id: Option<i64>,
+    deferred_snapshot: Option<(i64, i64)>,
+    snapshot_began: bool,
+}
+
+impl ConsensusModuleAgent {
+    /// Apply the live log once, up to `bound`.
+    ///
+    /// The handler is the same one the recovery replay uses, and so is what it
+    /// decides: the reference has one `LogAdapter` and one set of `onReplay*`
+    /// methods for both paths (`LogAdapter.java:192-297`).
+    ///
+    /// # Errors
+    ///
+    /// The first decode or handler error.
+    fn poll_log_adapter(&mut self, bound: i64) -> Result<LogApplyOutcome, ClusterError> {
+        let Self {
+            client,
+            log_adapter,
+            live_log_subscription_id,
+            sessions,
+            timer,
+            trackers,
+            expired_timer_count,
+            leadership_term_id,
+            config,
+            ..
+        } = self;
+
+        let mut handler = AgentLogReplayHandler {
+            sessions,
+            timer: &mut **timer,
+            trackers,
+            expired_timer_count,
+            leadership_term_id: *leadership_term_id,
+            service_count: config.service_count,
+            state_change: None,
+            new_leadership_term_id: None,
+            deferred_snapshot: None,
+            snapshot_began: false,
+        };
+
+        let count = log_adapter
+            .poll(
+                client,
+                *live_log_subscription_id,
+                bound,
+                &mut handler,
+                config.log_fragment_limit,
+            )?
+            .unwrap_or(0);
+
+        Ok(LogApplyOutcome {
+            count,
+            state_change: handler.state_change,
+            new_leadership_term_id: handler.new_leadership_term_id,
+            deferred_snapshot: handler.deferred_snapshot,
+            snapshot_began: handler.snapshot_began,
+        })
+    }
+
+    /// Apply what [`Self::poll_log_adapter`]'s handler decided — the agent-side
+    /// half of `onReplayClusterAction` and `onReplayNewLeadershipTermEvent`
+    /// that cannot run inside the borrow.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] from a completed snapshot.
+    fn apply_log_apply_outcome(&mut self, outcome: LogApplyOutcome) -> Result<(), ClusterError> {
+        if let Some(state) = outcome.state_change {
+            self.set_state(state, "replayed cluster action");
+        }
+        if let Some(term) = outcome.new_leadership_term_id {
+            self.leadership_term_id = term;
+            for tracker in self.trackers.iter_mut() {
+                tracker.set_leadership_term_id(term);
+            }
+        }
+        if outcome.snapshot_began {
+            self.snapshot_duration
+                .on_snapshot_begin(self.clock.time_nanos());
+        }
+        if let Some((log_position, timestamp)) = outcome.deferred_snapshot {
+            self.snapshot_on_service_ack(log_position, timestamp, &[])?;
+        }
+        Ok(())
     }
 }
 

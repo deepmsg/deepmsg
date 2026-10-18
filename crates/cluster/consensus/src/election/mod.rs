@@ -248,6 +248,12 @@ impl Election {
         self.notified_commit_position
     }
 
+    /// The log position this election started from or has reached
+    /// (`Election.logPosition()`), which a stalled catchup reports.
+    pub fn log_position(&self) -> i64 {
+        self.log_position
+    }
+
     /// The archive-to-archive replication this election is waiting on, if any.
     ///
     /// The reference reads `logReplication` directly from its own test

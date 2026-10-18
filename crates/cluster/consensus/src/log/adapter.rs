@@ -162,6 +162,21 @@ impl LogAdapter {
         self.image_registration_id = None;
     }
 
+    /// The image this adapter is reading, as the subscription has it
+    /// (`LogAdapter.image()`, `:115-120`).
+    pub fn image<'a>(
+        &self,
+        client: &'a deepmsg_client::client::Client,
+        subscription_id: i64,
+    ) -> Option<&'a deepmsg_client::image::Image> {
+        let image_registration_id = self.image_registration_id?;
+        client
+            .subscription(subscription_id)?
+            .images()
+            .iter()
+            .find(|image| image.registration_id() == image_registration_id)
+    }
+
     /// Whether there is no image, or the one there is has been withdrawn
     /// (`isImageClosed`, `:106-109`).
     pub fn is_image_closed(
@@ -169,38 +184,18 @@ impl LogAdapter {
         client: &deepmsg_client::client::Client,
         subscription_id: i64,
     ) -> bool {
-        let Some(image_registration_id) = self.image_registration_id else {
-            return true;
-        };
-        client
-            .subscription(subscription_id)
-            .and_then(|subscription| {
-                subscription
-                    .images()
-                    .iter()
-                    .find(|image| image.registration_id() == image_registration_id)
-            })
+        self.image(client, subscription_id)
             .is_none_or(deepmsg_client::image::Image::is_closed)
     }
 
     /// Whether the publisher signalled end of stream (`isLogEndOfStream`,
-    /// `:111-114`). A closed image answers `false`, as the reference's does.
+    /// `:111-114`). No image answers `false`, as the reference's does.
     pub fn is_log_end_of_stream(
         &self,
         client: &deepmsg_client::client::Client,
         subscription_id: i64,
     ) -> bool {
-        let Some(image_registration_id) = self.image_registration_id else {
-            return false;
-        };
-        client
-            .subscription(subscription_id)
-            .and_then(|subscription| {
-                subscription
-                    .images()
-                    .iter()
-                    .find(|image| image.registration_id() == image_registration_id)
-            })
+        self.image(client, subscription_id)
             .and_then(deepmsg_client::image::Image::is_end_of_stream)
             .unwrap_or(false)
     }

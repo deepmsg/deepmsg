@@ -316,6 +316,11 @@ pub struct Archive {
     recording_subscription_descriptor_poller: RecordingSubscriptionDescriptorPoller,
     control_session_id: i64,
     archive_id: i64,
+    /// The correlation id of the last request this archive sent
+    /// (`AeronArchive.lastCorrelationId()`, `AeronArchive.java:430-433`). The
+    /// cluster records it against a catchup replay so
+    /// `stopAllCatchups` knows whether a stop was ever asked for.
+    last_correlation_id: i64,
     /// The two callbacks, per connection rather than per configuration.
     ///
     /// **A recorded difference.** The reference keeps these on the *context* and
@@ -422,6 +427,7 @@ impl Archive {
             control_response_poller: connected.control_response_poller,
             control_session_id: connected.control_session_id,
             archive_id: connected.archive_id,
+            last_correlation_id: -1,
         }
     }
 
@@ -534,6 +540,15 @@ impl Archive {
         client
             .next_correlation_id()
             .map_err(|_| ArchiveError::Request(ProxyError::Closed))
+    }
+
+    /// The correlation id of the last request this archive sent
+    /// (`AeronArchive.lastCorrelationId()`, `AeronArchive.java:430-433`), or
+    /// `-1` before the first. The cluster's catchup path records it so
+    /// `stopAllCatchups` can tell "a stop was asked for" from "none was".
+    #[must_use]
+    pub const fn last_correlation_id(&self) -> i64 {
+        self.last_correlation_id
     }
 
     // -----------------------------------------------------------------------
@@ -1942,6 +1957,7 @@ impl Archive {
         offer: impl FnOnce(&Client, &mut ArchiveProxy, i64) -> Result<(), ProxyError>,
     ) -> Result<i64, ArchiveError> {
         let correlation_id = self.next_correlation_id(client)?;
+        self.last_correlation_id = correlation_id;
 
         // The offer borrows the client and the proxy only for as long as it
         // takes to publish; the wait below wants the client mutably, so the two
@@ -1963,6 +1979,7 @@ impl Archive {
         offer: impl FnOnce(&Client, &mut ArchiveProxy, i64) -> Result<(), ProxyError>,
     ) -> Result<bool, ArchiveError> {
         let correlation_id = self.next_correlation_id(client)?;
+        self.last_correlation_id = correlation_id;
 
         offer(client, &mut self.proxy, correlation_id).map_err(ArchiveError::Request)?;
 

@@ -409,13 +409,14 @@ impl ConsensusPublisher {
         })
     }
 
-    /// `stopCatchup` (`:351-381`).
+    /// `stopCatchup` (`:351-381`). Answers whether the message was sent: the
+    /// leader clears a follower's catchup session id only when it was.
     pub fn stop_catchup(
         &mut self,
         member_id: i32,
         leadership_term_id: i64,
         follower_member_id: i32,
-    ) {
+    ) -> bool {
         self.send(member_id, |buffer| {
             let encoder =
                 StopCatchupEncoder::default().wrap(WriteBuf::new(buffer), MESSAGE_HEADER_LENGTH);
@@ -425,7 +426,7 @@ impl ConsensusPublisher {
                 .leadership_term_id(leadership_term_id)
                 .follower_member_id(follower_member_id);
             MESSAGE_HEADER_LENGTH + message.encoded_length()
-        });
+        })
     }
 
     /// `terminationPosition` (`:383-416`).
