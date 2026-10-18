@@ -28,6 +28,10 @@ deepmsg-cluster = { path = "../crates/cluster/consensus" }
 deepmsg-cluster-common = { path = "../crates/cluster/common" }
 
 [[test]]
+name = "udp_receive_mtu"
+path = "integration/udp_receive_mtu.rs"
+
+[[test]]
 name = "basic_roundtrip"
 path = "integration/basic_roundtrip.rs"
 
