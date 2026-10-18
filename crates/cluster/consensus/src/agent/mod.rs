@@ -46,7 +46,9 @@ use deepmsg_archive::client::Handlers;
 use deepmsg_archive::client::archive::Archive;
 use deepmsg_archive::client::async_connect::NoCredentials;
 use deepmsg_archive::client::descriptor_poller::RecordingDescriptor;
-use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_key};
+use deepmsg_archive::server::recording_pos::{
+    find_counter_id_by_recording, find_counter_id_by_session, parse_key,
+};
 use deepmsg_client::client::Client;
 use deepmsg_client::counter::Counter;
 use deepmsg_client::publication::ExclusivePublication;
@@ -81,7 +83,7 @@ use crate::election::{
 };
 use crate::error::ClusterError;
 use crate::handles::{LogReplay, RecordingReplication};
-use crate::log::{AgentLogReplay, LogReplayHandler};
+use crate::log::{AgentLogReplay, AgentLogReplication, LogReplayHandler};
 use crate::log_publisher::LogPublisher;
 use crate::persist::node_state::NodeStateFile;
 use crate::persist::recording_log::{self, RecordingExtent, RecordingLog, RecoveryPlan};
@@ -317,6 +319,9 @@ pub struct ConsensusModuleAgent {
     service_client_ids: Vec<i64>,
     timer: Box<dyn TimerService>,
     log_replay: Option<AgentLogReplay>,
+    /// The archive-to-archive replication this agent is driving, if any. The
+    /// election holds the same handle; the session is the agent's (plan Q1).
+    log_replication: Option<AgentLogReplication>,
     uncommitted_timers: std::collections::VecDeque<(i64, i64)>,
     expired_timer_count: deepmsg_cluster_common::collections::HashMap<i64, i64>,
     live_log_destination: String,
@@ -614,6 +619,7 @@ impl ConsensusModuleAgent {
             service_client_ids,
             timer,
             log_replay: None,
+            log_replication: None,
             uncommitted_timers: std::collections::VecDeque::new(),
             expired_timer_count: deepmsg_cluster_common::collections::HashMap::default(),
             live_log_destination: String::new(),
@@ -702,14 +708,14 @@ impl ConsensusModuleAgent {
             return Ok(0);
         };
         self.publisher.refresh_position_limits(&self.client);
-        let mut publisher = mem::take(&mut self.publisher);
+        let mut publisher = self.publisher.clone();
         let result = election.do_work(self, &mut publisher);
         self.publisher = publisher;
 
         let result = match result {
             Err(error) if error.is_election_recoverable() => {
                 self.report_counted_error();
-                let publisher = mem::take(&mut self.publisher);
+                let publisher = self.publisher.clone();
                 let recovered = election.handle_error(self, now_ns, error);
                 self.publisher = publisher;
                 recovered.map(|()| 1)
@@ -752,6 +758,26 @@ impl ConsensusModuleAgent {
         if !self.archive.is_connected(&self.client) {
             self.report_counted_error();
             return Err(self.unexpected_termination("local archive is not connected"));
+        }
+
+        // `:464-470`: with an election in progress **any** error is the
+        // election's to recover from — `handleError` puts it back to `Init`,
+        // and every state can be retried from there. That is how the
+        // reference's `ClusterEvent`s (a log truncation, a leader that
+        // disappeared) are control flow rather than failures. With no
+        // election there is nobody to hand it to, and it is the caller's.
+        if self.election.is_some() {
+            let Some(mut election) = self.election.take() else {
+                return Err(error);
+            };
+            let now_ns = self.clock.time_nanos();
+            let publisher = self.publisher.clone();
+            let recovered = election.handle_error(self, now_ns, error);
+            self.publisher = publisher;
+            if election.state() != ElectionState::Closed {
+                self.election = Some(election);
+            }
+            return recovered.map(|()| 0);
         }
 
         Err(error)
@@ -1554,6 +1580,7 @@ impl ConsensusModuleAgent {
         self.closed = true;
 
         let stop_result = self.try_stop_log_recording();
+        self.stop_log_replication_session();
 
         // The log subscription and the destinations on it hold sockets at this
         // member's **log** and catchup endpoints; the consensus subscription
@@ -2145,7 +2172,7 @@ impl ConsensusModuleAgent {
             return Ok(0);
         };
         self.publisher.refresh_position_limits(&self.client);
-        let mut publisher = std::mem::take(&mut self.publisher);
+        let mut publisher = self.publisher.clone();
         let result = f(&mut election, self, &mut publisher);
         self.publisher = publisher;
         if election.state() != ElectionState::Closed {
@@ -2369,6 +2396,12 @@ impl ConsensusModuleAgent {
         now_ns: i64,
     ) -> Result<usize, ClusterError> {
         let leader_member_id_changed = self.leader_member_id();
+
+        // `:1041-1044`: ahead of the election branch — a member being told of a
+        // leadership term has heard from a leader and does not canvass yet.
+        if leadership_term_id >= self.leadership_term_id {
+            self.time_of_last_leader_update_ns = now_ns;
+        }
 
         if self.election.is_some() {
             return self.with_election(|election, host, _sender| {
@@ -2991,25 +3024,108 @@ impl ElectionHost for ConsensusModuleAgent {
         ConsensusModuleAgent::start_log_replay(self, log_position, append_position)
     }
 
+    /// `newLogReplication` (`:2951-2986`): copy the leader's log recording into
+    /// this member's archive.
+    ///
+    /// The destination is this member's own log recording, so the copy
+    /// **extends** it rather than making a new one — which is what leaves the
+    /// follower's log continuous through the hole.
     fn new_log_replication(
         &mut self,
-        _leader_archive_endpoint: &str,
-        _response_archive_endpoint: Option<&str>,
-        _leader_recording_id: i64,
-        _stop_position: i64,
+        leader_archive_endpoint: &str,
+        response_archive_endpoint: Option<&str>,
+        leader_recording_id: i64,
+        stop_position: i64,
         _now_ns: i64,
     ) -> Result<RecordingReplication, ClusterError> {
-        Err(ClusterError::Cluster("log replication is P3-6b".to_owned()))
+        let replication_session_id = self.client.next_correlation_id().map_err(cluster)?;
+
+        let mut params = deepmsg_archive::client::proxy::ReplicationParams {
+            dst_recording_id: self.log_recording_id,
+            stop_position,
+            replication_session_id: replication_session_id as i32,
+            ..deepmsg_archive::client::proxy::ReplicationParams::default()
+        };
+
+        let mut replication_channel = self.config.replication_channel.clone();
+        if let Some(response_endpoint) = response_archive_endpoint {
+            // `:2964-2972`: a replication over response channels names the
+            // source's response endpoint as `control`, and the source archive
+            // answers on it. That arm is P3-0e's (`n/a:0e` in the record).
+            let mut uri = ChannelUri::parse(&replication_channel)
+                .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+            uri.remove("endpoint");
+            uri.put("control", response_endpoint.to_owned());
+            uri.put("control-mode", "response".to_owned());
+            replication_channel = uri.build();
+            params.src_response_channel = replication_channel.clone();
+        }
+        params.replication_channel = replication_channel;
+
+        let src_control_channel = ChannelUri::create_destination_uri(
+            &self.config.leader_archive_control_channel,
+            Some(leader_archive_endpoint),
+        )
+        .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+        let src_control_stream_id = self.archive.context().control_request_stream_id;
+
+        let replication_id = self.archive.replicate(
+            &mut self.client,
+            leader_recording_id,
+            src_control_stream_id,
+            &src_control_channel,
+            &params,
+        )?;
+
+        let handle = RecordingReplication::new(leader_recording_id, replication_id);
+        self.log_replication = Some(AgentLogReplication::new(
+            handle.clone(),
+            leader_recording_id,
+        ));
+
+        Ok(handle)
     }
 
+    /// `truncateLogEntry` (`:1882-1892`): cut the log back to the last
+    /// committed position of a term that turned out not to be the one.
+    ///
+    /// Four things, in the reference's order: the archive cuts the recording,
+    /// the recording log records the new committed position for the term, the
+    /// log adapter lets go of its image — **and waits for the sockets it held**,
+    /// which is what lets the next subscription bind the same endpoint — and
+    /// the stop position follows the cut.
     fn truncate_log_entry(
         &mut self,
-        _leadership_term_id: i64,
-        _log_position: i64,
+        leadership_term_id: i64,
+        log_position: i64,
     ) -> Result<(), ClusterError> {
-        Err(ClusterError::Cluster(
-            "truncating a log entry is P3-6b".to_owned(),
-        ))
+        self.archive
+            .truncate_recording(&mut self.client, self.log_recording_id, log_position)?;
+
+        if leadership_term_id != NULL_VALUE {
+            self.recording_log
+                .commit_log_position_for_term(leadership_term_id, log_position)
+                .map_err(cluster)?;
+        }
+
+        // `logAdapter.disconnect(countedErrorHandler, logPosition)`
+        // (`LogAdapter.java:70-84`): the image's subscription is closed and its
+        // local sockets are waited for before the position is pinned.
+        if self.live_log_subscription_id != NULL_VALUE {
+            let registration_id = self.live_log_subscription_id;
+            self.live_log_subscription_id = NULL_VALUE;
+            self.log_adapter.disconnect(log_position);
+            let _ = self
+                .client
+                .remove_subscription(registration_id, COMMAND_TIMEOUT);
+            self.await_local_sockets_closed(registration_id)?;
+        } else {
+            self.log_adapter.disconnect(log_position);
+        }
+
+        self.log_recording_stop_position = log_position;
+
+        Ok(())
     }
 
     fn append_new_leadership_term_event(&mut self, now_ns: i64) -> Result<bool, ClusterError> {
@@ -3039,6 +3155,11 @@ impl ElectionHost for ConsensusModuleAgent {
         now_ns: i64,
     ) -> Result<i64, ClusterError> {
         self.set_role(Role::Follower);
+
+        // `Election.stopLogReplication` (`:1463-1472`) closes the session
+        // before the new term's work starts; a replication that is still
+        // running belongs to the term that is ending.
+        self.stop_log_replication_session();
 
         // `:1363`: the ingress adapter goes first; `connectIngress` makes new
         // subscriptions at the end of the next election.
@@ -3374,12 +3495,27 @@ impl ElectionHost for ConsensusModuleAgent {
 
     fn poll_archive_events(&mut self) -> usize {
         // The reference polls its `RecordingSignalPoller` here (`:2061-2075`).
-        // This build's archive client delivers descriptors inline; the recording
-        // position the election waits for is read from its counter
-        // (`try_create_append_position`), so there is no signal backlog to
-        // drain. `client.poll()` still runs, because the driver's answers and
-        // the heartbeat both need it.
-        usize::from(self.client.poll())
+        // A replication's progress arrives as `EXTEND`/`SYNC`/`STOP`/
+        // `REPLICATE_END` signals rather than as answers, so the control
+        // channel is read once per turn while a replication is running; with
+        // no replication there is nothing to read and the branch costs one
+        // `Option` test.
+        let mut work = usize::from(self.client.poll());
+
+        if self.log_replication.is_some() {
+            match self.archive.poll_recording_signal(&mut self.client) {
+                Ok(Some(signal)) => {
+                    work += 1;
+                    self.route_recording_signal(signal);
+                }
+                Ok(None) => {}
+                // The signal channel failing is the reference's counted error,
+                // not a reason to stop the agent.
+                Err(_) => self.report_counted_error(),
+            }
+        }
+
+        work
     }
 
     fn node_state(&mut self) -> &mut NodeStateFile {
@@ -4205,6 +4341,85 @@ impl IngressHandler for AgentIngressHandler<'_> {
 }
 
 impl ConsensusModuleAgent {
+    /// Close the replication session, if there is one
+    /// (`RecordingReplication.close`, `:154-171`, which asks the archive to
+    /// stop it).
+    fn stop_log_replication_session(&mut self) {
+        if let Some(replication) = self.log_replication.take() {
+            let _ = self
+                .archive
+                .try_stop_replication(&mut self.client, replication.replication_id());
+        }
+    }
+
+    /// Hand one recording signal to the replication (`RecordingReplication.onSignal`,
+    /// `:176-203`), re-reading the **destination** recording's position counter
+    /// for `EXTEND`.
+    fn route_recording_signal(
+        &mut self,
+        signal: deepmsg_archive::client::archive::RecordingSignal,
+    ) {
+        use deepmsg_codec::archive::recording_signal::RecordingSignal as CodecSignal;
+
+        // The handle is a clone sharing its atomics, so nothing borrows the
+        // session while the signal is applied to it.
+        let Some((replication_id, handle)) = self
+            .log_replication
+            .as_ref()
+            .map(|replication| (replication.replication_id(), replication.handle()))
+        else {
+            return;
+        };
+        if signal.correlation_id != replication_id {
+            return;
+        }
+
+        let mapped = match signal.signal {
+            CodecSignal::START => crate::handles::RecordingSignal::Start,
+            CodecSignal::STOP => crate::handles::RecordingSignal::Stop,
+            CodecSignal::EXTEND => crate::handles::RecordingSignal::Extend,
+            CodecSignal::SYNC => crate::handles::RecordingSignal::Sync,
+            CodecSignal::REPLICATE_END => crate::handles::RecordingSignal::ReplicateEnd,
+            CodecSignal::DELETE => {
+                // The reference throws "recording was deleted during
+                // replication" out of `onSignal`; a `pollArchiveEvents` here
+                // cannot, so the deletion is counted and the handle is told
+                // the replication ended — the election's deadline is what
+                // turns that into the term's failure.
+                self.report_counted_error();
+                self.log_replication = None;
+                return;
+            }
+            _ => return,
+        };
+
+        // `:190-193`: `EXTEND` means the recording's position counter is the
+        // authority, looked up by the recording id the signal names.
+        let position = if signal.signal == CodecSignal::EXTEND {
+            self.recording_position(signal.recording_id)
+                .unwrap_or(signal.position)
+        } else {
+            signal.position
+        };
+
+        handle.on_signal(signal.correlation_id, position, mapped);
+
+        if handle.has_replication_ended() && handle.has_stopped() {
+            // `REPLICATE_END` and the destination's `STOP` have both arrived:
+            // the archive has finished and the election has what it needs.
+            self.log_replication = None;
+        }
+    }
+
+    /// The position a recording has reached, by its recording id and this
+    /// archive's id (`RecordingPos.findCounterIdByRecording`).
+    fn recording_position(&self, recording_id: i64) -> Option<i64> {
+        let counters = self.client.counters_reader()?;
+        let counter_id =
+            find_counter_id_by_recording(&counters, recording_id, self.archive.archive_id())?;
+        counters.value(counter_id)
+    }
+
     /// Give a log destination back (`LogAdapter.asyncRemoveDestination`,
     /// `LogAdapter.java:136-142`).
     ///

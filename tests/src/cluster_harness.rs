@@ -114,6 +114,13 @@ impl Ports {
         self.base + 30
     }
 
+    /// Where this member's archive listens for control requests
+    /// (`TestCluster`'s archive scheme). Log replication dials it, so unlike
+    /// the catchup endpoint it cannot be a port the kernel picks.
+    pub fn archive(&self, member_id: i32) -> u16 {
+        self.base + 40 + u16::try_from(member_id).unwrap()
+    }
+
     pub fn ingress_channel(&self, member_id: i32) -> String {
         format!(
             "aeron:udp?term-length=128k|alias=ingress|endpoint=localhost:{}",
@@ -142,17 +149,18 @@ impl Default for Ports {
 /// `id,ingress,consensus,log,catchup,archive` per member
 /// (`ClusterMember.java:561-564`; `common/member.rs`).
 ///
-/// The archive endpoint is never dialled: the module's archive connection is
-/// IPC to the archive beside it, and a follower's catchup replay reaches it
-/// through a dynamically resolved catchup endpoint (`:0`).
+/// The archive endpoint is where **log replication** finds the leader's
+/// archive, so it is a real port (`Ports::archive`); a follower's catchup
+/// endpoint is resolved at run time and stays `:0`.
 pub fn members(ports: &Ports) -> String {
     (0..MEMBER_COUNT)
         .map(|id| {
             format!(
-                "{id},localhost:{},localhost:{},localhost:{},localhost:0,localhost:0",
+                "{id},localhost:{},localhost:{},localhost:{},localhost:0,localhost:{}",
                 ports.ingress(id),
                 ports.consensus(id),
                 ports.log(id),
+                ports.archive(id),
             )
         })
         .collect::<Vec<_>>()
@@ -227,8 +235,21 @@ impl Node {
         let archive_dir = TempDir::new(&format!("{name}-archive"));
         let cluster_dir = TempDir::new(&format!("{name}-cluster"));
 
-        let mut driver =
-            OwnArchivingMediaDriver::start(&name, archive_dir.path(), &archive::PROPERTIES)?;
+        // The archive's control channel is given a fixed endpoint: a follower
+        // replicating from this member's archive dials the endpoint in the
+        // member string, and `localhost:0` would name a port the kernel picked
+        // in another process.
+        let mut properties: Vec<String> = archive::PROPERTIES
+            .iter()
+            .map(|property| (*property).to_owned())
+            .collect();
+        properties.push(format!(
+            "-Daeron.archive.control.channel=aeron:udp?endpoint=localhost:{}",
+            ports.archive(id)
+        ));
+        let property_refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+
+        let mut driver = OwnArchivingMediaDriver::start(&name, archive_dir.path(), &property_refs)?;
         driver.await_ready(DEADLINE).expect("the driver comes up");
 
         let args = vec![

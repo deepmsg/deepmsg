@@ -111,12 +111,15 @@ pub type RecordingSignalHandler = fn(&RecordingSignal);
 
 /// One recording lifecycle signal, as a handler sees it.
 ///
-/// The reference's five fields (`aeron_archive_recording_signal.h`), all of them
+/// The reference's fields (`aeron_archive_recording_signal.h`), all of them
 /// out of the `RecordingSignalEvent` (24) the poller read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecordingSignal {
     /// The session the signal was sent on.
     pub control_session_id: i64,
+    /// The request the signal belongs to — a replication's id, for a
+    /// replication's own signals (`RecordingSignalEvent.correlationId`).
+    pub correlation_id: i64,
     /// The recording it is about.
     pub recording_id: i64,
     /// The recording subscription it is about.
@@ -1991,6 +1994,55 @@ impl Archive {
         )
     }
 
+    /// Poll the control channel **once** for a recording signal, with no
+    /// request in flight.
+    ///
+    /// This is what a cluster's duty cycle does with its own
+    /// `RecordingSignalPoller` (`ConsensusModuleAgent.java:2061-2075`): a
+    /// replication's progress arrives as `EXTEND`/`SYNC`/`STOP`/
+    /// `REPLICATE_END` events, not as answers, and they have to be read while
+    /// the replication is waiting rather than only inside a blocking call.
+    ///
+    /// Answers the signal when this session's poller read one, and `None` for
+    /// any other message. A control response that is not a signal is left in
+    /// the poller exactly as the blocking waits leave it — this method never
+    /// consumes an answer.
+    ///
+    /// # Errors
+    ///
+    /// [`ControlResponseError`]'s mapped form when the message was malformed.
+    pub fn poll_recording_signal(
+        &mut self,
+        client: &mut Client,
+    ) -> Result<Option<RecordingSignal>, ArchiveError> {
+        self.control_response_poller
+            .poll(client)
+            .map_err(map_poller_error)?;
+
+        if !self.control_response_poller.is_poll_complete()
+            || !self.control_response_poller.is_recording_signal()
+            || self.control_response_poller.control_session_id() != self.control_session_id
+        {
+            return Ok(None);
+        }
+
+        let signal = RecordingSignal {
+            control_session_id: self.control_response_poller.control_session_id(),
+            correlation_id: self.control_response_poller.correlation_id(),
+            recording_id: self.control_response_poller.recording_id(),
+            subscription_id: self.control_response_poller.subscription_id(),
+            position: self.control_response_poller.position(),
+            signal: self
+                .control_response_poller
+                .recording_signal()
+                .unwrap_or(deepmsg_codec::archive::recording_signal::RecordingSignal::NullVal),
+        };
+
+        self.dispatch_recording_signal();
+
+        Ok(Some(signal))
+    }
+
     // -----------------------------------------------------------------------
     // What the two handlers are told
     // -----------------------------------------------------------------------
@@ -2003,6 +2055,7 @@ impl Archive {
 
         handler(&RecordingSignal {
             control_session_id: self.control_response_poller.control_session_id(),
+            correlation_id: self.control_response_poller.correlation_id(),
             recording_id: self.control_response_poller.recording_id(),
             subscription_id: self.control_response_poller.subscription_id(),
             position: self.control_response_poller.position(),

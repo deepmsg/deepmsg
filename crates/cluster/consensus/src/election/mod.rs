@@ -157,6 +157,9 @@ pub struct Election {
     nomination_deadline_ns: i64,
     /// `:137` — how long a replication may stall before it is a `Timeout`.
     replication_deadline_ns: i64,
+    /// The replication position the last turn saw, for the progress clock
+    /// (`RecordingReplication.poll`'s `progressDeadlineNs`).
+    replication_progress_position: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +228,7 @@ impl Election {
             time_of_last_commit_position_update_ns: initial_time_of_last_update_ns,
             nomination_deadline_ns: 0,
             replication_deadline_ns: 0,
+            replication_progress_position: -1,
         }
     }
 
@@ -491,7 +495,10 @@ impl Election {
     ) -> Result<(), ClusterError> {
         let term = self.leadership_term_id;
         let position = self.log_position;
-        self.ensure_recording_log_coherent(host, term, None, Some(position), now_ns)?;
+        // `Election.java:1525`: `ensureRecordingLogCoherent(leadershipTermId,
+        // logPosition, NULL_VALUE, nowNs)` — the log position is the **new
+        // term's base**, and the commit position is deliberately not moved.
+        self.ensure_recording_log_coherent(host, term, Some(position), None, now_ns)?;
         self.log_leadership_term_id = term;
         Ok(())
     }
@@ -697,6 +704,7 @@ impl Election {
                     now_ns,
                 )?);
                 self.replication_deadline_ns = now_ns + host.leader_heartbeat_timeout_ns();
+                self.replication_progress_position = -1;
                 work += 1;
             } else {
                 let term = self.replication_leadership_term_id;
@@ -717,6 +725,17 @@ impl Election {
                 replication.position(),
             )
         };
+        // `RecordingReplication.poll`'s progress clock (`:185-201`): a position
+        // that moved buys another heartbeat timeout, and one that has not
+        // moved is the replication failing — whether or not it ever ended.
+        // This is where the check lives in this build (plan Q1: the handle's
+        // `poll` cannot read the agent, so the election that drives it keeps
+        // the deadline).
+        if position > self.replication_progress_position {
+            self.replication_progress_position = position;
+            self.replication_deadline_ns = now_ns + host.leader_heartbeat_timeout_ns();
+        }
+
         // The last position of the leadership is published after the completion
         // check (`Election.java:925-928`), so a replication that ends this turn
         // still sends it.
@@ -737,6 +756,10 @@ impl Election {
                     "timeout awaiting commit position".to_owned(),
                 ));
             }
+        } else if now_ns >= self.replication_deadline_ns {
+            return Err(ClusterError::Timeout(
+                "log replication has not progressed".to_owned(),
+            ));
         }
 
         Ok(work)
@@ -1590,6 +1613,15 @@ impl Election {
                 }
 
                 self.leader_member_id = leader_member_id;
+                // The member table learns the leader **now**, not at
+                // `electionComplete`: a follower in `FOLLOWER_CATCHUP` sends its
+                // append-position heartbeats from a host method
+                // (`ConsensusModuleAgent.catchupPoll` → `updateFollowerPosition`,
+                // `:2753-2785`), and those address the leader. The reference
+                // reads the election's own `leaderMember` there; this build's
+                // host only has the member table, so the flag has to be set when
+                // the term is accepted.
+                host.set_leader_member_id(leader_member_id);
                 self.is_leader_startup = is_startup;
                 self.leadership_term_id = leadership_term_id;
                 self.candidate_term_id = self.candidate_term_id.max(leadership_term_id);
@@ -1798,6 +1830,7 @@ impl Election {
     fn stop_log_replication(&mut self) {
         self.log_replication = None;
         self.replication_deadline_ns = 0;
+        self.replication_progress_position = -1;
         self.last_published_commit_position = 0;
     }
 

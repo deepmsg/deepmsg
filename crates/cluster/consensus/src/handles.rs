@@ -115,6 +115,12 @@ impl RecordingReplication {
         }
     }
 
+    /// The replication's id: the correlation id it was started under, which
+    /// is what its signals carry and what `stopReplication` names it by.
+    pub const fn correlation_id(&self) -> i64 {
+        self.correlation_id
+    }
+
     /// `recordingId()` (`:136-139`).
     pub fn recording_id(&self) -> i64 {
         self.recording_id.load(Ordering::Acquire)
@@ -140,35 +146,50 @@ impl RecordingReplication {
         self.synced.load(Ordering::Acquire)
     }
 
-    /// `poll(nowNs)` (`:176`): the reference advances the archive session here.
-    /// The session is `P3-6b`'s; until then this is where it will be called
-    /// from, and a test moves the handle through [`Self::on_signal`].
+    /// `poll(nowNs)` (`:176`).
+    ///
+    /// **Deliberately empty.** The reference advances its archive client and
+    /// its progress deadlines here; in this build the archive session is
+    /// advanced by the agent's [`ElectionHost::poll_archive_events`] and the
+    /// deadline lives in the election (`replication_deadline_ns`), because
+    /// this handle is polled from inside the election's turn and cannot borrow
+    /// the agent. The split is plan Q1: same thread, once per turn, and a
+    /// handful of atomics rather than a `Mutex` on every poll.
+    ///
+    /// [`ElectionHost::poll_archive_events`]: crate::election::ElectionHost::poll_archive_events
     pub fn poll(&self, _now_ns: i64) {}
 
     /// `onSignal(correlationId, recordingId, position, signal)` (`:176-203`).
     ///
-    /// `replication_id` is the correlation id the replication was started
-    /// under; the reference matches on it and ignores everyone else's signals.
+    /// `correlation_id` is the replication's id; the reference matches on it
+    /// and ignores everyone else's signals. `position` is the value the agent
+    /// read for this signal — for `EXTEND` that is the destination recording's
+    /// **position counter**, re-read by the agent as the reference does
+    /// (`:190-193`).
     pub fn on_signal(&self, correlation_id: i64, position: i64, signal: RecordingSignal) {
         if correlation_id != self.correlation_id {
             return;
         }
 
         match signal {
-            // `EXTEND` re-reads the recording position counter; that counter
-            // is the archive client's, so it is `P3-6b`'s half.
-            RecordingSignal::Extend => {}
+            RecordingSignal::Extend => {
+                // `EXTEND` re-reads the recording position counter instead of
+                // taking the signal's; the caller hands that value in, so
+                // there is nothing extra to do here.
+            }
             RecordingSignal::Sync => self.synced.store(true, Ordering::Release),
             RecordingSignal::ReplicateEnd => {
                 self.replication_ended.store(true, Ordering::Release);
             }
-            RecordingSignal::Stop => {
-                if position != -1 {
-                    self.position.store(position, Ordering::Release);
-                }
-                self.stopped.store(true, Ordering::Release);
-            }
+            RecordingSignal::Stop => self.stopped.store(true, Ordering::Release),
             _ => {}
+        }
+
+        // `:199-202`: every signal with a position carries it — `SYNC` in
+        // particular names where the two sides met, and that is the position
+        // a proxy publishes as its own.
+        if position != -1 {
+            self.position.store(position, Ordering::Release);
         }
     }
 }

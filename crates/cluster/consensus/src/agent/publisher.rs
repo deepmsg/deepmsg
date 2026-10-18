@@ -26,6 +26,9 @@
 //! publication or back-pressure is not an error: it is the next interval's
 //! work, exactly as in the reference.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use deepmsg_client::client::Client;
 use deepmsg_client::publication::ExclusivePublication;
 use deepmsg_codec_cluster::boolean_type::BooleanType;
@@ -65,40 +68,58 @@ struct MemberPublication {
     position_limit: i64,
 }
 
-/// The per-member consensus publications.
+/// What the table actually holds. Shared through [`ConsensusPublisher`].
 #[derive(Default)]
-pub struct ConsensusPublisher {
+struct PublisherState {
     publications: Vec<MemberPublication>,
     buffer: Vec<u8>,
     error: Option<ClusterError>,
 }
 
+/// The per-member consensus publications.
+///
+/// **Shared, not moved.** An election turn takes the sender out of the agent
+/// (`election.do_work(self, &mut publisher)`), and the *host* methods the
+/// election calls back into (`catchup_poll` → `updateFollowerPosition`, a
+/// leader's `publishCommitPosition`) send through the same table. When the
+/// table was a value, `mem::take` left the agent holding an empty one for the
+/// length of that turn: every send a host method made found no publication and
+/// quietly did nothing — the follower's catch-up heartbeats never reached the
+/// leader, so the leader never sent `StopCatchup` and the follower purged back
+/// into `Init` every heartbeat timeout. The `Rc<RefCell<_>>` is what lets the
+/// taken-out sender and the agent's own field be the **same** table, which is
+/// what the reference's two object references are.
+#[derive(Clone, Default)]
+pub struct ConsensusPublisher {
+    state: Rc<RefCell<PublisherState>>,
+}
+
 impl ConsensusPublisher {
     /// An empty table. The agent fills it with
     /// [`ConsensusPublisher::add_publication`] for every other member.
-    pub const fn new() -> Self {
-        Self {
-            publications: Vec::new(),
-            buffer: Vec::new(),
-            error: None,
-        }
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// The `ClusterMember.publication` slot (`ClusterMember.java:44`).
     pub fn add_publication(&mut self, member_id: i32, publication: ExclusivePublication) {
-        self.publications.push(MemberPublication {
+        let mut state = self.state.borrow_mut();
+        state.publications.push(MemberPublication {
             member_id,
             publication,
             position_limit: 0,
         });
-        self.publications.sort_by_key(|entry| entry.member_id);
+        state.publications.sort_by_key(|entry| entry.member_id);
     }
 
     /// Whether `publishCanvassPosition` would find a publication
     /// (`Election.java:1238`).
     #[must_use]
     pub fn has_publication(&self, member_id: i32) -> bool {
-        self.publications
+        self.state
+            .borrow()
+            .publications
             .iter()
             .any(|entry| entry.member_id == member_id)
     }
@@ -106,7 +127,9 @@ impl ConsensusPublisher {
     /// The member ids this table can reach.
     #[must_use]
     pub fn member_ids(&self) -> Vec<i32> {
-        self.publications
+        self.state
+            .borrow()
+            .publications
             .iter()
             .map(|entry| entry.member_id)
             .collect()
@@ -118,7 +141,7 @@ impl ConsensusPublisher {
         let Some(counters) = client.counters_reader() else {
             return;
         };
-        for entry in &mut self.publications {
+        for entry in &mut self.state.borrow_mut().publications {
             entry.position_limit = counters
                 .value(entry.publication.position_limit_counter_id())
                 .unwrap_or(0);
@@ -127,9 +150,11 @@ impl ConsensusPublisher {
 
     /// The first fatal publication error a send met, if any.
     pub fn take_error(&mut self) -> Option<ClusterError> {
-        self.error.take()
+        self.state.borrow_mut().error.take()
     }
+}
 
+impl PublisherState {
     fn publication(&self, member_id: i32) -> Option<&MemberPublication> {
         self.publications
             .iter()
@@ -194,19 +219,22 @@ impl ConsensusPublisher {
         }
         false
     }
+}
 
+impl ConsensusPublisher {
     /// Encode into the shared buffer, then claim and publish.
     fn send<F>(&mut self, member_id: i32, encode: F) -> bool
     where
         F: FnOnce(&mut Vec<u8>) -> usize,
     {
-        if !self.has_publication(member_id) {
+        let mut state = self.state.borrow_mut();
+        if state.publication(member_id).is_none() {
             return false;
         }
-        // The buffer is moved out so the claim can borrow it while `self` is
-        // borrowed mutably for the error slot. It is sized before the encoder
-        // sees it: `WriteBuf` indexes, it does not grow.
-        let mut buffer = std::mem::take(&mut self.buffer);
+        // The buffer is moved out so the claim can borrow the rest of the table
+        // while the encoder writes into it. It is sized before the encoder sees
+        // it: `WriteBuf` indexes, it does not grow.
+        let mut buffer = std::mem::take(&mut state.buffer);
         buffer.clear();
         buffer.resize(SCRATCH_LENGTH, 0);
         let length = encode(&mut buffer);
@@ -214,8 +242,8 @@ impl ConsensusPublisher {
             length <= SCRATCH_LENGTH,
             "a consensus message outgrew {SCRATCH_LENGTH}"
         );
-        let published = self.claim_and_publish(member_id, &buffer[..length]);
-        self.buffer = buffer;
+        let published = state.claim_and_publish(member_id, &buffer[..length]);
+        state.buffer = buffer;
         published
     }
 

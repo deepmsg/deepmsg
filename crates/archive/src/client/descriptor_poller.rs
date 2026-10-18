@@ -379,6 +379,7 @@ impl ControlledHandler for RecordingDescriptorPoller {
                 if signal.control_session_id() == self.control_session_id {
                     (self.signal_handler)(&crate::client::archive::RecordingSignal {
                         control_session_id: signal.control_session_id(),
+                        correlation_id: signal.correlation_id(),
                         recording_id: signal.recording_id(),
                         subscription_id: signal.subscription_id(),
                         position: signal.position(),
