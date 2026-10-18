@@ -87,11 +87,50 @@ list_only=0
 read_after=1
 quick=0
 
-# The archive's own cores. The driver pins its three out of
-# `lib/conf/benchmark.properties` (1/2/3); these are the archive's three agents
-# and the node, and they leave core 4 for the kernel.
-archive_cpus=${BENCH_ARCHIVE_CPUS:-0,6,7}
+# ★ The archive's cores are an **axis**: they land on both arms or on neither.
+#
+# Until 2026-10-18 they were a default for this build's archive only (0,6,7),
+# because the reference's archive lives inside its node JVM and cannot be
+# pinned on its own. A parameter on one arm only is the defect §3.3 names for
+# `file.io.max.length`, and this one is worth 6× on the archive's own schedule:
+# pinned, the recorder's block period lands on a whole-millisecond lattice
+# (49.6% / 34.1% of turns) and its fsync wakeup waits **136 µs**; unpinned,
+# 3.6% / 3.2% and **22 µs**, against the reference's 16 µs. Measured
+# 2026-10-18, `analysis/bench/review-2026-10-18/review-feedback-checked.md` §5.
+#
+# So naming a set without naming the mode is an error, not a silent one-armed
+# pin. `both` puts the same taskset on the reference's `ArchiveNode` JVM — which
+# carries the node as well as the archive, and the run info says so.
+archive_affinity=${BENCH_ARCHIVE_AFFINITY:-none}
+archive_cpus=${BENCH_ARCHIVE_CPUS:-}
 node_cpu=${BENCH_NODE_CPU:-5}
+
+case "$archive_affinity" in
+    none)
+        if [ -n "$archive_cpus" ]; then
+            echo "BENCH_ARCHIVE_CPUS=$archive_cpus is a pin, and a pin settles on one arm only." >&2
+            echo "Set BENCH_ARCHIVE_AFFINITY=both to pin both arms, or unset BENCH_ARCHIVE_CPUS." >&2
+            exit 2
+        fi ;;
+    both)
+        if [ -z "$archive_cpus" ]; then
+            echo "BENCH_ARCHIVE_AFFINITY=both needs BENCH_ARCHIVE_CPUS to name the cores." >&2
+            exit 2
+        fi ;;
+    *)
+        echo "BENCH_ARCHIVE_AFFINITY=$archive_affinity is not one of: none, both" >&2
+        exit 2 ;;
+esac
+
+# The prefix a command that carries an archive is started with — empty when the
+# axis is off, so nothing below has to branch on it.
+_archive_affinity=()
+[ "$archive_affinity" = both ] && _archive_affinity=(taskset -c "$archive_cpus")
+if [ "$archive_affinity" = both ]; then
+    _archive_cores="archive taskset $archive_cpus on EVERY arm (the j arm's JVM carries node + archive)"
+else
+    _archive_cores="archive unpinned on every arm"
+fi
 
 # The ports a cell's four channels use. Fixed per batch and printed, because
 # both hosts have to agree on them and a leftover listener from the previous
@@ -354,6 +393,7 @@ _start_java_server() {
 -Daeron.archive.file.sync.level=$_fsync \
 -Daeron.archive.catalog.file.sync.level=$_fsync \
 -Dio.aeron.benchmarks.output.directory=$dir" \
+        "${_archive_affinity[@]}" \
         "$BENCHMARKS_SCRIPTS_DIR/archive-node" >"$dir/archive-node.log" 2>&1 &
     _server_pid=$!
 }
@@ -373,7 +413,7 @@ _start_rust_server() {
         return 1
     }
 
-    taskset -c "$archive_cpus" "$BENCH_ARCHIVE" "${defines[@]}" \
+    "${_archive_affinity[@]}" "$BENCH_ARCHIVE" "${defines[@]}" \
         </dev/null >"$dir/archive.log" 2>&1 &
     _archive_pid=$!
     _await_archive "$dir/archive.log" || {
@@ -413,7 +453,7 @@ _start_attached_server() {
 
     local -a defines=()
     while IFS= read -r line; do defines+=("$line"); done < <(_archive_defines "$_fsync")
-    taskset -c "$archive_cpus" "$BENCH_ARCHIVE" "${defines[@]}" \
+    "${_archive_affinity[@]}" "$BENCH_ARCHIVE" "${defines[@]}" \
         </dev/null >"$dir/archive.log" 2>&1 &
     _archive_pid=$!
     _await_archive "$dir/archive.log" || {
@@ -810,9 +850,9 @@ if [ "$list_only" = 1 ]; then
     fi
     echo "archive dir     $archive_dir"
     if [ "$mode" = two ]; then
-        echo "cores           archive $archive_cpus, node $node_cpu; driver 1/2/3; peer rig $peer_rig_cpu"
+        echo "cores           $_archive_cores; node $node_cpu; driver 1/2/3; peer rig $peer_rig_cpu"
     else
-        echo "cores           archive $archive_cpus, node $node_cpu; server driver 1/2/3; client rig $BENCH_RIG_CPU"
+        echo "cores           $_archive_cores; node $node_cpu; server driver 1/2/3; client rig $BENCH_RIG_CPU"
     fi
     echo "results         $out"
     echo
@@ -837,7 +877,7 @@ bench_fingerprint "$out/fingerprint.txt" >/dev/null
     echo "rounds          forward, reverse"
     if [ "$mode" = two ]; then
         echo "network         two hosts, same segment: $_batch_ip <-> $_peer_ip"
-        echo "this machine    archive: driver + archive + archive node; cores $archive_cpus / $node_cpu"
+        echo "this machine    archive: driver + archive + archive node; $_archive_cores / node $node_cpu"
         echo "peer            $BENCH_PEER_SSH: driver + rig; cores $peer_rig_cpu"
     else
         echo "network         one machine (loopback); no peer"
@@ -847,7 +887,14 @@ bench_fingerprint "$out/fingerprint.txt" >/dev/null
         # driver's conductor runs at ~34%, so core 1 is where the kernel and the
         # softirqs have room. Written down because a table without its cores is
         # a table you cannot re-run.
-        echo "cores           driver conductor 1, sender 2, receiver 3; archive $archive_cpus (conductor/recorder/replayer); node $node_cpu; rig $BENCH_RIG_CPU"
+        echo "cores           driver conductor 1, sender 2, receiver 3; $_archive_cores; node $node_cpu; rig $BENCH_RIG_CPU"
+        # ★ Still a parameter on one arm, and named here rather than fixed:
+        # `r-attach`'s node is a JVM of its own and is pinned to `node_cpu`; the
+        # `j` arm's node is inside the archive's JVM and cannot be pinned
+        # without pinning that archive too. Removing it means unpinning our node
+        # as well, which changes a second thing this batch did not set out to
+        # change — so it is recorded, and a reader knows which arm had what.
+        echo "node            r-attach's node pinned to $node_cpu; the j arm's node shares its archive's JVM"
     fi
     echo "channels        destination $_batch_ip:$destination_port  source $_peer_ip:$source_port"
     echo "                control     $_batch_ip:$control_port  response <each host>:0 (ephemeral)"
