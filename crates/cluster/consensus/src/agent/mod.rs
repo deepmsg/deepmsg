@@ -2359,7 +2359,7 @@ impl ConsensusModuleAgent {
         }
     }
 
-    /// `onConsensusChallengeResponse` (`CMA:880-884`): the leader's half of a
+    /// `onConsensusChallengeResponse` (`CMA:883-887`): the leader's half of a
     /// follower's forward of a client's challenge answer.
     ///
     /// The reference hands it to
@@ -4246,7 +4246,7 @@ struct AgentIngressHandler<'a> {
     ingress_endpoints: &'a str,
     deferred_closes: Vec<(i64, i64)>,
     deferred_admins: Vec<DeferredAdminRequest>,
-    /// A follower's forwards for the leader (`CMA:870-880`), sent after the
+    /// A follower's forwards for the leader (`CMA:869-882`), sent after the
     /// poll: the handler has no consensus publisher to send through.
     deferred_challenge_responses: Vec<(i64, i64, Vec<u8>)>,
     extension_messages: usize,
@@ -4366,7 +4366,7 @@ impl IngressHandler for AgentIngressHandler<'_> {
                 self.now_ns,
             );
         } else {
-            // `:876-879`: a follower forwards the answer to the leader over the
+            // `:875-880`: a follower forwards the answer to the leader over the
             // consensus publication and ignores whether the offer landed — the
             // client will answer the challenge again, and the reference does
             // not count a failed forward either. The handler holds no

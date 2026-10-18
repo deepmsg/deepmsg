@@ -388,12 +388,16 @@ fn a_single_member_election_walks_to_closed() {
     assert_eq!(election.state(), ElectionState::LeaderReady);
     assert!(host.calls.contains(&"join_log_as_leader"));
     // `ensureCoherent` on an empty log writes every term from the initial one:
-    // term 0, then term 1 (the election's), the second committed at the applied
-    // position (`RecordingLog.java:1382-1393`).
+    // term 0, then term 1 (the election's) starting at the applied position and
+    // **uncommitted** — `updateRecordingLog` passes the log position as the new
+    // term's base and `NULL_VALUE` as the commit, which is the reference's own
+    // pair (`Election.java:1525`, `RecordingLog.java:1382-1393`). The term is
+    // committed when the *next* term's entry is appended, or at termination.
     assert_eq!(host.recording_log.entries().len(), 2, "terms 0 and 1");
     assert_eq!(host.recording_log.entries()[0].leadership_term_id, 0);
     assert_eq!(host.recording_log.entries()[1].leadership_term_id, 1);
-    assert_eq!(host.recording_log.entries()[1].log_position, 0);
+    assert_eq!(host.recording_log.entries()[1].term_base_log_position, 0);
+    assert_eq!(host.recording_log.entries()[1].log_position, -1);
 
     // 8 -> 17: the quorum has reached the position, the event is appended, and
     // the election hands control back.

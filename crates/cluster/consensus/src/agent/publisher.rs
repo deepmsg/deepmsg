@@ -510,7 +510,7 @@ impl ConsensusPublisher {
     }
 
     /// `challengeResponse` (`:558-573`): a follower's forward of the client's
-    /// answer to the leader (`CMA:870-880`).
+    /// answer to the leader (`CMA:869-882`).
     pub fn challenge_response(
         &mut self,
         member_id: i32,
