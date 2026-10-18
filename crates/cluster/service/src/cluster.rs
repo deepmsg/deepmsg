@@ -232,7 +232,11 @@ impl AgentContext {
     /// As [`Self::check_for_clock_tick`].
     pub fn idle(&mut self, client: &mut Client, work: usize) -> Result<(), ContainerError> {
         self.idle.idle(work);
-        self.check_for_clock_tick(client, deepmsg_core::clock::monotonic_nano_time())?;
+        // `CSA.idle(int)`: the clock tick only when the caller reports no work
+        // (`:423-430`); `idle()` with no argument always runs it.
+        if work == 0 {
+            self.check_for_clock_tick(client, deepmsg_core::clock::monotonic_nano_time())?;
+        }
         Ok(())
     }
 
