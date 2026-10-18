@@ -26,6 +26,7 @@ deepmsg-codec-cluster = { path = "../crates/codec/cluster" }
 deepmsg-archive = { path = "../crates/archive" }
 deepmsg-cluster = { path = "../crates/cluster/consensus" }
 deepmsg-cluster-common = { path = "../crates/cluster/common" }
+deepmsg-cluster-service = { path = "../crates/cluster/service" }
 
 [[test]]
 name = "basic_roundtrip"
@@ -666,4 +667,13 @@ path = "integration/udp_receive_mtu.rs"
 [[test]]
 name = "cluster_lc4b"
 path = "interop/cluster_lc4b.rs"
+required-features = ["interop"]
+
+# P3-2a's LC-4a smoke: the reference's driver, archive and consensus module in
+# one Java process, deepmsg's service container against them, and the
+# reference's own `AeronCluster` client. Needs the reference jar, a JDK and the
+# fork's Java probes.
+[[test]]
+name = "cluster_lc4a_smoke"
+path = "interop/cluster_lc4a_smoke.rs"
 required-features = ["interop"]
