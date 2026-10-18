@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 
 use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_tests::cluster_harness::{
-    ClientSide, DEADLINE, Faults, MEMBER_COUNT, Node, NodeCounters, Ports, ROLE_FOLLOWER,
-    announce_skip, await_launched, connect_request, ingress_message, members, offer_message,
-    wait_until,
+    ChannelShape, ClientSide, DEADLINE, ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters,
+    Ports, ROLE_FOLLOWER, announce_skip, await_launched, connect_request, ingress_message,
+    max_ingress_payload, members, offer_message, wait_until,
 };
 
 /// The scenarios here all bind ports derived from the **process** id
@@ -866,6 +866,367 @@ fn the_cluster_starts_from_a_recording_log_truncated_to_its_latest_snapshot() {
                 .is_some_and(|position| position > before)
         },
     );
+
+    for node in &mut nodes {
+        node.stop();
+    }
+}
+
+/// One batch of maximum-sized ingress messages for a channel of
+/// `term_length`: `computeMaxMessageLength(term) - SESSION_HEADER_LENGTH`
+/// payload bytes each, so every message fills exactly `term / 8` of the log
+/// (`ClusterTest.java:1850-1865`).
+fn send_max_sized_batch(
+    client: &ClientSide,
+    faults: &Faults,
+    leadership_term_id: i64,
+    cluster_session_id: i64,
+    byte: u8,
+    count: usize,
+    term_length: i32,
+) {
+    let payload = vec![byte; max_ingress_payload(term_length)];
+    for _ in 0..count {
+        let message = ingress_message(leadership_term_id, cluster_session_id, &payload);
+        offer_message(client, faults, &message);
+    }
+}
+
+/// The leader's commit position, which is what a cluster with no services can
+/// see of a batch landing in the log.
+fn commit_of(counters: &[NodeCounters], node: usize) -> Option<i64> {
+    counters[node].commit_position()
+}
+
+/// H5's second arm — the cluster takes a **new term buffer length and MTU**
+/// after its recording log is truncated to the latest snapshot.
+///
+/// The reference (`ClusterTest.shouldAllowChangingTermBufferLengthAndMtuAfter-
+/// RecordingLogIsTruncatedToTheLatestSnapshot`, `ClusterTest.java:1823-1933`)
+/// starts on 256 KiB terms with an MTU of 1408, fills the log with messages of
+/// the largest size that term allows, snapshots, sends more, then stops the
+/// whole cluster, seeds every `recording.log` from its latest snapshot
+/// (`ClusterTool.seedRecordingLogFromSnapshot`, `ClusterToolOperator.java:
+/// 201-270`: the snapshot entries only, term base and log position zeroed), and
+/// restarts it on 2 MiB terms with an MTU of 8992.
+///
+/// The reference proves the arm with its services' message counts and
+/// checksums — the second batch is dropped by the seeding. This cluster has no
+/// services (the service container is P3-2c), so the same claims are read where
+/// they are observable here:
+///
+/// * the log recording's **descriptor**: 256 KiB / 1408 before the seeding,
+///   2 MiB / 8992 after it (`Archive::list_recording`);
+/// * after the restart and **before a client touches it**, every member's
+///   commit position is below 64 KiB: the 20 messages that filled the old log
+///   were not replayed, only the snapshot state came back;
+/// * five maximum-sized messages for the **new** term length commit, and every
+///   member reaches the same position.
+#[test]
+fn a_restarted_cluster_takes_a_new_term_length_and_mtu_after_a_snapshot_seed() {
+    let _serial = serial();
+    let old_term = 256 * 1024;
+    let new_term = 2 * 1024 * 1024;
+    let old_mtu = 1408;
+    let new_mtu = 8992;
+    let mut ports = Ports::new();
+    ports.set_channel_shape(ChannelShape {
+        log_term_length: old_term,
+        ingress_term_length: old_term,
+        egress_term_length: old_term,
+        mtu: Some(old_mtu),
+    });
+
+    let member_string = members(&ports);
+    let faults = Faults::default();
+    let (launched_tx, launched_rx) = mpsc::channel();
+
+    let mut nodes = Vec::new();
+    for id in 0..MEMBER_COUNT {
+        let Some(node) = Node::start(id, &ports, &member_string, &faults, &launched_tx) else {
+            announce_skip();
+            return;
+        };
+        nodes.push(node);
+    }
+    await_launched(&faults, &launched_rx, MEMBER_COUNT);
+
+    let mut counters: Vec<NodeCounters> = nodes
+        .iter()
+        .map(|node| NodeCounters::open(node.aeron_dir()))
+        .collect();
+
+    wait_until("the election to close", &faults, || {
+        counters
+            .iter()
+            .all(|node| node.election_state() == Some(ELECTION_CLOSED))
+    });
+    let leader = (0..MEMBER_COUNT)
+        .find(|id| {
+            counters[*id as usize].role() == Some(deepmsg_tests::cluster_harness::ROLE_LEADER)
+        })
+        .expect("a leader");
+
+    // The first batch: 9 messages that each fill an eighth of a 256 KiB term.
+    let Some(mut client) = ClientSide::start(&ports, leader) else {
+        announce_skip();
+        return;
+    };
+    let connect = connect_request(11, &client.egress_channel);
+    offer_message(&client, &faults, &connect);
+    let mut open_event = None;
+    wait_until("the session open event", &faults, || {
+        for event in client.poll_events() {
+            if event.correlation_id == 11 && event.code == EventCode::OK {
+                open_event = Some(event);
+            }
+        }
+        open_event.is_some()
+    });
+    let open_event = open_event.expect("the session opened");
+
+    let before = commit_of(&counters, leader as usize).expect("the leader's commit");
+    send_max_sized_batch(
+        &client,
+        &faults,
+        open_event.leadership_term_id,
+        open_event.cluster_session_id,
+        b'x',
+        9,
+        old_term,
+    );
+    let per_message = i64::from(old_term / 8);
+    wait_until("the first batch to commit", &faults, || {
+        commit_of(&counters, leader as usize)
+            .is_some_and(|position| position >= before + 9 * per_message)
+    });
+
+    // The operator's snapshot; the toggle going back to NEUTRAL is the
+    // reference's "the snapshot is done" (`ClusterControl`).
+    counters[leader as usize].set(
+        deepmsg_cluster_common::counters::CLUSTER_CONTROL_TOGGLE_TYPE_ID,
+        i64::from(deepmsg_cluster::control::cluster_control::ToggleState::Snapshot.code()),
+    );
+    wait_until("the snapshot", &faults, || {
+        counters[leader as usize]
+            .snapshot_count()
+            .is_some_and(|count| count >= 1)
+            && counters[leader as usize]
+                .value(deepmsg_cluster_common::counters::CLUSTER_CONTROL_TOGGLE_TYPE_ID)
+                == Some(1)
+    });
+
+    // The log the snapshot recorded was made with the first shape, and the
+    // descriptor is where that is readable.
+    let old_shape = nodes[leader as usize]
+        .log_recording_shape()
+        .expect("the leader's log recording");
+    assert_eq!(
+        old_shape.term_buffer_length, old_term,
+        "the log recording before the seeding"
+    );
+    assert_eq!(old_shape.mtu_length, old_mtu, "its MTU");
+    let old_leadership_term = old_shape.leadership_term_id;
+
+    // The second batch: 11 more messages, on a reconnected client like the
+    // reference's (`:1870-1886`), on a **second egress port**. The reference
+    // gives the reconnected client the same egress channel, which leaves the
+    // old session's publication on it; this build's driver does not bring up an
+    // image for the new session's publication on that channel while the old one
+    // is there (the session-open event never arrives — see the record's
+    // findings). The response channel is not what this arm is about, so the
+    // second client answers on a port of its own.
+    drop(client);
+    let Some(mut client) = ClientSide::start_at(&ports, leader, 5) else {
+        announce_skip();
+        return;
+    };
+    let connect = connect_request(12, &client.egress_channel);
+    offer_message(&client, &faults, &connect);
+    let mut open_event = None;
+    let mut seen: Vec<(i64, i32, String)> = Vec::new();
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        faults.check();
+        for event in client.poll_events() {
+            seen.push((
+                event.correlation_id,
+                event.code.into(),
+                event.detail.clone(),
+            ));
+            if event.correlation_id == 12 && event.code == EventCode::OK {
+                open_event = Some(event);
+            }
+        }
+        if open_event.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let diagnostics = |type_id: i32| -> Vec<Option<i64>> {
+        counters
+            .iter()
+            .map(|counter| counter.value(type_id))
+            .collect()
+    };
+    let recording_shapes: Vec<String> = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| match node.log_recording_shape() {
+            Ok(shape) => format!(
+                "recording={} term={} stop={} applied={:?} buffer={} mtu={}",
+                shape.recording_id,
+                shape.leadership_term_id,
+                shape.stop_position,
+                counters[index].recording_position(shape.recording_id),
+                shape.term_buffer_length,
+                shape.mtu_length
+            ),
+            Err(error) => format!("<{error}>"),
+        })
+        .collect();
+    assert!(
+        open_event.is_some(),
+        "timed out waiting for the second session; images={} leader_role={:?} election={:?} \
+         commit={:?}/{:?}/{:?} timeouts={:?} errors={:?} invalid={:?} log={recording_shapes:?} \
+         events={seen:?} driver={:?} client_driver={:?}",
+        client.egress_image_count(),
+        counters[leader as usize].role(),
+        counters[leader as usize].election_state(),
+        commit_of(&counters, 0),
+        commit_of(&counters, 1),
+        commit_of(&counters, 2),
+        diagnostics(deepmsg_cluster_common::counters::CLUSTER_CLIENT_TIMEOUT_COUNT_TYPE_ID),
+        diagnostics(deepmsg_cluster_common::counters::CLUSTER_CONSENSUS_MODULE_ERROR_COUNT_TYPE_ID),
+        diagnostics(deepmsg_cluster_common::counters::CLUSTER_INVALID_REQUEST_COUNT_TYPE_ID),
+        nodes[leader as usize].driver_log_tail(20),
+        client.driver_log_tail(20),
+    );
+    let open_event = open_event.expect("the second session opened");
+    let before = commit_of(&counters, leader as usize).expect("the leader's commit");
+    send_max_sized_batch(
+        &client,
+        &faults,
+        open_event.leadership_term_id,
+        open_event.cluster_session_id,
+        b'y',
+        11,
+        old_term,
+    );
+    wait_until("the second batch to commit", &faults, || {
+        commit_of(&counters, leader as usize)
+            .is_some_and(|position| position >= before + 11 * per_message)
+    });
+    let before_stop = commit_of(&counters, leader as usize).expect("the leader's commit");
+    assert!(
+        before_stop >= 20 * per_message,
+        "the log was filled by two batches: {before_stop}"
+    );
+
+    // Stop every module **and its media** (the reference's `TestNode.close`
+    // closes the module, the containers, the archive and the driver), then seed
+    // every recording log from its latest snapshot.
+    for node in &mut nodes {
+        node.stop_media();
+    }
+    drop(client);
+    for node in &nodes {
+        node.seed_recording_log_from_snapshot()
+            .expect("the recording log is seeded from the snapshot");
+    }
+
+    // The same ports, the new shape — and a whole-cluster restart.
+    ports.set_channel_shape(ChannelShape {
+        log_term_length: new_term,
+        ingress_term_length: new_term,
+        egress_term_length: new_term,
+        mtu: Some(new_mtu),
+    });
+    let (restart_tx, restart_rx) = mpsc::channel();
+    for node in &mut nodes {
+        node.set_channel_shape(&ports);
+        node.restart_whole(&restart_tx);
+    }
+    await_launched(&faults, &restart_rx, MEMBER_COUNT);
+
+    counters = nodes
+        .iter()
+        .map(|node| NodeCounters::open(node.aeron_dir()))
+        .collect();
+
+    // The seeded log has no term entry: the recovery plan starts at the
+    // snapshot's term, position zero, with no log to replay
+    // (`RecordingLog.java:890-935`). So the commit settles **below the old
+    // log**, on every member, before anything new is written.
+    wait_until("the election after the seeded start", &faults, || {
+        counters
+            .iter()
+            .all(|node| node.election_state() == Some(ELECTION_CLOSED))
+    });
+    wait_until("the commit to settle below the old log", &faults, || {
+        let values: Vec<Option<i64>> = (0..counters.len())
+            .map(|node| commit_of(&counters, node))
+            .collect();
+        values[0].is_some()
+            && values.iter().all(|value| *value == values[0])
+            && values[0].is_some_and(|position| position < 64 * 1024)
+    });
+
+    let leader = (0..MEMBER_COUNT)
+        .find(|id| {
+            counters[*id as usize].role() == Some(deepmsg_tests::cluster_harness::ROLE_LEADER)
+        })
+        .expect("a leader after the seeded start");
+    let new_shape = nodes[leader as usize]
+        .log_recording_shape()
+        .expect("the leader's log recording after the restart");
+    assert_eq!(
+        new_shape.term_buffer_length, new_term,
+        "the log recording after the restart"
+    );
+    assert_eq!(new_shape.mtu_length, new_mtu, "its MTU");
+    assert!(
+        new_shape.leadership_term_id > old_leadership_term,
+        "a new leadership term: {} > {old_leadership_term}",
+        new_shape.leadership_term_id
+    );
+
+    // And the new shape carries a whole term's worth of messages.
+    let Some(mut client) = ClientSide::start(&ports, leader) else {
+        announce_skip();
+        return;
+    };
+    let connect = connect_request(13, &client.egress_channel);
+    offer_message(&client, &faults, &connect);
+    let mut open_event = None;
+    wait_until("the session on the reseeded cluster", &faults, || {
+        for event in client.poll_events() {
+            if event.correlation_id == 13 && event.code == EventCode::OK {
+                open_event = Some(event);
+            }
+        }
+        open_event.is_some()
+    });
+    let open_event = open_event.expect("the session opened");
+    let before = commit_of(&counters, leader as usize).expect("the leader's commit");
+    send_max_sized_batch(
+        &client,
+        &faults,
+        open_event.leadership_term_id,
+        open_event.cluster_session_id,
+        b'z',
+        5,
+        new_term,
+    );
+    let per_message = i64::from(new_term / 8);
+    wait_until("the third batch to commit", &faults, || {
+        commit_of(&counters, leader as usize)
+            .is_some_and(|position| position >= before + 5 * per_message)
+    });
+    wait_until("every member to reach the third batch", &faults, || {
+        let target = commit_of(&counters, leader as usize);
+        target.is_some() && (0..counters.len()).all(|node| commit_of(&counters, node) == target)
+    });
 
     for node in &mut nodes {
         node.stop();

@@ -85,14 +85,91 @@ pub const ELECTION_CLOSED: i64 = 17;
 /// on a fixed port.
 pub struct Ports {
     base: u16,
+    /// Added to [`Self::client_egress`], so a second client can answer on a
+    /// port of its own.
+    egress_offset: u16,
+    /// The shape of the three channels the reference lets a test change
+    /// (`TestCluster.java:145-149`): the log, the ingress and the egress.
+    ///
+    /// The defaults are the reference's own. They are fields rather than
+    /// literals so H5's second arm can rest the *same ports* on a different
+    /// term buffer length and MTU (`ClusterTest.java:1892-1895`).
+    shape: ChannelShape,
+}
+
+/// Term buffer length and MTU of the log, ingress and egress channels.
+///
+/// The ingress and the log share a term length in the second arm because an
+/// ingress message is appended to the log unchanged, so the largest legal
+/// message is `term-length / 8` on both.
+#[derive(Clone, Copy)]
+pub struct ChannelShape {
+    /// `aeron.cluster.log.channel`'s `term-length` (`TestCluster.java:145`).
+    pub log_term_length: i32,
+    /// `aeron.cluster.ingress.channel`'s (`:148`).
+    pub ingress_term_length: i32,
+    /// `aeron.cluster.egress.channel`'s (`:147`).
+    pub egress_term_length: i32,
+    /// `mtu`, when the test names one; the driver's default otherwise.
+    pub mtu: Option<i32>,
+}
+
+impl Default for ChannelShape {
+    fn default() -> Self {
+        Self {
+            log_term_length: 512 * 1024,
+            ingress_term_length: 128 * 1024,
+            egress_term_length: 128 * 1024,
+            mtu: None,
+        }
+    }
 }
 
 impl Ports {
     pub fn new() -> Self {
-        // 21000..24990, in tens; the highest offset used is +30.
+        // 21000..24990, in tens; the highest offset used is +35 (a second
+        // client's egress port is +30 plus its offset).
         Self {
             base: 21_000 + (u16::try_from(std::process::id() % 400).unwrap()) * 10,
+            egress_offset: 0,
+            shape: ChannelShape::default(),
         }
+    }
+
+    /// Sit the same ports on a new channel shape — H5's second arm, which
+    /// restarts the cluster with the new one (`ClusterTest.java:1892-1895`).
+    pub fn set_channel_shape(&mut self, shape: ChannelShape) {
+        self.shape = shape;
+    }
+
+    fn mtu_parameter(&self) -> String {
+        self.shape
+            .mtu
+            .map(|mtu| format!("|mtu={mtu}"))
+            .unwrap_or_default()
+    }
+
+    /// `aeron:udp?term-length=…|alias=raft` (`TestCluster.java:145`).
+    pub fn log_channel(&self) -> String {
+        format!(
+            "aeron:udp?term-length={}|alias=raft{}",
+            self.shape.log_term_length,
+            self.mtu_parameter()
+        )
+    }
+
+    /// The egress channel's **parameters**, as a template for the module
+    /// (`TestCluster.java:147`). No `endpoint`: the reference's client names
+    /// `endpoint=localhost:0` and its response channel is rewritten by the
+    /// driver through `response-correlation-id`; this harness's client names a
+    /// fixed endpoint of its own, and `refine_response_channel` would overwrite
+    /// it.
+    pub fn egress_channel_template(&self) -> String {
+        format!(
+            "aeron:udp?term-length={}{}",
+            self.shape.egress_term_length,
+            self.mtu_parameter()
+        )
     }
 
     /// `hostname(memberId):2<clusterId>11<memberId>` (`:1924-1927`).
@@ -112,7 +189,7 @@ impl Ports {
 
     /// Where the client's egress subscription listens.
     pub fn client_egress(&self) -> u16 {
-        self.base + 30
+        self.base + 30 + self.egress_offset
     }
 
     /// Where this member's archive listens for control requests
@@ -124,8 +201,22 @@ impl Ports {
 
     pub fn ingress_channel(&self, member_id: i32) -> String {
         format!(
-            "aeron:udp?term-length=128k|alias=ingress|endpoint=localhost:{}",
-            self.ingress(member_id)
+            "aeron:udp?term-length={}|alias=ingress|endpoint=localhost:{}{}",
+            self.shape.ingress_term_length,
+            self.ingress(member_id),
+            self.mtu_parameter()
+        )
+    }
+
+    /// The client's request publication, which is the ingress channel's shape
+    /// with the leader's endpoint (`TestCluster.java:856-858`: the reference
+    /// client is configured with the ingress channel itself).
+    pub fn ingress_publication_channel(&self, member_id: i32) -> String {
+        format!(
+            "aeron:udp?term-length={}|endpoint=localhost:{}{}",
+            self.shape.ingress_term_length,
+            self.ingress(member_id),
+            self.mtu_parameter()
         )
     }
 
@@ -136,8 +227,23 @@ impl Ports {
         )
     }
 
+    /// A copy of these ports whose egress port is moved by `offset`.
+    #[must_use]
+    pub fn with_egress_offset(&self, offset: u16) -> Self {
+        Self {
+            base: self.base,
+            egress_offset: offset,
+            shape: self.shape,
+        }
+    }
+
     pub fn client_egress_channel(&self) -> String {
-        format!("aeron:udp?endpoint=localhost:{}", self.client_egress())
+        format!(
+            "aeron:udp?term-length={}|endpoint=localhost:{}{}",
+            self.shape.egress_term_length,
+            self.client_egress(),
+            self.mtu_parameter()
+        )
     }
 }
 
@@ -281,7 +387,11 @@ impl Node {
             // No endpoint: the reference calls that shape MDC
             // (`ConsensusModule.java:2145`), and the module puts
             // `control-mode=manual` on the publication itself.
-            "-Daeron.cluster.log.channel=aeron:udp?term-length=512k|alias=raft".to_owned(),
+            format!("-Daeron.cluster.log.channel={}", ports.log_channel()),
+            format!(
+                "-Daeron.cluster.egress.channel={}",
+                ports.egress_channel_template()
+            ),
             "-Daeron.cluster.control.channel=aeron:ipc?term-length=128k".to_owned(),
             "-Daeron.cluster.replication.channel=aeron:udp?endpoint=localhost:0".to_owned(),
             "-Daeron.cluster.service.count=0".to_owned(),
@@ -377,6 +487,33 @@ impl Node {
         }
     }
 
+    /// Re-settle the module's three channel arguments from `ports`.
+    ///
+    /// The channels are the one part of a launch this harness lets a test
+    /// change between restarts (`ClusterTest.java:1892-1895`), so they are
+    /// re-read rather than frozen at [`Self::start`]. Everything else — the
+    /// directories, the member list, the stream ids — settles from the same
+    /// values.
+    pub fn set_channel_shape(&mut self, ports: &Ports) {
+        let id = self.id;
+        let replacements = [
+            (
+                "-Daeron.cluster.ingress.channel=",
+                ports.ingress_channel(id),
+            ),
+            ("-Daeron.cluster.log.channel=", ports.log_channel()),
+            (
+                "-Daeron.cluster.egress.channel=",
+                ports.egress_channel_template(),
+            ),
+        ];
+        for (prefix, value) in replacements {
+            if let Some(arg) = self.args.iter_mut().find(|arg| arg.starts_with(prefix)) {
+                *arg = format!("{prefix}{value}");
+            }
+        }
+    }
+
     /// Bring the **driver and the module** back over the same directories.
     ///
     /// The reference's `restartAllNodes` (`StartFromTruncatedRecordingLogTest`)
@@ -422,6 +559,14 @@ impl Node {
             .as_ref()
             .expect("the driver is running")
             .aeron_dir()
+    }
+
+    /// The last `lines` lines the node's driver+archive process wrote.
+    #[must_use]
+    pub fn driver_log_tail(&self, lines: usize) -> String {
+        self.driver
+            .as_ref()
+            .map_or_else(|| "<no driver>".to_owned(), |driver| driver.log_tail(lines))
     }
 
     pub fn cluster_dir(&self) -> &std::path::Path {
@@ -541,6 +686,193 @@ impl Node {
 
         Ok(())
     }
+
+    /// The reference's `ClusterTool.seedRecordingLogFromSnapshot`
+    /// (`ClusterToolOperator.java:201-270`): rewrite `recording.log` down to
+    /// the latest snapshot **and its services'**, with every entry's term base
+    /// and log position set to zero, keeping the original as
+    /// `recording.log.bak`.
+    ///
+    /// This is H5's second arm's `seedRecordingsFromLatestSnapshot`
+    /// (`TestCluster.java:2449-2456`). Unlike [`Self::truncate_recording_log`]
+    /// it neither keeps the last term entry nor deletes the mark files: the
+    /// cluster is meant to come back with **no log at all**, only the snapshot
+    /// state, which is what lets the next term be recorded with a different
+    /// term buffer length and MTU (`ClusterTest.java:1823-1933`).
+    ///
+    /// The module and the driver must both be stopped, as for the truncation:
+    /// the next start is what reads the rewritten log.
+    pub fn seed_recording_log_from_snapshot(&self) -> Result<(), String> {
+        use deepmsg_cluster::persist::recording_log::{
+            self, CONSENSUS_MODULE_SERVICE_ID, ENTRY_TYPE_SNAPSHOT, RecordingLog,
+        };
+
+        let log_path = self.cluster_dir.path().join(recording_log::FILENAME);
+        let original = RecordingLog::open(&log_path).map_err(|error| error.to_string())?;
+        let entries = original.entries().to_vec();
+        drop(original);
+
+        // The latest snapshot of the module itself, then the ones services
+        // wrote immediately before it, by service id. `isValidSnapshot` is
+        // `isValid && type == SNAPSHOT` (`RecordingLog.java:1354-1357`), which
+        // is *not* `Entry::is_snapshot` — that also admits standby snapshots.
+        let module_snapshot = entries.iter().rposition(|entry| {
+            entry.is_valid
+                && entry.entry_type == ENTRY_TYPE_SNAPSHOT
+                && entry.service_id == CONSENSUS_MODULE_SERVICE_ID
+        });
+
+        let seeded: Vec<_> = match module_snapshot {
+            None => Vec::new(),
+            Some(index) => {
+                let mut seeded = Vec::new();
+                let mut service_id = CONSENSUS_MODULE_SERVICE_ID;
+                let mut at = Some(index);
+                while let Some(i) = at {
+                    let entry = &entries[i];
+                    if !(entry.is_valid
+                        && entry.entry_type == ENTRY_TYPE_SNAPSHOT
+                        && entry.service_id == service_id)
+                    {
+                        break;
+                    }
+                    let mut zeroed = entry.clone();
+                    zeroed.term_base_log_position = 0;
+                    zeroed.log_position = 0;
+                    zeroed.archive_endpoint = None;
+                    seeded.push(zeroed);
+                    service_id += 1;
+                    at = i.checked_sub(1);
+                }
+                seeded.reverse();
+                seeded
+            }
+        };
+
+        let backup = self.cluster_dir.path().join("recording.log.bak");
+        std::fs::copy(&log_path, &backup).map_err(|error| error.to_string())?;
+
+        let new_path = self.cluster_dir.path().join("recording.log.seeded");
+        let _ = std::fs::remove_file(&new_path);
+        let mut log = RecordingLog::open(&new_path).map_err(|error| error.to_string())?;
+        for entry in &seeded {
+            log.append_snapshot(
+                entry.leadership_term_id,
+                entry.term_base_log_position,
+                entry.log_position,
+                entry.timestamp,
+                entry.recording_id,
+                entry.service_id,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        log.force(1).map_err(|error| error.to_string())?;
+        drop(log);
+        std::fs::rename(&new_path, &log_path).map_err(|error| error.to_string())?;
+
+        Ok(())
+    }
+
+    /// `recording.log` as `type:term:recording:base:position` per entry — a
+    /// failure's way to say what the recovery plan was built from.
+    #[must_use]
+    pub fn recording_log_entries(&self) -> String {
+        use deepmsg_cluster::persist::recording_log::{self, RecordingLog};
+
+        let path = self.cluster_dir.path().join(recording_log::FILENAME);
+        match RecordingLog::open(&path) {
+            Ok(log) => log
+                .entries()
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{}:{}:{}:{}:{}",
+                        entry.entry_type,
+                        entry.leadership_term_id,
+                        entry.recording_id,
+                        entry.term_base_log_position,
+                        entry.log_position
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+            Err(error) => format!("<{error}>"),
+        }
+    }
+
+    /// The term buffer length and MTU the archive recorded the **current log
+    /// recording** with.
+    ///
+    /// The descriptor is where H5's second arm reads "the channels changed":
+    /// the log recording made before the restart is 256 KiB / 1408, the one
+    /// made after it is 2 MiB / 8992 (`Archive::list_recording`, the same query
+    /// `crates/cluster/consensus/src/agent/mod.rs` builds its recovery plan
+    /// from).
+    ///
+    /// A second client on the node's own aeron directory and an archive
+    /// control session over IPC — the shape the module itself uses
+    /// (`crates/cluster/consensus/src/config.rs:481-487`), with the response
+    /// stream left at its default (the module offsets its own by
+    /// `clusterId * 100 + 100`).
+    pub fn log_recording_shape(&self) -> Result<RecordingShape, String> {
+        use deepmsg_archive::client::{
+            Archive as ArchiveClient, ArchiveContext, Handlers, NoCredentials,
+        };
+        use deepmsg_cluster::persist::recording_log::{self, RecordingLog};
+
+        let log_path = self.cluster_dir.path().join(recording_log::FILENAME);
+        let log = RecordingLog::open(&log_path).map_err(|error| error.to_string())?;
+        let term = log
+            .find_last_term()
+            .ok_or_else(|| "recording.log has no term entry".to_owned())?;
+        let (leadership_term_id, recording_id) = (term.leadership_term_id, term.recording_id);
+        drop(log);
+
+        let mut client = Client::connect(self.aeron_dir()).map_err(|error| error.to_string())?;
+        let mut context = ArchiveContext::new();
+        context.aeron_dir = self.aeron_dir().to_string_lossy().into_owned();
+        context.control_request_channel = Some("aeron:ipc".to_owned());
+        context.control_response_channel = Some("aeron:ipc".to_owned());
+        let mut archive = ArchiveClient::connect(
+            &context,
+            &mut client,
+            &mut NoCredentials,
+            Handlers::default(),
+        )
+        .map_err(|error| format!("{error:?}"))?;
+
+        let mut shape = None;
+        archive
+            .list_recording(&mut client, recording_id, &mut |descriptor| {
+                shape = Some(RecordingShape {
+                    recording_id,
+                    leadership_term_id,
+                    term_buffer_length: descriptor.term_buffer_length,
+                    mtu_length: descriptor.mtu_length,
+                    stop_position: descriptor.stop_position,
+                });
+            })
+            .map_err(|error| format!("{error:?}"))?;
+
+        shape.ok_or_else(|| format!("the archive does not know recording {recording_id}"))
+    }
+}
+
+/// What [`Node::log_recording_shape`] read: the term the recording holds, and
+/// the shape it was made with.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordingShape {
+    /// The log recording.
+    pub recording_id: i64,
+    /// The leadership term whose recording this is.
+    pub leadership_term_id: i64,
+    /// `term_buffer_length` from the recording's descriptor.
+    pub term_buffer_length: i32,
+    /// `mtu_length` from the recording's descriptor.
+    pub mtu_length: i32,
+    /// How far the recording has been written; for a live log this is the
+    /// member's applied position.
+    pub stop_position: i64,
 }
 
 impl Drop for Node {
@@ -593,6 +925,30 @@ impl NodeCounters {
         self.value(CLUSTER_COMMIT_POSITION_TYPE_ID)
     }
 
+    /// The archive's position counter for `recording_id`: how far this
+    /// member's log recording has been written, which is the position the
+    /// member has applied the log up to.
+    #[must_use]
+    pub fn recording_position(&self, recording_id: i64) -> Option<i64> {
+        use deepmsg_archive::server::counters::ARCHIVE_RECORDING_POSITION_TYPE_ID;
+        use deepmsg_archive::server::recording_pos::parse_key;
+
+        let counters = self.cnc.counters()?;
+        let mut position = None;
+        counters.for_each(|descriptor| {
+            if position.is_some() || descriptor.type_id != ARCHIVE_RECORDING_POSITION_TYPE_ID {
+                return;
+            }
+            let Some(key) = counters.key(descriptor.counter_id) else {
+                return;
+            };
+            if parse_key(&key).is_some_and(|identity| identity.recording_id == recording_id) {
+                position = counters.value(descriptor.counter_id);
+            }
+        });
+        position
+    }
+
     pub fn election_state(&self) -> Option<i64> {
         self.value(CLUSTER_ELECTION_STATE_TYPE_ID)
     }
@@ -635,13 +991,21 @@ pub struct ClientSide {
 
 impl ClientSide {
     pub fn start(ports: &Ports, leader_id: i32) -> Option<Self> {
+        Self::start_at(ports, leader_id, 0)
+    }
+
+    /// [`Self::start`], with the egress port moved by `egress_offset` — a
+    /// second client whose response channel does not collide with a previous
+    /// one the cluster may still hold open.
+    pub fn start_at(ports: &Ports, leader_id: i32, egress_offset: u16) -> Option<Self> {
+        let ports = &ports.with_egress_offset(egress_offset);
         let driver = OwnDriver::start("cluster-harness-client")?;
         let mut client = Client::connect(driver.aeron_dir()).expect("the test client connects");
 
         let egress_channel = ports.client_egress_channel();
         let ingress_publication_id = client
             .add_publication(
-                &format!("aeron:udp?endpoint=localhost:{}", ports.ingress(leader_id)),
+                &ports.ingress_publication_channel(leader_id),
                 INGRESS_STREAM_ID,
                 DEADLINE,
             )
@@ -657,6 +1021,24 @@ impl ClientSide {
             egress_subscription_id,
             egress_channel,
         })
+    }
+
+    /// The ingress publication's shape and window, for a failure's message.
+    #[must_use]
+    pub fn ingress_publication_state(&self) -> String {
+        let Some(publication) = self.client.publication(self.ingress_publication_id) else {
+            return "<no publication>".to_owned();
+        };
+        let limit = self
+            .client
+            .counters_reader()
+            .and_then(|counters| counters.value(publication.position_limit_counter_id()));
+        format!(
+            "term={} position={:?} limit={limit:?} connected={:?}",
+            publication.term_buffer_length(),
+            publication.position(),
+            publication.is_connected(),
+        )
     }
 
     pub fn offer(&self, bytes: &[u8]) -> bool {
@@ -684,14 +1066,31 @@ impl ClientSide {
     pub fn poll(&mut self) {
         self.client.poll();
     }
+
+    /// The last `lines` lines the client's own driver wrote.
+    #[must_use]
+    pub fn driver_log_tail(&self, lines: usize) -> String {
+        self._driver.log_tail(lines)
+    }
+
+    /// How many images the egress subscription has — a test's way to tell "the
+    /// cluster never published" from "the event was not read".
+    #[must_use]
+    pub fn egress_image_count(&self) -> usize {
+        self.client
+            .subscription(self.egress_subscription_id)
+            .map_or(0, |subscription| subscription.images().len())
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SessionEvent {
     pub cluster_session_id: i64,
     pub correlation_id: i64,
     pub leadership_term_id: i64,
     pub code: EventCode,
+    /// The event's `detail` — a close reason, or an error's message.
+    pub detail: String,
 }
 
 pub fn decode_session_event(payload: &[u8]) -> Option<SessionEvent> {
@@ -707,12 +1106,15 @@ pub fn decode_session_event(payload: &[u8]) -> Option<SessionEvent> {
         return None;
     }
 
-    let decoder = SessionEventDecoder::default().header(header, 0);
+    let mut decoder = SessionEventDecoder::default().header(header, 0);
+    let (detail_offset, detail_length) = decoder.detail_decoder();
     Some(SessionEvent {
         cluster_session_id: decoder.cluster_session_id(),
         correlation_id: decoder.correlation_id(),
         leadership_term_id: decoder.leadership_term_id(),
         code: decoder.code(),
+        detail: String::from_utf8_lossy(decoder.detail_slice((detail_offset, detail_length)))
+            .into_owned(),
     })
 }
 
@@ -736,6 +1138,34 @@ pub fn connect_request(correlation_id: i64, response_channel: &str) -> Vec<u8> {
     buffer.truncate(length);
     buffer
 }
+
+/// The longest payload an ingress message may carry on a channel of this term
+/// length: `computeMaxMessageLength(term) - SESSION_HEADER_LENGTH`
+/// (`ClusterTest.java:1850`).
+///
+/// The message *is* the session header plus the payload —
+/// `AeronCluster.SESSION_HEADER_LENGTH = MessageHeaderEncoder.ENCODED_LENGTH +
+/// SessionMessageHeaderEncoder.BLOCK_LENGTH` (`AeronCluster.java:99-100`) — and
+/// [`ingress_message`] writes exactly that. One such message fills one eighth
+/// of a term, which is what makes the log position advance per message equal to
+/// `term-length / 8`.
+///
+/// # Panics
+///
+/// A term length too small for a session header.
+#[must_use]
+pub fn max_ingress_payload(term_length: i32) -> usize {
+    let message_length = usize::try_from(deepmsg_core::logbuffer::position::max_message_length(
+        term_length,
+    ))
+    .expect("a positive term length");
+    message_length
+        .checked_sub(MESSAGE_HEADER_LENGTH + usize::from(SBE_SESSION_HEADER_BLOCK_LENGTH))
+        .expect("the term length is too small for a session header")
+}
+
+/// `SessionMessageHeaderEncoder.BLOCK_LENGTH` (`AeronCluster.java:99-100`).
+const SBE_SESSION_HEADER_BLOCK_LENGTH: u16 = 24;
 
 /// A `SessionMessageHeader` and its payload (`SessionMessageHeaderEncoder`).
 pub fn ingress_message(
@@ -824,7 +1254,9 @@ pub fn offer_message(client: &ClientSide, faults: &Faults, message: &[u8]) {
     while !client.offer(message) {
         assert!(
             Instant::now() < deadline,
-            "the ingress publication is stuck"
+            "the ingress publication is stuck: {} len={}",
+            client.ingress_publication_state(),
+            message.len()
         );
         faults.check();
         std::thread::sleep(Duration::from_millis(5));

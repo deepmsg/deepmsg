@@ -651,6 +651,14 @@ path = "integration/archive_replay_merge.rs"
 name = "short_datagram"
 path = "integration/short_datagram.rs"
 
+# The receiver's buffers are `AERON_DRIVER_RECEIVER_MAX_UDP_PACKET_LENGTH`, not
+# the driver's default MTU: a publication may name a larger `mtu=` of its own
+# (P3-6b's second arm restarts a cluster on `mtu=8992`), and a buffer sized
+# from the default drops every datagram that large without an error.
+[[test]]
+name = "udp_receive_mtu"
+path = "integration/udp_receive_mtu.rs"
+
 # P3-4f's LC-4b: our consensus module, the reference's own service container
 # (a Java `ClusteredService` from the fork's `deepmsg-tests/java/`) and the
 # reference's own `AeronCluster` client. Needs the reference jar, a JDK, our

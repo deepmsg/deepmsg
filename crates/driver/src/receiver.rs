@@ -60,6 +60,18 @@ use crate::udp_channel::UdpChannel;
 /// Java's cadence over C's allocation.
 pub const RECEIVE_SLOTS_DEFAULT: usize = crate::config::RECEIVER_IO_VECTOR_CAPACITY_DEFAULT;
 
+/// How big one receive buffer is: `AERON_DRIVER_RECEIVER_MAX_UDP_PACKET_LENGTH`
+/// (`aeron-driver/src/main/c/aeron_driver_context.h:60`, 64 KiB).
+///
+/// **Not** the driver's `mtu_length`: that setting is the default a
+/// *publication* is built from, and a publication may name a larger mtu of its
+/// own (`mtu=` on its channel, e.g. 8992). A receive buffer sized from the
+/// default would truncate every datagram past 1408 bytes, and the frame would
+/// be discarded without an error anywhere — the reference sizes the buffers
+/// from this constant for exactly that reason
+/// (`aeron_driver_receiver.c:48-62`, both the allocation and the `iov_len`).
+pub const RECEIVE_BUFFER_LENGTH: usize = 64 * 1024;
+
 /// How many datagrams one receive poll takes from one destination, which is
 /// one — the Java driver's shape. See the call site for why a burst is not
 /// paced by it.
@@ -831,7 +843,8 @@ pub(crate) struct ReceiverThread {
     cnc: Arc<CncFile>,
     counters: CounterManager,
     #[allow(dead_code)]
-    // the datagram size the buffers are built from, kept for a caller that re-reads it
+    // the datagram size a *publication* defaults to; the receive buffers are
+    // not built from it — see [`RECEIVE_BUFFER_LENGTH`].
     mtu_length: usize,
     #[allow(dead_code)] // the image's status-message cadence, which the image itself carries
     status_message_timeout_ns: i64,
@@ -926,7 +939,7 @@ impl ReceiverThread {
             // reads with (`:127`) — so this is the one setting that decides how
             // much of a burst one turn takes.
             buffers: (0..io_vector_capacity.max(RECEIVE_SLOTS_DEFAULT))
-                .map(|_| vec![0u8; mtu_length])
+                .map(|_| vec![0u8; RECEIVE_BUFFER_LENGTH])
                 .collect(),
             datagrams: Datagrams::new(),
             poller,
