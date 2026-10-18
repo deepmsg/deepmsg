@@ -43,7 +43,8 @@ use deepmsg_cluster::{ConsensusModuleAgent, ConsensusModuleConfig};
 use deepmsg_cluster_common::config::Properties;
 use deepmsg_cluster_common::counters::{
     CLUSTER_COMMIT_POSITION_TYPE_ID, CLUSTER_ELECTION_STATE_TYPE_ID,
-    CLUSTER_LEADERSHIP_TERM_ID_TYPE_ID, CLUSTER_NODE_ROLE_TYPE_ID, find_cluster_counter,
+    CLUSTER_LEADERSHIP_TERM_ID_TYPE_ID, CLUSTER_NODE_ROLE_TYPE_ID,
+    CLUSTER_SNAPSHOT_COUNTER_TYPE_ID, find_cluster_counter,
 };
 use deepmsg_cnc::file::CncFile;
 use deepmsg_codec_cluster::event_code::EventCode;
@@ -211,8 +212,15 @@ impl Faults {
 pub struct Node {
     id: i32,
     cluster_dir: TempDir,
-    _archive_dir: TempDir,
-    driver: OwnArchivingMediaDriver,
+    archive_dir: TempDir,
+    /// `None` only while [`Self::restart_whole`] is between two drivers: the
+    /// old one has to be **dropped** before the new one starts, because its
+    /// `Drop` removes the aeron directory and the log — the same path the new
+    /// one has just created.
+    driver: Option<OwnArchivingMediaDriver>,
+    /// The driver's own property list, kept so [`Self::restart_whole`] starts
+    /// the same archive again over the same directory.
+    driver_properties: Vec<String>,
     /// The properties the module is launched with, kept so a restart settles
     /// the same configuration from the same values.
     args: Vec<String>,
@@ -282,8 +290,9 @@ impl Node {
         let mut node = Self {
             id,
             cluster_dir,
-            _archive_dir: archive_dir,
-            driver,
+            archive_dir,
+            driver: Some(driver),
+            driver_properties: properties,
             args,
             faults: faults.clone(),
             stop: Arc::new(AtomicBool::new(false)),
@@ -351,6 +360,49 @@ impl Node {
         }));
     }
 
+    /// The archive directory this node owns.
+    pub fn archive_dir(&self) -> &std::path::Path {
+        self.archive_dir.path()
+    }
+
+    /// Stop the module and the **driver**, keeping every directory.
+    ///
+    /// H5's construction needs the media down before the mark files go: an
+    /// archive still running would rewrite its mark and catalog after the
+    /// test had deleted them.
+    pub fn stop_media(&mut self) {
+        self.stop();
+        if let Some(mut driver) = self.driver.take() {
+            driver.stop().expect("the driver stops");
+        }
+    }
+
+    /// Bring the **driver and the module** back over the same directories.
+    ///
+    /// The reference's `restartAllNodes` (`StartFromTruncatedRecordingLogTest`)
+    /// restarts the whole cluster because the archive and cluster mark files
+    /// are deleted while nothing holds them; a module-only restart leaves the
+    /// running archive's view of its own mark file in place. The driver's
+    /// aeron directory is derived from the process id and the node's name, so
+    /// it is the same path and the module's `-Daeron.dir` stays valid.
+    pub fn restart_whole(&mut self, launched: &mpsc::Sender<(i32, Result<(), String>)>) {
+        self.stop();
+        // Stop and **drop** the old driver first: its `Drop` removes the aeron
+        // directory and the log file, which are exactly the paths the new
+        // driver creates — an assignment would drop it after the new one had
+        // started and take the new driver's CnC file with it.
+        if let Some(mut driver) = self.driver.take() {
+            driver.stop().expect("the driver stops");
+        }
+        let name = format!("cluster-node-{}", self.id);
+        let refs: Vec<&str> = self.driver_properties.iter().map(String::as_str).collect();
+        let mut driver = OwnArchivingMediaDriver::start(&name, self.archive_dir.path(), &refs)
+            .expect("the driver comes back up");
+        driver.await_ready(DEADLINE).expect("the driver is ready");
+        self.driver = Some(driver);
+        self.launch_thread(launched);
+    }
+
     /// Bring a stopped module back on the same directory, archive and driver.
     ///
     /// The previous agent's `close` has run (that is what [`Self::stop`] waits
@@ -366,7 +418,10 @@ impl Node {
     }
 
     pub fn aeron_dir(&self) -> &std::path::Path {
-        self.driver.aeron_dir()
+        self.driver
+            .as_ref()
+            .expect("the driver is running")
+            .aeron_dir()
     }
 
     pub fn cluster_dir(&self) -> &std::path::Path {
@@ -391,6 +446,100 @@ impl Node {
     #[must_use]
     pub fn has_finished(&self) -> bool {
         self.finished.load(Ordering::Relaxed)
+    }
+
+    /// The reference's construction for starting from a truncated log
+    /// (`StartFromTruncatedRecordingLogTest.truncateRecordingLogAndDeleteMarkFiles`):
+    /// rewrite `recording.log` down to the last term entry plus the latest
+    /// snapshots, delete the two mark files, and drop the `.rec` segments the
+    /// rewritten log no longer names.
+    ///
+    /// The module and the driver must both be stopped: the archive holds its
+    /// own mark file and catalog open, and the whole point is that the next
+    /// start rebuilds them.
+    pub fn truncate_recording_log(&self) -> Result<(), String> {
+        use deepmsg_cluster::persist::recording_log::{self, RecordingLog};
+
+        let log_path = self.cluster_dir.path().join(recording_log::FILENAME);
+        let old = RecordingLog::open(&log_path).map_err(|error| error.to_string())?;
+        let last_term = old
+            .find_last_term()
+            .cloned()
+            .ok_or_else(|| "recording.log has no term entry".to_owned())?;
+        let mut snapshots: Vec<_> = old
+            .entries()
+            .iter()
+            .filter(|entry| entry.is_snapshot())
+            .cloned()
+            .collect();
+        snapshots.sort_by_key(|entry| entry.position);
+        let snapshots = &snapshots[snapshots.len().saturating_sub(2)..];
+        drop(old);
+
+        let new_path = self.cluster_dir.path().join("recording.log.truncated");
+        let _ = std::fs::remove_file(&new_path);
+        let mut truncated = RecordingLog::open(&new_path).map_err(|error| error.to_string())?;
+        truncated
+            .append_term(
+                last_term.leadership_term_id,
+                last_term.term_base_log_position,
+                last_term.log_position,
+                last_term.timestamp,
+                last_term.recording_id,
+                last_term.service_id,
+            )
+            .map_err(|error| error.to_string())?;
+        for snapshot in snapshots {
+            truncated
+                .append_snapshot(
+                    snapshot.leadership_term_id,
+                    snapshot.term_base_log_position,
+                    snapshot.log_position,
+                    snapshot.timestamp,
+                    snapshot.recording_id,
+                    snapshot.service_id,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        truncated.force(1).map_err(|error| error.to_string())?;
+        drop(truncated);
+        std::fs::rename(&new_path, &log_path).map_err(|error| error.to_string())?;
+
+        // The mark files are what the restarted archive and module write afresh.
+        for path in [
+            self.cluster_dir.path().join("cluster-mark.dat"),
+            self.archive_dir.path().join("archive-mark.dat"),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("{}: {error}", path.display())),
+            }
+        }
+
+        // Segments no entry names any more are the recordings the truncation
+        // just dropped; the reference deletes them for the same reason.
+        let rewritten = RecordingLog::open(&log_path).map_err(|error| error.to_string())?;
+        let referenced: Vec<i64> = rewritten.entries().iter().map(|e| e.recording_id).collect();
+        drop(rewritten);
+        let entries =
+            std::fs::read_dir(self.archive_dir.path()).map_err(|error| error.to_string())?;
+        for entry in entries {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(recording_id) = name
+                .strip_suffix(".rec")
+                .and_then(|prefix| prefix.split('-').next())
+                .and_then(|id| id.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            if !referenced.contains(&recording_id) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -446,6 +595,10 @@ impl NodeCounters {
 
     pub fn election_state(&self) -> Option<i64> {
         self.value(CLUSTER_ELECTION_STATE_TYPE_ID)
+    }
+
+    pub fn snapshot_count(&self) -> Option<i64> {
+        self.value(CLUSTER_SNAPSHOT_COUNTER_TYPE_ID)
     }
 
     pub fn leadership_term_id(&self) -> Option<i64> {

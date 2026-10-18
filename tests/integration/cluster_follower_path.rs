@@ -682,3 +682,177 @@ fn an_orderly_shutdown_ends_every_members_duty_cycle() {
         node.stop();
     }
 }
+
+/// H5 — the cluster starts from a recording log truncated to its latest
+/// snapshot.
+///
+/// The reference's construction (`StartFromTruncatedRecordingLogTest`): take a
+/// snapshot, stop the whole cluster, rewrite every node's `recording.log` down
+/// to the last term and its snapshots, delete the archive and cluster mark
+/// files and the `.rec` segments the rewritten log no longer names, and start
+/// the cluster again. The reference repeats it three times; two rounds here
+/// keep the run inside the harness's budget while still proving the log is
+/// rewritten **from a log that a previous round produced**.
+#[test]
+fn the_cluster_starts_from_a_recording_log_truncated_to_its_latest_snapshot() {
+    let ports = Ports::new();
+    let member_string = members(&ports);
+    let faults = Faults::default();
+    let (launched_tx, launched_rx) = mpsc::channel();
+
+    let mut nodes = Vec::new();
+    for id in 0..MEMBER_COUNT {
+        let Some(node) = Node::start(id, &ports, &member_string, &faults, &launched_tx) else {
+            announce_skip();
+            return;
+        };
+        nodes.push(node);
+    }
+    await_launched(&faults, &launched_rx, MEMBER_COUNT);
+
+    let mut counters: Vec<NodeCounters> = nodes
+        .iter()
+        .map(|node| NodeCounters::open(node.aeron_dir()))
+        .collect();
+
+    for round in 0..2 {
+        wait_until("the election to close", &faults, || {
+            counters.iter().all(|node| {
+                node.election_state() == Some(deepmsg_tests::cluster_harness::ELECTION_CLOSED)
+            })
+        });
+        let leader = (0..MEMBER_COUNT)
+            .find(|id| {
+                counters[*id as usize].role() == Some(deepmsg_tests::cluster_harness::ROLE_LEADER)
+            })
+            .expect("a leader");
+
+        // A client session and a committed message, so the snapshot is of a
+        // log a client has written to.
+        let Some(mut client) = ClientSide::start(&ports, leader) else {
+            announce_skip();
+            return;
+        };
+        let connect = connect_request(round * 2 + 1, &client.egress_channel);
+        let correlation_id = round * 2 + 1;
+        offer_message(&client, &faults, &connect);
+
+        let mut open_event = None;
+        wait_until("the session open event", &faults, || {
+            for event in client.poll_events() {
+                if event.correlation_id == correlation_id && event.code == EventCode::OK {
+                    open_event = Some(event);
+                }
+            }
+            open_event.is_some()
+        });
+        let open_event = open_event.expect("the session opened");
+
+        let before = counters[leader as usize]
+            .commit_position()
+            .expect("the leader's commit");
+        let message = ingress_message(
+            open_event.leadership_term_id,
+            open_event.cluster_session_id,
+            b"before the truncation",
+        );
+        offer_message(&client, &faults, &message);
+        wait_until("the message to commit", &faults, || {
+            client.poll_events();
+            counters[leader as usize]
+                .commit_position()
+                .is_some_and(|position| position > before)
+        });
+
+        // The operator's snapshot, and the counter going back to NEUTRAL is
+        // the reference's "the snapshot is done" (`ClusterControl`).
+        counters[leader as usize].set(
+            deepmsg_cluster_common::counters::CLUSTER_CONTROL_TOGGLE_TYPE_ID,
+            i64::from(deepmsg_cluster::control::cluster_control::ToggleState::Snapshot.code()),
+        );
+        wait_until("the snapshot", &faults, || {
+            counters[leader as usize]
+                .snapshot_count()
+                .is_some_and(|count| count >= 1)
+                && counters[leader as usize]
+                    .value(deepmsg_cluster_common::counters::CLUSTER_CONTROL_TOGGLE_TYPE_ID)
+                    == Some(1)
+        });
+
+        // Stop every module **and its media**, truncate, then bring both halves
+        // of each node back: an archive still running would rewrite the mark
+        // file and its catalog after the test had deleted them.
+        for node in &mut nodes {
+            node.stop_media();
+        }
+        drop(client);
+        for node in &nodes {
+            node.truncate_recording_log()
+                .expect("the recording log is truncated");
+        }
+
+        let (restart_tx, restart_rx) = mpsc::channel();
+        for node in &mut nodes {
+            node.restart_whole(&restart_tx);
+        }
+        await_launched(&faults, &restart_rx, MEMBER_COUNT);
+
+        // The driver's aeron directory was rebuilt with the driver.
+        counters = nodes
+            .iter()
+            .map(|node| NodeCounters::open(node.aeron_dir()))
+            .collect();
+    }
+
+    // And the cluster is operational after the last round: a fresh session on
+    // the leader it elects, and a message it commits.
+    wait_until("the election after the truncated start", &faults, || {
+        counters.iter().all(|node| {
+            node.election_state() == Some(deepmsg_tests::cluster_harness::ELECTION_CLOSED)
+        })
+    });
+    let leader = (0..MEMBER_COUNT)
+        .find(|id| {
+            counters[*id as usize].role() == Some(deepmsg_tests::cluster_harness::ROLE_LEADER)
+        })
+        .expect("a leader after the truncated start");
+    let Some(mut client) = ClientSide::start(&ports, leader) else {
+        announce_skip();
+        return;
+    };
+    let connect = connect_request(99, &client.egress_channel);
+    offer_message(&client, &faults, &connect);
+    let mut open_event = None;
+    wait_until("the session on the restarted cluster", &faults, || {
+        for event in client.poll_events() {
+            if event.correlation_id == 99 && event.code == EventCode::OK {
+                open_event = Some(event);
+            }
+        }
+        open_event.is_some()
+    });
+    let open_event = open_event.expect("the session opened");
+    let before = counters[leader as usize]
+        .commit_position()
+        .expect("the leader's commit");
+    let message = ingress_message(
+        open_event.leadership_term_id,
+        open_event.cluster_session_id,
+        b"after the truncated start",
+    );
+    offer_message(&client, &faults, &message);
+    wait_until(
+        "the message after the truncated start to commit",
+        &faults,
+        || {
+            client.poll_events();
+            counters[leader as usize]
+                .commit_position()
+                .is_some_and(|position| position > before)
+        },
+    );
+
+    for node in &mut nodes {
+        node.stop();
+    }
+}
