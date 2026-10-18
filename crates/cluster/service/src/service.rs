@@ -1,0 +1,281 @@
+//! The business API: `ClusteredService` and the views handed to it.
+//!
+//! The reference's business implements `ClusteredService`
+//! (`ClusteredService.java:36-167`) and is passed live objects: the container's
+//! `Cluster`, a `ClientSession`, a snapshot `Image`. This build passes the same
+//! information as short-lived views and values — a `Cluster<'_>` borrowed for
+//! the call, a `SessionId` that indexes the container's table, a slice that
+//! points into the adapter's buffer — because the container owns all of it and
+//! a business that kept a hold would be a business holding a producer's memory.
+//!
+//! # Callbacks return `Result`
+//!
+//! The reference's callbacks return `void` and signal failure by throwing,
+//! which the container catches and turns into its own termination. A Rust
+//! callback that cannot return an error would have to panic, so every method
+//! here returns [`ContainerError`] and the container propagates it with `?` —
+//! the same control flow, in the language's own spelling (plan rule 5).
+
+use deepmsg_client::image::Image;
+use deepmsg_client::publication::ExclusivePublication;
+use deepmsg_codec_cluster::close_reason::CloseReason;
+
+use crate::cluster::Cluster;
+use crate::error::ContainerError;
+use crate::role::Role;
+
+/// A cluster session's id (`ClientSession.id()`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionId(pub i64);
+
+impl From<i64> for SessionId {
+    fn from(id: i64) -> Self {
+        Self(id)
+    }
+}
+
+impl From<SessionId> for i64 {
+    fn from(id: SessionId) -> Self {
+        id.0
+    }
+}
+
+impl core::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// The Aeron header a session message arrived with (`Header.java`), reduced to
+/// what a business can act on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogHeader {
+    /// Where the message ends in the log (`Header.position()`).
+    pub position: i64,
+    /// The publication's session.
+    pub session_id: i32,
+    /// The stream.
+    pub stream_id: i32,
+}
+
+/// A `NewLeadershipTermEvent(24)`, as the business sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewLeadershipTermEvent {
+    /// The new leadership term.
+    pub leadership_term_id: i64,
+    /// The log position the term began at.
+    pub log_position: i64,
+    /// The log timestamp.
+    pub timestamp: i64,
+    /// The term's base log position.
+    pub term_base_log_position: i64,
+    /// The leader.
+    pub leader_member_id: i32,
+    /// The log publication's session.
+    pub log_session_id: i32,
+    /// The unit of the term's timestamps.
+    pub time_unit: crate::role::TimeUnit,
+    /// The application version.
+    pub app_version: i32,
+}
+
+/// What the business writes its state into (`ServiceSnapshotTaker`'s
+/// publication, `onTakeSnapshot(ExclusivePublication)`).
+///
+/// P3-2a defines it so the trait is complete; the container does not call
+/// `on_take_snapshot` until P3-2b.
+pub struct SnapshotWriter<'a> {
+    publication: &'a ExclusivePublication,
+    position_limit: i64,
+}
+
+impl<'a> SnapshotWriter<'a> {
+    /// A writer over one snapshot recording's publication.
+    pub const fn new(publication: &'a ExclusivePublication, position_limit: i64) -> Self {
+        Self {
+            publication,
+            position_limit,
+        }
+    }
+
+    /// The snapshot publication.
+    pub const fn publication(&self) -> &'a ExclusivePublication {
+        self.publication
+    }
+
+    /// How far the recording has been written.
+    pub fn position(&self) -> i64 {
+        self.publication.position().unwrap_or(0)
+    }
+
+    /// `Publication.maxPayloadLength()`.
+    pub fn max_payload_length(&self) -> usize {
+        self.publication.max_payload_length().unwrap_or(0)
+    }
+
+    /// Offer one record.
+    pub fn offer(&self, payload: &[u8]) -> i64 {
+        match self.publication.offer(self.position_limit, payload) {
+            deepmsg_core::logbuffer::append::Appended::Ok { position, .. } => position.raw(),
+            deepmsg_core::logbuffer::append::Appended::BackPressured => {
+                crate::proxy::OFFER_BACK_PRESSURED
+            }
+            deepmsg_core::logbuffer::append::Appended::NotConnected => {
+                crate::proxy::OFFER_NOT_CONNECTED
+            }
+            deepmsg_core::logbuffer::append::Appended::MaxPositionExceeded
+            | deepmsg_core::logbuffer::append::Appended::MessageTooLarge
+            | deepmsg_core::logbuffer::append::Appended::Malformed => {
+                crate::proxy::OFFER_MAX_POSITION_EXCEEDED
+            }
+            deepmsg_core::logbuffer::append::Appended::EndOfLog
+            | deepmsg_core::logbuffer::append::Appended::MidRotation => {
+                crate::proxy::OFFER_ADMIN_ACTION
+            }
+        }
+    }
+}
+
+/// What the business reads its state out of (`onStart`'s snapshot image).
+///
+/// P3-2a always passes `None`; P3-2b fills the reader in.
+pub struct SnapshotReader<'a> {
+    image: &'a mut Image,
+}
+
+impl<'a> SnapshotReader<'a> {
+    /// A reader over a replay image.
+    pub const fn new(image: &'a mut Image) -> Self {
+        Self { image }
+    }
+
+    /// Where the reader is.
+    pub fn position(&self) -> i64 {
+        self.image.position()
+    }
+
+    /// Whether the replay has ended.
+    pub fn is_end_of_stream(&self) -> bool {
+        self.image.is_end_of_stream().unwrap_or(false)
+    }
+
+    /// Read up to `fragment_limit` fragments.
+    pub fn poll<F>(&mut self, fragment_limit: usize, handler: F) -> usize
+    where
+        F: FnMut(&deepmsg_client::image::Fragment<'_>),
+    {
+        self.image.poll(fragment_limit, handler)
+    }
+}
+
+/// `ClusteredService` (`ClusteredService.java:36-167`).
+///
+/// Every method has the reference's name and arguments, with two deliberate
+/// differences recorded in the plan: sessions arrive as [`SessionId`] rather
+/// than as objects (the container's table owns them), and a callback that fails
+/// returns an error instead of throwing.
+pub trait ClusteredService {
+    /// Called once, after recovery has read the snapshot (if any).
+    ///
+    /// # Errors
+    ///
+    /// Any error ends the container (`CSA:765-815`).
+    fn on_start(
+        &mut self,
+        cluster: &mut Cluster<'_>,
+        snapshot: Option<&mut SnapshotReader<'_>>,
+    ) -> Result<(), ContainerError>;
+
+    /// A session has opened (`:61-65`).
+    ///
+    /// # Errors
+    ///
+    /// Any error ends the container.
+    fn on_session_open(
+        &mut self,
+        cluster: &mut Cluster<'_>,
+        session: SessionId,
+        timestamp: i64,
+    ) -> Result<(), ContainerError>;
+
+    /// A session has closed (`:70-75`).
+    ///
+    /// # Errors
+    ///
+    /// Any error ends the container.
+    fn on_session_close(
+        &mut self,
+        cluster: &mut Cluster<'_>,
+        session: SessionId,
+        timestamp: i64,
+        reason: CloseReason,
+    ) -> Result<(), ContainerError>;
+
+    /// A message arrived. `session` is `None` for a service message — one the
+    /// service itself offered (`CSA:484-498`).
+    ///
+    /// # Errors
+    ///
+    /// Any error ends the container.
+    fn on_session_message(
+        &mut self,
+        cluster: &mut Cluster<'_>,
+        session: Option<SessionId>,
+        timestamp: i64,
+        payload: &[u8],
+        header: &LogHeader,
+    ) -> Result<(), ContainerError>;
+
+    /// A scheduled timer expired (`:96-99`).
+    ///
+    /// # Errors
+    ///
+    /// Any error ends the container.
+    fn on_timer_event(
+        &mut self,
+        cluster: &mut Cluster<'_>,
+        correlation_id: i64,
+        timestamp: i64,
+    ) -> Result<(), ContainerError>;
+
+    /// Take a snapshot (`:108-113`). P3-2b's container calls it; P3-2a's never
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// Any error ends the container.
+    fn on_take_snapshot(&mut self, writer: &mut SnapshotWriter<'_>) -> Result<(), ContainerError>;
+
+    /// The node's role changed (`:115-119`).
+    ///
+    /// # Errors
+    ///
+    /// Any error ends the container.
+    fn on_role_change(&mut self, new_role: Role) -> Result<(), ContainerError>;
+
+    /// The container is terminating (`:122-125`).
+    ///
+    /// # Errors
+    ///
+    /// The reference reports rather than rethrows here; the container does the
+    /// same and keeps going.
+    fn on_terminate(&mut self, cluster: &mut Cluster<'_>) -> Result<(), ContainerError>;
+
+    /// A new leadership term began (`:136-150`); the default does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Any error ends the container.
+    fn on_new_leadership_term_event(
+        &mut self,
+        _cluster: &mut Cluster<'_>,
+        _event: &NewLeadershipTermEvent,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    /// Short, constant-time work that must not touch the log (`:163-166`).
+    fn do_background_work(&mut self, _now_ns: i64) -> usize {
+        0
+    }
+}
