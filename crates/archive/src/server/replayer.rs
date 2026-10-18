@@ -24,13 +24,15 @@ use deepmsg_cnc::counters::CountersReader;
 use deepmsg_core::buffer::ReadWrite;
 
 use crate::mark::NULL_VALUE;
+use crate::server::create_replay_publication::{LimitCounter, read_limit_counter};
 use crate::server::replay_session::{Progress, Publication, ReplaySession, State};
 
 use crate::server::counters::{
     ARCHIVE_REPLAY_SESSION_COUNT_TYPE_ID, ARCHIVE_REPLAYER_MAX_READ_TIME_TYPE_ID,
     ARCHIVE_REPLAYER_TOTAL_READ_BYTES_TYPE_ID, ARCHIVE_REPLAYER_TOTAL_READ_TIME_TYPE_ID,
-    ArchiveIdCounter, CounterAllocator, CounterKind, REPLAY_SESSIONS_NAME,
-    REPLAYER_MAX_READ_TIME_NAME, REPLAYER_TOTAL_READ_BYTES_NAME, REPLAYER_TOTAL_READ_TIME_NAME,
+    ArchiveIdCounter, CounterAllocator, CounterKind, DEDICATED_MODE, DutyCycleActor,
+    DutyCycleCounters, REPLAY_SESSIONS_NAME, REPLAYER_MAX_READ_TIME_NAME,
+    REPLAYER_TOTAL_READ_BYTES_NAME, REPLAYER_TOTAL_READ_TIME_NAME,
 };
 
 /// One of the replayer's four counters.
@@ -249,15 +251,19 @@ impl Replayer {
 /// and [`LimitUpdate::Gone`] clamps what the replay may still send to where it
 /// has already got to — which is what takes it to `INACTIVE`.
 ///
-/// ★ **The conductor computes it and a session cannot** (P2-9a): the number is a
-/// recording's position, which lives either in the driver's counters or in the
-/// **conductor's own** `recordingSessionByIdMap`, and a replay's thread has
-/// neither. So it crosses — one per live replay per turn, and only when it
-/// moved.
+/// ★ **Which one it is depends on where the number lives.** A counter in the
+/// driver's region is read by the replayer itself ([`LimitUpdate::Follow`]),
+/// which is the reference's shape and saves a conductor turn on every message;
+/// a position the **conductor alone** can see — its own `recordingSessionByIdMap`
+/// for a recording whose session has not published a counter yet — still
+/// crosses as [`LimitUpdate::ExtendTo`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitUpdate {
     /// The counter, or the live recording, says this.
     ExtendTo(i64),
+    /// Read this counter in every turn, from here on: the reference's
+    /// `limitPosition` (`ReplaySession.java:374`, `:546-578`).
+    Follow(LimitCounter),
     /// There is nothing left to read: the counter was closed, or its slot has
     /// been taken by another counter.
     Gone,
@@ -279,6 +285,9 @@ pub struct RunningReplay {
     pub publication: Box<dyn Publication>,
     /// The replay itself.
     pub session: ReplaySession,
+    /// The counter this replay follows, once the conductor has named it. Read in
+    /// this thread's own turn rather than carried across from the conductor.
+    pub follow: Option<LimitCounter>,
 }
 
 /// What the conductor tells a replayer that is on a thread of its own.
@@ -415,6 +424,14 @@ pub struct ReplayerThread {
 /// by the time the session arrives here.
 pub struct ReplayerWorker {
     running: Replays,
+    /// The id its counters are keyed by, which is also what its duty-cycle pair
+    /// is labelled with.
+    archive_id: i64,
+    /// This thread's own 103/104, once the conductor's claim has reached the
+    /// region — see [`DutyCycleCounters::find`].
+    duty: Option<DutyCycleCounters>,
+    /// The threshold its 104 counts against (`Archive.java:1460-1468`).
+    cycle_threshold_ns: i64,
     cnc: deepmsg_cnc::CncFile,
     idle: deepmsg_driver::idle::Strategy,
     commands: std::sync::mpsc::Receiver<ReplayCommand>,
@@ -562,16 +579,26 @@ impl ReplayerThread {
     ///
     /// [`ReplayerWorker::new`]'s, when the counter region will not open.
     pub fn pair(
+        archive_id: i64,
         aeron_dir: &std::path::Path,
         idle: deepmsg_driver::idle::Strategy,
         timeout: std::time::Duration,
+        cycle_threshold_ns: i64,
     ) -> Result<(Self, ReplayerWorker), String> {
         let (commands, from_conductor) = std::sync::mpsc::channel();
         let (to_conductor, notices) = std::sync::mpsc::channel();
 
         Ok((
             Self { commands, notices },
-            ReplayerWorker::new(aeron_dir, idle, timeout, from_conductor, to_conductor)?,
+            ReplayerWorker::new(
+                archive_id,
+                aeron_dir,
+                idle,
+                timeout,
+                cycle_threshold_ns,
+                from_conductor,
+                to_conductor,
+            )?,
         ))
     }
 
@@ -595,9 +622,11 @@ impl ReplayerWorker {
     /// The message from [`deepmsg_cnc::CncFile::open_writable`] when the region
     /// will not open.
     pub fn new(
+        archive_id: i64,
         aeron_dir: &std::path::Path,
         idle: deepmsg_driver::idle::Strategy,
         timeout: std::time::Duration,
+        cycle_threshold_ns: i64,
         commands: std::sync::mpsc::Receiver<ReplayCommand>,
         notices: std::sync::mpsc::Sender<ReplayNotice>,
     ) -> Result<Self, String> {
@@ -606,6 +635,9 @@ impl ReplayerWorker {
 
         Ok(Self {
             running: Replays::new(),
+            archive_id,
+            duty: None,
+            cycle_threshold_ns,
             cnc,
             idle,
             commands,
@@ -620,6 +652,10 @@ impl ReplayerWorker {
     /// two.
     pub fn run(mut self) {
         loop {
+            // The cycle that just ended, before this turn does anything with it
+            // (`DedicatedModeArchiveConductor.java:346`).
+            self.measure_cycle();
+
             let mut work = 0;
 
             loop {
@@ -676,6 +712,40 @@ impl ReplayerWorker {
             self.idle.idle(work);
         }
     }
+
+    /// One turn of this thread's duty cycle, into the pair the conductor
+    /// allocated for the replayer (`Archive.java:1460-1468`).
+    fn measure_cycle(&mut self) {
+        let now_ns = deepmsg_core::clock::monotonic_nano_time();
+
+        if self.duty.is_none() {
+            let found = {
+                let Some(counters) = self.cnc.counters_writable() else {
+                    return;
+                };
+                DutyCycleCounters::find(
+                    &counters,
+                    DutyCycleActor::Replayer,
+                    DEDICATED_MODE,
+                    self.archive_id,
+                    self.cycle_threshold_ns,
+                )
+            };
+            if let Some(mut duty) = found {
+                // `onStart`'s baseline, not the conductor's claim time.
+                duty.update(now_ns);
+                self.duty = Some(duty);
+            }
+            return;
+        }
+
+        let Some(counters) = self.cnc.counters_writable() else {
+            return;
+        };
+        if let Some(duty) = self.duty.as_mut() {
+            duty.measure(&counters, now_ns);
+        }
+    }
 }
 
 /// One turn of one replay, and what the conductor has to hear about it.
@@ -689,6 +759,21 @@ fn drive_one(
     now_ns: u64,
     notices: &mut Vec<ReplayNotice>,
 ) {
+    // ★ The reference's `notExtended` (`ReplaySession.java:374`, `:546-578`),
+    // read **here**, in the turn that is about to read the recording, rather
+    // than in the conductor's turn and carried over. The counter is in the
+    // driver's region, which this thread has a mapping of; a turn between the
+    // recorder writing and the replay reading is a turn of latency on every
+    // message, and it showed as 2.6× on the cell's p50.
+    if let Some(limit) = replay.follow {
+        match read_limit_counter(counters, limit) {
+            Some(position) => replay.session.extend_stop_position(position),
+            // `notExtended`'s closed arm: the publisher is gone, so the limit
+            // freezes where the replay has got to and the reader reaches it.
+            None => replay.session.limit_counter_gone(),
+        }
+    }
+
     let progress = replay
         .session
         .do_work(replay.publication.as_mut(), counters, now_ns);
@@ -735,6 +820,7 @@ fn drive_one(
 fn apply_limit(replay: &mut RunningReplay, update: LimitUpdate) {
     match update {
         LimitUpdate::ExtendTo(position) => replay.session.extend_stop_position(position),
+        LimitUpdate::Follow(limit) => replay.follow = Some(limit),
         LimitUpdate::Gone => replay.session.limit_counter_gone(),
     }
 }

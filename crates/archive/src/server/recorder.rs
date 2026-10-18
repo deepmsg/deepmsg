@@ -44,7 +44,8 @@ use crate::recording_writer::WriteStats;
 use crate::server::counters::{
     ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID, ARCHIVE_RECORDER_TOTAL_WRITE_BYTES_TYPE_ID,
     ARCHIVE_RECORDER_TOTAL_WRITE_TIME_TYPE_ID, ArchiveIdCounter, CounterAllocator, CounterKind,
-    RECORDER_MAX_WRITE_TIME_NAME, RECORDER_TOTAL_WRITE_BYTES_NAME, RECORDER_TOTAL_WRITE_TIME_NAME,
+    DEDICATED_MODE, DutyCycleActor, DutyCycleCounters, RECORDER_MAX_WRITE_TIME_NAME,
+    RECORDER_TOTAL_WRITE_BYTES_NAME, RECORDER_TOTAL_WRITE_TIME_NAME,
 };
 use crate::server::recording_session::RecordingSession;
 
@@ -464,6 +465,7 @@ impl RecorderThread {
         aeron_dir: &std::path::Path,
         idle: deepmsg_driver::idle::Strategy,
         timeout: std::time::Duration,
+        cycle_threshold_ns: i64,
     ) -> Result<(Self, RecorderWorker), String> {
         let (commands, from_conductor) = std::sync::mpsc::channel();
         let (to_conductor, finished) = std::sync::mpsc::channel();
@@ -487,6 +489,7 @@ impl RecorderThread {
                 aeron_dir,
                 idle,
                 timeout,
+                cycle_threshold_ns,
                 from_conductor,
                 to_conductor,
                 failures,
@@ -555,6 +558,14 @@ impl RecorderThread {
 #[derive(Debug)]
 pub struct RecorderWorker {
     recorder: Recorder,
+    /// The id its counters are keyed by, which is also what its duty-cycle pair
+    /// is labelled with.
+    archive_id: i64,
+    /// This thread's own 103/104, once the conductor's claim has reached the
+    /// region — see [`DutyCycleCounters::find`].
+    duty: Option<DutyCycleCounters>,
+    /// The threshold its 104 counts against (`Archive.java:1441-1450`).
+    cycle_threshold_ns: i64,
     cnc: deepmsg_cnc::CncFile,
     idle: deepmsg_driver::idle::Strategy,
     /// What the conductor has told it, until the conductor is gone.
@@ -573,11 +584,13 @@ impl RecorderWorker {
     ///
     /// The message from [`deepmsg_cnc::CncFile::open_writable`] when the region
     /// will not open — the same reason the conductor cannot run without one.
+    #[allow(clippy::too_many_arguments)] // one per thing this thread owns: its id, its region, its policy, its three channels
     pub fn new(
         archive_id: i64,
         aeron_dir: &std::path::Path,
         idle: deepmsg_driver::idle::Strategy,
         timeout: std::time::Duration,
+        cycle_threshold_ns: i64,
         commands: std::sync::mpsc::Receiver<RecorderCommand>,
         finished: std::sync::mpsc::Sender<RecordingSession>,
         failures: std::sync::mpsc::Sender<EventsError>,
@@ -587,12 +600,49 @@ impl RecorderWorker {
 
         Ok(Self {
             recorder: Recorder::new(archive_id),
+            archive_id,
+            duty: None,
+            cycle_threshold_ns,
             cnc,
             idle,
             commands,
             finished,
             failures,
         })
+    }
+
+    /// One turn of this thread's duty cycle, into the pair the conductor
+    /// allocated for the recorder (`Archive.java:1441-1450`).
+    fn measure_cycle(&mut self) {
+        let now_ns = deepmsg_core::clock::monotonic_nano_time();
+
+        if self.duty.is_none() {
+            let found = {
+                let Some(counters) = self.cnc.counters_writable() else {
+                    return;
+                };
+                DutyCycleCounters::find(
+                    &counters,
+                    DutyCycleActor::Recorder,
+                    DEDICATED_MODE,
+                    self.archive_id,
+                    self.cycle_threshold_ns,
+                )
+            };
+            if let Some(mut duty) = found {
+                // `onStart`'s baseline, not the conductor's claim time.
+                duty.update(now_ns);
+                self.duty = Some(duty);
+            }
+            return;
+        }
+
+        let Some(counters) = self.cnc.counters_writable() else {
+            return;
+        };
+        if let Some(duty) = self.duty.as_mut() {
+            duty.measure(&counters, now_ns);
+        }
     }
 
     /// The recorder's own loop: what the conductor said, then a turn of every
@@ -616,6 +666,13 @@ impl RecorderWorker {
     /// is where that is written down.
     pub fn run(mut self) {
         loop {
+            // The cycle that just ended is measured before anything else is
+            // done with it (`DedicatedModeRecorder.doWork:191`). The region is
+            // the worker's own mapping, and the pair is found the first time it
+            // is there — the conductor's claim is a driver round trip, and this
+            // thread starts before it comes back.
+            self.measure_cycle();
+
             let mut work = 0;
 
             loop {

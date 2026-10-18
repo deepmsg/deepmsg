@@ -17,17 +17,60 @@ two differ by exactly that. `r-java` against `r-attach` is the driver's
 contribution, and `r-rust` against `j` differs by all three layers and is the
 product-level number rather than an attribution.
 
-## What is here so far
+All four arms run. `r-attach` and `r-java` need `patches/external-archive.patch`
+— an `ArchiveNode` that connects to an archive it does not own — which
+`patches/install.sh --apply` puts in and rebuilds the harness jar for:
+`--check` reads the switch out of both the source and the compiled class, so a
+patched source behind a stale jar is visible rather than silently used.
+
+## One machine or two
+
+The batch runs both shapes and **defaults to one machine**:
+
+```
+bench/archive-vs-java/run-batch.sh --quick                    # one machine, ~2 minutes
+bench/archive-vs-java/run-batch.sh                            # both arms, both rounds
+bench/archive-vs-java/run-batch.sh --two-host --peer gavin@host ...
+```
+
+On one machine the server half (driver + archive + node) and the client half
+(driver + rig) are separate processes joined by loopback. On two the client half
+moves to the peer, and `lib/lan.sh` proves a UDP datagram makes the round trip
+**in both directions** before the first cell.
+
+★ **Two machines is not the default because of what the wire here costs.** A cell
+was run both ways on 2026-10-17 with the same parameters: one machine sent
+125,000 of 125,000 messages at a 4.25 ms mean, the peer shape sent 56,165 (55%
+lost) at a 55.7 ms median with a 1.86 s mean. The link carried 2.4 Gb/s but its
+**round trip was milliseconds** — WSL2's virtual path — while the archive's own
+cost is microseconds. The full readings are in
+`analysis/bench/deepmsg-bench-plan-archive-vs-java.md` §6.5.
+
+## What is here
 
 | file | what it is |
 |---|---|
-| `read.py` | the readings: latency quantiles from the cells' histograms, the three ratios, the drift floor, and the archive's own counters and disk |
+| `run-batch.sh` | the batch: `--list`, `--quick`, `--out`, `--arms`, `--fsync`, `--two-host` |
+| `read.py` | the readings: latency quantiles from the cells' histograms, the three ratios, the drift floor, the archive's own counters and disk |
 | `self-check.sh` | builds a result tree whose every number is known and checks the table `read.py` prints from it |
 | `../lib/conf/archive.properties` | the archive settings a batch runs on, each with what this build does with it |
+| `patches/external-archive.patch` + `install.sh` | the reference's `ArchiveNode` with "connect to an archive somebody else runs" (`--check` / `--apply` / `--revert`) |
 
-The batch itself (`run-batch.sh`, the cells, the patches that let the reference's
-harness be pointed at an archive it does not own) is **not here yet** — it is the
-next slice, and `read.py`'s module note is the contract it has to satisfy.
+The scenarios the reference does not have (`S1`, `S3`, `S4`, `S5`) are the next
+slices.
+
+## The tree a batch writes
+
+```
+<out>/round-<name>/
+    <scenario>_<arm>_fsync=<0|2>_mtu=<M>_length=<L>_rate=<R>/
+        run-<N>/<*.hdr>  counters.txt  archive-du.txt  client.log
+```
+
+`counters.txt` is `<label>\t<value>` per line, with the ` - archiveId=` suffix
+every archive appends (`ArchiveCounters.ARCHIVE_ID_LABEL_SUFFIX`) normalised
+away: the labels are the reference's own, which is what makes a column read from
+the `j` arm and the same column from `r-attach` the same counter.
 
 ## Running the reader
 
@@ -36,11 +79,7 @@ bench/archive-vs-java/read.py <results-dir> [--stat e_lt_p99|p50|p40]
 bench/archive-vs-java/self-check.sh          # needs a HdrHistogram to read with
 ```
 
-`self-check.sh` wants the same thing `tools/quantiles.sh` does — the harness's
-jar, or `HdrHistogram` and `agrona` in the Gradle cache — and prints `SKIPPED`
-without it rather than failing.
-
-## The two rules a cell keeps
+## The rules a cell keeps
 
 They are the driver batches' rules, unchanged, and they are worth restating
 because a green table hides both:

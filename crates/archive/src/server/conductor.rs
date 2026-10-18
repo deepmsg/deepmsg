@@ -148,6 +148,7 @@ use crate::server::counters::{
 };
 use crate::server::create_replay_publication::{
     CreateReplayPublicationSession, LimitCounter, Progress as CreationProgress, Replay,
+    read_limit_counter,
 };
 use crate::server::delete_segments::{
     DeleteSegmentsSession, Progress as DeleteProgress, find_detached_segments, list_segment_files,
@@ -2177,16 +2178,6 @@ fn resolve_limit_counter<Access>(
 /// the reference answers **reuse**, which is to freeze: [`None`] here means the
 /// stop position stops moving, and it never moves backwards either, because
 /// [`ReplaySession::extend_stop_position`] only ever raises it.
-fn read_limit_counter<Access>(
-    counters: &CountersReader<'_, Access>,
-    limit: LimitCounter,
-) -> Option<i64> {
-    let descriptor = counters.get(limit.counter_id)?;
-
-    (descriptor.type_id == limit.type_id && descriptor.registration_id == limit.registration_id)
-        .then_some(descriptor.value)
-}
-
 /// Which counter bounds a replay (`ArchiveConductor.startReplay`, `:789-797`).
 ///
 /// The client's own request may name one (`BoundedReplayRequest`, template 18).
@@ -2449,10 +2440,13 @@ struct ReplayHandle {
     /// waited for, so this is a fact about the conversation and not something
     /// the session can be asked.
     started: bool,
-    /// The bounded limit counter, when the request named one, which is what
-    /// [`Sessions::drive_replay_sessions`] reads each turn in place of the live
-    /// recording's position.
+    /// The bounded limit counter, when the request named one, which the
+    /// **replayer** reads every turn in place of the live recording's position.
     limit: Option<LimitCounter>,
+    /// Whether it has been told to follow it. A counter is named once and then
+    /// read where it is written; a position only the conductor can see is sent
+    /// every turn instead.
+    following: bool,
     /// Where the recording began, which the live-position fallback needs and a
     /// session does not keep.
     start_position: i64,
@@ -4756,6 +4750,7 @@ impl Sessions {
                 registration_id,
                 recording_id: replay.recording_id,
                 limit: replay.limit,
+                following: false,
                 start_position: replay.start_position,
                 started: false,
                 replay_position: replay.replay_position,
@@ -4765,6 +4760,7 @@ impl Sessions {
                 recording_id: replay.recording_id,
                 publication: Box::new(publication),
                 session,
+                follow: None,
             },
         ))
     }
@@ -4797,13 +4793,16 @@ impl Sessions {
             .iter()
             .filter_map(|(replay_session_id, handle)| {
                 let update = match handle.limit {
-                    Some(limit) => match read_limit_counter(counters, limit) {
-                        Some(position) => LimitUpdate::ExtendTo(position),
-                        // Closed, or its slot taken by another counter — this
-                        // build reads both as absent, and the reference answers
-                        // both by freezing (see [`read_limit_counter`]).
-                        None => LimitUpdate::Gone,
-                    },
+                    // ★ Told **once**: from here the replayer reads the counter
+                    // in its own turn, as the reference's session does
+                    // (`ReplaySession.java:374`, `:546-578`). The conductor hop
+                    // this replaces was a turn of latency on every replayed
+                    // message — measured against the reference's archive as
+                    // 2.6× on p50 (analysis/bench, 2026-10-17).
+                    Some(limit) if !handle.following => LimitUpdate::Follow(limit),
+                    Some(_) => return None,
+                    // A position only the conductor can see still crosses: the
+                    // recording session has not published a counter yet.
                     None => LimitUpdate::ExtendTo(self.live_recording_position(
                         counters,
                         handle.recording_id,
@@ -4817,6 +4816,12 @@ impl Sessions {
 
         for (replay_session_id, update) in &limits {
             self.replayer_half.extend(*replay_session_id, *update);
+
+            if matches!(update, LimitUpdate::Follow(_)) {
+                if let Some(handle) = self.replay_sessions.get_mut(replay_session_id) {
+                    handle.following = true;
+                }
+            }
         }
 
         let notices = self.replayer_half.drive(counters, now_ns);

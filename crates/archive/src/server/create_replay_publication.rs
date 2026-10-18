@@ -29,6 +29,7 @@
 //! returns to, because this session has no conductor.
 
 use deepmsg_client::client::{AsyncAddPoll, DEFAULT_TIMEOUT};
+use deepmsg_cnc::counters::CountersReader;
 
 use crate::server::control_session::Publications;
 use crate::server::replay_session::GENERIC;
@@ -50,6 +51,36 @@ pub struct LimitCounter {
     pub type_id: i32,
     /// The registration that must still own it (`:544-578`).
     pub registration_id: i64,
+}
+
+/// Read the counter a replay is bounded by, if the slot is still that counter.
+///
+/// The type and the registration are checked as well as the value: the driver
+/// reuses ids, and a slot that has become somebody else's counter is not this
+/// one (`ReplaySession.notExtended`, `:544-578`, which asks
+/// `countersReader.getCounterRegistrationId`).
+///
+/// ★ It lives here rather than in the conductor because **the replayer reads it
+/// too**: the reference's session reads its `limitPosition` in its own turn, and
+/// a conductor that read it for the session put a turn's delay on every replayed
+/// message (see `LimitUpdate::Follow`).
+pub(crate) fn read_limit_counter<Access>(
+    counters: &CountersReader<'_, Access>,
+    limit: LimitCounter,
+) -> Option<i64> {
+    // ★ **Constant time, both halves.** `CountersReader::get` scans the whole
+    // catalogue and builds a `CounterDescriptor` — label and `String` — for every
+    // counter on the way; the doc says so in as many words ("a caller that asks
+    // this question in a loop is asking the wrong one"). This *is* asked in a
+    // loop now that the replayer reads its own limit, and the first probe showed
+    // what it cost: **14.6 µs per turn** between the recorder writing the
+    // position and the replayer noticing it, which was almost all of the gap
+    // this line was meant to close.
+    if !counters.is_active(limit.counter_id, limit.type_id, limit.registration_id) {
+        return None;
+    }
+
+    counters.value(limit.counter_id)
 }
 
 /// Everything one replay was asked for: `ArchiveConductor.startReplay`'s

@@ -1,0 +1,89 @@
+diff --git a/benchmarks-aeron/src/main/java/io/aeron/benchmarks/aeron/ArchiveNode.java b/benchmarks-aeron/src/main/java/io/aeron/benchmarks/aeron/ArchiveNode.java
+index 7817e68..7496dfd 100644
+--- a/benchmarks-aeron/src/main/java/io/aeron/benchmarks/aeron/ArchiveNode.java
++++ b/benchmarks-aeron/src/main/java/io/aeron/benchmarks/aeron/ArchiveNode.java
+@@ -23,6 +23,7 @@ import io.aeron.benchmarks.Configuration;
+ import org.agrona.concurrent.ShutdownSignalBarrier;
+ import org.agrona.concurrent.SystemNanoClock;
+ 
++import java.io.File;
+ import java.nio.file.Path;
+ import java.util.Properties;
+ import java.util.concurrent.atomic.AtomicBoolean;
+@@ -51,6 +52,18 @@ import static org.agrona.PropertyAction.REPLACE;
+  */
+ public final class ArchiveNode implements AutoCloseable, Runnable
+ {
++    /**
++     * When true this node connects to an archive somebody else runs instead of launching one of
++     * its own; the archive is reached through {@code aeron.archive.control.channel} exactly as a
++     * client reaches it. The measurement side -- the forwarding and the answer that is the
++     * archive's replay rather than the node's -- is untouched, which is the point: a cell may
++     * swap the archive and nothing else.
++     */
++    public static final String ARCHIVE_EXTERNAL_PROP_NAME = "io.aeron.benchmarks.aeron.archive.external";
++
++    /** Where an external archive keeps its recordings, for the error dump at the end. */
++    private static final String ARCHIVE_DIR_PROP_NAME = "aeron.archive.dir";
++
+     private final AtomicBoolean running;
+     private final ArchivingMediaDriver archivingMediaDriver;
+     private final AeronArchive aeronArchive;
+@@ -60,7 +73,12 @@ public final class ArchiveNode implements AutoCloseable, Runnable
+ 
+     ArchiveNode(final AtomicBoolean running)
+     {
+-        this(running, launchArchivingMediaDriver(), connect(), true);
++        this(running, externalArchive() ? null : launchArchivingMediaDriver(), connect(), true);
++    }
++
++    private static boolean externalArchive()
++    {
++        return Boolean.getBoolean(ARCHIVE_EXTERNAL_PROP_NAME);
+     }
+ 
+     ArchiveNode(
+@@ -105,7 +123,14 @@ public final class ArchiveNode implements AutoCloseable, Runnable
+ 
+         if (ownsArchiveClient)
+         {
+-            closeAll(aeronArchive, archivingMediaDriver);
++            if (null == archivingMediaDriver)
++            {
++                closeAll(aeronArchive);
++            }
++            else
++            {
++                closeAll(aeronArchive, archivingMediaDriver);
++            }
+         }
+     }
+ 
+@@ -124,16 +149,22 @@ public final class ArchiveNode implements AutoCloseable, Runnable
+             server.run();
+ 
+             final String prefix = "archive-node-";
+-            AeronUtil.dumpArchiveErrors(
+-                server.archivingMediaDriver.archive.context().archiveDir(),
+-                outputDir.resolve(prefix + "archive-errors.txt"));
++            // The same three dumps whichever archive this node talked to, taken from the driver it
++            // is a client of rather than from an `ArchivingMediaDriver` this process may not own.
++            final String aeronDirectoryName = server.aeronArchive.context().aeron()
++                .context().aeronDirectoryName();
++            final File archiveDir = null == server.archivingMediaDriver
++                ? new File(System.getProperty(ARCHIVE_DIR_PROP_NAME, aeronDirectoryName))
++                : server.archivingMediaDriver.archive.context().archiveDir();
++
++            AeronUtil.dumpArchiveErrors(archiveDir, outputDir.resolve(prefix + "archive-errors.txt"));
+             AeronUtil.dumpAeronStats(
+-                server.archivingMediaDriver.archive.context().aeron().context().cncFile(),
++                server.aeronArchive.context().aeron().context().cncFile(),
+                 outputDir.resolve(prefix + "aeron-stat.txt"),
+                 outputDir.resolve(prefix + "errors.txt")
+             );
+             AeronUtil.dumpLossStat(
+-                server.archivingMediaDriver.archive.context().aeronDirectoryName(),
++                aeronDirectoryName,
+                 outputDir.resolve(prefix + "loss-stat.txt")
+             );
+         }

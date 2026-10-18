@@ -63,6 +63,13 @@ bench_fingerprint() {
         _digest "$BENCH_DRIVER" "driver"
         _digest "$BENCH_RIG" "rig"
         _digest "$BENCH_NODE" "node"
+        # The archive batch's own programs. Written here for every batch so a
+        # fingerprint keeps one shape; an arm that did not use them reads
+        # `(missing)` and that is the truth about that batch.
+        _digest "$BENCH_ARCHIVE" "archive"
+        _digest "$BENCH_ARCHIVE_DRIVER" "archiving-drv"
+        _digest "$BENCH_ARCHIVE_NODE" "archive-node"
+        _digest "$BENCH_CNC_DUMP" "cnc-dump"
         echo "driver profile  $(awk '/^\[profile\.release\]$/{f=1;next} /^\[/{f=0} f && /^(lto|codegen-units|panic)/{gsub(/ /,"");printf "%s ",$0}' "$DEEPMSG_DIR/Cargo.toml" | sed 's/ $//')"
         echo "rig build       CARGO_TARGET_DIR=target/rig CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_PANIC=abort RUSTFLAGS=-C target-cpu=${RIG_TARGET_CPU:-skylake} cargo build --release -p deepmsg-bench --bin loadtest-rig --bin echo-node"
 

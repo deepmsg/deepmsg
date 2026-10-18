@@ -278,6 +278,7 @@ impl DutyCycleActor {
 }
 
 /// One actor's pair of duty-cycle counters (`DutyCycleStallTracker`).
+#[derive(Debug, Clone, Copy)]
 pub struct DutyCycleCounters {
     max_cycle_time_id: i32,
     threshold_exceeded_id: i32,
@@ -474,7 +475,56 @@ impl DutyCycleCounters {
         self.threshold_ns
     }
 
-    fn measure(&mut self, counters: &CountersReader<'_, ReadWrite>, now_ns: i64) {
+    /// Set the baseline the next cycle is measured from, without measuring —
+    /// the reference's `onStart` (`DedicatedModeArchiveConductor.java:176`,
+    /// `:333`). A worker's first turn has to do this: the pair it found was not
+    /// the one the conductor claimed at its own clock, and measuring from that
+    /// would make the first cycle the whole uptime of the archive.
+    pub(crate) fn update(&mut self, now_ns: i64) {
+        self.last_update_ns = now_ns;
+    }
+
+    /// Find this actor's pair in a counters region, by the labels it was
+    /// allocated under.
+    ///
+    /// The recorder and the replayer cannot be handed their ids at construction:
+    /// the ids are the driver's answers to `ADD_COUNTER` commands, which come
+    /// back on a conductor turn — after the worker's thread exists. What the
+    /// worker can do is what the reference's own agents do with their
+    /// `CountersReader`: look, and keep the answer once it is there.
+    ///
+    /// ★ The labels are matched **exactly**, and both halves must be present:
+    /// a pair with one label is a pair whose 103 and 104 would answer different
+    /// questions, and `None` is the honest answer to that.
+    pub(crate) fn find<Access>(
+        counters: &CountersReader<'_, Access>,
+        actor: DutyCycleActor,
+        mode: &str,
+        archive_id: i64,
+        threshold_ns: i64,
+    ) -> Option<Self> {
+        let wanted_max = max_cycle_time_label(actor, mode, archive_id);
+        let wanted_exceeded = threshold_exceeded_label(actor, mode, threshold_ns, archive_id);
+        let mut max_cycle_time_id = None;
+        let mut threshold_exceeded_id = None;
+
+        counters.for_each(|counter| {
+            if counter.label == wanted_max {
+                max_cycle_time_id = Some(counter.counter_id);
+            } else if counter.label == wanted_exceeded {
+                threshold_exceeded_id = Some(counter.counter_id);
+            }
+        });
+
+        Some(Self {
+            max_cycle_time_id: max_cycle_time_id?,
+            threshold_exceeded_id: threshold_exceeded_id?,
+            threshold_ns,
+            last_update_ns: 0,
+        })
+    }
+
+    pub(crate) fn measure(&mut self, counters: &CountersReader<'_, ReadWrite>, now_ns: i64) {
         let duration_ns = now_ns.saturating_sub(self.last_update_ns);
         self.last_update_ns = now_ns;
 
@@ -496,6 +546,11 @@ impl DutyCycleCounters {
         }
     }
 }
+
+/// The mode a dedicated worker's pair is labelled with
+/// (`Archive.java:1407`, where `MODE` is `DEDICATED` for the two agents on
+/// threads of their own).
+pub const DEDICATED_MODE: &str = "DEDICATED";
 
 /// `"archive-{actor} max cycle time in ns: {MODE}"` (`Archive.java:1407`).
 fn max_cycle_time_label(actor: DutyCycleActor, mode: &str, archive_id: i64) -> String {
@@ -1562,6 +1617,92 @@ mod tests {
         cycles.measure(DutyCycleActor::Conductor, &counters, 3_100);
         assert_eq!(Some(1_500), counters.value(103));
         assert_eq!(Some(1), counters.value(104));
+    }
+
+    /// A metadata region holding `(id, type id, label)` counters, all allocated.
+    fn metadata_with_labels(counters: &[(i32, i32, String)]) -> Region {
+        let slots = counters
+            .iter()
+            .map(|(id, _, _)| *id as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut region = Region::zeroed(slots * layout::COUNTER_METADATA_LENGTH);
+
+        for (id, type_id, label) in counters {
+            let base = *id as usize * layout::COUNTER_METADATA_LENGTH;
+            let bytes = label.as_bytes();
+
+            region.0
+                [base + layout::COUNTER_TYPE_ID_OFFSET..base + layout::COUNTER_TYPE_ID_OFFSET + 4]
+                .copy_from_slice(&type_id.to_le_bytes());
+            region.0[base + layout::COUNTER_LABEL_LENGTH_OFFSET
+                ..base + layout::COUNTER_LABEL_LENGTH_OFFSET + 4]
+                .copy_from_slice(&(bytes.len() as i32).to_le_bytes());
+            region.0[base + layout::COUNTER_LABEL_OFFSET
+                ..base + layout::COUNTER_LABEL_OFFSET + bytes.len()]
+                .copy_from_slice(bytes);
+            region.0[base + layout::COUNTER_STATE_OFFSET..base + layout::COUNTER_STATE_OFFSET + 4]
+                .copy_from_slice(&layout::COUNTER_STATE_ALLOCATED.to_le_bytes());
+        }
+
+        region
+    }
+
+    /// The recorder and the replayer find their own pair by the labels the
+    /// conductor allocated it under — they start before the driver has answered
+    /// the `ADD_COUNTER`, so the ids cannot be handed to them at construction.
+    ///
+    /// ★ What the negative halves pin: **another archive's** pair is not this
+    /// archive's, and **another actor's** is not this actor's. A finder that
+    /// matched on the type id alone would take the conductor's 103 and count the
+    /// recorder's cycles into it.
+    #[test]
+    fn a_worker_finds_its_duty_cycle_pair_by_label() {
+        let max = max_cycle_time_label(DutyCycleActor::Recorder, DEDICATED_MODE, 42);
+        let exceeded =
+            threshold_exceeded_label(DutyCycleActor::Recorder, DEDICATED_MODE, 1_000, 42);
+        let mut meta = metadata_with_labels(&[
+            (0, ARCHIVE_MAX_CYCLE_TIME_TYPE_ID, max),
+            (1, ARCHIVE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID, exceeded),
+        ]);
+        let mut vals = values(2);
+        let counters = CountersReader::new(meta.buffer_mut(), vals.buffer_mut());
+
+        let found = DutyCycleCounters::find(
+            &counters,
+            DutyCycleActor::Recorder,
+            DEDICATED_MODE,
+            42,
+            1_000,
+        )
+        .expect("the pair is there");
+        assert_eq!(0, found.max_cycle_time_id());
+        assert_eq!(1, found.threshold_exceeded_id());
+        assert_eq!(1_000, found.threshold_ns());
+
+        // Another archive's labels are another archive's pair.
+        assert!(
+            DutyCycleCounters::find(
+                &counters,
+                DutyCycleActor::Recorder,
+                DEDICATED_MODE,
+                7,
+                1_000
+            )
+            .is_none()
+        );
+
+        // And the conductor's pair is not the recorder's.
+        assert!(
+            DutyCycleCounters::find(
+                &counters,
+                DutyCycleActor::Conductor,
+                DEDICATED_MODE,
+                42,
+                1_000
+            )
+            .is_none()
+        );
     }
 
     /// The reference throws here rather than start an archive whose session

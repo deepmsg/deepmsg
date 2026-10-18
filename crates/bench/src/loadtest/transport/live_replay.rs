@@ -31,9 +31,7 @@
 
 use std::time::Instant;
 
-use deepmsg_archive::client::archive::{
-    Archive as ArchiveClient, Handlers, channel_with_session_id,
-};
+use deepmsg_archive::client::archive::{Archive as ArchiveClient, Handlers};
 use deepmsg_archive::client::proxy::ReplayParams;
 use deepmsg_archive::client::{ArchiveContext, NoCredentials};
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
@@ -231,9 +229,18 @@ impl<C: Clock> MessageTransceiver<C> for LiveReplayTransceiver {
         // node starts before the client for this reason and no other.
         self.last_recording_id = self.await_last_recording_id()?;
 
-        let replay_session_id = self
+        // ★ Start the replay **and subscribe to it in one step**, because the
+        // session id that subscription has to name is the replay's low 32 bits
+        // — `(replayId << 32) | replayPublication.sessionId()` — and truncating
+        // it is the whole of what makes this a subscription to *this* replay
+        // (`ArchiveConductor.java:956`, `AeronArchive.java:890-891`). Doing it
+        // in two steps here is how this went wrong once: `i32::try_from` on an
+        // id that is by construction out of range yielded `i32::MAX`, the
+        // subscription named a session nobody had, and the run died on
+        // "Failed to connect within timeout" against **both** archives.
+        self.subscription = self
             .archive
-            .start_replay(
+            .replay(
                 &mut self.client,
                 self.last_recording_id,
                 &source_channel,
@@ -247,23 +254,7 @@ impl<C: Clock> MessageTransceiver<C> for LiveReplayTransceiver {
                 },
             )
             .map_err(|error| TransceiverError::Failed {
-                action: "start the replay",
-                message: error.to_string(),
-            })?;
-
-        let session_id = i32::try_from(replay_session_id).unwrap_or(i32::MAX);
-        let channel = channel_with_session_id(&source_channel, session_id).map_err(|error| {
-            TransceiverError::Failed {
-                action: "name the replay in its channel",
-                message: error.to_string(),
-            }
-        })?;
-
-        self.subscription = self
-            .client
-            .add_subscription(&channel, source_stream, DEFAULT_TIMEOUT)
-            .map_err(|error| TransceiverError::Failed {
-                action: "add the subscription",
+                action: "start the replay and subscribe to it",
                 message: error.to_string(),
             })?;
 

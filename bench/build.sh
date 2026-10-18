@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 #
-# The three binaries a batch measures: the driver, the rig that drives it, and
-# the node that answers.
+# The binaries a batch measures: the driver, the rig that drives it, and the
+# nodes that answer — `echo-node` for the echo batches, `archive-node` for the
+# archive one. Plus the archive's own two programs, which `archive-vs-java` runs
+# in a process of their own (`deepmsg-archive` attaches to a driver somebody
+# else runs; `deepmsg-archiving-media-driver` carries its own).
 #
 # Why the rig and the node are not just `cargo build --release`:
 #
@@ -33,27 +36,35 @@ cpu=${BENCH_TARGET_CPU:-skylake}
 
 cd "$repo"
 
-echo "== the driver (the workspace's release profile) =="
-cargo build --release -p deepmsg-driver
+echo "== the driver and the archive (the workspace's release profile) =="
+cargo build --release -p deepmsg-driver -p deepmsg-archive --bins
 
 echo
-echo "== the rig and the node =="
+echo "== the counters reader (the archive batch explains a cell with it) =="
+cargo build --release -p deepmsg-tools --bin cnc-dump
+
+echo
+echo "== the rig and the two nodes =="
 echo "CARGO_TARGET_DIR=target/rig \\"
 echo "CARGO_PROFILE_RELEASE_LTO=fat \\"
 echo "CARGO_PROFILE_RELEASE_PANIC=abort \\"
 echo "RUSTFLAGS=-C target-cpu=$cpu \\"
-echo "cargo build --release -p deepmsg-bench --bin loadtest-rig --bin echo-node"
+echo "cargo build --release -p deepmsg-bench --bin loadtest-rig --bin echo-node --bin archive-node"
 echo
 
 CARGO_TARGET_DIR=target/rig \
     CARGO_PROFILE_RELEASE_LTO=fat \
     CARGO_PROFILE_RELEASE_PANIC=abort \
     RUSTFLAGS="-C target-cpu=$cpu" \
-    cargo build --release -p deepmsg-bench --bin loadtest-rig --bin echo-node
+    cargo build --release -p deepmsg-bench --bin loadtest-rig --bin echo-node --bin archive-node
 
 echo
 echo "== what a batch will use =="
-ls -l target/release/deepmsg-driver target/rig/release/loadtest-rig target/rig/release/echo-node
+ls -l target/release/deepmsg-driver target/release/deepmsg-archive \
+    target/release/deepmsg-archiving-media-driver target/release/cnc-dump \
+    target/rig/release/loadtest-rig target/rig/release/echo-node target/rig/release/archive-node
 echo
 echo "== digests (these are what the fingerprint records) =="
-sha256sum target/release/deepmsg-driver target/rig/release/loadtest-rig target/rig/release/echo-node
+sha256sum target/release/deepmsg-driver target/release/deepmsg-archive \
+    target/release/deepmsg-archiving-media-driver target/release/cnc-dump \
+    target/rig/release/loadtest-rig target/rig/release/echo-node target/rig/release/archive-node

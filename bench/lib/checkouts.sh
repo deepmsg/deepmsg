@@ -36,9 +36,12 @@
 #                     reads it.
 #   BENCH_OUT_DIR     where results land (default: <repo>/bench/out)
 #
-# `BENCH_DRIVER` is the built release driver, and the rig and node are the ones
-# `bench/build.sh` produces — see `bench/README.md` for why they are built
-# apart from the workspace's own profile.
+# `BENCH_DRIVER` is the built release driver, and the rig and the nodes are the
+# ones `bench/build.sh` produces — see `bench/README.md` for why they are built
+# apart from the workspace's own profile. `BENCH_ARCHIVE`,
+# `BENCH_ARCHIVE_DRIVER` and `BENCH_ARCHIVE_NODE` are the archive batch's three
+# programs; they are separate names because that batch, alone among these, can
+# put them on two machines.
 
 if [ -z "${BASH_VERSION:-}" ]; then
     echo "checkouts.sh needs bash" >&2
@@ -67,6 +70,22 @@ BENCHMARKS_SCRIPTS_DIR="$BENCHMARKS_DIR/scripts/aeron"
 BENCH_DRIVER="${BENCH_DRIVER:-$DEEPMSG_DIR/target/release/deepmsg-driver}"
 BENCH_RIG="${BENCH_RIG:-$DEEPMSG_DIR/target/rig/release/loadtest-rig}"
 BENCH_NODE="${BENCH_NODE:-$DEEPMSG_DIR/target/rig/release/echo-node}"
+
+# The archive batch's three programs. The two archives differ in who owns the
+# driver: `deepmsg-archive` is the reference's `Archive.main` — an archive that
+# attaches to a driver somebody else runs, which is what the `r-attach` arm is —
+# and `deepmsg-archiving-media-driver` carries its own, for the arms where this
+# build owns both halves. `archive-node` is the far end of a live-replay cell:
+# it forwards into a recording and answers nothing.
+BENCH_ARCHIVE="${BENCH_ARCHIVE:-$DEEPMSG_DIR/target/release/deepmsg-archive}"
+BENCH_ARCHIVE_DRIVER="${BENCH_ARCHIVE_DRIVER:-$DEEPMSG_DIR/target/release/deepmsg-archiving-media-driver}"
+BENCH_ARCHIVE_NODE="${BENCH_ARCHIVE_NODE:-$DEEPMSG_DIR/target/rig/release/archive-node}"
+
+# The counters a cell is explained with are read straight out of the driver's CnC
+# file, because both archives allocate the same type ids under the same labels —
+# so one reader serves both arms, and a cell whose archive was the reference's is
+# read with this build's tool rather than with a different one from each side.
+BENCH_CNC_DUMP="${BENCH_CNC_DUMP:-$DEEPMSG_DIR/target/release/cnc-dump}"
 
 BENCH_AERON_DIR="${BENCH_AERON_DIR:-/dev/shm/aeron}"
 
