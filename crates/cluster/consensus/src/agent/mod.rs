@@ -76,7 +76,7 @@ use crate::consensus::{ConsensusMessage, decode_consensus_message};
 use crate::control::cluster_control::ToggleState as ClusterControlToggle;
 use crate::control::node_control::ToggleState as NodeControlToggle;
 use crate::control::termination::ClusterTermination;
-use crate::election::{Election, ElectionHost, ElectionState};
+use crate::election::{APPEND_POSITION_FLAG_CATCHUP, Election, ElectionHost, ElectionState};
 use crate::error::ClusterError;
 use crate::handles::{LogReplay, RecordingReplication};
 use crate::log::{AgentLogReplay, LogReplayHandler};
@@ -1555,6 +1555,24 @@ impl ConsensusModuleAgent {
         );
 
         if channel.media() == "udp" {
+            // `addLogPublication` (`:1650-1656`): under a manual MDC log the
+            // publication says so itself, and — unless the configuration turns
+            // it off — binds the control endpoint at this member's own log
+            // address with a wildcard port. The reference puts these on the
+            // publication regardless of what the configured channel says.
+            if self.log_is_mdc() {
+                channel.put("control-mode", "manual");
+                if self.config.log_control_enabled {
+                    if let Some(control) = self
+                        .member_log_endpoint(self.config.member_id)
+                        .as_deref()
+                        .and_then(replace_port_with_wildcard)
+                    {
+                        channel.put("control", control);
+                    }
+                }
+            }
+
             channel.put("ssc", (self.members.len() == 1).to_string());
         }
 
@@ -2715,8 +2733,16 @@ impl ElectionHost for ConsensusModuleAgent {
             self.start_log_recording(&channel, stream_id, false)?;
         }
 
+        // The image is kept **before** the append position is looked for: the
+        // client hands the image over once (`take_image` removes it from the
+        // subscription), and the archive's recording counter appears a cycle or
+        // two after the recording starts — so a failed attempt that dropped the
+        // image would leave `followerLogAwait` waiting for an image it already
+        // had. The reference keeps the same `Image` object in the subscription
+        // for the life of the term; this is that object held here.
+        self.taken_log_image = Some(image);
+
         if self.try_create_append_position(session_id)? {
-            self.taken_log_image = Some(image);
             self.last_append_position = join_position;
             self.time_of_last_append_position_send_ns = now_ns;
 
@@ -2847,15 +2873,37 @@ impl ElectionHost for ConsensusModuleAgent {
 
     fn track_catchup_completion(
         &mut self,
-        _member_id: i32,
+        member_id: i32,
         _leadership_term_id: i64,
-        _append_position_flags: i16,
+        append_position_flags: i16,
     ) -> Result<(), ClusterError> {
-        Err(ClusterError::Cluster("catchup is P3-6b".to_owned()))
+        // `trackCatchupCompletion` (`ConsensusModuleAgent.java:1946-1949`) is a
+        // no-op unless this follower has a replay in progress or its append
+        // position carries the catchup flag — every ordinary heartbeat goes
+        // through here, so an unconditional refusal would fail the steady
+        // state. Starting and stopping the replay is P3-6b.
+        let has_catchup_session = self
+            .members
+            .iter()
+            .any(|member| member.id == member_id && member.catchup_replay_session_id != NULL_VALUE);
+        let is_catchup = 0 != (APPEND_POSITION_FLAG_CATCHUP & append_position_flags);
+
+        if has_catchup_session || is_catchup {
+            return Err(ClusterError::Cluster("catchup is P3-6b".to_owned()));
+        }
+
+        Ok(())
     }
 
     fn stop_all_catchups(&mut self) -> Result<(), ClusterError> {
-        Err(ClusterError::Cluster("catchup is P3-6b".to_owned()))
+        // `stopAllCatchups` (`ConsensusModuleAgent.java:1900-1912`): stop the
+        // replay for every member that has one. Nothing starts one until
+        // P3-6b, so the list is empty; the members' fields are cleared so a
+        // later slice starts from the reference's state.
+        for member in &mut self.members {
+            member.catchup_replay_session_id = NULL_VALUE;
+        }
+        Ok(())
     }
 
     fn live_log_destination(&self) -> &str {
@@ -2880,6 +2928,18 @@ impl ElectionHost for ConsensusModuleAgent {
         Err(ClusterError::Cluster(
             "waiting for local sockets to close is P3-6b".to_owned(),
         ))
+    }
+
+    fn set_leader_member_id(&mut self, leader_member_id: i32) {
+        // `updateMemberDetails(election.leader())` (`:1930`, `:2370-2381`).
+        ClusterMember::set_is_leader(&mut self.members, leader_member_id);
+    }
+
+    fn set_leadership_term_id(&mut self, leadership_term_id: i64) {
+        // `electionComplete`'s first line (`ConsensusModuleAgent.java:1907`).
+        // For a leader `join_log_as_leader` has already set it; for a follower
+        // this is the only place the steady state ever learns its term.
+        self.leadership_term_id = leadership_term_id;
     }
 
     fn election_complete(&mut self, now_ns: i64) -> Result<(), ClusterError> {
@@ -3097,19 +3157,25 @@ impl ElectionHost for ConsensusModuleAgent {
         member::is_quorum_leader(&self.members, candidate_term_id)
     }
 
-    fn member_has_publication(&self, _member_id: i32) -> bool {
-        // One member has nobody to publish to; per-member publications are
-        // P3-6a's.
-        false
+    fn member_has_publication(&self, member_id: i32) -> bool {
+        self.publisher.has_publication(member_id)
     }
 
-    fn try_add_member_publication(&mut self, _member_id: i32) -> Result<(), ClusterError> {
-        // Per-member consensus publications are P3-6a's; a one-member cluster
-        // has nobody to send to, so it succeeds vacuously.
-        if self.members.len() > 1 {
-            return Err(ClusterError::Cluster(
-                "member consensus publications are P3-6a".to_owned(),
-            ));
+    fn try_add_member_publication(&mut self, member_id: i32) -> Result<(), ClusterError> {
+        // `ClusterMember.tryAddPublication` (`:777-800`): a registration that
+        // fails is the reference's **counted** error, not a fatal one — the
+        // next canvass round tries again. The `Result` is the frozen seam's,
+        // and it is always `Ok`.
+        match self.consensus_channel_for(member_id) {
+            Ok(channel) => {
+                if self
+                    .ensure_consensus_publication(member_id, &channel)
+                    .is_err()
+                {
+                    self.report_counted_error();
+                }
+            }
+            Err(_) => self.report_counted_error(),
         }
         Ok(())
     }
@@ -3135,10 +3201,14 @@ impl ElectionHost for ConsensusModuleAgent {
     }
 
     fn log_is_mdc(&self) -> bool {
+        // `ConsensusModule.Context.isLogMdc` (`:2145`): a UDP log is manual
+        // multi-destination control unless the channel names one endpoint.
+        // This is the configured channel's shape, not a property the caller
+        // writes: `add_log_publication` puts `control-mode=manual` on the
+        // publication itself, the way `addLogPublication` does (`:1650-1653`).
         ChannelUri::parse(&self.config.log_channel)
             .ok()
-            .and_then(|uri| uri.get("control-mode").map(str::to_owned))
-            .is_some_and(|mode| mode == "manual")
+            .is_some_and(|uri| uri.media() == "udp" && uri.get("endpoint").is_none())
     }
 
     fn member_log_endpoint(&self, member_id: i32) -> Option<String> {
@@ -3256,6 +3326,13 @@ impl ElectionHost for ConsensusModuleAgent {
 /// Whether a channel's media is UDP (`ChannelUri.isUdp()`).
 fn channel_uri_media_is_udp(channel: &str) -> bool {
     ChannelUri::parse(channel).is_ok_and(|uri| uri.media() == "udp")
+}
+
+/// `ChannelUri.replacePortWithWildcard` (`ChannelUri.java:664-678`): the
+/// endpoint with its port replaced by `0`, or `None` when it names no port.
+fn replace_port_with_wildcard(endpoint: &str) -> Option<String> {
+    let index = endpoint.rfind(':')?;
+    Some(format!("{}0", &endpoint[..=index]))
 }
 
 fn storage_space_refusal(error: &ClusterError) -> bool {

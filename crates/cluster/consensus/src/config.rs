@@ -52,6 +52,10 @@ pub const CONSENSUS_CHANNEL_DEFAULT: &str = "aeron:udp";
 pub const LOG_CHANNEL_PROP_NAME: &str = "aeron.cluster.log.channel";
 /// `LOG_CHANNEL_DEFAULT` (`ConsensusModule.java:533`).
 pub const LOG_CHANNEL_DEFAULT: &str = "aeron:udp?term-length=64m";
+/// `aeron.cluster.log.control.enable` (`ConsensusModule.java:1026-1027`).
+pub const LOG_CONTROL_ENABLE_PROP_NAME: &str = "aeron.cluster.log.control.enable";
+/// `CONSENSUS_MODULE_ENABLE_CONTROL_ON_LOG_CHANNEL_DEFAULT` (`ConsensusModule.java:1569`).
+pub const LOG_CONTROL_ENABLE_DEFAULT: bool = true;
 /// `aeron.cluster.egress.channel` (`AeronCluster.java:1302`).
 pub const EGRESS_CHANNEL_PROP_NAME: &str = "aeron.cluster.egress.channel";
 /// `aeron.cluster.snapshot.channel` (`ClusteredServiceContainer.java:319`).
@@ -286,6 +290,9 @@ pub struct ConsensusModuleConfig {
     pub consensus_channel: String,
     /// Log channel (`aeron.cluster.log.channel`).
     pub log_channel: String,
+    /// Whether a manual-MDC log publication also binds the control endpoint
+    /// (`aeron.cluster.log.control.enable`, default true).
+    pub log_control_enabled: bool,
     /// Egress channel template, or `None`.
     pub egress_channel: Option<String>,
     /// The IPC control channel both agents share (`aeron.cluster.control.channel`).
@@ -493,6 +500,7 @@ impl ConsensusModuleConfig {
                 .get(LOG_CHANNEL_PROP_NAME)
                 .unwrap_or(LOG_CHANNEL_DEFAULT)
                 .to_owned(),
+            log_control_enabled: boolean(LOG_CONTROL_ENABLE_PROP_NAME, LOG_CONTROL_ENABLE_DEFAULT),
             egress_channel: properties.get(EGRESS_CHANNEL_PROP_NAME).map(str::to_owned),
             control_channel: properties
                 .get(CONTROL_CHANNEL_PROP_NAME)

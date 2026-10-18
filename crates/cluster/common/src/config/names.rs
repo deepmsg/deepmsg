@@ -140,7 +140,7 @@ pub const NAMES: &[(&str, Disposition)] = &[
         Disposition::Honoured,
     ),
     ("aeron.cluster.log.channel", Disposition::Honoured),
-    ("aeron.cluster.log.control.enable", Disposition::Pending),
+    ("aeron.cluster.log.control.enable", Disposition::Honoured),
     ("aeron.cluster.log.fragment.limit", Disposition::Honoured),
     ("aeron.cluster.log.stream.id", Disposition::Honoured),
     ("aeron.cluster.mark.file.dir", Disposition::Honoured),

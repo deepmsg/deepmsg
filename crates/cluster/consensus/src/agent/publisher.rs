@@ -51,6 +51,13 @@ pub const PROTOCOL_SEMANTIC_VERSION: i32 = 17;
 /// `ConsensusPublisher.SEND_ATTEMPTS` (`:29`).
 const SEND_ATTEMPTS: usize = 3;
 
+/// Room the shared encode buffer is given before a message is written into it.
+/// The reference wraps an `ExpandableArrayBuffer` that grows; this one is
+/// fixed because a steady-state send may not allocate (performance spec R8).
+/// The largest fixed consensus message is far below this (`NewLeadershipTerm`
+/// is the widest at a few dozen bytes).
+const SCRATCH_LENGTH: usize = 512;
+
 struct MemberPublication {
     member_id: i32,
     publication: ExclusivePublication,
@@ -197,10 +204,16 @@ impl ConsensusPublisher {
             return false;
         }
         // The buffer is moved out so the claim can borrow it while `self` is
-        // borrowed mutably for the error slot.
+        // borrowed mutably for the error slot. It is sized before the encoder
+        // sees it: `WriteBuf` indexes, it does not grow.
         let mut buffer = std::mem::take(&mut self.buffer);
         buffer.clear();
+        buffer.resize(SCRATCH_LENGTH, 0);
         let length = encode(&mut buffer);
+        debug_assert!(
+            length <= SCRATCH_LENGTH,
+            "a consensus message outgrew {SCRATCH_LENGTH}"
+        );
         let published = self.claim_and_publish(member_id, &buffer[..length]);
         self.buffer = buffer;
         published
