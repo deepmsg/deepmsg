@@ -26,6 +26,16 @@ use deepmsg_tests::cluster_harness::{
     wait_until,
 };
 
+/// The scenarios here all bind ports derived from the **process** id
+/// (`cluster_harness::Ports`), so `cargo test`'s parallel threads would race
+/// for them. They take turns instead.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// [`wait_until`] for a condition a timeout has to explain: the panic carries
 /// what the counters were saying when the deadline passed.
 fn wait_with_state(
@@ -47,6 +57,7 @@ fn wait_with_state(
 
 #[test]
 fn a_stopped_follower_catches_up_through_the_leaders_archive() {
+    let _serial = serial();
     let ports = Ports::new();
     let member_string = members(&ports);
     let faults = Faults::default();
@@ -245,6 +256,7 @@ fn a_stopped_follower_catches_up_through_the_leaders_archive() {
 /// build.
 #[test]
 fn a_member_that_missed_a_term_is_caught_up_by_replication() {
+    let _serial = serial();
     let ports = Ports::new();
     let member_string = members(&ports);
     let faults = Faults::default();
@@ -440,6 +452,7 @@ fn a_member_that_missed_a_term_is_caught_up_by_replication() {
 /// makes them the evidence that the old term really ended there.
 #[test]
 fn the_surviving_members_elect_a_new_leader_and_keep_committing() {
+    let _serial = serial();
     let ports = Ports::new();
     let member_string = members(&ports);
     let faults = Faults::default();
@@ -623,6 +636,7 @@ fn the_surviving_members_elect_a_new_leader_and_keep_committing() {
 /// follower half.
 #[test]
 fn an_orderly_shutdown_ends_every_members_duty_cycle() {
+    let _serial = serial();
     let ports = Ports::new();
     let member_string = members(&ports);
     let faults = Faults::default();
@@ -695,6 +709,7 @@ fn an_orderly_shutdown_ends_every_members_duty_cycle() {
 /// rewritten **from a log that a previous round produced**.
 #[test]
 fn the_cluster_starts_from_a_recording_log_truncated_to_its_latest_snapshot() {
+    let _serial = serial();
     let ports = Ports::new();
     let member_string = members(&ports);
     let faults = Faults::default();
