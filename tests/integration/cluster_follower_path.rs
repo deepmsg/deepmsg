@@ -905,7 +905,7 @@ fn commit_of(counters: &[NodeCounters], node: usize) -> Option<i64> {
 /// RecordingLogIsTruncatedToTheLatestSnapshot`, `ClusterTest.java:1823-1933`)
 /// starts on 256 KiB terms with an MTU of 1408, fills the log with messages of
 /// the largest size that term allows, snapshots, sends more, then stops the
-/// whole cluster, seals every `recording.log` from its latest snapshot
+/// whole cluster, seeds every `recording.log` from its latest snapshot
 /// (`ClusterTool.seedRecordingLogFromSnapshot`, `ClusterToolOperator.java:
 /// 201-270`: the snapshot entries only, term base and log position zeroed), and
 /// restarts it on 2 MiB terms with an MTU of 8992.

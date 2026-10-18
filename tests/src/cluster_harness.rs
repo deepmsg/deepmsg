@@ -127,7 +127,8 @@ impl Default for ChannelShape {
 
 impl Ports {
     pub fn new() -> Self {
-        // 21000..24990, in tens; the highest offset used is +30.
+        // 21000..24990, in tens; the highest offset used is +35 (a second
+        // client's egress port is +30 plus its offset).
         Self {
             base: 21_000 + (u16::try_from(std::process::id() % 400).unwrap()) * 10,
             egress_offset: 0,
