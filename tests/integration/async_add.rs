@@ -151,6 +151,54 @@ fn an_async_counter_is_allocated_by_the_time_the_poll_says_ready() {
     );
 }
 
+/// A counter a caller writes itself moves up and never down: Agrona's
+/// `proposeMaxRelease` / the C `aeron_counter_propose_max_release`
+/// (`concurrent/aeron_counters_manager.h:236-245`). The high-water-mark read
+/// and the store both go through the driver's values region, so a driver that
+/// did not allocate the slot would answer `None` for both.
+#[test]
+fn a_counter_only_moves_up() {
+    let Some((_own, mut client)) = own_driver_and_client("async-add-counter-propose-max") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    const TYPE_ID: i32 = 1001;
+
+    let add = client
+        .async_add_counter(TYPE_ID, b"a-key", "a high-water mark", DEFAULT_TIMEOUT)
+        .expect("the command is written");
+    assert!(matches!(until_ready(&mut client, add), AsyncAddPoll::Ready));
+
+    let counter = client
+        .counter(add.registration_id())
+        .expect("the counter the add drew");
+
+    let counters = client.counters_writable().expect("the counter regions");
+    assert_eq!(Some(()), counters.set_value(counter.counter_id(), 100));
+
+    assert_eq!(
+        Some(false),
+        counter.propose_max(&counters, 50),
+        "a lower proposal is not a move"
+    );
+    assert_eq!(Some(100), counters.value(counter.counter_id()));
+
+    assert_eq!(
+        Some(true),
+        counter.propose_max(&counters, 150),
+        "a higher proposal is"
+    );
+    assert_eq!(Some(150), counters.value(counter.counter_id()));
+
+    assert_eq!(
+        Some(false),
+        counter.propose_max(&counters, 150),
+        "an equal proposal is not a move either"
+    );
+    assert_eq!(Some(150), counters.value(counter.counter_id()));
+}
+
 /// Giving up on a counter is the one cancellation that is not a publication
 /// removal, which is what the handle had to start saying.
 ///

@@ -56,6 +56,10 @@ name = "cluster_three_nodes"
 path = "integration/cluster_three_nodes.rs"
 
 [[test]]
+name = "cluster_follower_path"
+path = "integration/cluster_follower_path.rs"
+
+[[test]]
 name = "forwarding_poll"
 path = "integration/forwarding_poll.rs"
 

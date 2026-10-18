@@ -26,6 +26,9 @@
 //! publication or back-pressure is not an error: it is the next interval's
 //! work, exactly as in the reference.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use deepmsg_client::client::Client;
 use deepmsg_client::publication::ExclusivePublication;
 use deepmsg_codec_cluster::boolean_type::BooleanType;
@@ -33,6 +36,7 @@ use deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH as MESSAGE_HEADE
 use deepmsg_codec_cluster::{
     WriteBuf, append_position_codec::AppendPositionEncoder,
     canvass_position_codec::CanvassPositionEncoder, catchup_position_codec::CatchupPositionEncoder,
+    challenge_response_codec::ChallengeResponseEncoder,
     commit_position_codec::CommitPositionEncoder,
     new_leadership_term_codec::NewLeadershipTermEncoder, request_vote_codec::RequestVoteEncoder,
     stop_catchup_codec::StopCatchupEncoder, termination_ack_codec::TerminationAckEncoder,
@@ -65,40 +69,58 @@ struct MemberPublication {
     position_limit: i64,
 }
 
-/// The per-member consensus publications.
+/// What the table actually holds. Shared through [`ConsensusPublisher`].
 #[derive(Default)]
-pub struct ConsensusPublisher {
+struct PublisherState {
     publications: Vec<MemberPublication>,
     buffer: Vec<u8>,
     error: Option<ClusterError>,
 }
 
+/// The per-member consensus publications.
+///
+/// **Shared, not moved.** An election turn takes the sender out of the agent
+/// (`election.do_work(self, &mut publisher)`), and the *host* methods the
+/// election calls back into (`catchup_poll` → `updateFollowerPosition`, a
+/// leader's `publishCommitPosition`) send through the same table. When the
+/// table was a value, `mem::take` left the agent holding an empty one for the
+/// length of that turn: every send a host method made found no publication and
+/// quietly did nothing — the follower's catch-up heartbeats never reached the
+/// leader, so the leader never sent `StopCatchup` and the follower purged back
+/// into `Init` every heartbeat timeout. The `Rc<RefCell<_>>` is what lets the
+/// taken-out sender and the agent's own field be the **same** table, which is
+/// what the reference's two object references are.
+#[derive(Clone, Default)]
+pub struct ConsensusPublisher {
+    state: Rc<RefCell<PublisherState>>,
+}
+
 impl ConsensusPublisher {
     /// An empty table. The agent fills it with
     /// [`ConsensusPublisher::add_publication`] for every other member.
-    pub const fn new() -> Self {
-        Self {
-            publications: Vec::new(),
-            buffer: Vec::new(),
-            error: None,
-        }
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// The `ClusterMember.publication` slot (`ClusterMember.java:44`).
     pub fn add_publication(&mut self, member_id: i32, publication: ExclusivePublication) {
-        self.publications.push(MemberPublication {
+        let mut state = self.state.borrow_mut();
+        state.publications.push(MemberPublication {
             member_id,
             publication,
             position_limit: 0,
         });
-        self.publications.sort_by_key(|entry| entry.member_id);
+        state.publications.sort_by_key(|entry| entry.member_id);
     }
 
     /// Whether `publishCanvassPosition` would find a publication
     /// (`Election.java:1238`).
     #[must_use]
     pub fn has_publication(&self, member_id: i32) -> bool {
-        self.publications
+        self.state
+            .borrow()
+            .publications
             .iter()
             .any(|entry| entry.member_id == member_id)
     }
@@ -106,7 +128,9 @@ impl ConsensusPublisher {
     /// The member ids this table can reach.
     #[must_use]
     pub fn member_ids(&self) -> Vec<i32> {
-        self.publications
+        self.state
+            .borrow()
+            .publications
             .iter()
             .map(|entry| entry.member_id)
             .collect()
@@ -118,7 +142,7 @@ impl ConsensusPublisher {
         let Some(counters) = client.counters_reader() else {
             return;
         };
-        for entry in &mut self.publications {
+        for entry in &mut self.state.borrow_mut().publications {
             entry.position_limit = counters
                 .value(entry.publication.position_limit_counter_id())
                 .unwrap_or(0);
@@ -127,9 +151,11 @@ impl ConsensusPublisher {
 
     /// The first fatal publication error a send met, if any.
     pub fn take_error(&mut self) -> Option<ClusterError> {
-        self.error.take()
+        self.state.borrow_mut().error.take()
     }
+}
 
+impl PublisherState {
     fn publication(&self, member_id: i32) -> Option<&MemberPublication> {
         self.publications
             .iter()
@@ -194,28 +220,42 @@ impl ConsensusPublisher {
         }
         false
     }
+}
 
+impl ConsensusPublisher {
     /// Encode into the shared buffer, then claim and publish.
     fn send<F>(&mut self, member_id: i32, encode: F) -> bool
     where
         F: FnOnce(&mut Vec<u8>) -> usize,
     {
-        if !self.has_publication(member_id) {
+        self.send_sized(member_id, SCRATCH_LENGTH, encode)
+    }
+
+    /// [`Self::send`] for a message whose length the caller can bound: the
+    /// challenge response carries the client's credentials, which are opaque
+    /// and can be longer than every fixed message put together. The reference's
+    /// encoder writes into an `ExpandableArrayBuffer` that grows; here the
+    /// buffer is sized once, by the caller, before the encoder sees it.
+    fn send_sized<F>(&mut self, member_id: i32, capacity: usize, encode: F) -> bool
+    where
+        F: FnOnce(&mut Vec<u8>) -> usize,
+    {
+        let mut state = self.state.borrow_mut();
+        if state.publication(member_id).is_none() {
             return false;
         }
-        // The buffer is moved out so the claim can borrow it while `self` is
-        // borrowed mutably for the error slot. It is sized before the encoder
-        // sees it: `WriteBuf` indexes, it does not grow.
-        let mut buffer = std::mem::take(&mut self.buffer);
+        // The buffer is moved out so the claim can borrow the rest of the table
+        // while the encoder writes into it.
+        let mut buffer = std::mem::take(&mut state.buffer);
         buffer.clear();
-        buffer.resize(SCRATCH_LENGTH, 0);
+        buffer.resize(capacity.max(SCRATCH_LENGTH), 0);
         let length = encode(&mut buffer);
         debug_assert!(
-            length <= SCRATCH_LENGTH,
-            "a consensus message outgrew {SCRATCH_LENGTH}"
+            length <= capacity.max(SCRATCH_LENGTH),
+            "a consensus message outgrew its buffer"
         );
-        let published = self.claim_and_publish(member_id, &buffer[..length]);
-        self.buffer = buffer;
+        let published = state.claim_and_publish(member_id, &buffer[..length]);
+        state.buffer = buffer;
         published
     }
 
@@ -409,13 +449,14 @@ impl ConsensusPublisher {
         })
     }
 
-    /// `stopCatchup` (`:351-381`).
+    /// `stopCatchup` (`:351-381`). Answers whether the message was sent: the
+    /// leader clears a follower's catchup session id only when it was.
     pub fn stop_catchup(
         &mut self,
         member_id: i32,
         leadership_term_id: i64,
         follower_member_id: i32,
-    ) {
+    ) -> bool {
         self.send(member_id, |buffer| {
             let encoder =
                 StopCatchupEncoder::default().wrap(WriteBuf::new(buffer), MESSAGE_HEADER_LENGTH);
@@ -425,7 +466,7 @@ impl ConsensusPublisher {
                 .leadership_term_id(leadership_term_id)
                 .follower_member_id(follower_member_id);
             MESSAGE_HEADER_LENGTH + message.encoded_length()
-        });
+        })
     }
 
     /// `terminationPosition` (`:383-416`).
@@ -464,6 +505,30 @@ impl ConsensusPublisher {
                 .leadership_term_id(leadership_term_id)
                 .log_position(log_position)
                 .member_id(follower_member_id);
+            MESSAGE_HEADER_LENGTH + message.encoded_length()
+        })
+    }
+
+    /// `challengeResponse` (`:558-573`): a follower's forward of the client's
+    /// answer to the leader (`CMA:869-882`).
+    pub fn challenge_response(
+        &mut self,
+        member_id: i32,
+        correlation_id: i64,
+        cluster_session_id: i64,
+        encoded_credentials: &[u8],
+    ) -> bool {
+        // Header, the fixed block, the credentials' length word and the bytes.
+        let capacity = MESSAGE_HEADER_LENGTH + 16 + 4 + encoded_credentials.len();
+        self.send_sized(member_id, capacity, |buffer| {
+            let encoder = ChallengeResponseEncoder::default()
+                .wrap(WriteBuf::new(buffer), MESSAGE_HEADER_LENGTH);
+            let mut header = encoder.header(0);
+            let mut message = header.parent().expect("the encoder just wrapped");
+            message
+                .correlation_id(correlation_id)
+                .cluster_session_id(cluster_session_id)
+                .encoded_credentials(encoded_credentials);
             MESSAGE_HEADER_LENGTH + message.encoded_length()
         })
     }

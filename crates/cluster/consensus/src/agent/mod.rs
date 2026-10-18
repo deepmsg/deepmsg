@@ -46,7 +46,9 @@ use deepmsg_archive::client::Handlers;
 use deepmsg_archive::client::archive::Archive;
 use deepmsg_archive::client::async_connect::NoCredentials;
 use deepmsg_archive::client::descriptor_poller::RecordingDescriptor;
-use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_key};
+use deepmsg_archive::server::recording_pos::{
+    find_counter_id_by_recording, find_counter_id_by_session, parse_key,
+};
 use deepmsg_client::client::Client;
 use deepmsg_client::counter::Counter;
 use deepmsg_client::publication::ExclusivePublication;
@@ -76,10 +78,12 @@ use crate::consensus::{ConsensusMessage, decode_consensus_message};
 use crate::control::cluster_control::ToggleState as ClusterControlToggle;
 use crate::control::node_control::ToggleState as NodeControlToggle;
 use crate::control::termination::ClusterTermination;
-use crate::election::{APPEND_POSITION_FLAG_CATCHUP, Election, ElectionHost, ElectionState};
+use crate::election::{
+    APPEND_POSITION_FLAG_CATCHUP, APPEND_POSITION_FLAG_NONE, Election, ElectionHost, ElectionState,
+};
 use crate::error::ClusterError;
 use crate::handles::{LogReplay, RecordingReplication};
-use crate::log::{AgentLogReplay, LogReplayHandler};
+use crate::log::{AgentLogReplay, AgentLogReplication, LogReplayHandler};
 use crate::log_publisher::LogPublisher;
 use crate::persist::node_state::NodeStateFile;
 use crate::persist::recording_log::{self, RecordingExtent, RecordingLog, RecoveryPlan};
@@ -256,11 +260,18 @@ pub struct ConsensusModuleAgent {
     /// through. `try_join_log_as_follower` records that channel, and the
     /// election's host accessors do not hand it back.
     log_subscription_channel: String,
-    /// An image the election asked for and `try_join_log_as_follower` has not
-    /// consumed yet. The reference hands the same `Image` object out every duty
-    /// cycle; here the image is taken out of the subscription once
-    /// (`Client::take_image`) and kept here until an adapter owns it.
-    taken_log_image: Option<deepmsg_client::image::Image>,
+    /// The steady-state reader of the live log (`logAdapter`,
+    /// `LogAdapter.java:44`). A follower applies the leader's log through it
+    /// (`ConsensusModuleAgent.java:2523-2532`); the recovery replay has its own
+    /// (`AgentLogReplay`), as the reference's single adapter would otherwise be
+    /// polled from both paths.
+    log_adapter: crate::log::LogAdapter,
+    /// The **election's** log subscription — the one the live image arrives on
+    /// (`Election.logSubscription`, `Election.java:106`). It is not
+    /// [`Self::log_subscription_id`], which is the archive's recording
+    /// registration (`ConsensusModuleAgent.java:199`). The live adapter needs
+    /// this one to poll and to answer `isImageClosed`.
+    live_log_subscription_id: i64,
     append_position: Option<AppendPosition>,
 
     state: ModuleState,
@@ -275,6 +286,10 @@ pub struct ConsensusModuleAgent {
     last_append_position: i64,
     /// `timeOfLastAppendPositionSendNs` (`:152`): the follower's heartbeat.
     time_of_last_append_position_send_ns: i64,
+    /// `timeOfLastAppendPositionUpdateNs` (`:151`): when the append position
+    /// last moved, which is what tells a catchup that has stalled
+    /// (`:1999-2010`).
+    time_of_last_append_position_update_ns: i64,
     last_quorum_backtrack_commit_position: i64,
     time_of_last_log_update_ns: i64,
     time_of_last_leader_update_ns: i64,
@@ -304,6 +319,9 @@ pub struct ConsensusModuleAgent {
     service_client_ids: Vec<i64>,
     timer: Box<dyn TimerService>,
     log_replay: Option<AgentLogReplay>,
+    /// The archive-to-archive replication this agent is driving, if any. The
+    /// election holds the same handle; the session is the agent's (plan Q1).
+    log_replication: Option<AgentLogReplication>,
     uncommitted_timers: std::collections::VecDeque<(i64, i64)>,
     expired_timer_count: deepmsg_cluster_common::collections::HashMap<i64, i64>,
     live_log_destination: String,
@@ -566,7 +584,8 @@ impl ConsensusModuleAgent {
             log_recording_stop_position: 0,
             log_subscription_id: NULL_VALUE,
             log_subscription_channel: String::new(),
-            taken_log_image: None,
+            log_adapter: crate::log::LogAdapter::new(),
+            live_log_subscription_id: NULL_VALUE,
             append_position: None,
             state: ModuleState::Init,
             role: Role::Follower,
@@ -575,6 +594,7 @@ impl ConsensusModuleAgent {
             leadership_term_id: NULL_VALUE,
             last_append_position: NULL_VALUE,
             time_of_last_append_position_send_ns: now_ns,
+            time_of_last_append_position_update_ns: now_ns,
             last_quorum_backtrack_commit_position: NULL_POSITION,
             time_of_last_log_update_ns: now_ns,
             time_of_last_leader_update_ns: now_ns,
@@ -599,6 +619,7 @@ impl ConsensusModuleAgent {
             service_client_ids,
             timer,
             log_replay: None,
+            log_replication: None,
             uncommitted_timers: std::collections::VecDeque::new(),
             expired_timer_count: deepmsg_cluster_common::collections::HashMap::default(),
             live_log_destination: String::new(),
@@ -687,14 +708,14 @@ impl ConsensusModuleAgent {
             return Ok(0);
         };
         self.publisher.refresh_position_limits(&self.client);
-        let mut publisher = mem::take(&mut self.publisher);
+        let mut publisher = self.publisher.clone();
         let result = election.do_work(self, &mut publisher);
         self.publisher = publisher;
 
         let result = match result {
             Err(error) if error.is_election_recoverable() => {
                 self.report_counted_error();
-                let publisher = mem::take(&mut self.publisher);
+                let publisher = self.publisher.clone();
                 let recovered = election.handle_error(self, now_ns, error);
                 self.publisher = publisher;
                 recovered.map(|()| 1)
@@ -737,6 +758,26 @@ impl ConsensusModuleAgent {
         if !self.archive.is_connected(&self.client) {
             self.report_counted_error();
             return Err(self.unexpected_termination("local archive is not connected"));
+        }
+
+        // `:464-470`: with an election in progress **any** error is the
+        // election's to recover from — `handleError` puts it back to `Init`,
+        // and every state can be retried from there. That is how the
+        // reference's `ClusterEvent`s (a log truncation, a leader that
+        // disappeared) are control flow rather than failures. With no
+        // election there is nobody to hand it to, and it is the caller's.
+        if self.election.is_some() {
+            let Some(mut election) = self.election.take() else {
+                return Err(error);
+            };
+            let now_ns = self.clock.time_nanos();
+            let publisher = self.publisher.clone();
+            let recovered = election.handle_error(self, now_ns, error);
+            self.publisher = publisher;
+            if election.state() != ElectionState::Closed {
+                self.election = Some(election);
+            }
+            return recovered.map(|()| 0);
         }
 
         Err(error)
@@ -1399,12 +1440,7 @@ impl ConsensusModuleAgent {
         }
     }
 
-    /// `consensusWork` (`:2481-2543`), leader half.
-    ///
-    /// The follower half needs the log adapter and the follower position
-    /// publisher, both `P3-4b`/`P3-6a`; a node that reaches this method as a
-    /// follower is one the reference would not produce in this slice, so it is a
-    /// refusal rather than a silent `0`.
+    /// `consensusWork` (`:2481-2543`).
     fn consensus_work(&mut self, timestamp: i64, now_ns: i64) -> Result<usize, ClusterError> {
         let mut work = 0;
 
@@ -1421,12 +1457,12 @@ impl ConsensusModuleAgent {
             self.publisher.refresh_position_limits(&self.client);
             work += self.update_leader_position_internal(now_ns)?;
         } else {
-            // `:2499-2533`, without the log adapter: the follower's half of the
-            // stream is `P3-6b`. What is here is ingress forwarding (a client
-            // parked on a follower is redirected by the session, not the log)
-            // and the append position that is the follower's heartbeat.
-            if self.state == ModuleState::Active || self.state == ModuleState::Suspended {
-                work += self.poll_ingress()?;
+            // `:2499-2533`: apply what the leader has committed, then send this
+            // follower's own append position — its heartbeat. A closed image
+            // ends the cycle early, because the election has begun.
+            match self.poll_follower_log()? {
+                Some(follower_work) => work += follower_work,
+                None => return Ok(1),
             }
             work += self.update_follower_position_internal(now_ns)?;
         }
@@ -1435,6 +1471,82 @@ impl ConsensusModuleAgent {
         work += self.poll_service_control()?;
 
         Ok(work)
+    }
+
+    /// The follower half of `consensusWork` (`:2499-2533`).
+    ///
+    /// `None` means the log image closed, so an election has begun and the
+    /// reference returns `1` for the whole cycle without sending the follower
+    /// position (`:2526-2530`).
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] from a replayed record, from the election the closed
+    /// image starts, or from termination.
+    fn poll_follower_log(&mut self) -> Result<Option<usize>, ClusterError> {
+        if self.state != ModuleState::Active && self.state != ModuleState::Suspended {
+            return Ok(Some(0));
+        }
+
+        if self.termination_position != NULL_POSITION
+            && self.log_adapter.position() >= self.termination_position
+        {
+            // `:2502-2512`: the follower has applied up to the position the
+            // cluster is stopping at. With services the container is asked to
+            // stop there; without, this agent acknowledges and closes.
+            self.set_state(
+                ModuleState::Terminating,
+                &format!("terminationPosition={}", self.termination_position),
+            );
+            if self.config.service_count > 0 {
+                self.send_service_termination_position(true);
+            } else {
+                self.do_termination(self.log_adapter.position())?;
+            }
+            return Ok(Some(0));
+        }
+
+        // `:2514-2525`: the log is applied only up to what has been committed
+        // (`min(notifiedCommitPosition, limit)`), where the limit is the
+        // append position counter if one exists, otherwise where the recording
+        // stopped.
+        let limit = match self.append_position {
+            Some(_) => self.append_position_value(),
+            None => self.log_recording_stop_position,
+        };
+        let bound = self.notified_commit_position.min(limit);
+
+        let outcome = self.poll_log_adapter(bound)?;
+        let count = outcome.count;
+        self.apply_log_apply_outcome(outcome)?;
+
+        // `:2526-2530`: a quiet log whose image is gone is a leader that left;
+        // an end of stream means it left gracefully.
+        if count == 0
+            && self
+                .log_adapter
+                .is_image_closed(&self.client, self.live_log_subscription_id)
+        {
+            let is_eos = self
+                .log_adapter
+                .is_log_end_of_stream(&self.client, self.live_log_subscription_id);
+            self.enter_election(
+                is_eos,
+                &format!("log disconnected from leader: eos={is_eos}"),
+            )?;
+            return Ok(None);
+        }
+
+        // `:2532`: what was applied is committed.
+        propose_max_counter(
+            &self.client,
+            self.counters.commit_position,
+            self.log_adapter.position(),
+        );
+
+        let ingress_work = self.poll_ingress()?;
+
+        Ok(Some(count + ingress_work))
     }
 
     /// The `ConsensusModuleAgent.updateLeaderPosition(nowNs)` one-argument form
@@ -1468,6 +1580,48 @@ impl ConsensusModuleAgent {
         self.closed = true;
 
         let stop_result = self.try_stop_log_recording();
+        self.stop_log_replication_session();
+
+        // The log subscription and the destinations on it hold sockets at this
+        // member's **log** and catchup endpoints; the consensus subscription
+        // below holds one at its consensus endpoint. The reference gives none
+        // of them back here — a Java restart takes the media driver with it, so
+        // the ports are free anyway — but a module restarted in the same
+        // process (the harness's shape, and a driver shared between members in
+        // production) has to be able to bind them again.
+        if self.live_log_subscription_id != NULL_VALUE {
+            for destination in [
+                std::mem::take(&mut self.catchup_log_destination),
+                std::mem::take(&mut self.live_log_destination),
+            ] {
+                if !destination.is_empty() {
+                    self.remove_log_destination(&destination);
+                }
+            }
+            let registration_id = self.live_log_subscription_id;
+            self.live_log_subscription_id = NULL_VALUE;
+            let _ = self
+                .client
+                .remove_subscription(registration_id, COMMAND_TIMEOUT);
+            let _ = self.await_local_sockets_closed(registration_id);
+        }
+
+        // The consensus subscription holds this member's **consensus
+        // endpoint**. The reference does not give it back here — a Java
+        // restart takes the media driver with it, so the port is free anyway —
+        // but a module restarted in the same process (the harness's shape, and
+        // a driver shared between members in production) has to be able to
+        // bind it again. Removing it and waiting for its local sockets is the
+        // same primitive the election uses after closing its log subscription
+        // (`Election.java:672-676`), used here for the same reason.
+        if self.consensus_subscription_id != NULL_VALUE {
+            let registration_id = self.consensus_subscription_id;
+            self.consensus_subscription_id = NULL_VALUE;
+            let _ = self
+                .client
+                .remove_subscription(registration_id, COMMAND_TIMEOUT);
+            let _ = self.await_local_sockets_closed(registration_id);
+        }
 
         // A client's counters are its own to give back: `Aeron.close()` closes
         // every `AtomicCounter` it owns (`ClientConductor.java:184`), which is
@@ -1990,8 +2144,19 @@ impl ConsensusModuleAgent {
             } => self
                 .on_termination_ack(leadership_term_id, log_position, member_id)
                 .map(|()| 1),
+            ConsensusMessage::ChallengeResponse {
+                correlation_id,
+                cluster_session_id,
+                encoded_credentials,
+            } => {
+                self.on_consensus_challenge_response(
+                    correlation_id,
+                    cluster_session_id,
+                    &encoded_credentials,
+                );
+                Ok(0)
+            }
             ConsensusMessage::BackupQuery { .. }
-            | ConsensusMessage::ChallengeResponse { .. }
             | ConsensusMessage::HeartbeatRequest { .. }
             | ConsensusMessage::StandbySnapshot { .. } => {
                 // Backup queries, the challenge response and the standby
@@ -2018,7 +2183,7 @@ impl ConsensusModuleAgent {
             return Ok(0);
         };
         self.publisher.refresh_position_limits(&self.client);
-        let mut publisher = std::mem::take(&mut self.publisher);
+        let mut publisher = self.publisher.clone();
         let result = f(&mut election, self, &mut publisher);
         self.publisher = publisher;
         if election.state() != ElectionState::Closed {
@@ -2066,64 +2231,94 @@ impl ConsensusModuleAgent {
         }
 
         self.update_member_log_position(follower_member_id, log_leadership_term_id, log_position);
-        // `stopExistingCatchupReplay` is the catchup path (P3-6b).
+        self.stop_existing_catchup_replay(follower_member_id);
 
-        if log_leadership_term_id < self.leadership_term_id {
-            let term_base_log_position = self
-                .recording_log
-                .find_term_entry(self.leadership_term_id)
-                .map_or(0, |entry| entry.term_base_log_position);
-            let next = self
-                .recording_log
-                .find_term_entry(log_leadership_term_id + 1)
-                .map(|entry| {
-                    (
+        let term_base_log_position = self
+            .recording_log
+            .find_term_entry(self.leadership_term_id)
+            .map_or(0, |entry| entry.term_base_log_position);
+        // `:932-940`: when the canvassing member is already in this term there
+        // is no next term to name, and the answer is still sent — a member that
+        // restarted in the same term has to be told the leadership term and
+        // the log session before it can join anything.
+        let (next_leadership_term_id, next_term_base, next_log_position) =
+            if log_leadership_term_id < self.leadership_term_id {
+                match self
+                    .recording_log
+                    .find_term_entry(log_leadership_term_id + 1)
+                {
+                    Some(entry) => (
                         entry.leadership_term_id,
                         entry.term_base_log_position,
                         entry.log_position,
-                    )
-                });
-            let (next_leadership_term_id, next_term_base, next_log_position) = match next {
-                Some((term, base, position)) => (term, base, position),
-                None => (
-                    self.leadership_term_id,
-                    term_base_log_position,
-                    NULL_POSITION,
-                ),
+                    ),
+                    None => (
+                        self.leadership_term_id,
+                        term_base_log_position,
+                        NULL_POSITION,
+                    ),
+                }
+            } else {
+                (NULL_VALUE, NULL_POSITION, NULL_POSITION)
             };
-            let log_position_now = self.log_publisher.position();
-            let commit_position = self.commit_position_value();
-            let leadership_term_id = self.leadership_term_id;
-            let member_id = self.config.member_id;
-            let timestamp = self.clock.time();
-            let log_session_id = self.log_publication_session_id;
-            let log_recording_id = self.log_recording_id;
-            let app_version = self.config.app_version;
 
-            self.publisher.refresh_position_limits(&self.client);
-            self.publisher.new_leadership_term(
-                follower_member_id,
-                log_leadership_term_id,
-                next_leadership_term_id,
-                next_term_base,
-                next_log_position,
-                leadership_term_id,
-                term_base_log_position,
-                log_position_now,
-                commit_position,
-                log_recording_id,
-                timestamp,
-                member_id,
-                log_session_id,
-                app_version,
-                false,
-            );
-            if let Some(error) = self.publisher.take_error() {
-                return Err(error);
-            }
+        let log_position_now = self.log_publisher.position();
+        let commit_position = self.commit_position_value();
+        let leadership_term_id = self.leadership_term_id;
+        let member_id = self.config.member_id;
+        let timestamp = self.clock.time();
+        let log_session_id = self.log_publication_session_id;
+        let log_recording_id = self.log_recording_id;
+        let app_version = self.config.app_version;
+
+        self.publisher.refresh_position_limits(&self.client);
+        self.publisher.new_leadership_term(
+            follower_member_id,
+            log_leadership_term_id,
+            next_leadership_term_id,
+            next_term_base,
+            next_log_position,
+            leadership_term_id,
+            term_base_log_position,
+            log_position_now,
+            commit_position,
+            log_recording_id,
+            timestamp,
+            member_id,
+            log_session_id,
+            app_version,
+            false,
+        );
+        if let Some(error) = self.publisher.take_error() {
+            return Err(error);
         }
 
         Ok(1)
+    }
+
+    /// `stopExistingCatchupReplay` (`:3477-3490`): a member that canvasses
+    /// again is not being caught up any more by whatever replay it had.
+    fn stop_existing_catchup_replay(&mut self, follower_member_id: i32) {
+        let Some(index) = self
+            .members
+            .iter()
+            .position(|member| member.id == follower_member_id)
+        else {
+            return;
+        };
+        if self.members[index].catchup_replay_session_id == NULL_VALUE {
+            return;
+        }
+
+        let replay_session_id = self.members[index].catchup_replay_session_id;
+        if self
+            .archive
+            .stop_replay(&mut self.client, replay_session_id)
+            .is_ok()
+        {
+            self.members[index].catchup_replay_session_id = NULL_VALUE;
+            self.members[index].catchup_replay_correlation_id = NULL_VALUE;
+        }
     }
 
     /// `onRequestVote` (`:962-980`).
@@ -2162,6 +2357,23 @@ impl ConsensusModuleAgent {
         } else {
             Ok(0)
         }
+    }
+
+    /// `onConsensusChallengeResponse` (`CMA:883-887`): the leader's half of a
+    /// follower's forward of a client's challenge answer.
+    ///
+    /// The reference hands it to
+    /// `SessionManager.onChallengeResponseForBackupSession`, which answers
+    /// **backup sessions** — `ClusterBackup`'s, P3-9's (plan §8). This build has
+    /// no backup sessions, so the call finds nothing and says nothing, exactly
+    /// as the reference's does for a user session's id.
+    fn on_consensus_challenge_response(
+        &mut self,
+        correlation_id: i64,
+        cluster_session_id: i64,
+        encoded_credentials: &[u8],
+    ) {
+        let _ = (correlation_id, cluster_session_id, encoded_credentials);
     }
 
     /// `onVote` (`:982-997`).
@@ -2212,6 +2424,12 @@ impl ConsensusModuleAgent {
         now_ns: i64,
     ) -> Result<usize, ClusterError> {
         let leader_member_id_changed = self.leader_member_id();
+
+        // `:1041-1044`: ahead of the election branch — a member being told of a
+        // leadership term has heard from a leader and does not canvass yet.
+        if leadership_term_id >= self.leadership_term_id {
+            self.time_of_last_leader_update_ns = now_ns;
+        }
 
         if self.election.is_some() {
             return self.with_election(|election, host, _sender| {
@@ -2335,30 +2553,79 @@ impl ConsensusModuleAgent {
         }
     }
 
-    /// `onCatchupPosition` (`:1147-1168`): the leader starts an archive replay
-    /// for the follower. That replay stream is the catchup path, `P3-6b`;
-    /// hearing the message is counted rather than silently assumed.
+    /// `onCatchupPosition` (`:1147-1168`): the leader replays its log into the
+    /// follower's catchup endpoint, through the follower's own archive.
+    ///
+    /// The replay channel is `aeron.cluster.follower.catchup.channel` with the
+    /// follower's endpoint, **the leader's log publication session id**, no
+    /// linger and no end-of-stream marker substituted into it — the shape is
+    /// what lets the follower's log subscription recognise the image as its
+    /// log rather than as a stranger on the channel.
     fn on_catchup_position(
         &mut self,
         leadership_term_id: i64,
-        _log_position: i64,
-        _follower_member_id: i32,
-        _catchup_endpoint: &str,
+        log_position: i64,
+        follower_member_id: i32,
+        catchup_endpoint: &str,
     ) -> Result<usize, ClusterError> {
-        if leadership_term_id <= self.leadership_term_id && self.role == Role::Leader {
-            self.report_counted_error();
+        if leadership_term_id > self.leadership_term_id || self.role != Role::Leader {
             return Ok(0);
         }
-        Ok(0)
+
+        let Some(index) = self
+            .members
+            .iter()
+            .position(|member| member.id == follower_member_id)
+        else {
+            return Ok(0);
+        };
+        if self.members[index].catchup_replay_session_id != NULL_VALUE {
+            return Ok(0);
+        }
+
+        let mut channel = ChannelUri::parse(&self.config.follower_catchup_channel)
+            .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+        channel.put("endpoint", catchup_endpoint.to_owned());
+        channel.put("session-id", self.log_publication_session_id.to_string());
+        channel.put("linger", "0".to_owned());
+        channel.put("eos", "false".to_owned());
+        channel.put("alias", format!("catchup-followerId-{follower_member_id}"));
+
+        let replay_session_id = self.archive.start_replay(
+            &mut self.client,
+            self.log_recording_id,
+            &channel.build(),
+            self.config.log_stream_id,
+            &deepmsg_archive::client::proxy::ReplayParams {
+                position: log_position,
+                length: i64::MAX,
+                ..deepmsg_archive::client::proxy::ReplayParams::default()
+            },
+        )?;
+        let correlation_id = self.archive.last_correlation_id();
+
+        self.members[index].catchup_replay_session_id = replay_session_id;
+        self.members[index].catchup_replay_correlation_id = correlation_id;
+
+        Ok(1)
     }
 
-    /// `onStopCatchup` (`:1170-1181`): removing a catchup destination is
-    /// `P3-6b`'s.
+    /// `onStopCatchup` (`:1170-1181`): this follower's catchup replay is over,
+    /// so the destination the leader was replaying to comes off the log
+    /// subscription.
     fn on_stop_catchup(
         &mut self,
-        _leadership_term_id: i64,
-        _follower_member_id: i32,
+        leadership_term_id: i64,
+        follower_member_id: i32,
     ) -> Result<usize, ClusterError> {
+        if leadership_term_id == self.leadership_term_id
+            && follower_member_id == self.config.member_id
+            && !self.catchup_log_destination.is_empty()
+        {
+            let destination = std::mem::take(&mut self.catchup_log_destination);
+            self.remove_log_destination(&destination);
+            return Ok(1);
+        }
         Ok(0)
     }
 
@@ -2369,7 +2636,19 @@ impl ConsensusModuleAgent {
             Some(_) => self.append_position_value(),
             None => self.log_recording_stop_position,
         };
-        let position = recorded_position.max(self.last_append_position);
+        self.update_follower_position(now_ns, recorded_position, APPEND_POSITION_FLAG_NONE)
+    }
+
+    /// The five-argument form (`:2763-2785`): catchup sends the same heartbeat
+    /// with `APPEND_POSITION_FLAG_CATCHUP`, which is what tells the leader the
+    /// position came from a replay.
+    fn update_follower_position(
+        &mut self,
+        now_ns: i64,
+        append_position: i64,
+        flags: i16,
+    ) -> Result<usize, ClusterError> {
+        let position = append_position.max(self.last_append_position);
 
         if position > self.last_append_position
             || now_ns
@@ -2383,7 +2662,7 @@ impl ConsensusModuleAgent {
                 self.leadership_term_id,
                 position,
                 self.config.member_id,
-                0,
+                flags,
             );
             if let Some(error) = self.publisher.take_error() {
                 return Err(error);
@@ -2391,6 +2670,7 @@ impl ConsensusModuleAgent {
             if sent {
                 if position > self.last_append_position {
                     self.last_append_position = position;
+                    self.time_of_last_append_position_update_ns = now_ns;
                 }
                 self.time_of_last_append_position_send_ns = now_ns;
                 return Ok(1);
@@ -2624,11 +2904,7 @@ impl ElectionHost for ConsensusModuleAgent {
 
         // `commitPosition.proposeMaxRelease(quorumPosition)`: the commit
         // position never moves backwards, even when the quorum answer does.
-        let commit_position = self.counters.commit_position;
-        let current = read_counter(&self.client, commit_position).unwrap_or(0);
-        if quorum_position > current {
-            write_counter(&self.client, commit_position, quorum_position);
-        }
+        propose_max_counter(&self.client, self.counters.commit_position, quorum_position);
         self.sweep_uncommitted_entries_to(quorum_position);
         self.time_of_last_log_update_ns = now_ns;
         self.time_of_last_leader_update_ns = now_ns;
@@ -2711,16 +2987,16 @@ impl ElectionHost for ConsensusModuleAgent {
     }
 
     /// `tryJoinLogAsFollower` (`:1771-1799`): record the subscription the
-    /// image arrived on, find the recording's position counter, and tell the
+    /// image arrived on, find the recording's position counter, hand the image
+    /// to the live [`LogAdapter`](crate::log::LogAdapter), and tell the
     /// services where the log starts.
     ///
-    /// The `LogAdapter` the reference attaches here — the reader that applies
-    /// the stream to the module's state — is `P3-6b`; the recording and the
-    /// append position it makes are what a follower needs to take part in the
-    /// quorum, and that is this slice.
+    /// The image stays in the client's subscription — the reference keeps the
+    /// same `Image` object there for the life of the term — so the election is
+    /// handed a view of it and no `take_image` is needed.
     fn try_join_log_as_follower(
         &mut self,
-        image: deepmsg_client::image::Image,
+        image: deepmsg_client::image::ImageView,
         is_leader_startup: bool,
         now_ns: i64,
     ) -> Result<bool, ClusterError> {
@@ -2733,18 +3009,15 @@ impl ElectionHost for ConsensusModuleAgent {
             self.start_log_recording(&channel, stream_id, false)?;
         }
 
-        // The image is kept **before** the append position is looked for: the
-        // client hands the image over once (`take_image` removes it from the
-        // subscription), and the archive's recording counter appears a cycle or
-        // two after the recording starts — so a failed attempt that dropped the
-        // image would leave `followerLogAwait` waiting for an image it already
-        // had. The reference keeps the same `Image` object in the subscription
-        // for the life of the term; this is that object held here.
-        self.taken_log_image = Some(image);
-
         if self.try_create_append_position(session_id)? {
+            // `logAdapter.image(image)` (`:1793`): the adapter reads this image
+            // from now on, and the position it starts from is where the
+            // subscription joined.
+            self.log_adapter
+                .set_image(image.registration_id(), join_position);
             self.last_append_position = join_position;
             self.time_of_last_append_position_send_ns = now_ns;
+            self.time_of_last_append_position_update_ns = now_ns;
 
             let channel = self.log_subscription_channel.clone();
             let stream_id = self.config.log_stream_id;
@@ -2779,25 +3052,108 @@ impl ElectionHost for ConsensusModuleAgent {
         ConsensusModuleAgent::start_log_replay(self, log_position, append_position)
     }
 
+    /// `newLogReplication` (`:2951-2986`): copy the leader's log recording into
+    /// this member's archive.
+    ///
+    /// The destination is this member's own log recording, so the copy
+    /// **extends** it rather than making a new one — which is what leaves the
+    /// follower's log continuous through the hole.
     fn new_log_replication(
         &mut self,
-        _leader_archive_endpoint: &str,
-        _response_archive_endpoint: Option<&str>,
-        _leader_recording_id: i64,
-        _stop_position: i64,
+        leader_archive_endpoint: &str,
+        response_archive_endpoint: Option<&str>,
+        leader_recording_id: i64,
+        stop_position: i64,
         _now_ns: i64,
     ) -> Result<RecordingReplication, ClusterError> {
-        Err(ClusterError::Cluster("log replication is P3-6b".to_owned()))
+        let replication_session_id = self.client.next_correlation_id().map_err(cluster)?;
+
+        let mut params = deepmsg_archive::client::proxy::ReplicationParams {
+            dst_recording_id: self.log_recording_id,
+            stop_position,
+            replication_session_id: replication_session_id as i32,
+            ..deepmsg_archive::client::proxy::ReplicationParams::default()
+        };
+
+        let mut replication_channel = self.config.replication_channel.clone();
+        if let Some(response_endpoint) = response_archive_endpoint {
+            // `:2964-2972`: a replication over response channels names the
+            // source's response endpoint as `control`, and the source archive
+            // answers on it. That arm is P3-0e's (`n/a:0e` in the record).
+            let mut uri = ChannelUri::parse(&replication_channel)
+                .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+            uri.remove("endpoint");
+            uri.put("control", response_endpoint.to_owned());
+            uri.put("control-mode", "response".to_owned());
+            replication_channel = uri.build();
+            params.src_response_channel = replication_channel.clone();
+        }
+        params.replication_channel = replication_channel;
+
+        let src_control_channel = ChannelUri::create_destination_uri(
+            &self.config.leader_archive_control_channel,
+            Some(leader_archive_endpoint),
+        )
+        .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+        let src_control_stream_id = self.archive.context().control_request_stream_id;
+
+        let replication_id = self.archive.replicate(
+            &mut self.client,
+            leader_recording_id,
+            src_control_stream_id,
+            &src_control_channel,
+            &params,
+        )?;
+
+        let handle = RecordingReplication::new(leader_recording_id, replication_id);
+        self.log_replication = Some(AgentLogReplication::new(
+            handle.clone(),
+            leader_recording_id,
+        ));
+
+        Ok(handle)
     }
 
+    /// `truncateLogEntry` (`:1882-1892`): cut the log back to the last
+    /// committed position of a term that turned out not to be the one.
+    ///
+    /// Four things, in the reference's order: the archive cuts the recording,
+    /// the recording log records the new committed position for the term, the
+    /// log adapter lets go of its image — **and waits for the sockets it held**,
+    /// which is what lets the next subscription bind the same endpoint — and
+    /// the stop position follows the cut.
     fn truncate_log_entry(
         &mut self,
-        _leadership_term_id: i64,
-        _log_position: i64,
+        leadership_term_id: i64,
+        log_position: i64,
     ) -> Result<(), ClusterError> {
-        Err(ClusterError::Cluster(
-            "truncating a log entry is P3-6b".to_owned(),
-        ))
+        self.archive
+            .truncate_recording(&mut self.client, self.log_recording_id, log_position)?;
+
+        if leadership_term_id != NULL_VALUE {
+            self.recording_log
+                .commit_log_position_for_term(leadership_term_id, log_position)
+                .map_err(cluster)?;
+        }
+
+        // `logAdapter.disconnect(countedErrorHandler, logPosition)`
+        // (`LogAdapter.java:70-84`): the image's subscription is closed and its
+        // local sockets are waited for before the position is pinned.
+        if self.live_log_subscription_id != NULL_VALUE {
+            let registration_id = self.live_log_subscription_id;
+            self.live_log_subscription_id = NULL_VALUE;
+            self.log_adapter.disconnect(log_position);
+            let _ = self
+                .client
+                .remove_subscription(registration_id, COMMAND_TIMEOUT);
+            self.await_local_sockets_closed(registration_id)?;
+        } else {
+            self.log_adapter.disconnect(log_position);
+        }
+
+        self.log_recording_stop_position = log_position;
+
+        Ok(())
     }
 
     fn append_new_leadership_term_event(&mut self, now_ns: i64) -> Result<bool, ClusterError> {
@@ -2827,14 +3183,47 @@ impl ElectionHost for ConsensusModuleAgent {
         now_ns: i64,
     ) -> Result<i64, ClusterError> {
         self.set_role(Role::Follower);
-        self.live_log_destination.clear();
-        self.catchup_log_destination.clear();
+
+        // `Election.stopLogReplication` (`:1463-1472`) closes the session
+        // before the new term's work starts; a replication that is still
+        // running belongs to the term that is ending.
+        self.stop_log_replication_session();
+
+        // `:1363`: the ingress adapter goes first; `connectIngress` makes new
+        // subscriptions at the end of the next election.
+        self.ingress.close(&mut self.client);
+
+        // `:1365-1375`: the log's extra destinations are given up and the image
+        // is let go.
+        for destination in [
+            std::mem::take(&mut self.catchup_log_destination),
+            std::mem::take(&mut self.live_log_destination),
+        ] {
+            if !destination.is_empty() {
+                self.remove_log_destination(&destination);
+            }
+        }
+        self.log_adapter.disconnect(i64::MAX);
+
+        // `logAdapter.disconnect(errorHandler, maxLogPosition)`
+        // (`LogAdapter.java:70-74`): the image's subscription is closed **and
+        // its local sockets are waited for**. The wait is what a re-election
+        // depends on — the live log destination binds this member's fixed log
+        // port, and the next term adds it again; without the wait the driver
+        // still holds the old socket and answers `Address already in use`
+        // (98) on every attempt, which leaves the follower looping
+        // `FOLLOWER_LOG_INIT -> INIT`.
+        if self.live_log_subscription_id != NULL_VALUE {
+            let registration_id = self.live_log_subscription_id;
+            self.live_log_subscription_id = NULL_VALUE;
+            self.remove_log_subscription(registration_id)?;
+            self.await_local_sockets_closed(registration_id)?;
+        }
+
         self.last_quorum_backtrack_commit_position = NULL_POSITION;
 
         // `prepareForNewLeadership` (`:1382`): an operator switch is only
-        // honoured by a leader, so losing leadership disarms it. (The
-        // reference also disconnects the ingress and log adapters here; those
-        // are P3-6b's.)
+        // honoured by a leader, so losing leadership disarms it.
         ClusterControlToggle::deactivate(&self.client, self.counters.control_toggle);
 
         let had_recording = self.log_recording_id != NULL_VALUE;
@@ -2859,49 +3248,175 @@ impl ElectionHost for ConsensusModuleAgent {
         Ok(self.last_append_position)
     }
 
-    fn catchup_initiated(&mut self, _now_ns: i64) -> Result<(), ClusterError> {
-        Err(ClusterError::Cluster("catchup is P3-6b".to_owned()))
+    fn catchup_initiated(&mut self, now_ns: i64) -> Result<(), ClusterError> {
+        // `:1964-1968`: a catchup that has just been asked for starts its
+        // progress clock now, so the first heartbeat is not already late.
+        self.time_of_last_append_position_update_ns = now_ns;
+        self.time_of_last_append_position_send_ns = now_ns;
+        Ok(())
     }
 
-    fn catchup_poll(&mut self, _limit_position: i64, _now_ns: i64) -> Result<usize, ClusterError> {
-        Err(ClusterError::Cluster("catchup is P3-6b".to_owned()))
+    fn catchup_poll(&mut self, limit_position: i64, now_ns: i64) -> Result<usize, ClusterError> {
+        let mut work = 0;
+
+        if self.state == ModuleState::Active || self.state == ModuleState::Suspended {
+            if self.append_position.is_none() {
+                // `:1974-1977`: the recording stopped under the catchup, which
+                // is a `ClusterEvent` rather than a quiet zero.
+                return Err(ClusterError::ClusterEvent(format!(
+                    "unexpected recording stop during catchup: position={}",
+                    self.log_adapter.position()
+                )));
+            }
+
+            let current_append_position = self.append_position_value();
+            let bound = current_append_position.min(limit_position);
+
+            let outcome = self.poll_log_adapter(bound)?;
+            work += outcome.count;
+
+            // `:1980-1987`: the replay's image closing mid-catchup is a
+            // `ClusterEvent`; the leader's archive has gone.
+            if outcome.count == 0
+                && self
+                    .log_adapter
+                    .is_image_closed(&self.client, self.live_log_subscription_id)
+            {
+                return Err(ClusterError::ClusterEvent(format!(
+                    "unexpected image close during catchup: position={}",
+                    self.log_adapter.position()
+                )));
+            }
+            self.apply_log_apply_outcome(outcome)?;
+
+            work += self.update_follower_position(
+                now_ns,
+                current_append_position,
+                APPEND_POSITION_FLAG_CATCHUP,
+            )?;
+            propose_max_counter(
+                &self.client,
+                self.counters.commit_position,
+                self.log_adapter.position(),
+            );
+        }
+
+        // `:1999-2010`: no append position has moved within a heartbeat
+        // timeout. Only while ACTIVE — a SUSPEND is allowed to be quiet.
+        if now_ns
+            > self.time_of_last_append_position_update_ns + self.config.leader_heartbeat_timeout_ns
+            && self.state == ModuleState::Active
+        {
+            let log_position = self
+                .election
+                .as_ref()
+                .map_or(NULL_POSITION, |election| election.log_position());
+            return Err(ClusterError::ClusterEvent(format!(
+                "no catchup progress: commitPosition={} limitPosition={limit_position} \
+                 lastAppendPosition={} appendPosition={} logPosition={log_position}",
+                self.commit_position_value(),
+                self.last_append_position,
+                self.append_position_value(),
+            )));
+        }
+
+        work += self.poll_service_control()?;
+
+        Ok(work)
     }
 
-    fn is_catchup_near_live(&mut self, _position: i64) -> bool {
-        false
+    fn is_catchup_near_live(&mut self, position: i64) -> bool {
+        // `:2026-2038`: within a window of the leader, where the window is a
+        // quarter of an image's term or the live-add limit, whichever is
+        // smaller — the same arithmetic `ReplayMerge` uses to decide a replay
+        // may be joined to a live stream.
+        let Some(image) = self
+            .log_adapter
+            .image(&self.client, self.live_log_subscription_id)
+        else {
+            return false;
+        };
+
+        let window = i64::from(image.term_buffer_length() >> 2)
+            .min(deepmsg_archive::client::replay_merge::LIVE_ADD_MAX_WINDOW);
+
+        image.position() >= position - window
     }
 
     fn track_catchup_completion(
         &mut self,
         member_id: i32,
-        _leadership_term_id: i64,
+        leadership_term_id: i64,
         append_position_flags: i16,
     ) -> Result<(), ClusterError> {
-        // `trackCatchupCompletion` (`ConsensusModuleAgent.java:1946-1949`) is a
-        // no-op unless this follower has a replay in progress or its append
-        // position carries the catchup flag — every ordinary heartbeat goes
-        // through here, so an unconditional refusal would fail the steady
-        // state. Starting and stopping the replay is P3-6b.
-        let has_catchup_session = self
+        // `:1946-1962`. Every ordinary heartbeat comes through here, so the
+        // gate is the first thing the reference does.
+        let Some(index) = self
             .members
             .iter()
-            .any(|member| member.id == member_id && member.catchup_replay_session_id != NULL_VALUE);
+            .position(|member| member.id == member_id)
+        else {
+            return Ok(());
+        };
+        let has_session = self.members[index].catchup_replay_session_id != NULL_VALUE;
         let is_catchup = 0 != (APPEND_POSITION_FLAG_CATCHUP & append_position_flags);
 
-        if has_catchup_session || is_catchup {
-            return Err(ClusterError::Cluster("catchup is P3-6b".to_owned()));
+        if !(has_session || is_catchup) {
+            return Ok(());
+        }
+
+        if self.members[index].log_position < self.log_publisher.position() {
+            return Ok(());
+        }
+
+        if self.members[index].catchup_replay_correlation_id != NULL_VALUE {
+            let replay_session_id = self.members[index].catchup_replay_session_id;
+            // The reference clears the correlation id only when the stop
+            // landed (`:1955-1963`); a failed stop leaves it for the next
+            // heartbeat to try again.
+            if self
+                .archive
+                .stop_replay(&mut self.client, replay_session_id)
+                .is_ok()
+            {
+                self.members[index].catchup_replay_correlation_id = NULL_VALUE;
+            }
+        }
+
+        // `consensusPublisher.stopCatchup(follower.publication(), ...)` — a
+        // send that did not land leaves the session id for the next attempt.
+        if self
+            .publisher
+            .stop_catchup(member_id, leadership_term_id, member_id)
+        {
+            self.members[index].catchup_replay_session_id = NULL_VALUE;
         }
 
         Ok(())
     }
 
     fn stop_all_catchups(&mut self) -> Result<(), ClusterError> {
-        // `stopAllCatchups` (`ConsensusModuleAgent.java:1900-1912`): stop the
-        // replay for every member that has one. Nothing starts one until
-        // P3-6b, so the list is empty; the members' fields are cleared so a
-        // later slice starts from the reference's state.
-        for member in &mut self.members {
-            member.catchup_replay_session_id = NULL_VALUE;
+        // `:2037-2058`: stop every replay this leader is serving. A stop that
+        // fails is counted and the member's fields are cleared anyway — the
+        // cluster is leaving the term these replays belong to.
+        for index in 0..self.members.len() {
+            if self.members[index].catchup_replay_session_id == NULL_VALUE {
+                continue;
+            }
+
+            if self.members[index].catchup_replay_correlation_id != NULL_VALUE {
+                let replay_session_id = self.members[index].catchup_replay_session_id;
+                if self
+                    .archive
+                    .stop_replay(&mut self.client, replay_session_id)
+                    .is_err()
+                {
+                    self.report_counted_error();
+                }
+            }
+
+            self.members[index].catchup_replay_session_id = NULL_VALUE;
+            self.members[index].catchup_replay_correlation_id = NULL_VALUE;
         }
         Ok(())
     }
@@ -2924,10 +3439,30 @@ impl ElectionHost for ConsensusModuleAgent {
         Ok(())
     }
 
-    fn await_local_sockets_closed(&mut self, _registration_id: i64) -> Result<(), ClusterError> {
-        Err(ClusterError::Cluster(
-            "waiting for local sockets to close is P3-6b".to_owned(),
-        ))
+    fn await_local_sockets_closed(&mut self, registration_id: i64) -> Result<(), ClusterError> {
+        // `:2988-3000`: idle until the driver has let go of every local socket
+        // the closed registration held. This is the wait that makes a rebound
+        // port possible — `LocalSocketAddressStatus.findNumberOfAddressesByRegistrationId`
+        // counts the `LOCAL_SOCKADDR` counters that still name the id.
+        loop {
+            self.idle()?;
+
+            let open = self.client.counters_reader().map_or(0, |counters| {
+                let mut open = 0;
+                counters.for_each(|descriptor| {
+                    if descriptor.type_id == deepmsg_cnc::counters::LOCAL_SOCKADDR_TYPE_ID
+                        && descriptor.registration_id == registration_id
+                    {
+                        open += 1;
+                    }
+                });
+                open
+            });
+
+            if open == 0 {
+                return Ok(());
+            }
+        }
     }
 
     fn set_leader_member_id(&mut self, leader_member_id: i32) {
@@ -3002,12 +3537,27 @@ impl ElectionHost for ConsensusModuleAgent {
 
     fn poll_archive_events(&mut self) -> usize {
         // The reference polls its `RecordingSignalPoller` here (`:2061-2075`).
-        // This build's archive client delivers descriptors inline; the recording
-        // position the election waits for is read from its counter
-        // (`try_create_append_position`), so there is no signal backlog to
-        // drain. `client.poll()` still runs, because the driver's answers and
-        // the heartbeat both need it.
-        usize::from(self.client.poll())
+        // A replication's progress arrives as `EXTEND`/`SYNC`/`STOP`/
+        // `REPLICATE_END` signals rather than as answers, so the control
+        // channel is read once per turn while a replication is running; with
+        // no replication there is nothing to read and the branch costs one
+        // `Option` test.
+        let mut work = usize::from(self.client.poll());
+
+        if self.log_replication.is_some() {
+            match self.archive.poll_recording_signal(&mut self.client) {
+                Ok(Some(signal)) => {
+                    work += 1;
+                    self.route_recording_signal(signal);
+                }
+                Ok(None) => {}
+                // The signal channel failing is the reference's counted error,
+                // not a reason to stop the agent.
+                Err(_) => self.report_counted_error(),
+            }
+        }
+
+        work
     }
 
     fn node_state(&mut self) -> &mut NodeStateFile {
@@ -3255,6 +3805,13 @@ impl ElectionHost for ConsensusModuleAgent {
     }
 
     fn remove_log_subscription(&mut self, registration_id: i64) -> Result<(), ClusterError> {
+        // A subscription this client no longer holds is already gone: the
+        // agent's `prepare_for_new_leadership` and the election's `INIT` can
+        // both name the same registration (they are the same subscription),
+        // and the second close must not turn into a driver refusal.
+        if self.client.subscription(registration_id).is_none() {
+            return Ok(());
+        }
         self.client
             .remove_subscription(registration_id, COMMAND_TIMEOUT)
             .map_err(cluster)
@@ -3292,20 +3849,20 @@ impl ElectionHost for ConsensusModuleAgent {
         counters.value(status_id) == Some(-1) // `CHANNEL_ENDPOINT_STATUS_ERRORED`
     }
 
+    /// `logImageBySession` (`Election.java:1414-1432`): the image an election
+    /// state is waiting for, as a view — the subscription keeps it, so the same
+    /// image can be asked about on every duty cycle until the state moves on.
     fn log_image_by_session(
         &mut self,
         registration_id: i64,
         session_id: i32,
-    ) -> Option<deepmsg_client::image::Image> {
-        if let Some(image) = self.taken_log_image.take() {
-            return Some(image);
-        }
-        let publication_id = self
+    ) -> Option<deepmsg_client::image::ImageView> {
+        let image = self
             .client
             .subscription(registration_id)?
-            .image_by_session_id(session_id)?
-            .registration_id();
-        self.client.take_image(registration_id, publication_id)
+            .image_view_by_session_id(session_id)?;
+        self.live_log_subscription_id = registration_id;
+        Some(image)
     }
 
     fn commit_position_value(&self) -> i64 {
@@ -3352,6 +3909,14 @@ fn read_counter(client: &Client, counter: Counter) -> Option<i64> {
 fn write_counter(client: &Client, counter: Counter, value: i64) {
     if let Some(counters) = client.counters_writable() {
         let _ = counter.set_value(&counters, value);
+    }
+}
+
+/// `commitPosition.proposeMaxRelease(value)` — see
+/// [`Counter::propose_max`](deepmsg_client::counter::Counter::propose_max).
+fn propose_max_counter(client: &Client, counter: Counter, value: i64) {
+    if let Some(counters) = client.counters_writable() {
+        let _ = counter.propose_max(&counters, value);
     }
 }
 
@@ -3681,6 +4246,9 @@ struct AgentIngressHandler<'a> {
     ingress_endpoints: &'a str,
     deferred_closes: Vec<(i64, i64)>,
     deferred_admins: Vec<DeferredAdminRequest>,
+    /// A follower's forwards for the leader (`CMA:869-882`), sent after the
+    /// poll: the handler has no consensus publisher to send through.
+    deferred_challenge_responses: Vec<(i64, i64, Vec<u8>)>,
     extension_messages: usize,
 }
 
@@ -3798,8 +4366,15 @@ impl IngressHandler for AgentIngressHandler<'_> {
                 self.now_ns,
             );
         } else {
-            return Err(ClusterError::Cluster(
-                "sending a challenge response to the leader is P3-6b".to_owned(),
+            // `:875-880`: a follower forwards the answer to the leader over the
+            // consensus publication and ignores whether the offer landed — the
+            // client will answer the challenge again, and the reference does
+            // not count a failed forward either. The handler holds no
+            // publisher, so the send is deferred to the duty cycle.
+            self.deferred_challenge_responses.push((
+                correlation_id,
+                cluster_session_id,
+                encoded_credentials.to_vec(),
             ));
         }
         Ok(())
@@ -3825,6 +4400,103 @@ impl IngressHandler for AgentIngressHandler<'_> {
 }
 
 impl ConsensusModuleAgent {
+    /// Close the replication session, if there is one
+    /// (`RecordingReplication.close`, `:154-171`, which asks the archive to
+    /// stop it).
+    fn stop_log_replication_session(&mut self) {
+        if let Some(replication) = self.log_replication.take() {
+            let _ = self
+                .archive
+                .try_stop_replication(&mut self.client, replication.replication_id());
+        }
+    }
+
+    /// Hand one recording signal to the replication (`RecordingReplication.onSignal`,
+    /// `:176-203`), re-reading the **destination** recording's position counter
+    /// for `EXTEND`.
+    fn route_recording_signal(
+        &mut self,
+        signal: deepmsg_archive::client::archive::RecordingSignal,
+    ) {
+        use deepmsg_codec::archive::recording_signal::RecordingSignal as CodecSignal;
+
+        // The handle is a clone sharing its atomics, so nothing borrows the
+        // session while the signal is applied to it.
+        let Some((replication_id, handle)) = self
+            .log_replication
+            .as_ref()
+            .map(|replication| (replication.replication_id(), replication.handle()))
+        else {
+            return;
+        };
+        if signal.correlation_id != replication_id {
+            return;
+        }
+
+        let mapped = match signal.signal {
+            CodecSignal::START => crate::handles::RecordingSignal::Start,
+            CodecSignal::STOP => crate::handles::RecordingSignal::Stop,
+            CodecSignal::EXTEND => crate::handles::RecordingSignal::Extend,
+            CodecSignal::SYNC => crate::handles::RecordingSignal::Sync,
+            CodecSignal::REPLICATE_END => crate::handles::RecordingSignal::ReplicateEnd,
+            CodecSignal::DELETE => {
+                // The reference throws "recording was deleted during
+                // replication" out of `onSignal`; a `pollArchiveEvents` here
+                // cannot, so the deletion is counted and the handle is told
+                // the replication ended — the election's deadline is what
+                // turns that into the term's failure.
+                self.report_counted_error();
+                self.log_replication = None;
+                return;
+            }
+            _ => return,
+        };
+
+        // `:190-193`: `EXTEND` means the recording's position counter is the
+        // authority, looked up by the recording id the signal names.
+        let position = if signal.signal == CodecSignal::EXTEND {
+            self.recording_position(signal.recording_id)
+                .unwrap_or(signal.position)
+        } else {
+            signal.position
+        };
+
+        handle.on_signal(signal.correlation_id, position, mapped);
+
+        if handle.has_replication_ended() && handle.has_stopped() {
+            // `REPLICATE_END` and the destination's `STOP` have both arrived:
+            // the archive has finished and the election has what it needs.
+            self.log_replication = None;
+        }
+    }
+
+    /// The position a recording has reached, by its recording id and this
+    /// archive's id (`RecordingPos.findCounterIdByRecording`).
+    fn recording_position(&self, recording_id: i64) -> Option<i64> {
+        let counters = self.client.counters_reader()?;
+        let counter_id =
+            find_counter_id_by_recording(&counters, recording_id, self.archive.archive_id())?;
+        counters.value(counter_id)
+    }
+
+    /// Give a log destination back (`LogAdapter.asyncRemoveDestination`,
+    /// `LogAdapter.java:136-142`).
+    ///
+    /// The reference's call is asynchronous; this one waits for the driver's
+    /// answer, which is the client's synchronous face (plan Q2). It is not on
+    /// the hot path — only a catchup ending or a term ending removes one.
+    fn remove_log_destination(&mut self, destination: &str) {
+        let registration_id = self.live_log_subscription_id;
+        if registration_id == NULL_VALUE {
+            return;
+        }
+        // `asyncRemoveDestination` reports through `countedErrorHandler`; a
+        // destination that is already gone is not a reason to stop the agent.
+        let _ = self
+            .client
+            .remove_destination(registration_id, destination, COMMAND_TIMEOUT);
+    }
+
     /// `connectIngress` (`ConsensusModuleAgent.java:3387-3415`): the ingress
     /// subscription, and the IPC one when a leader allows IPC ingress.
     fn connect_ingress(&mut self) -> Result<(), ClusterError> {
@@ -3897,6 +4569,7 @@ impl ConsensusModuleAgent {
             ingress_endpoints,
             deferred_closes: Vec::new(),
             deferred_admins: Vec::new(),
+            deferred_challenge_responses: Vec::new(),
             extension_messages: 0,
         };
 
@@ -3904,8 +4577,22 @@ impl ConsensusModuleAgent {
         let work = result?;
         let deferred_closes = std::mem::take(&mut handler.deferred_closes);
         let deferred_admins = std::mem::take(&mut handler.deferred_admins);
+        let deferred_challenge_responses =
+            std::mem::take(&mut handler.deferred_challenge_responses);
         let extension_messages = handler.extension_messages;
         drop(handler);
+
+        for (correlation_id, cluster_session_id, encoded_credentials) in
+            deferred_challenge_responses
+        {
+            let leader_member_id = self.leader_member_id();
+            let _ = self.publisher.challenge_response(
+                leader_member_id,
+                correlation_id,
+                cluster_session_id,
+                &encoded_credentials,
+            );
+        }
 
         if extension_messages > 0 {
             let error_counter = self.counters.error;
@@ -5464,7 +6151,9 @@ impl ConsensusModuleAgent {
                         replay.start_position
                     )));
                 }
-                replay.adapter.set_image(image.registration_id());
+                replay
+                    .adapter
+                    .set_image(image.registration_id(), join_position);
                 return Ok(1);
             }
 
@@ -5484,6 +6173,7 @@ impl ConsensusModuleAgent {
             work = replay.adapter.poll(
                 client,
                 replay.subscription_id,
+                replay.stop_position,
                 &mut handler,
                 config.log_fragment_limit,
             )?;
@@ -5548,6 +6238,103 @@ impl ConsensusModuleAgent {
         }
 
         Ok(work.unwrap_or(0))
+    }
+}
+
+/// What one poll of the live log applied.
+///
+/// The handler's record callbacks write into its own fields rather than the
+/// agent's — the borrow that lets `sessions`, `timer` and the trackers be
+/// mutated together — so what they decided is applied once the poll is over.
+struct LogApplyOutcome {
+    count: usize,
+    state_change: Option<ModuleState>,
+    new_leadership_term_id: Option<i64>,
+    deferred_snapshot: Option<(i64, i64)>,
+    snapshot_began: bool,
+}
+
+impl ConsensusModuleAgent {
+    /// Apply the live log once, up to `bound`.
+    ///
+    /// The handler is the same one the recovery replay uses, and so is what it
+    /// decides: the reference has one `LogAdapter` and one set of `onReplay*`
+    /// methods for both paths (`LogAdapter.java:192-297`).
+    ///
+    /// # Errors
+    ///
+    /// The first decode or handler error.
+    fn poll_log_adapter(&mut self, bound: i64) -> Result<LogApplyOutcome, ClusterError> {
+        let Self {
+            client,
+            log_adapter,
+            live_log_subscription_id,
+            sessions,
+            timer,
+            trackers,
+            expired_timer_count,
+            leadership_term_id,
+            config,
+            ..
+        } = self;
+
+        let mut handler = AgentLogReplayHandler {
+            sessions,
+            timer: &mut **timer,
+            trackers,
+            expired_timer_count,
+            leadership_term_id: *leadership_term_id,
+            service_count: config.service_count,
+            state_change: None,
+            new_leadership_term_id: None,
+            deferred_snapshot: None,
+            snapshot_began: false,
+        };
+
+        let count = log_adapter
+            .poll(
+                client,
+                *live_log_subscription_id,
+                bound,
+                &mut handler,
+                config.log_fragment_limit,
+            )?
+            .unwrap_or(0);
+
+        Ok(LogApplyOutcome {
+            count,
+            state_change: handler.state_change,
+            new_leadership_term_id: handler.new_leadership_term_id,
+            deferred_snapshot: handler.deferred_snapshot,
+            snapshot_began: handler.snapshot_began,
+        })
+    }
+
+    /// Apply what [`Self::poll_log_adapter`]'s handler decided — the agent-side
+    /// half of `onReplayClusterAction` and `onReplayNewLeadershipTermEvent`
+    /// that cannot run inside the borrow.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] from a completed snapshot.
+    fn apply_log_apply_outcome(&mut self, outcome: LogApplyOutcome) -> Result<(), ClusterError> {
+        if let Some(state) = outcome.state_change {
+            self.set_state(state, "replayed cluster action");
+        }
+        if let Some(term) = outcome.new_leadership_term_id {
+            self.leadership_term_id = term;
+            for tracker in self.trackers.iter_mut() {
+                tracker.set_leadership_term_id(term);
+            }
+        }
+        if outcome.snapshot_began {
+            self.snapshot_duration
+                .on_snapshot_begin(self.clock.time_nanos());
+        }
+        if let Some((log_position, timestamp)) = outcome.deferred_snapshot {
+            self.snapshot_on_service_ack(log_position, timestamp, &[])?;
+        }
+        Ok(())
     }
 }
 

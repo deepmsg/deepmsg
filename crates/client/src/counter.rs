@@ -117,6 +117,28 @@ impl StaticCounter {
         counters.set_value(self.counter_id, value).is_some()
     }
 
+    /// Move the counter up to `value` if it is behind, and leave it alone
+    /// otherwise — Agrona's `AtomicCounter.proposeMaxRelease`, the C
+    /// `aeron_counter_propose_max_release`
+    /// (`concurrent/aeron_counters_manager.h:236-245`).
+    ///
+    /// `None` when the slot is gone; `Some(true)` when it moved; `Some(false)`
+    /// when it already held at least `value`. There is no compare-and-set in
+    /// the reference either: a counter has one writer, and a high-water mark
+    /// read the plain way is the whole of the operation.
+    pub fn propose_max(
+        &self,
+        counters: &CountersReader<'_, ReadWrite>,
+        value: i64,
+    ) -> Option<bool> {
+        let current = counters.value(self.counter_id)?;
+        if value > current {
+            counters.set_value(self.counter_id, value).map(|()| true)
+        } else {
+            Some(false)
+        }
+    }
+
     /// The counter's descriptor — type, key, label, owner — as the file has it
     /// right now.
     ///
@@ -184,6 +206,21 @@ impl Counter {
     /// concerned: nothing validates the value, and nothing echoes it anywhere.
     pub fn set_value(&self, counters: &CountersReader<'_, ReadWrite>, value: i64) -> bool {
         counters.set_value(self.counter_id, value).is_some()
+    }
+
+    /// Move the counter up to `value` if it is behind, and leave it alone
+    /// otherwise — see [`StaticCounter::propose_max`].
+    pub fn propose_max(
+        &self,
+        counters: &CountersReader<'_, ReadWrite>,
+        value: i64,
+    ) -> Option<bool> {
+        let current = counters.value(self.counter_id)?;
+        if value > current {
+            counters.set_value(self.counter_id, value).map(|()| true)
+        } else {
+            Some(false)
+        }
     }
 
     /// The counter's descriptor — type, key, label, owner — as the file has

@@ -21,6 +21,7 @@
 pub mod aeron_tests;
 pub mod archive;
 pub mod archiving_driver;
+pub mod cluster_harness;
 pub mod driver;
 pub mod java;
 pub mod java_archiving_driver;

@@ -1410,6 +1410,12 @@ impl Catalog {
         }
 
         self.index = index;
+        // `Catalog.java:968`: the walk ends where the last record does, and
+        // that is where the **next** `addRecording` writes. Without this an
+        // archive that reopens a non-empty catalog appends over its first
+        // record and leaves the tail un-walkable — which is what the next
+        // start then reports as a record whose length cannot be walked.
+        self.next_offset = offset;
 
         Ok(())
     }
@@ -2027,6 +2033,49 @@ mod tests {
             expected.recording_id = *id;
             assert_eq!(expected, reopened.recording(*id).expect("read back"));
         }
+    }
+
+    /// A recording added **after a reopen** goes after the records the walk
+    /// found, not over them (`Catalog.java:968`: `buildIndex` leaves
+    /// `nextRecordingDescriptorOffset` at the end of the walk).
+    ///
+    /// The failure without that line is not a lost recording but a catalog the
+    /// *next* open cannot walk: the new record is written at 288, the first
+    /// record's remains start inside the new frame, and their bytes are read
+    /// as a record length.
+    #[test]
+    fn a_recording_added_after_a_reopen_follows_the_others() {
+        let dir = TempDir::new();
+
+        {
+            let mut catalog = created(&dir);
+            for index in 0..3 {
+                catalog.add_recording(&recording(index)).expect("added");
+            }
+        }
+
+        let added_after_reopen = {
+            let mut catalog = Catalog::open(dir.path(), 0).expect("open");
+            assert_eq!(3, catalog.count_entries());
+            catalog.add_recording(&recording(3)).expect("added")
+        };
+
+        let reopened = Catalog::open(dir.path(), 0).expect("the catalog still walks");
+        assert_eq!(4, reopened.count_entries());
+        assert_eq!(
+            recording(0).stripped_channel,
+            reopened
+                .recording(NEXT_ID)
+                .expect("the first record")
+                .stripped_channel,
+            "the record written before the reopen is still the first one"
+        );
+        let mut expected = recording(3);
+        expected.recording_id = added_after_reopen;
+        assert_eq!(
+            expected,
+            reopened.recording(added_after_reopen).expect("read back")
+        );
     }
 
     /// A retired recording is still in the file and no longer in the catalogue,

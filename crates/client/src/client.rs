@@ -3196,6 +3196,33 @@ impl Client {
     where
         F: FnMut(&Fragment<'_>),
     {
+        self.poll_image_bounded(
+            subscription_id,
+            image_registration_id,
+            i64::MAX,
+            fragment_limit,
+            handler,
+        )
+    }
+
+    /// [`Client::poll_image`] bounded by a position: fragments that **start**
+    /// before `bound_position` are delivered, the rest wait
+    /// (`Image.boundedControlledPoll`, `Image.java:565-665`).
+    ///
+    /// A cluster follower polls its log image this way up to what the leader
+    /// has committed, so it never applies an entry ahead of the commit
+    /// position (`ConsensusModuleAgent.java:2523`).
+    pub fn poll_image_bounded<F>(
+        &mut self,
+        subscription_id: i64,
+        image_registration_id: i64,
+        bound_position: i64,
+        fragment_limit: usize,
+        handler: F,
+    ) -> Option<usize>
+    where
+        F: FnMut(&Fragment<'_>),
+    {
         let (counter_id, position_before, position, read) = {
             let subscription = self
                 .subscriptions
@@ -3207,7 +3234,7 @@ impl Client {
                 .find(|i| i.registration_id() == image_registration_id)?;
 
             let position_before = image.position();
-            let read = image.poll(fragment_limit, handler);
+            let read = image.bounded_poll(bound_position, fragment_limit, handler);
 
             (
                 image.subscriber_position_id(),

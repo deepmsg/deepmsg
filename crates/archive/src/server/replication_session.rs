@@ -1288,7 +1288,15 @@ impl ReplicationSession {
             return None;
         }
 
-        self.replay_position = descriptor.start_position;
+        // **Not here.** `replayPosition` moves in exactly two places, both the
+        // caller's (`Election`-free, but the same shape as
+        // `ReplicationSession.java:335`/`:355`): a copy into a new row, and one
+        // into an empty row, both start where the source does. A copy into a
+        // row that already has data starts where **that row stopped** — which
+        // the constructor took off the destination summary — and an assignment
+        // here would overwrite it, making the replay join at the source's start
+        // and the destination recording refuse the extension
+        // (`image.joinPosition != rec.stopPosition`).
 
         Some(Recording {
             recording_id: self.dst_recording_id,

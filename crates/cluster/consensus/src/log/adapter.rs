@@ -146,9 +146,68 @@ impl LogAdapter {
         }
     }
 
-    /// `image(Image)` (`:126-134`): keep the old position when replacing.
-    pub fn set_image(&mut self, image_registration_id: i64) {
+    /// `image(Image)` (`:126-134`): attach the image the election found.
+    ///
+    /// The reference reads the position off the image object it keeps; here the
+    /// image stays in the client's subscription and [`Self::poll`] reads it by
+    /// registration id, so the position it starts from is handed over with it.
+    pub fn set_image(&mut self, image_registration_id: i64, position: i64) {
         self.image_registration_id = Some(image_registration_id);
+        self.position = position;
+    }
+
+    /// `image(null)` after the image is gone: the sticky position stays, and no
+    /// further poll reads anything (`LogAdapter.java:106-109`).
+    pub fn clear_image(&mut self) {
+        self.image_registration_id = None;
+    }
+
+    /// The image this adapter is reading, as the subscription has it
+    /// (`LogAdapter.image()`, `:115-120`).
+    pub fn image<'a>(
+        &self,
+        client: &'a deepmsg_client::client::Client,
+        subscription_id: i64,
+    ) -> Option<&'a deepmsg_client::image::Image> {
+        let image_registration_id = self.image_registration_id?;
+        client
+            .subscription(subscription_id)?
+            .images()
+            .iter()
+            .find(|image| image.registration_id() == image_registration_id)
+    }
+
+    /// Whether there is no image, or the one there is has been withdrawn
+    /// (`isImageClosed`, `:106-109`).
+    pub fn is_image_closed(
+        &self,
+        client: &deepmsg_client::client::Client,
+        subscription_id: i64,
+    ) -> bool {
+        self.image(client, subscription_id)
+            .is_none_or(deepmsg_client::image::Image::is_closed)
+    }
+
+    /// Whether the publisher signalled end of stream (`isLogEndOfStream`,
+    /// `:111-114`). No image answers `false`, as the reference's does.
+    pub fn is_log_end_of_stream(
+        &self,
+        client: &deepmsg_client::client::Client,
+        subscription_id: i64,
+    ) -> bool {
+        self.image(client, subscription_id)
+            .and_then(deepmsg_client::image::Image::is_end_of_stream)
+            .unwrap_or(false)
+    }
+
+    /// `disconnect(errorHandler, maxLogPosition)` (`:70-84`): pin the last
+    /// position at no more than `max_log_position` and let go of the image.
+    ///
+    /// Closing the image's subscription, and waiting for its local sockets to
+    /// be free, is the caller's: it owns the client those counters live in.
+    pub fn disconnect(&mut self, max_log_position: i64) {
+        self.image_registration_id = None;
+        self.position = self.position.min(max_log_position);
     }
 
     /// Whether an image has been attached.
@@ -166,7 +225,13 @@ impl LogAdapter {
         self.position
     }
 
-    /// Poll the image once (`boundedControlledPoll`, `:96-104`).
+    /// Poll the image once, up to `bound_position`
+    /// (`boundedControlledPoll`, `:96-104`).
+    ///
+    /// A live follower bounds this at `min(commitPosition, limit)` and a replay
+    /// at the replay's stop position (`ConsensusModuleAgent.java:2523`,
+    /// `:1853`) — the same number, the reference's single `LogAdapter` serves
+    /// both.
     ///
     /// # Errors
     ///
@@ -175,6 +240,7 @@ impl LogAdapter {
         &mut self,
         client: &mut Client,
         subscription_id: i64,
+        bound_position: i64,
         handler: &mut dyn LogReplayHandler,
         fragment_limit: usize,
     ) -> Result<Option<usize>, ClusterError> {
@@ -187,9 +253,10 @@ impl LogAdapter {
             handler,
             error: None,
         };
-        let result = client.poll_image(
+        let result = client.poll_image_bounded(
             subscription_id,
             image_registration_id,
+            bound_position,
             fragment_limit,
             |fragment| {
                 let _ = assembler.push_controlled(fragment, &mut dispatch);
