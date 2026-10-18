@@ -95,6 +95,10 @@ pub struct ClusterMember {
     pub is_ballot_sent: bool,
     /// The catchup replay session this member is serving, or `-1`.
     pub catchup_replay_session_id: i64,
+    /// The correlation id of the catchup replay this member asked its archive
+    /// for, or `-1` (`ClusterMember.catchupReplayCorrelationId`, `:56`). The
+    /// leader stops the replay by this id when the follower has caught up.
+    pub catchup_replay_correlation_id: i64,
     /// Whether this member is the leader of the current term
     /// (`ClusterMember.isLeader`, `:46`). Set when a term is established
     /// (`ConsensusModuleAgent.updateMemberDetails` `:2370-2381`).
@@ -158,6 +162,7 @@ impl ClusterMember {
             vote: None,
             is_ballot_sent: false,
             catchup_replay_session_id: -1,
+            catchup_replay_correlation_id: -1,
             is_leader: false,
             has_terminated: false,
         })

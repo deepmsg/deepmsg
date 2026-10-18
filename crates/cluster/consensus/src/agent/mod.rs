@@ -2624,11 +2624,7 @@ impl ElectionHost for ConsensusModuleAgent {
 
         // `commitPosition.proposeMaxRelease(quorumPosition)`: the commit
         // position never moves backwards, even when the quorum answer does.
-        let commit_position = self.counters.commit_position;
-        let current = read_counter(&self.client, commit_position).unwrap_or(0);
-        if quorum_position > current {
-            write_counter(&self.client, commit_position, quorum_position);
-        }
+        propose_max_counter(&self.client, self.counters.commit_position, quorum_position);
         self.sweep_uncommitted_entries_to(quorum_position);
         self.time_of_last_log_update_ns = now_ns;
         self.time_of_last_leader_update_ns = now_ns;
@@ -3352,6 +3348,14 @@ fn read_counter(client: &Client, counter: Counter) -> Option<i64> {
 fn write_counter(client: &Client, counter: Counter, value: i64) {
     if let Some(counters) = client.counters_writable() {
         let _ = counter.set_value(&counters, value);
+    }
+}
+
+/// `commitPosition.proposeMaxRelease(value)` — see
+/// [`Counter::propose_max`](deepmsg_client::counter::Counter::propose_max).
+fn propose_max_counter(client: &Client, counter: Counter, value: i64) {
+    if let Some(counters) = client.counters_writable() {
+        let _ = counter.propose_max(&counters, value);
     }
 }
 

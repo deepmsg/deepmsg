@@ -52,6 +52,19 @@ pub const CONSENSUS_CHANNEL_DEFAULT: &str = "aeron:udp";
 pub const LOG_CHANNEL_PROP_NAME: &str = "aeron.cluster.log.channel";
 /// `LOG_CHANNEL_DEFAULT` (`ConsensusModule.java:533`).
 pub const LOG_CHANNEL_DEFAULT: &str = "aeron:udp?term-length=64m";
+/// `aeron.cluster.follower.catchup.channel`
+/// (`ConsensusModule.java:626`): the template the leader replays a log to a
+/// follower over, with the follower's catchup endpoint substituted.
+pub const FOLLOWER_CATCHUP_CHANNEL_PROP_NAME: &str = "aeron.cluster.follower.catchup.channel";
+/// `FOLLOWER_CATCHUP_CHANNEL_DEFAULT` (`ConsensusModule.java:633`): `UDP_CHANNEL`.
+pub const FOLLOWER_CATCHUP_CHANNEL_DEFAULT: &str = "aeron:udp";
+/// `aeron.cluster.leader.archive.control.channel`
+/// (`ConsensusModule.java:639`): the leader archive's control channel, which
+/// log replication also uses as its destination template.
+pub const LEADER_ARCHIVE_CONTROL_CHANNEL_PROP_NAME: &str =
+    "aeron.cluster.leader.archive.control.channel";
+/// `LEADER_ARCHIVE_CONTROL_CHANNEL_DEFAULT` (`ConsensusModule.java:646`).
+pub const LEADER_ARCHIVE_CONTROL_CHANNEL_DEFAULT: &str = "aeron:udp?term-length=64k";
 /// `aeron.cluster.log.control.enable` (`ConsensusModule.java:1026-1027`).
 pub const LOG_CONTROL_ENABLE_PROP_NAME: &str = "aeron.cluster.log.control.enable";
 /// `CONSENSUS_MODULE_ENABLE_CONTROL_ON_LOG_CHANNEL_DEFAULT` (`ConsensusModule.java:1569`).
@@ -299,6 +312,15 @@ pub struct ConsensusModuleConfig {
     pub control_channel: String,
     /// The replication channel (`aeron.cluster.replication.channel`); required.
     pub replication_channel: String,
+    /// The channel template the leader replays a follower's log over
+    /// (`aeron.cluster.follower.catchup.channel`); the follower's catchup
+    /// endpoint is substituted in (`ConsensusModuleAgent.java:1156`).
+    pub follower_catchup_channel: String,
+    /// The leader archive's control channel
+    /// (`aeron.cluster.leader.archive.control.channel`); log replication turns
+    /// it into the archive's destination
+    /// (`ConsensusModuleAgent.java:2980`).
+    pub leader_archive_control_channel: String,
     /// Consensus stream id.
     pub consensus_stream_id: i32,
     /// Log stream id.
@@ -507,6 +529,14 @@ impl ConsensusModuleConfig {
                 .unwrap_or(CONTROL_CHANNEL_DEFAULT)
                 .to_owned(),
             replication_channel: required(REPLICATION_CHANNEL_PROP_NAME)?,
+            follower_catchup_channel: properties
+                .get(FOLLOWER_CATCHUP_CHANNEL_PROP_NAME)
+                .unwrap_or(FOLLOWER_CATCHUP_CHANNEL_DEFAULT)
+                .to_owned(),
+            leader_archive_control_channel: properties
+                .get(LEADER_ARCHIVE_CONTROL_CHANNEL_PROP_NAME)
+                .unwrap_or(LEADER_ARCHIVE_CONTROL_CHANNEL_DEFAULT)
+                .to_owned(),
             consensus_stream_id: int(CONSENSUS_STREAM_ID_PROP_NAME, CONSENSUS_STREAM_ID_DEFAULT)?,
             log_stream_id: int(LOG_STREAM_ID_PROP_NAME, LOG_STREAM_ID_DEFAULT)?,
             ingress_stream_id: int(INGRESS_STREAM_ID_PROP_NAME, INGRESS_STREAM_ID_DEFAULT)?,

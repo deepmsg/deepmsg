@@ -115,7 +115,7 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ),
     (
         "aeron.cluster.follower.catchup.channel",
-        Disposition::Pending,
+        Disposition::Honoured,
     ),
     ("aeron.cluster.id", Disposition::Honoured),
     ("aeron.cluster.idle.strategy", Disposition::Honoured),
@@ -129,7 +129,7 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ("aeron.cluster.ingress.stream.id", Disposition::Honoured),
     (
         "aeron.cluster.leader.archive.control.channel",
-        Disposition::Pending,
+        Disposition::Honoured,
     ),
     (
         "aeron.cluster.leader.heartbeat.interval",
