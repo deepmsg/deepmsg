@@ -15,7 +15,11 @@ Dependency direction, and the rules it encodes:
 ```
 consensus ─┐
 service ───┼─▶ common
-client ────┘          (client also uses deepmsg-client; service does not use consensus)
+client ────┘
+    service ──▶ deepmsg-client      (the container is a client of the driver)
+    service ──▶ deepmsg-driver      (idle strategies only — the reference's
+                                     `aeron-cluster` depends on `aeron-driver`
+                                     for the same names)
 ```
 
 - **`client` does not depend on `consensus` or `service`.** An application

@@ -289,7 +289,13 @@ dependencies = [
 name = "deepmsg-cluster-service"
 version = "0.1.0"
 dependencies = [
+ "deepmsg-client",
  "deepmsg-cluster-common",
+ "deepmsg-cnc",
+ "deepmsg-codec-cluster",
+ "deepmsg-codec-cluster-mark",
+ "deepmsg-core",
+ "deepmsg-driver",
 ]
 
 [[package]]
@@ -367,6 +373,7 @@ dependencies = [
  "deepmsg-client",
  "deepmsg-cluster",
  "deepmsg-cluster-common",
+ "deepmsg-cluster-service",
  "deepmsg-cnc",
  "deepmsg-codec",
  "deepmsg-codec-cluster",
