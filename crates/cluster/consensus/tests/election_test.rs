@@ -9,8 +9,9 @@
 //! # What a mock can and cannot make
 //!
 //! A `LogReplay` and the follower's four flags are scriptable
-//! ([`deepmsg_cluster::handles`]' handles). An **`Image` is not**: it is a mapped log
-//! buffer and has no test constructor, so the two cases whose success needs
+//! ([`deepmsg_cluster::handles`]' handles). An **`ImageView` is not**: it is a
+//! window onto a mapped log buffer and has no test constructor, so the two cases
+//! whose success needs
 //! `logSubscription.imageBySessionId(..)` to answer (FOLLOWER_CATCHUP_AWAIT and
 //! FOLLOWER_LOG_AWAIT succeeding) are recorded as deferred in the delivery
 //! record rather than faked. Every other state is reachable.
@@ -20,7 +21,7 @@
 
 use std::path::PathBuf;
 
-use deepmsg_client::image::Image;
+use deepmsg_client::image::ImageView;
 use deepmsg_cluster::election::state::ElectionState;
 use deepmsg_cluster::election::{ConsensusSender, ElectionRng};
 use deepmsg_cluster::election::{Election, ElectionHost};
@@ -269,7 +270,7 @@ struct TestHost {
     catchup_destination: String,
     live_destination: String,
     channel_errored: bool,
-    image: Option<Image>,
+    image: Option<ImageView>,
     election_state: Option<ElectionState>,
     prepare_calls: usize,
     join_log_as_leader_calls: usize,
@@ -414,7 +415,7 @@ impl ElectionHost for TestHost {
     }
     fn try_join_log_as_follower(
         &mut self,
-        _image: Image,
+        _image: ImageView,
         _is_leader_startup: bool,
         _now_ns: i64,
     ) -> Result<bool, ClusterError> {
@@ -646,7 +647,11 @@ impl ElectionHost for TestHost {
     fn log_subscription_channel_errored(&self, _registration_id: i64) -> bool {
         self.channel_errored
     }
-    fn log_image_by_session(&mut self, _registration_id: i64, _session_id: i32) -> Option<Image> {
+    fn log_image_by_session(
+        &mut self,
+        _registration_id: i64,
+        _session_id: i32,
+    ) -> Option<ImageView> {
         self.image.take()
     }
     fn commit_position_value(&self) -> i64 {

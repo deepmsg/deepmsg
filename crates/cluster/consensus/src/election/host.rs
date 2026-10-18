@@ -62,7 +62,7 @@
 //! `random()` (`:723`): it is replaced by the injected `ElectionRng` field, so
 //! that the canvass backoff is reproducible (see the `election` module docs).
 
-use deepmsg_client::image::Image;
+use deepmsg_client::image::ImageView;
 
 use crate::persist::node_state::NodeStateFile;
 use crate::persist::recording_log::RecordingLog;
@@ -160,7 +160,7 @@ pub trait ElectionHost {
     /// `tryJoinLogAsFollower(Image, boolean, long)` at `:1771`. **Blocks**.
     fn try_join_log_as_follower(
         &mut self,
-        image: Image,
+        image: ImageView,
         is_leader_startup: bool,
         now_ns: i64,
     ) -> Result<bool, ClusterError>;
@@ -472,7 +472,7 @@ pub trait ElectionHost {
     /// (`Client::take_image`): the adapter that `try_join_log_as_follower`
     /// builds owns it, and the reference's second call in the same election is
     /// the same object.
-    fn log_image_by_session(&mut self, registration_id: i64, session_id: i32) -> Option<Image>;
+    fn log_image_by_session(&mut self, registration_id: i64, session_id: i32) -> Option<ImageView>;
 
     /// `ctx.commitPositionCounter().getPlain()` (`Election.java:265`,
     /// `:456`, `:1100`).

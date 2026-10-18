@@ -631,10 +631,40 @@ impl Image {
     ///
     /// A `fragment_limit` of zero reads nothing, matching the reference. The
     /// caller must pass a positive limit or make no progress.
-    pub fn poll<F>(&mut self, fragment_limit: usize, mut handler: F) -> usize
+    pub fn poll<F>(&mut self, fragment_limit: usize, handler: F) -> usize
     where
         F: FnMut(&Fragment<'_>),
     {
+        self.bounded_poll(i64::MAX, fragment_limit, handler)
+    }
+
+    /// Read up to `fragment_limit` fragments that **start before
+    /// `bound_position`** — `Image.boundedControlledPoll`
+    /// (`Image.java:565-665`) and `aeron_image_bounded_controlled_poll`
+    /// (`aeron_image.c:528-633`).
+    ///
+    /// The bound is the cluster's: a follower applies only what the leader has
+    /// committed, so it polls its log image up to `min(commitPosition, limit)`
+    /// and comes back for the rest (`ConsensusModuleAgent.java:2523`). A
+    /// fragment that starts before the bound and ends after it is still read —
+    /// the reference tests the start offset only.
+    ///
+    /// Returns how many were delivered. The reader position advances past
+    /// exactly those fragments; publishing it to the counter is the caller's,
+    /// for the reason [`Image::poll`] gives.
+    pub fn bounded_poll<F>(
+        &mut self,
+        bound_position: i64,
+        fragment_limit: usize,
+        mut handler: F,
+    ) -> usize
+    where
+        F: FnMut(&Fragment<'_>),
+    {
+        if self.is_closed() || self.position.raw() >= bound_position {
+            return 0;
+        }
+
         let geometry = self.log.geometry();
         let term_length = geometry.term_length as usize;
         let mut fragments = 0;
@@ -664,6 +694,14 @@ impl Image {
                     offset,
                     frame_length,
                 } => {
+                    // The bound is a **start** position: the reference's loop
+                    // condition is `offset < limitOffset`
+                    // (`Image.java:590`), so a frame that begins at or after
+                    // the bound is left for the next poll even if it is
+                    // already in the term.
+                    if next.raw() >= bound_position {
+                        break;
+                    }
                     handler(&Fragment {
                         frame: Frame::new(&term, offset),
                         position: next.raw(),

@@ -555,6 +555,93 @@ fn a_run_of_frames_can_be_read_in_one_call() {
     );
 }
 
+/// The bounded face: a caller that may only apply what has been committed
+/// polls up to the commit position and comes back for the rest
+/// (`Image.boundedControlledPoll`, `Image.java:565-665`).
+///
+/// The bound is a **start** position: a frame that begins at or after it is
+/// left in the term even though it has been written, which is what lets a
+/// cluster follower refuse to apply an entry the leader has not committed
+/// (`ConsensusModuleAgent.java:2523`).
+#[test]
+fn a_bounded_poll_stops_at_the_bound() {
+    let Some((_own, mut client)) = own_driver_and_client("image-bounded-poll") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let publication = client
+        .add_publication(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication");
+    let subscription = client
+        .add_subscription(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a subscription");
+
+    await_image(&mut client, subscription);
+
+    const PAYLOAD: &[u8] = b"one";
+    for index in 0..3_u8 {
+        let mut bytes = PAYLOAD.to_vec();
+        bytes[2] = b'1' + index;
+        offer(&mut client, publication, &bytes);
+    }
+
+    let image = client
+        .subscription(subscription)
+        .expect("the subscription")
+        .images()
+        .first()
+        .expect("the image");
+
+    let image_registration_id = image.registration_id();
+    let position_before = image.position();
+    let subscriber_position_id = image.subscriber_position_id();
+
+    let reach = i64::from(align_up(
+        i32::try_from(DATA_HEADER_LENGTH + PAYLOAD.len()).expect("small"),
+        FRAME_ALIGNMENT,
+    ));
+
+    // The bound names the second frame's start, so only the first is read.
+    let mut delivered = Vec::new();
+    let read = client
+        .poll_image_bounded(
+            subscription,
+            image_registration_id,
+            position_before + reach,
+            10,
+            |fragment| delivered.push(fragment.position()),
+        )
+        .expect("the image this client holds");
+
+    assert_eq!(1, read, "one frame starts before the bound");
+    assert_eq!(vec![position_before], delivered);
+    assert_eq!(
+        position_before + reach,
+        client
+            .subscription(subscription)
+            .expect("the subscription")
+            .images()
+            .first()
+            .expect("the image")
+            .position(),
+        "the reader stopped at the bound"
+    );
+    assert_eq!(
+        Some(position_before + reach),
+        client
+            .counters_reader()
+            .and_then(|reader| reader.value(subscriber_position_id)),
+        "and the stop was published to the counter"
+    );
+
+    // The bound is gone, so the rest of the term is read in one poll.
+    let read = client
+        .poll_image(subscription, image_registration_id, 10, |_| {})
+        .expect("the image this client holds");
+    assert_eq!(2, read, "the two frames the bound withheld");
+}
+
 /// An image that **left** the subscription is still told when its stream is
 /// over — both ways it can be over.
 ///

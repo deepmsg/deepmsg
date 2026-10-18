@@ -11,7 +11,7 @@
 //! from a cluster (the quorum position, whether the quorum reached a position)
 //! it returns the answer this one-member cluster would produce.
 
-use deepmsg_client::image::Image;
+use deepmsg_client::image::ImageView;
 use deepmsg_cluster::election::state::ElectionState;
 use deepmsg_cluster::election::{ConsensusSender, Election, ElectionHost, ElectionRng};
 use deepmsg_cluster::error::ClusterError;
@@ -104,7 +104,7 @@ impl ElectionHost for Mock {
     }
     fn try_join_log_as_follower(
         &mut self,
-        _i: Image,
+        _i: ImageView,
         _s: bool,
         _n: i64,
     ) -> Result<bool, ClusterError> {
@@ -292,7 +292,11 @@ impl ElectionHost for Mock {
     fn log_subscription_channel_errored(&self, _r: i64) -> bool {
         false
     }
-    fn log_image_by_session(&mut self, _r: i64, _s: i32) -> Option<deepmsg_client::image::Image> {
+    fn log_image_by_session(
+        &mut self,
+        _r: i64,
+        _s: i32,
+    ) -> Option<deepmsg_client::image::ImageView> {
         None
     }
     fn commit_position_value(&self) -> i64 {

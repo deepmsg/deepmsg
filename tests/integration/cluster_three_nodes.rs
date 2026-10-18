@@ -639,20 +639,17 @@ fn three_nodes_elect_commit_and_keep_committing_when_a_follower_dies() {
         .expect("the leader's commit position");
     assert!(leader_commit > target);
 
-    // A follower's *commit* counter is moved by the log adapter as it applies
-    // the stream (`P3-6b`); what P3-6a owes is that its recording reached what
-    // the leader committed — the append position that put it in the quorum.
+    // `P3-6b` gives each follower a log adapter, so its **commit** counter —
+    // not just its recording — reaches what the leader committed: the same 203
+    // on all three (`ConsensusModuleAgent.java:2526-2532`).
     wait_until(
-        "the followers' log recordings to reach the commit",
+        "every member's commit counter to reach the leader's",
         &faults,
         || {
             client.poll_events();
-            counters.iter().enumerate().all(|(index, node)| {
-                index == leader_id as usize
-                    || node
-                        .append_position()
-                        .is_some_and(|position| position >= leader_commit)
-            })
+            counters
+                .iter()
+                .all(|node| node.commit_position() == Some(leader_commit))
         },
     );
 

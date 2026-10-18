@@ -41,6 +41,10 @@ use deepmsg_codec_cluster::{ReadBuf, SBE_SCHEMA_ID};
 use crate::error::ClusterError;
 use crate::session::manager::SessionConnectRequest;
 
+/// How long a driver command waits for its answer, as the agent's own
+/// `COMMAND_TIMEOUT` does.
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// `AeronCluster.SESSION_HEADER_LENGTH`: the SBE header plus
 /// `SessionMessageHeader`'s block (`AeronCluster.java:99-100`).
 pub const SESSION_HEADER_LENGTH: usize = deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH
@@ -170,6 +174,28 @@ impl IngressAdapter {
     /// Whether any subscription exists.
     pub const fn is_connected(&self) -> bool {
         self.udp_subscription_id.is_some() || self.ipc_subscription_id.is_some()
+    }
+
+    /// `CloseHelper.close(ingressAdapter)` (`ConsensusModuleAgent.java:1363`):
+    /// give both subscriptions back. A new election's `connectIngress` makes
+    /// its own.
+    ///
+    /// The reference closes the adapter objects and does not wait; a
+    /// `REMOVE_SUBSCRIPTION` here waits for the driver's answer, which is this
+    /// client's face for it.
+    pub fn close(&mut self, client: &mut Client) {
+        for subscription_id in [
+            self.udp_subscription_id.take(),
+            self.ipc_subscription_id.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = client.remove_subscription(subscription_id, COMMAND_TIMEOUT);
+        }
+        self.cached_subscription_id = None;
+        self.cached_image_keys.clear();
+        self.cached_image_identities.clear();
     }
 
     /// The fragment limit.
