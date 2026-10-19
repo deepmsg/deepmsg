@@ -127,6 +127,18 @@ pub struct Election {
     leader_recording_id: i64,
     /// `:129` — where a follower must join; `-1` when not catching up.
     catchup_join_position: i64,
+    /// A live-log join found the publication **ahead** of this member's log:
+    /// the next term that is accepted must take the catch-up path.
+    ///
+    /// Not in the reference. Its `verifyLogJoinPosition` throws a
+    /// `ClusterEvent` for the same case and the retry from `INIT` takes the
+    /// live path again — the publication is still ahead, so the retry throws
+    /// the same event, and the member only recovers if a new term happens to
+    /// start. A follower that is slow enough to subscribe after the leader has
+    /// published is therefore stuck for as long as the leader lives; measured
+    /// at 96 bytes of startup entries against a log of zero on a loaded
+    /// machine.
+    force_catchup: bool,
     /// `:138`.
     replication_leadership_term_id: i64,
     /// `:139`.
@@ -215,6 +227,7 @@ impl Election {
             log_session_id: -1,
             leader_recording_id: -1,
             catchup_join_position: -1,
+            force_catchup: false,
             replication_leadership_term_id: -1,
             replication_stop_position: -1,
             replication_term_base_log_position: 0,
@@ -983,7 +996,17 @@ impl Election {
         };
 
         if let Some(image) = host.log_image_by_session(registration_id, self.log_session_id) {
-            self.verify_log_join_position("followerLogAwait", image.join_position())?;
+            let join_position = image.join_position();
+            if join_position > self.log_position {
+                // The live publication is ahead of this member's log: a
+                // subscription that attached late joins at the publisher's
+                // **current** position (the `SETUP` carries `snd-pos`,
+                // `media/aeron_network_publication.c:581-584`), and the frames
+                // between are only in the leader's archive. See
+                // [`Election::force_catchup`].
+                self.force_catchup = true;
+            }
+            self.verify_log_join_position("followerLogAwait", join_position)?;
             let startup = self.is_leader_startup;
             if host.try_join_log_as_follower(image, startup, now_ns)? {
                 self.update_recording_log(host, now_ns)?;
@@ -1024,6 +1047,7 @@ impl Election {
             host.set_leadership_term_id(self.leadership_term_id);
             host.set_leader_member_id(self.leader_member_id);
             host.election_complete(now_ns)?;
+            self.force_catchup = false;
             self.transition(ElectionState::Closed, now_ns, host)?;
         } else if now_ns >= self.time_of_last_state_change_ns + host.leader_heartbeat_timeout_ns() {
             return Err(ClusterError::Timeout(
@@ -1629,6 +1653,9 @@ impl Election {
                 self.leader_recording_id = leader_recording_id;
                 self.catchup_join_position = if self.append_position < log_position {
                     log_position
+                } else if self.force_catchup {
+                    // Behind by definition: the live image joined ahead of us.
+                    self.log_position
                 } else {
                     -1
                 };

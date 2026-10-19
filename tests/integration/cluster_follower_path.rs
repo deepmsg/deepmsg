@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 
 use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_tests::cluster_harness::{
-    ChannelShape, ClientSide, DEADLINE, ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters,
-    Ports, ROLE_FOLLOWER, announce_skip, await_launched, connect_request, ingress_message,
-    max_ingress_payload, members, offer_message, wait_until,
+    CATCHUP_DEADLINE, ChannelShape, ClientSide, DEADLINE, ELECTION_CLOSED, Faults, MEMBER_COUNT,
+    Node, NodeCounters, Ports, ROLE_FOLLOWER, announce_skip, await_launched, connect_request,
+    ingress_message, max_ingress_payload, members, offer_message, wait_until,
 };
 
 /// The scenarios here all bind ports derived from the **process** id
@@ -41,10 +41,11 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 fn wait_with_state(
     what: &str,
     faults: &Faults,
-    condition: impl Fn() -> bool,
+    timeout: Duration,
+    mut condition: impl FnMut() -> bool,
     state: impl Fn() -> String,
 ) {
-    let deadline = Instant::now() + DEADLINE;
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         faults.check();
         if condition() {
@@ -188,14 +189,30 @@ fn a_stopped_follower_catches_up_through_the_leaders_archive() {
     // back; the leader may commit more meanwhile (an idle client session times
     // out and its close is logged), so the follower is asked to **reach** it,
     // not to stop on it.
-    wait_until(
+    wait_with_state(
         "the restarted follower to commit what the leader committed",
         &faults,
+        CATCHUP_DEADLINE,
         || {
             client.poll_events();
             counters[victim as usize]
                 .commit_position()
                 .is_some_and(|position| position >= leader_commit)
+        },
+        || {
+            let victim_counters = &counters[victim as usize];
+            format!(
+                "leader_commit={leader_commit}, victim append={:?} commit={:?} role={:?} \
+                 election={:?}, leader commit={:?}",
+                victim_counters.append_position(),
+                victim_counters.commit_position(),
+                victim_counters.role(),
+                victim_counters.election_state(),
+                counters[leader_id as usize].commit_position(),
+            ) + &format!(
+                "\nvictim archive/driver log:\n{}",
+                nodes[victim as usize].driver_log_tail(40)
+            )
         },
     );
 
@@ -403,6 +420,7 @@ fn a_member_that_missed_a_term_is_caught_up_by_replication() {
     wait_with_state(
         "the returning member to be caught up by replication",
         &faults,
+        CATCHUP_DEADLINE,
         || {
             counters[victim as usize].election_state()
                 == Some(deepmsg_tests::cluster_harness::ELECTION_CLOSED)
@@ -679,6 +697,7 @@ fn an_orderly_shutdown_ends_every_members_duty_cycle() {
     wait_with_state(
         "every member's duty cycle to end",
         &faults,
+        DEADLINE,
         || nodes.iter().all(Node::has_finished),
         || {
             format!(

@@ -714,7 +714,7 @@ impl ConsensusModuleAgent {
 
         let result = match result {
             Err(error) if error.is_election_recoverable() => {
-                self.report_counted_error();
+                self.report_counted_error(Some(&error));
                 let publisher = self.publisher.clone();
                 let recovered = election.handle_error(self, now_ns, error);
                 self.publisher = publisher;
@@ -752,11 +752,11 @@ impl ConsensusModuleAgent {
             return Err(error);
         }
         if storage_space_refusal(&error) {
-            self.report_counted_error();
+            self.report_counted_error(Some(&error));
             return Err(self.unexpected_termination(&error.to_string()));
         }
         if !self.archive.is_connected(&self.client) {
-            self.report_counted_error();
+            self.report_counted_error(None);
             return Err(self.unexpected_termination("local archive is not connected"));
         }
 
@@ -771,6 +771,11 @@ impl ConsensusModuleAgent {
                 return Err(error);
             };
             let now_ns = self.clock.time_nanos();
+            // The reference's `handleError` reports through
+            // `ctx.countedErrorHandler()` (`Election.java:262-267`); this path
+            // is the one that hands the error over without having counted it
+            // first, so the report belongs here beside the count.
+            self.report_counted_error(Some(&error));
             let publisher = self.publisher.clone();
             let recovered = election.handle_error(self, now_ns, error);
             self.publisher = publisher;
@@ -1016,7 +1021,7 @@ impl ConsensusModuleAgent {
                         // by name, count it, and put the counter back so the
                         // operator's next action is not shadowed by this one.
                         ClusterControlToggle::reset(&self.client, self.counters.control_toggle);
-                        self.report_counted_error();
+                        self.report_counted_error(None);
                     }
                     ClusterControlToggle::Shutdown => {
                         let timestamp = self.clock.time();
@@ -1101,7 +1106,7 @@ impl ConsensusModuleAgent {
             NodeControlToggle::ReplicateStandbySnapshot
             | NodeControlToggle::ValidateRecordingLog => {
                 NodeControlToggle::reset(&self.client, self.counters.node_control_toggle);
-                self.report_counted_error();
+                self.report_counted_error(None);
                 Ok(1)
             }
             NodeControlToggle::Inactive | NodeControlToggle::Neutral => Ok(0),
@@ -1209,7 +1214,7 @@ impl ConsensusModuleAgent {
             } else {
                 // `:3330-3332`: the reference's ERROR `ClusterEvent` for an ack
                 // that belongs to a previous term.
-                self.report_counted_error();
+                self.report_counted_error(None);
             }
 
             self.recording_log
@@ -1241,8 +1246,8 @@ impl ConsensusModuleAgent {
         if self.config.service_count > 0 {
             self.send_service_termination_position_at(0, true);
         }
-        if self.try_stop_log_recording().is_err() {
-            self.report_counted_error();
+        if let Err(error) = self.try_stop_log_recording() {
+            self.report_counted_error(Some(&error));
         }
         self.set_state(ModuleState::Closed, reason);
         ClusterError::AgentTermination(reason.to_owned())
@@ -1256,8 +1261,8 @@ impl ConsensusModuleAgent {
     /// counted and the close continues — a node being told to stop must still
     /// stop.
     fn close_and_terminate(&mut self) -> ClusterError {
-        if self.try_stop_log_recording().is_err() {
-            self.report_counted_error();
+        if let Err(error) = self.try_stop_log_recording() {
+            self.report_counted_error(Some(&error));
         }
 
         self.set_state(ModuleState::Closed, "expected termination");
@@ -1330,10 +1335,18 @@ impl ConsensusModuleAgent {
     }
 
     /// The reference's `ctx.countedErrorHandler().onError(...)`: one on counter
-    /// 210. The text forms of those events need the error log (`P3-4f`), so
-    /// what is visible here is the count.
-    fn report_counted_error(&self) {
+    /// 210, and the error's own words on the process's stderr.
+    ///
+    /// The count alone is what a driver-side error log would carry in
+    /// `P3-4f`; until then this is the only place the reason survives, and
+    /// without it a counted error is invisible — an election that resets to
+    /// `INIT` and tries again looks exactly like an election that is slow.
+    fn report_counted_error(&self, error: Option<&dyn std::fmt::Display>) {
         increment_counter(&self.client, self.counters.error, 1);
+
+        if let Some(error) = error {
+            eprintln!("cluster: {error}");
+        }
     }
 
     /// `onTerminationPosition` (`:1183-1193`): a follower records where the
@@ -1774,7 +1787,7 @@ impl ConsensusModuleAgent {
                     log_publisher.add_destination(&mut self.client, &log_channel, &endpoint);
                 self.log_publisher = log_publisher;
                 if added.is_err() {
-                    self.report_counted_error();
+                    self.report_counted_error(None);
                 }
             }
         }
@@ -2162,7 +2175,7 @@ impl ConsensusModuleAgent {
                 // Backup queries, the challenge response and the standby
                 // snapshot are ClusterBackup's (P3-9) and premium's; a member
                 // that hears one is heard, counted and not answered.
-                self.report_counted_error();
+                self.report_counted_error(None);
                 Ok(0)
             }
         }
@@ -2708,7 +2721,7 @@ impl ConsensusModuleAgent {
         let commit_position = self.commit_position_value();
 
         // `ctx.countedErrorHandler().onError(new ClusterEvent(reason))`.
-        self.report_counted_error();
+        self.report_counted_error(None);
 
         let member_ids: Vec<i32> = self.members.iter().map(|member| member.id).collect();
         let graceful_closed_leader_id = if is_log_end_of_stream {
@@ -2809,10 +2822,10 @@ impl ConsensusModuleAgent {
                     .ensure_consensus_publication(member_id, &channel)
                     .is_err()
                 {
-                    self.report_counted_error();
+                    self.report_counted_error(None);
                 }
             }
-            Err(_) => self.report_counted_error(),
+            Err(error) => self.report_counted_error(Some(&error)),
         }
     }
 }
@@ -3411,7 +3424,7 @@ impl ElectionHost for ConsensusModuleAgent {
                     .stop_replay(&mut self.client, replay_session_id)
                     .is_err()
                 {
-                    self.report_counted_error();
+                    self.report_counted_error(None);
                 }
             }
 
@@ -3553,7 +3566,7 @@ impl ElectionHost for ConsensusModuleAgent {
                 Ok(None) => {}
                 // The signal channel failing is the reference's counted error,
                 // not a reason to stop the agent.
-                Err(_) => self.report_counted_error(),
+                Err(error) => self.report_counted_error(Some(&error)),
             }
         }
 
@@ -3722,10 +3735,10 @@ impl ElectionHost for ConsensusModuleAgent {
                     .ensure_consensus_publication(member_id, &channel)
                     .is_err()
                 {
-                    self.report_counted_error();
+                    self.report_counted_error(None);
                 }
             }
-            Err(_) => self.report_counted_error(),
+            Err(error) => self.report_counted_error(Some(&error)),
         }
         Ok(())
     }
@@ -4445,7 +4458,7 @@ impl ConsensusModuleAgent {
                 // cannot, so the deletion is counted and the handle is told
                 // the replication ended — the election's deadline is what
                 // turns that into the term's failure.
-                self.report_counted_error();
+                self.report_counted_error(None);
                 self.log_replication = None;
                 return;
             }
