@@ -2954,6 +2954,20 @@ impl Setting {
         property: "debug.receive.data.loss.endpoint.skip",
         env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_ENDPOINT_SKIP",
     };
+    /// `deepmsg.debug.receive.data.loss.drop.heartbeats`: whether a blackout
+    /// withholds the heartbeats too.
+    ///
+    /// A `DATA` frame that is only its header is how an image knows its sender
+    /// is alive, so the ordinary blackout lets them through — the connection
+    /// has to survive the loss being injected under it. A case that wants the
+    /// **image** to die, as the reference's
+    /// `StreamIdLossGenerator` makes it (it drops every `DATA` frame of the
+    /// stream), says so here. `docs/compat.md` records it with the rest of the
+    /// family.
+    const RECEIVE_LOSS_DROP_HEARTBEATS: Self = Self {
+        property: "debug.receive.data.loss.drop.heartbeats",
+        env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_DROP_HEARTBEATS",
+    };
 }
 
 /// Why a configuration could not be resolved.
@@ -3815,6 +3829,17 @@ fn receive_data_loss(
         });
     }
 
+    if let Some(value) = get(&Setting::RECEIVE_LOSS_DROP_HEARTBEATS) {
+        spec.drop_heartbeats = parse_bool(&Setting::RECEIVE_LOSS_DROP_HEARTBEATS, &value)?;
+    }
+
+    if spec.drop_heartbeats && spec.until_ms.is_none() {
+        return Err(ConfigError::ConflictingSettings {
+            first: Setting::RECEIVE_LOSS_DROP_HEARTBEATS.property,
+            second: Setting::RECEIVE_LOSS_UNTIL_MILLIS.property,
+        });
+    }
+
     if let Some(value) = get(&Setting::RECEIVE_LOSS_ENDPOINT_SKIP) {
         spec.endpoint_skip = Some(value);
     }
@@ -4671,6 +4696,34 @@ mod tests {
                 ("deepmsg.dir", "/tmp/aeron"),
                 ("deepmsg.debug.send.data.loss.drop.every", "4"),
                 ("deepmsg.debug.send.data.loss.hold.millis", "2000"),
+            ]),
+            Err(ConfigError::ConflictingSettings { .. })
+        ));
+    }
+
+    /// A blackout can be asked to take the heartbeats too — the rule that
+    /// starves an image rather than starving a response — and the modifier
+    /// without a blackout to modify is refused.
+    #[test]
+    fn a_blackout_can_be_asked_to_take_the_heartbeats_too() {
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/aeron"),
+            ("deepmsg.debug.receive.data.loss.stream.id", "5101"),
+            ("deepmsg.debug.receive.data.loss.pass.first", "10"),
+            ("deepmsg.debug.receive.data.loss.until.millis", "1200"),
+            ("deepmsg.debug.receive.data.loss.drop.heartbeats", "true"),
+        ])
+        .expect("a blackout that takes the heartbeats");
+
+        let spec = config.receive_data_loss.expect("the settings ask for loss");
+        assert!(spec.drop_heartbeats);
+        assert_eq!(Some(10), spec.pass_first);
+        assert_eq!(Some(1200), spec.until_ms);
+
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("deepmsg.debug.receive.data.loss.drop.heartbeats", "true"),
             ]),
             Err(ConfigError::ConflictingSettings { .. })
         ));

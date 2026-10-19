@@ -391,11 +391,17 @@ impl LossGenerator for DataInRange {
 ///
 /// # What counts as a frame
 ///
-/// ★ **Heartbeats pass and are not counted.** A `DATA` frame that is nothing but
-/// its header is how a publication carries `EOS` and `REVOKE`, and — as
-/// important here — how a session says it is still alive: a blackout that
-/// swallowed them would drop the connection rather than a response. The
-/// reference's own predicate draws the line in the same place (`:1928-1937`).
+/// ★ **Heartbeats pass and are not counted by default.** A `DATA` frame that is
+/// nothing but its header is how a session says it is still alive, and also
+/// how a publication carries `EOS` and `REVOKE`: a blackout that swallowed them
+/// would drop the connection rather than a response. The reference's own
+/// archive predicate draws the line in the same place (`:1928-1937`).
+///
+/// A case that wants the **connection** to time out is the other way round and
+/// asks for them explicitly (`Spec::drop_heartbeats`): an image is kept alive
+/// by the heartbeats arriving, so a rule that lets them through is a rule the
+/// image cannot notice. That is what the reference's `StreamIdLossGenerator`
+/// does — it drops every `DATA` frame of the stream, heartbeats included.
 #[derive(Debug, Clone)]
 pub struct Blackout {
     /// Which stream's frames this counts, or `None` for any.
@@ -421,6 +427,13 @@ pub struct Blackout {
     /// that `pass_first` counts frames of the stream and not transmissions of
     /// them.
     seen: Vec<(i32, i32)>,
+    /// Whether a heartbeat — a `DATA` frame with no payload — is withheld like
+    /// any other frame.
+    ///
+    /// False is the ordinary rule and true is the one that takes the connection
+    /// down: an image's liveness is refreshed by the heartbeats it receives, so
+    /// a blackout that passes them can never starve an image.
+    drop_heartbeats: bool,
 }
 
 impl Blackout {
@@ -436,6 +449,7 @@ impl Blackout {
         pass_first: u64,
         from: Duration,
         until: Duration,
+        drop_heartbeats: bool,
     ) -> Self {
         Self {
             stream_id,
@@ -444,6 +458,7 @@ impl Blackout {
             until,
             started: None,
             seen: Vec::new(),
+            drop_heartbeats,
         }
     }
 
@@ -474,20 +489,22 @@ impl LossGenerator for Blackout {
         _session_id: i32,
         term_id: i32,
         term_offset: i32,
-        length: usize,
+        _length: usize,
     ) -> bool {
         if self.stream_id.is_some_and(|wanted| wanted != stream_id) {
             return false;
         }
 
-        if length == DataFrame::LENGTH {
-            // A frame that is only its header is a heartbeat: it passes, and it
-            // is not one of the frames being counted.
-            if let Some(header) = FrameHeader::read(buffer) {
-                if header.frame_length == 0 {
-                    return false;
-                }
-            }
+        // A `DATA` frame that is only its header — `DataFrame::LENGTH` is the
+        // data header, so a frame no longer than that carries no message — is a
+        // heartbeat. It passes unless this rule was asked to take the
+        // connection down, and when it passes it is not one of the frames being
+        // counted (`pass_first` names messages, not liveness).
+        let heartbeat = FrameHeader::read(buffer)
+            .is_some_and(|header| header.frame_length <= DataFrame::LENGTH as i32);
+
+        if heartbeat && !self.drop_heartbeats {
+            return false;
         }
 
         // Which frame of the stream this is — the same answer for a frame that
@@ -564,6 +581,11 @@ pub struct Spec {
     pub setup_at_position: Option<SetupPosition>,
     /// The one run of `DATA` to drop.
     pub data_in_range: Option<DataRange>,
+    /// Whether a **blackout** withholds heartbeats too.
+    ///
+    /// False is the ordinary rule; true is the one that can starve an image,
+    /// because an image's liveness is refreshed by the heartbeats it receives.
+    pub drop_heartbeats: bool,
     /// Endpoints whose channel URI contains this are **left alone**.
     pub endpoint_skip: Option<String>,
 }
@@ -620,6 +642,7 @@ impl Spec {
                 self.pass_first.unwrap_or(0),
                 Duration::from_millis(self.from_ms.unwrap_or(0)),
                 Duration::from_millis(until_ms),
+                self.drop_heartbeats,
             )));
         }
 
@@ -834,7 +857,13 @@ mod tests {
 
     #[test]
     fn a_blackout_passes_its_first_frames_and_then_holds() {
-        let mut generator = Blackout::new(Some(4218), 2, Duration::ZERO, Duration::from_secs(60));
+        let mut generator = Blackout::new(
+            Some(4218),
+            2,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            false,
+        );
 
         // Two through, and then withheld for as long as the window lasts.
         assert!(!detailed(&mut generator, &nth_frame(4218, 0)));
@@ -844,7 +873,13 @@ mod tests {
         assert_eq!(4, generator.matched());
 
         // Another stream is not what it counts.
-        let mut generator = Blackout::new(Some(4218), 0, Duration::ZERO, Duration::from_secs(60));
+        let mut generator = Blackout::new(
+            Some(4218),
+            0,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            false,
+        );
 
         assert!(!detailed(&mut generator, &data_frame(4219, 1, 0, 32)));
         assert!(detailed(&mut generator, &nth_frame(4218, 0)));
@@ -858,7 +893,13 @@ mod tests {
     /// long before a frame budget is used up.
     #[test]
     fn a_blackout_ends_when_its_window_does() {
-        let mut generator = Blackout::new(Some(4218), 0, Duration::ZERO, Duration::from_millis(1));
+        let mut generator = Blackout::new(
+            Some(4218),
+            0,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            false,
+        );
 
         assert!(detailed(&mut generator, &nth_frame(4218, 0)));
 
@@ -887,6 +928,7 @@ mod tests {
             0,
             Duration::from_millis(50),
             Duration::from_millis(150),
+            false,
         );
 
         // Before the window opens: through, and counted as frames of the stream.
@@ -911,7 +953,13 @@ mod tests {
     /// connection rather than the responses.
     #[test]
     fn a_heartbeat_is_neither_dropped_nor_counted_by_a_blackout() {
-        let mut generator = Blackout::new(Some(4218), 0, Duration::ZERO, Duration::from_secs(60));
+        let mut generator = Blackout::new(
+            Some(4218),
+            0,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            false,
+        );
 
         let mut heartbeat = data_frame(4218, 1, 0, 0);
         heartbeat[0..4].copy_from_slice(&0i32.to_le_bytes());
@@ -928,13 +976,34 @@ mod tests {
         assert_eq!(2, generator.matched());
     }
 
+    /// ★ And when the case asks for the **connection** to go down, the
+    /// heartbeat is a frame like any other: it is counted and withheld, which
+    /// is what an image's liveness check notices.
+    #[test]
+    fn a_blackout_can_be_asked_to_take_the_heartbeats_too() {
+        let mut generator =
+            Blackout::new(Some(4218), 0, Duration::ZERO, Duration::from_secs(60), true);
+
+        // A real heartbeat is a DATA frame of exactly the data header's length.
+        let heartbeat = data_frame(4218, 1, 0, 0);
+
+        assert!(detailed(&mut generator, &heartbeat));
+        assert_eq!(1, generator.matched());
+    }
+
     /// ★ **A retransmission is the same frame.** The counter that made this real:
     /// a withheld frame is asked for again, and a blackout that counted every
     /// arrival was burned through by those retransmissions long before the
     /// machine it was aimed at retried anything.
     #[test]
     fn a_retransmission_neither_advances_nor_escapes_a_blackout() {
-        let mut generator = Blackout::new(Some(4218), 0, Duration::ZERO, Duration::from_secs(60));
+        let mut generator = Blackout::new(
+            Some(4218),
+            0,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            false,
+        );
 
         let first = data_frame(4218, 1, 0, 32);
 
@@ -951,7 +1020,13 @@ mod tests {
         // And `pass_first` still counts **frames of the stream**: a second
         // distinct frame is the second frame, whatever the transport did with
         // the first.
-        let mut generator = Blackout::new(Some(4218), 1, Duration::ZERO, Duration::from_secs(60));
+        let mut generator = Blackout::new(
+            Some(4218),
+            1,
+            Duration::ZERO,
+            Duration::from_secs(60),
+            false,
+        );
 
         assert!(!detailed(&mut generator, &nth_frame(4218, 0)));
 
