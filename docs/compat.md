@@ -1383,3 +1383,44 @@ channel above and runs one business.
 | Replay channel | `aeron.cluster.replay.channel` (default `aeron:ipc`) stream 103; the subscription names `\|session-id=<low 32 bits of the replay id>` | `ClusteredServiceContainer.java:259-277`, `LogReplay.java:50-55` | `cluster_snapshot.rs` (the snapshot loads over it) |
 | Log replay bounds | `[logPosition, appendPosition)`; the image's join position must equal the start; done when the adapter position reaches the stop and the state is not `SNAPSHOT` | `LogReplay.java:39-60, :114-118` | `cluster_snapshot.rs::a_node_replays_the_log_tail_written_after_its_snapshot` (the tail's session open moves the next session id) |
 | Startup session handling | sessions recovered from a snapshot are `closing(TIMEOUT)` at the end of the **startup** election (`isLeaderStartup`) | `Election.java:1914`, `SessionManager.java:932-946` | `cluster_snapshot.rs` (the recovered session closes; the next id comes from the snapshot) |
+
+## The cluster tool (P3-8)
+
+`deepmsg-cluster-tool` is the reference's `ClusterTool` and
+`ClusterToolOperator`: `<cluster-dir> <command> [options]`, the same
+eighteen commands, the same output strings, and the same exit statuses
+(`ClusterToolOperator.java:85-87`, `ClusterTool.java:239-270`).
+
+| Contract | Value | Reference source | Pinned by |
+|---|---|---|---|
+| Command line | `<cluster-dir> <command> [args]`; an absent directory, an unknown command or a missing required argument prints the help and answers `-1` | `ClusterTool.java:239-270`, `ClusterToolCommand.java:67-81` | `command::run`'s tests: `file_commands::a_command_line_without_a_cluster_directory_prints_the_help`, `::a_missing_cluster_directory_is_reported_on_stderr`, `::an_unknown_command_is_refused_by_name` |
+| Exit status | `0` on success, `-1` for a failure; the process reports `255`, which is what `System.exit(-1)` leaves | `ClusterToolOperator.java:85-87` | the binary's `ExitCode` mapping in `main.rs`; every failing tool test asserts the `-1` |
+| Tool settings | `aeron.cluster.tool.timeout` (ns, default 0), `.delay` (ns, 0), `.replay.channel` (`aeron:ipc`), `.replay.stream.id` (103); passed as `-D` here, JVM properties there | `ClusterTool.java:64-118` | `properties.rs`; `file_commands::the_tool_properties_are_the_references_defaults` |
+| Mark file header line | the SBE generated `[MarkFileHeader](sbeTemplateId=200\|sbeSchemaId=110\|sbeSchemaVersion=2\|sbeBlockLength=128):field=…\|…` with `'` around the six var-data strings | `MarkFileHeaderDecoder.appendTo` (generated), `ClusterToolOperator.java:1147` | `file_commands::describe_prints_the_header_and_the_service_mark_files` |
+| `.lnk` indirection | `cluster-mark.lnk` holds the ASCII path of the mark file's directory; the service links resolve the same way and the link wins over a same-named `.dat` | `ClusterToolOperator.java:1309-1331`, `:1221-1254` | `file_commands::a_link_file_points_the_tool_at_the_real_directory`; `cluster_mark::the_link_points_at_the_mark_files_directory_or_is_absent` |
+| Timestamps | `%tF %tH:%tM:%tS` and the error log's `yyyy-MM-dd HH:mm:ss.SSSZ`, **in UTC**. The reference uses the JVM's default time zone; this build has no time-zone database. | `ClusterToolOperator.java:1271-1276`, `CommonContext.java:1233` | `date_time`'s unit tests |
+| `sort-recording-log` | rewrite in the sorted view's order through `recording.log.tmp` and a rename; already sorted, empty or absent is `-1` | `ClusterToolOperator.java:173-192`, `:1381-1425` | `sort_and_seed::sort_recording_log_*` (four cases) |
+| `seed-recording-log-from-snapshot` | back up to `recording.log.bak` **with the original's times**, then keep the run of snapshots from the newest valid consensus-module snapshot with term base and log position zeroed; none valid ⇒ delete the log | `ClusterToolOperator.java:201-269` | `sort_and_seed::seed_recording_log_*` (three cases, including the command line) |
+| Snapshot description | the reference's begin/end lines and the record lines; **the two hex dumps are omitted** — this build's adapter hands its listener decoded fields, not the buffers | `ConsensusModuleSnapshotPrinter.java:36-143` | `cluster_tool::the_tool_operates_a_three_node_cluster` (the describe-latest arm asserts `Snapshot: appVersion=1 timeUnit=MILLISECONDS`) |
+| Members query answer | `ClusterMembersExtendedResponse` with `leaderMember.id()` — the leader the election recorded, `-1` before a term names one | `ConsensusModuleAgent.java:1267-1280` | `cluster_tool::the_tool_operates_a_three_node_cluster` (a follower must refuse the switch) |
+
+The counters the container owns, completed by P3-8: **218**
+`Cluster container max cycle time in ns` and **219** `Cluster container
+work cycle time exceeded count: threshold=<duration>`, keyed by
+`clusterId` + `serviceId` (`ClusteredServiceContainer.java:969-984`);
+`aeron.cluster.service.cycle.threshold` (100 ms default) is their budget.
+
+The thread names, and where they are set:
+
+| Component | `classic` (the default) | `new` | Set at |
+|---|---|---|---|
+| consensus module | `consensus-module-<clusterId>-<memberId>` | `aeron-cl-cm` | `ConsensusModuleAgent::launch_with_components`; the property `aeron.cluster.consensus.module.agent.role.name` overrides both |
+| service container | `clustered-service-<clusterId>-<serviceId>` | `aeron-cl-cs-<serviceId>` | `ClusteredServiceAgent::launch`; `aeron.cluster.service.name` overrides both |
+
+The kernel keeps 15 bytes of a thread name, so the system tests assert the
+truncated name and the configuration tests assert the full one
+(`ClusterThreadNamingTest.java:62-123`). The backup's name
+(`cluster-backup` / `aeron-cl-bu`) is P3-9's.
+
+LC-6's table is `crates/cluster/common/src/config/names.rs`: all 80 names
+have a disposition, and `property_names.rs` fails if any is `Pending`.
