@@ -375,6 +375,7 @@ dependencies = [
  "deepmsg-archive",
  "deepmsg-client",
  "deepmsg-cluster",
+ "deepmsg-cluster-client",
  "deepmsg-cluster-common",
  "deepmsg-cluster-service",
  "deepmsg-cnc",
