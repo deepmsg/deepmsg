@@ -528,10 +528,24 @@ impl ConsensusModuleConfig {
         }
 
         let cluster_id = int(CLUSTER_ID_PROP_NAME, CLUSTER_ID_DEFAULT)?;
+        let member_id = int(CLUSTER_MEMBER_ID_PROP_NAME, CLUSTER_MEMBER_ID_DEFAULT)?;
+        // `concludeArchiveContext` (`ConsensusModule.java:2077-2100`): the
+        // local archive's two channels carry an alias that names this member,
+        // so two members sharing a driver do not share a control session.
+        let request_uri = deepmsg_core::uri::ChannelUri::parse("aeron:ipc")
+            .expect("a built-in URI")
+            .with_alias_if_absent(&format!(
+                "cm-archive-ctrl-req-cluster-{cluster_id}-member-{member_id}"
+            ));
+        let response_uri = deepmsg_core::uri::ChannelUri::parse("aeron:ipc")
+            .expect("a built-in URI")
+            .with_alias_if_absent(&format!(
+                "cm-archive-ctrl-resp-cluster-{cluster_id}-member-{member_id}"
+            ));
         let mut archive = ArchiveContext::new();
         archive.aeron_dir = aeron_dir.to_string_lossy().into_owned();
-        archive.control_request_channel = Some("aeron:ipc".to_owned());
-        archive.control_response_channel = Some("aeron:ipc".to_owned());
+        archive.control_request_channel = Some(request_uri.build());
+        archive.control_response_channel = Some(response_uri.build());
         // `Context.conclude` (`ConsensusModule.java:2077-2084`): the response
         // stream is per-cluster so two clusters can share one archive.
         archive.control_response_stream_id += cluster_id * 100 + 100;
@@ -560,7 +574,7 @@ impl ConsensusModuleConfig {
             cluster_dir,
             mark_file_dir: mark_file_dir.unwrap_or_else(|| PathBuf::from(CLUSTER_DIR_DEFAULT)),
             aeron_dir,
-            member_id: int(CLUSTER_MEMBER_ID_PROP_NAME, CLUSTER_MEMBER_ID_DEFAULT)?,
+            member_id,
             cluster_id,
             cluster_members: required(CLUSTER_MEMBERS_PROP_NAME)?,
             ingress_channel: required(INGRESS_CHANNEL_PROP_NAME)?,
@@ -1044,6 +1058,36 @@ mod tests {
             ])
             .unwrap();
         ConsensusModuleConfig::from_properties(&source).expect("30 s is six heartbeats");
+    }
+
+    #[test]
+    fn the_archive_control_channels_carry_member_aliases() {
+        // `shouldCreateAliasForControlStreams`
+        // (`ConsensusModuleContextTest.java:897`).
+        let config = ConsensusModuleConfig::from_properties(&properties()).unwrap();
+        let request = config
+            .archive
+            .control_request_channel
+            .as_deref()
+            .expect("a request channel");
+        let response = config
+            .archive
+            .control_response_channel
+            .as_deref()
+            .expect("a response channel");
+        assert!(
+            request.contains("alias=cm-archive-ctrl-req-cluster-19-member-7"),
+            "{request}"
+        );
+        assert!(
+            response.contains("alias=cm-archive-ctrl-resp-cluster-19-member-7"),
+            "{response}"
+        );
+        assert_eq!(
+            19 * 100 + 100 + 20,
+            config.archive.control_response_stream_id,
+            "the response stream is per cluster"
+        );
     }
 
     #[test]

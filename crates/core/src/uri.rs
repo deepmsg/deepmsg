@@ -241,6 +241,17 @@ impl ChannelUri {
     /// Every occurrence is replaced rather than the first: [`get`](Self::get)
     /// is last-wins, so leaving an earlier duplicate behind would make the
     /// value written here the one that does *not* win.
+    /// `ChannelUri.addAliasIfAbsent`: this URI with `alias` when it names
+    /// none, and unchanged when it does.
+    #[must_use]
+    pub fn with_alias_if_absent(&self, alias: &str) -> Self {
+        let mut uri = self.clone();
+        if uri.get("alias").is_none() {
+            uri.put("alias", alias);
+        }
+        uri
+    }
+
     pub fn put(&mut self, key: &str, value: impl Into<String>) {
         let value = value.into();
         let position = self.params.iter().position(|(name, _)| name == key);

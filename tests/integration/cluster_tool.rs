@@ -89,6 +89,13 @@ fn the_tool_operates_a_three_node_cluster() {
         "{described}"
     );
     assert!(described.contains("clusterId="), "{described}");
+    // `writeAuthenticatorSupplierClassNameIntoTheMarkFile`
+    // (`ConsensusModuleContextTest.java:382`): the mark file names the
+    // authenticator's class.
+    assert!(
+        described.contains("authenticator='io.aeron.security.DefaultAuthenticatorSupplier'"),
+        "{described}"
+    );
 
     let mut out = Vec::new();
     assert_eq!(0, tool.pid(nodes[leader].cluster_dir(), &mut out));

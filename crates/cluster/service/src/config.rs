@@ -366,9 +366,24 @@ impl ServiceContainerConfig {
     /// not share a control session.
     #[must_use]
     pub fn archive_context(&self) -> ArchiveContext {
+        // `concludeArchiveContext` (`ClusteredServiceContainer.java:1011-1045`):
+        // both control channels carry an alias naming this service and
+        // cluster, so two services of one cluster do not share an archive
+        // control session.
+        let aliased = |suffix: &str| {
+            deepmsg_core::uri::ChannelUri::parse(&self.archive_local_control_channel)
+                .map(|uri| {
+                    uri.with_alias_if_absent(&format!(
+                        "sc-{}-archive-ctrl-{suffix}-cluster-{}",
+                        self.service_id, self.cluster_id
+                    ))
+                    .build()
+                })
+                .unwrap_or_else(|_| self.archive_local_control_channel.clone())
+        };
         let mut context = ArchiveContext::new();
-        context.control_request_channel = Some(self.archive_local_control_channel.clone());
-        context.control_response_channel = Some(self.archive_local_control_channel.clone());
+        context.control_request_channel = Some(aliased("req"));
+        context.control_response_channel = Some(aliased("resp"));
         context.control_request_stream_id = self.archive_local_control_stream_id;
         context.control_response_stream_id = self.archive_control_response_stream_id;
         context
@@ -460,6 +475,34 @@ mod tests {
         assert_eq!(config.archive_control_response_stream_id, 121);
         assert_eq!(config.snapshot_duration_threshold_ns, 1_000_000_000);
         assert_eq!(config.cycle_threshold_ns, 100_000_000);
+    }
+
+    #[test]
+    fn the_archive_control_channels_carry_service_aliases() {
+        // `shouldCreateAliasForControlStreams`
+        // (`ClusteredServiceContainerContextTest.java:326`).
+        let config =
+            ServiceContainerConfig::from_properties(&Properties::new()).expect("defaults parse");
+        let context = config.archive_context();
+        let request = context
+            .control_request_channel
+            .as_deref()
+            .expect("a request channel");
+        let response = context
+            .control_response_channel
+            .as_deref()
+            .expect("a response channel");
+        assert!(
+            request.contains("alias=sc-0-archive-ctrl-req-cluster-0"),
+            "{request}"
+        );
+        assert!(
+            response.contains("alias=sc-0-archive-ctrl-resp-cluster-0"),
+            "{response}"
+        );
+        assert_eq!(context.control_request_stream_id, 10);
+        // clusterId 0, serviceId 0, control response stream 20: 121.
+        assert_eq!(context.control_response_stream_id, 121);
     }
 
     #[test]
