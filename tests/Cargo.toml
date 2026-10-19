@@ -685,6 +685,21 @@ name = "cluster_lc1_echo"
 path = "interop/cluster_lc1_echo.rs"
 required-features = ["interop"]
 
+# P3-3c's LC-1 scenarios: our client on its own driver, over UDP, against a
+# Java cluster — one channel, an endpoint list, a redirect, a failed leader, a
+# session timeout, a snapshot and a challenge.
+[[test]]
+name = "cluster_lc1_scenarios"
+path = "interop/cluster_lc1_scenarios.rs"
+required-features = ["interop"]
+
+# P3-3c's LC-1 reliability cases: the reference's ClusterSessionReliabilityTest,
+# with the loss injected by our driver's own settings because it is a process.
+[[test]]
+name = "cluster_lc1_reliability"
+path = "interop/cluster_lc1_reliability.rs"
+required-features = ["interop"]
+
 # P3-2a's LC-4a smoke: the reference's driver, archive and consensus module in
 # one Java process, deepmsg's service container against them, and the
 # reference's own `AeronCluster` client. Needs the reference jar, a JDK and the

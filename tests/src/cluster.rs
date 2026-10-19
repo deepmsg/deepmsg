@@ -49,6 +49,7 @@
 //! previous run's file, and a test that waited for existence would read the dead
 //! one and call the new process started.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -68,7 +69,7 @@ use deepmsg_cluster_service::service::{LogHeader, SnapshotReader, SnapshotWriter
 use deepmsg_cluster_service::services;
 use deepmsg_cluster_service::{
     ClusteredService, ClusteredServiceAgent, ContainerError, Role, ServiceContainerConfig,
-    SessionId, ShutdownHandle,
+    SessionId, ShutdownHandle, TimeUnit,
 };
 use deepmsg_codec_cluster::close_reason::CloseReason;
 use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
@@ -184,6 +185,11 @@ impl MemberSpec {
     }
 
     /// Our test business on a Java node, in process.
+    ///
+    /// `service` is `test-service` (echo, plus the reference's test-business
+    /// observables) or `sequence-service` (the same echo, and every session
+    /// message's first eight bytes checked against that session's next
+    /// sequence number).
     #[must_use]
     pub const fn test_container(id: i32, service: &'static str) -> Self {
         Self {
@@ -282,6 +288,86 @@ impl Options {
         self.members.clone().unwrap_or_else(|| {
             "0,localhost:0,localhost:0,localhost:0,localhost:0,localhost:0".to_owned()
         })
+    }
+}
+
+/// The reference's port scheme for a multi-node cluster: every member owns a
+/// block of [`PORTS_PER_NODE`], with the archive control channel, the client
+/// facing ingress, the member facing consensus and the log at fixed offsets
+/// inside it (`ClusterConfig.java:42-67`).
+///
+/// A cluster and its client must agree on these numbers twice over: the members
+/// are told `id,ingress,consensus,log,catchup,archive` (which is how a member
+/// binds its endpoints), and a client that names `ingressEndpoints` is told
+/// `id=endpoint` instead. Both spellings are produced here so a scenario
+/// cannot get one of them from a different base than the other.
+#[derive(Clone, Copy, Debug)]
+pub struct ClusterPorts {
+    base: u16,
+}
+
+/// `ClusterConfig.PORTS_PER_NODE`.
+pub const PORTS_PER_NODE: u16 = 100;
+/// The offset of a member's archive control port (`ClusterConfig.java:47`).
+pub const ARCHIVE_CONTROL_PORT_OFFSET: u16 = 1;
+/// The offset of a member's ingress port (`:52`).
+pub const CLIENT_FACING_PORT_OFFSET: u16 = 2;
+/// The offset of a member's consensus port (`:57`).
+pub const MEMBER_FACING_PORT_OFFSET: u16 = 3;
+/// The offset of a member's log port (`:62`).
+pub const LOG_PORT_OFFSET: u16 = 4;
+
+impl ClusterPorts {
+    /// A cluster whose first member's block starts at `base`.
+    #[must_use]
+    pub const fn new(base: u16) -> Self {
+        Self { base }
+    }
+
+    /// One port in a member's block.
+    #[must_use]
+    pub fn endpoint(&self, member: i32, offset: u16) -> String {
+        format!(
+            "localhost:{}",
+            self.base + u16::try_from(member).expect("a member id") * PORTS_PER_NODE + offset
+        )
+    }
+
+    /// Where a member's clients connect (`:52`).
+    #[must_use]
+    pub fn ingress_endpoint(&self, member: i32) -> String {
+        self.endpoint(member, CLIENT_FACING_PORT_OFFSET)
+    }
+
+    /// The reference's `aeron.cluster.members`:
+    /// `id,ingress,consensus,log,catchup,archive` per member, `|` between them.
+    ///
+    /// The catch-up endpoint is left at port zero: the reference's own scheme
+    /// assigns it from the same block, and nothing in these scenarios uses it.
+    #[must_use]
+    pub fn members_string(&self, members: i32) -> String {
+        (0..members)
+            .map(|member| {
+                format!(
+                    "{member},{},{},{},localhost:0,{}",
+                    self.endpoint(member, CLIENT_FACING_PORT_OFFSET),
+                    self.endpoint(member, MEMBER_FACING_PORT_OFFSET),
+                    self.endpoint(member, LOG_PORT_OFFSET),
+                    self.endpoint(member, ARCHIVE_CONTROL_PORT_OFFSET),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// What a client's `ingressEndpoints` names: `id=endpoint`, comma
+    /// separated (`AeronCluster.parseIngressEndpoints`, `AC:735-756`).
+    #[must_use]
+    pub fn ingress_endpoints(&self, members: i32) -> String {
+        (0..members)
+            .map(|member| format!("{member}={}", self.ingress_endpoint(member)))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -512,6 +598,35 @@ impl TestCluster {
     pub fn counter_on(&self, member: i32, type_id: i32) -> Option<i64> {
         let client = Client::connect(self.aeron_dir(member)).ok()?;
         counter_value(&client, type_id, self.options.cluster_id)
+    }
+
+    /// The member whose role counter says LEADER, other than `excluded`.
+    ///
+    /// The connect timeout is short on purpose: a member that has been stopped
+    /// leaves a directory whose heartbeat ages out, and `Client::connect` would
+    /// spend its whole timeout discovering that — long enough that a caller
+    /// waiting here stops polling its own client, which is that client's
+    /// liveness window on another driver.
+    #[must_use]
+    pub fn leader_other_than(&self, excluded: i32) -> Option<i32> {
+        self.nodes
+            .iter()
+            .map(|node| node.id)
+            .filter(|member| *member != excluded)
+            .find(|member| {
+                Client::connect_with_timeout(self.aeron_dir(*member), Duration::from_millis(100))
+                    .ok()
+                    .and_then(|client| {
+                        let counters = client.counters_reader()?;
+                        let id = counters::find_cluster_counter(
+                            &counters,
+                            CLUSTER_NODE_ROLE_TYPE_ID,
+                            self.options.cluster_id,
+                        )?;
+                        counters.value(id)
+                    })
+                    == Some(ROLE_LEADER)
+            })
     }
 
     /// The member whose role counter says LEADER, once one does.
@@ -964,7 +1079,16 @@ impl TestCluster {
             args.push(format!("-D{name}={value}"));
         }
         args.push("-cp".to_owned());
-        args.push(self.jar.to_string_lossy().into_owned());
+        // The probes are on the node's classpath too: a Java node loads its
+        // authenticator supplier **by class name** from a property
+        // (`ConsensusModule.java:807`), which is how a scenario gives a
+        // three-node cluster a challenge/response authenticator without a
+        // custom node main.
+        args.push(format!(
+            "{}:{}",
+            self.jar.display(),
+            self.classes.path().display()
+        ));
         args.push("io.aeron.cluster.ClusteredMediaDriver".to_owned());
 
         let log = node.cluster.path().join("java-node.log");
@@ -991,12 +1115,23 @@ impl TestCluster {
                 (container, None)
             }
             ServiceImpl::Test(name) => {
-                assert_eq!(
-                    name, "test-service",
-                    "no test business called `{name}`; the fixture has one"
+                assert!(
+                    matches!(
+                        name,
+                        "test-service" | "sequence-service" | "sequenced-egress"
+                    ),
+                    "no test business called `{name}`; the fixture has `test-service`, \
+                     `sequence-service` and `sequenced-egress`"
                 );
                 let state = Arc::new(TestServiceState::default());
-                let service = Box::new(TestService::new(Arc::clone(&state)));
+                let service: Box<dyn ClusteredService + Send> = if name == "sequenced-egress" {
+                    Box::new(SequencedEgressService::new(Arc::clone(&state)))
+                } else {
+                    Box::new(TestService::new(
+                        Arc::clone(&state),
+                        name == "sequence-service",
+                    ))
+                };
                 let container = self.spawn_in_process(index, service);
                 (container, Some(state))
             }
@@ -1241,6 +1376,18 @@ pub struct TestServiceState {
     close_reasons: Mutex<Vec<CloseReason>>,
     fail_next_snapshot: AtomicBool,
     terminated: AtomicBool,
+    /// The messages whose first eight bytes were not the session's next
+    /// sequence number — a gap, a repeat, or a payload too short to hold one.
+    ///
+    /// The reference's `SequenceCheckingService` counts the same thing
+    /// (`ClusterSessionReliabilityTest.java:267-309`), and it is the assertion
+    /// two kinds of case need: "the session was closed before messages could be
+    /// lost silently" and "a failover neither lost nor repeated one".
+    out_of_sequence: AtomicUsize,
+    /// The next sequence number the business expects from each session.
+    next_sequence: Mutex<HashMap<SessionId, u64>>,
+    /// Messages a timer-driven business offered, which no client action drove.
+    offered: AtomicUsize,
 }
 
 impl TestServiceState {
@@ -1248,6 +1395,18 @@ impl TestServiceState {
     #[must_use]
     pub fn messages(&self) -> usize {
         self.messages.load(Ordering::Acquire)
+    }
+
+    /// Messages that were not the session's next sequence number.
+    #[must_use]
+    pub fn out_of_sequence(&self) -> usize {
+        self.out_of_sequence.load(Ordering::Acquire)
+    }
+
+    /// Messages a timer-driven business offered (`sequenced-egress`).
+    #[must_use]
+    pub fn offered(&self) -> usize {
+        self.offered.load(Ordering::Acquire)
     }
 
     /// `on_session_open` calls.
@@ -1287,13 +1446,44 @@ impl TestServiceState {
 struct TestService {
     inner: deepmsg_cluster_service::EchoService,
     state: Arc<TestServiceState>,
+    /// Whether the first eight bytes of every session message are that
+    /// session's sequence number, little endian.
+    ///
+    /// On only for the fixture's `sequence-service`: the other cases send
+    /// whatever they like, and reading "hello cluster" as a sequence would
+    /// count a gap on every message.
+    check_sequence: bool,
 }
 
 impl TestService {
-    fn new(state: Arc<TestServiceState>) -> Self {
+    fn new(state: Arc<TestServiceState>, check_sequence: bool) -> Self {
         Self {
             inner: deepmsg_cluster_service::EchoService::new(),
             state,
+            check_sequence,
+        }
+    }
+
+    /// `SequenceCheckingService.onSessionMessage` (`CSR:278-296`): the message's
+    /// first eight bytes against what this session owes next.
+    fn check_one_sequence(&self, session: SessionId, payload: &[u8]) {
+        let sequence = payload
+            .get(..8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes);
+
+        let mut next = self.state.next_sequence.lock().expect("the sequence lock");
+        let expected = next.entry(session).or_insert(0);
+
+        if sequence != Some(*expected) {
+            self.state.out_of_sequence.fetch_add(1, Ordering::AcqRel);
+        }
+
+        // A message with no sequence in it still moves nothing: the next
+        // message is judged against the same expectation, so one malformed
+        // payload counts as one failure rather than poisoning the session.
+        if let Some(sequence) = sequence {
+            *expected = sequence.wrapping_add(1);
         }
     }
 }
@@ -1314,6 +1504,15 @@ impl ClusteredService for TestService {
         timestamp: i64,
     ) -> Result<(), ContainerError> {
         self.state.session_opens.fetch_add(1, Ordering::AcqRel);
+
+        if self.check_sequence {
+            self.state
+                .next_sequence
+                .lock()
+                .expect("the sequence lock")
+                .insert(session, 0);
+        }
+
         self.inner.on_session_open(cluster, session, timestamp)
     }
 
@@ -1330,6 +1529,15 @@ impl ClusteredService for TestService {
             .lock()
             .expect("the reasons lock")
             .push(reason);
+
+        if self.check_sequence {
+            self.state
+                .next_sequence
+                .lock()
+                .expect("the sequence lock")
+                .remove(&session);
+        }
+
         self.inner
             .on_session_close(cluster, session, timestamp, reason)
     }
@@ -1343,6 +1551,13 @@ impl ClusteredService for TestService {
         header: &LogHeader,
     ) -> Result<(), ContainerError> {
         self.state.messages.fetch_add(1, Ordering::AcqRel);
+
+        if self.check_sequence {
+            if let Some(session) = session {
+                self.check_one_sequence(session, payload);
+            }
+        }
+
         self.inner
             .on_session_message(cluster, session, timestamp, payload, header)
     }
@@ -1376,6 +1591,175 @@ impl ClusteredService for TestService {
     ) -> Result<(), ContainerError> {
         self.state.terminated.store(true, Ordering::Release);
         self.inner.on_terminate(cluster)
+    }
+}
+
+/// The reference's `SequencedEgressService`
+/// (`ClusterSessionReliabilityTest.java:311-380`): a ten-millisecond timer
+/// offers every open session's next sequence number.
+///
+/// What it is for is egress traffic that **no client action drives**. The case
+/// that drops the client's egress and then lets it through again needs the
+/// stream to have moved on while the client was not reading: an echo service
+/// stops producing the moment the client stops offering, so a client that
+/// rejoined the image would be shown nothing and the case could not tell a
+/// rejoin from a correct absence.
+struct SequencedEgressService {
+    state: Arc<TestServiceState>,
+    next_sequence: HashMap<SessionId, u64>,
+}
+
+/// The reference's `TIMER_CORRELATION_ID`.
+const SEQUENCED_TIMER_ID: i64 = 1;
+
+impl SequencedEgressService {
+    fn new(state: Arc<TestServiceState>) -> Self {
+        Self {
+            state,
+            next_sequence: HashMap::new(),
+        }
+    }
+
+    /// Schedule the next tick, retrying while the cluster refuses.
+    ///
+    /// A timer's deadline is in the **cluster clock's unit**, not nanoseconds:
+    /// the reference converts ten milliseconds into it
+    /// (`cluster.timeUnit().convert(10, MILLISECONDS)`,
+    /// `ClusterSessionReliabilityTest.java:345`), and a deadline a million
+    /// times too large is a timer that never fires.
+    fn schedule(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+    ) -> Result<(), ContainerError> {
+        let interval = match cluster.time_unit() {
+            TimeUnit::Milliseconds => 10,
+            TimeUnit::Microseconds => 10_000,
+            TimeUnit::Nanoseconds => 10_000_000,
+        };
+        let deadline = cluster.time().saturating_add(interval);
+
+        while !cluster.schedule_timer(SEQUENCED_TIMER_ID, deadline)? {
+            cluster.idle(0)?;
+        }
+
+        Ok(())
+    }
+
+    fn cancel(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+    ) -> Result<(), ContainerError> {
+        while !cluster.cancel_timer(SEQUENCED_TIMER_ID)? {
+            cluster.idle(0)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl ClusteredService for SequencedEgressService {
+    fn on_start(
+        &mut self,
+        _cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        _snapshot: Option<&mut SnapshotReader<'_>>,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    fn on_session_open(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        session: SessionId,
+        _timestamp: i64,
+    ) -> Result<(), ContainerError> {
+        self.state.session_opens.fetch_add(1, Ordering::AcqRel);
+        self.next_sequence.insert(session, 0);
+        if self.next_sequence.len() == 1 {
+            self.schedule(cluster)?;
+        }
+
+        Ok(())
+    }
+
+    fn on_session_close(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        session: SessionId,
+        _timestamp: i64,
+        reason: CloseReason,
+    ) -> Result<(), ContainerError> {
+        self.state.session_closes.fetch_add(1, Ordering::AcqRel);
+        self.state
+            .close_reasons
+            .lock()
+            .expect("the reasons lock")
+            .push(reason);
+        self.next_sequence.remove(&session);
+
+        if self.next_sequence.is_empty() {
+            self.cancel(cluster)?;
+        }
+
+        Ok(())
+    }
+
+    fn on_session_message(
+        &mut self,
+        _cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        _session: Option<SessionId>,
+        _timestamp: i64,
+        _payload: &[u8],
+        _header: &LogHeader,
+    ) -> Result<(), ContainerError> {
+        self.state.messages.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn on_timer_event(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        correlation_id: i64,
+        _timestamp: i64,
+    ) -> Result<(), ContainerError> {
+        if correlation_id != SEQUENCED_TIMER_ID {
+            return Ok(());
+        }
+
+        self.schedule(cluster)?;
+
+        let sessions: Vec<SessionId> = self.next_sequence.keys().copied().collect();
+
+        for session in sessions {
+            let Some(sequence) = self.next_sequence.get(&session).copied() else {
+                continue;
+            };
+            let Some(mut client_session) = cluster.session(session) else {
+                continue;
+            };
+
+            if client_session.offer(&sequence.to_le_bytes())? > 0 {
+                self.next_sequence.insert(session, sequence.wrapping_add(1));
+                self.state.offered.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn on_take_snapshot(&mut self, _writer: &mut SnapshotWriter<'_>) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    fn on_role_change(&mut self, _new_role: Role) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    fn on_terminate(
+        &mut self,
+        _cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+    ) -> Result<(), ContainerError> {
+        self.state.terminated.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
