@@ -79,6 +79,29 @@ const REJOIN_PARAM_NAME: &str = "rejoin";
 /// Where the IPC channel prefix starts (`CommonContext.IPC_CHANNEL`).
 const IPC_CHANNEL: &str = "aeron:ipc";
 
+/// What the session reads deadlines from (`AeronCluster.Context.nanoClock`,
+/// `AC:251`).
+///
+/// The reference takes a `NanoClock` on its context, and its two
+/// wait-for-a-leader timeouts are the reason: a test that has to watch a
+/// deadline pass advances a clock instead of sleeping. [`SystemNanoClock`] is
+/// the default and reads the driver's own monotonic clock
+/// (`deepmsg_core::clock::monotonic_nano_time`).
+pub trait NanoClock {
+    /// Nanoseconds from a clock that only goes forwards.
+    fn nano_time(&mut self) -> i64;
+}
+
+/// The default: a monotonic reading of this process's clock.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemNanoClock;
+
+impl NanoClock for SystemNanoClock {
+    fn nano_time(&mut self) -> i64 {
+        deepmsg_core::clock::monotonic_nano_time()
+    }
+}
+
 /// What a cluster client sends when the cluster asks it to prove itself.
 ///
 /// The reference's `CredentialsSupplier` is two methods
@@ -139,6 +162,8 @@ pub struct AeronClusterContext {
     pub is_ingress_exclusive: bool,
     /// The challenge/response supplier.
     pub credentials: Box<dyn CredentialsSupplier>,
+    /// What the session's deadlines read.
+    pub nano_clock: Box<dyn NanoClock>,
     /// `conclude` has run, once.
     is_concluded: bool,
 }
@@ -156,6 +181,7 @@ impl Default for AeronClusterContext {
             client_name: String::new(),
             is_ingress_exclusive: true,
             credentials: Box::new(NullCredentialsSupplier),
+            nano_clock: Box::new(SystemNanoClock),
             is_concluded: false,
         }
     }
@@ -291,6 +317,13 @@ impl AeronClusterContext {
     #[must_use]
     pub fn credentials(mut self, supplier: Box<dyn CredentialsSupplier>) -> Self {
         self.credentials = supplier;
+        self
+    }
+
+    /// Replace the clock the session's deadlines read.
+    #[must_use]
+    pub fn nano_clock(mut self, clock: Box<dyn NanoClock>) -> Self {
+        self.nano_clock = clock;
         self
     }
 
@@ -523,6 +556,36 @@ mod tests {
         let mut context = context();
         context.conclude().expect("the first");
         assert!(context.conclude().is_err(), "the second is refused");
+    }
+
+    /// The session's deadline clock comes from the context, and a fake is a
+    /// first-class one — which is how the two wait-for-a-leader timeouts are
+    /// tested without sleeping.
+    #[test]
+    fn the_deadline_clock_is_the_contexts() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct TestClock(Rc<Cell<i64>>);
+
+        impl NanoClock for TestClock {
+            fn nano_time(&mut self) -> i64 {
+                self.0.get()
+            }
+        }
+
+        let now = Rc::new(Cell::new(1_000));
+        let mut context = context().nano_clock(Box::new(TestClock(Rc::clone(&now))));
+
+        assert_eq!(1_000, context.nano_clock.nano_time());
+        now.set(2_000);
+        assert_eq!(2_000, context.nano_clock.nano_time());
+
+        // And the default goes forwards rather than reading the wall clock.
+        let mut system = SystemNanoClock;
+        let first = system.nano_time();
+        let second = system.nano_time();
+        assert!(second >= first);
     }
 
     /// The seven names, read from one `Properties` — the values the interop
