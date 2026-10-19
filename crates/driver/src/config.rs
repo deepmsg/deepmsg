@@ -2842,7 +2842,7 @@ impl Setting {
     ///
     /// **No counterpart in the reference**; it switches its
     /// `PortLossGenerator` on from the test's thread instead
-    /// (`aeron-test-support/.../PortLossGenerator.java:32-37`).
+    /// (`aeron-test-support/.../PortLossGenerator.java:29-35`).
     /// `docs/compat.md` records the difference.
     const SEND_LOSS_PASS_FIRST: Self = Self {
         property: "debug.send.data.loss.pass.first",

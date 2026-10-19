@@ -233,7 +233,7 @@ impl SendDataLoss {
 /// enough of them to be past a connection.
 ///
 /// The reference's `PortLossGenerator.startDropping(port, durationNs)`
-/// (`aeron-test-support/src/main/java/io/aeron/test/driver/PortLossGenerator.java:32-37`)
+/// (`aeron-test-support/src/main/java/io/aeron/test/driver/PortLossGenerator.java:29-35`)
 /// is switched on from the test's own thread after the service has seen five
 /// messages; a driver configured before it starts has no such moment, so the
 /// moment is made **deterministic** instead: the `pass_first`-th datagram that

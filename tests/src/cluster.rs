@@ -1625,7 +1625,7 @@ impl SequencedEgressService {
     /// A timer's deadline is in the **cluster clock's unit**, not nanoseconds:
     /// the reference converts ten milliseconds into it
     /// (`cluster.timeUnit().convert(10, MILLISECONDS)`,
-    /// `ClusterSessionReliabilityTest.java:346`), and a deadline a million
+    /// `ClusterSessionReliabilityTest.java:345`), and a deadline a million
     /// times too large is a timer that never fires.
     fn schedule(
         &mut self,
