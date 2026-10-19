@@ -167,6 +167,12 @@ impl MemberIngress {
     pub(crate) const fn member_id(&self) -> i32 {
         self.member_id
     }
+
+    /// The member's ingress endpoint.
+    #[must_use]
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
 }
 
 /// A connect in progress.
@@ -924,7 +930,7 @@ pub fn connect(
 }
 
 /// `parseIngressEndpoints` (`AC:735-756`).
-fn parse_ingress_endpoints(
+pub(crate) fn parse_ingress_endpoints(
     endpoints: Option<&str>,
 ) -> Result<Vec<MemberIngress>, ClusterClientError> {
     let Some(endpoints) = endpoints else {
@@ -963,7 +969,7 @@ fn parse_ingress_endpoints(
 
 /// The channel a member's ingress publication is added on (`AC:2617-2627`):
 /// a UDP ingress channel has its `endpoint` replaced with the member's.
-fn member_channel(context: &AeronClusterContext, endpoint: &str) -> String {
+pub(crate) fn member_channel(context: &AeronClusterContext, endpoint: &str) -> String {
     let Some(channel) = context.ingress_channel.as_deref() else {
         return String::new();
     };
@@ -981,7 +987,7 @@ fn member_channel(context: &AeronClusterContext, endpoint: &str) -> String {
 }
 
 /// `asyncAddIngressPublication` (`AC:795-805`).
-fn async_add_ingress(
+pub(crate) fn async_add_ingress(
     client: &mut impl ClientOps,
     context: &AeronClusterContext,
     channel: &str,
@@ -1004,7 +1010,10 @@ fn async_add_ingress(
 }
 
 /// The kind an ingress publication is (`AC:795-805`).
-fn ingress_kind(context: &AeronClusterContext, registration_id: i64) -> IngressPublication {
+pub(crate) fn ingress_kind(
+    context: &AeronClusterContext,
+    registration_id: i64,
+) -> IngressPublication {
     if context.is_ingress_exclusive {
         IngressPublication::Exclusive(registration_id)
     } else {
@@ -1020,7 +1029,7 @@ fn client_info(client_name: &str) -> String {
 }
 
 /// `AERON_ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE` is an add to retry.
-fn is_temporarily_unavailable(error: &CommandError) -> bool {
+pub(crate) fn is_temporarily_unavailable(error: &CommandError) -> bool {
     matches!(
         error,
         CommandError::Driver { code, .. }
@@ -1057,303 +1066,13 @@ const CONTROL_MODE_MANUAL: &str = "manual";
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, VecDeque};
-
-    use deepmsg_client::fragment_assembler::{Action, Message};
     use deepmsg_codec::cluster::event_code::EventCode;
     use deepmsg_codec::cluster::message_header_codec::MessageHeaderDecoder;
     use deepmsg_codec::cluster::session_connect_request_codec::SessionConnectRequestDecoder;
     use deepmsg_codec::cluster::session_event_codec::SessionEventEncoder;
-    use deepmsg_core::logbuffer::append::Appended;
-    use deepmsg_core::logbuffer::position::Position;
 
     use super::*;
-    use crate::client_ops::PublicationKind;
-
-    /// What an add answers the next time it is polled.
-    #[derive(Debug)]
-    enum AddAnswer {
-        Pending,
-        Ready,
-        /// The add answers "no such handle": the reference's `NULL_VALUE`
-        /// registration id, which makes the connect try again next turn.
-        Unknown,
-        Failed(CommandError),
-    }
-
-    struct Subscription {
-        channel: String,
-        resolved: Option<String>,
-        ready: bool,
-    }
-
-    struct Publication {
-        connected: bool,
-        ready: bool,
-    }
-
-    /// A client that answers from a script and records what it was asked.
-    ///
-    /// The reference's eight connect tests mock `Aeron` with Mockito and
-    /// assert the calls it saw; this is the same object said as a value.
-    /// Every method appends one line to `calls` — the order the connect asked
-    /// in is the order the lines appear.
-    #[derive(Default)]
-    struct RecordingClient {
-        calls: Vec<String>,
-        next_id: i64,
-        next_correlation: i64,
-        pending: BTreeMap<i64, AddAnswer>,
-        subscriptions: BTreeMap<i64, Subscription>,
-        publications: BTreeMap<i64, Publication>,
-        egress: VecDeque<Vec<u8>>,
-        offered: std::cell::RefCell<Vec<Vec<u8>>>,
-    }
-
-    impl RecordingClient {
-        fn new() -> Self {
-            Self {
-                next_correlation: 100,
-                next_id: 1,
-                ..Self::default()
-            }
-        }
-
-        fn last_registration_id(&self) -> i64 {
-            self.next_id - 1
-        }
-
-        fn answer(&mut self, id: i64, answer: AddAnswer) {
-            self.pending.insert(id, answer);
-        }
-
-        fn connect(&mut self, id: i64) {
-            if let Some(publication) = self.publications.get_mut(&id) {
-                publication.ready = true;
-                publication.connected = true;
-            }
-        }
-
-        fn land(&mut self, id: i64) {
-            // The answer the next poll gives: `Ready`. The resource's own
-            // `ready` flag is set when that answer is read, as the driver's
-            // answer is what makes the resource usable.
-            self.pending.insert(id, AddAnswer::Ready);
-        }
-
-        fn push_egress(&mut self, bytes: Vec<u8>) {
-            self.egress.push_back(bytes);
-        }
-
-        fn calls(&self) -> &[String] {
-            &self.calls
-        }
-
-        fn offered(&self) -> Vec<Vec<u8>> {
-            self.offered.borrow().clone()
-        }
-    }
-
-    impl ClientOps for RecordingClient {
-        fn next_correlation_id(&mut self) -> Result<i64, CommandError> {
-            self.calls.push("next_correlation_id".to_owned());
-            self.next_correlation += 1;
-            Ok(self.next_correlation - 1)
-        }
-
-        fn async_add_subscription(
-            &mut self,
-            channel: &str,
-            stream_id: i32,
-            _timeout: Duration,
-        ) -> Result<AsyncAdd, CommandError> {
-            let id = self.next_id;
-            self.next_id += 1;
-            self.calls
-                .push(format!("async_add_subscription({channel}, {stream_id})"));
-            self.subscriptions.insert(
-                id,
-                Subscription {
-                    channel: channel.to_owned(),
-                    resolved: None,
-                    ready: false,
-                },
-            );
-            self.pending.insert(id, AddAnswer::Pending);
-            Ok(AsyncAdd::subscription(id))
-        }
-
-        fn async_add_publication(
-            &mut self,
-            channel: &str,
-            stream_id: i32,
-            _timeout: Duration,
-        ) -> Result<AsyncAdd, CommandError> {
-            let id = self.next_id;
-            self.next_id += 1;
-            self.calls
-                .push(format!("async_add_publication({channel}, {stream_id})"));
-            self.publications.insert(
-                id,
-                Publication {
-                    connected: false,
-                    ready: false,
-                },
-            );
-            self.pending.insert(id, AddAnswer::Pending);
-            Ok(AsyncAdd::publication(id))
-        }
-
-        fn async_add_exclusive_publication(
-            &mut self,
-            channel: &str,
-            stream_id: i32,
-            _timeout: Duration,
-        ) -> Result<AsyncAdd, CommandError> {
-            let id = self.next_id;
-            self.next_id += 1;
-            self.calls.push(format!(
-                "async_add_exclusive_publication({channel}, {stream_id})"
-            ));
-            self.publications.insert(
-                id,
-                Publication {
-                    connected: false,
-                    ready: false,
-                },
-            );
-            self.pending.insert(id, AddAnswer::Pending);
-            Ok(AsyncAdd::publication(id))
-        }
-
-        fn async_add_poll(&mut self, add: AsyncAdd) -> AsyncAddPoll {
-            let id = add.registration_id();
-            self.calls.push(format!("async_add_poll({id})"));
-
-            match self.pending.remove(&id) {
-                Some(AddAnswer::Pending) => {
-                    // Still pending: put it back, so every turn of the connect
-                    // sees the same answer until the test changes it.
-                    self.pending.insert(id, AddAnswer::Pending);
-                    AsyncAddPoll::Awaiting
-                }
-                Some(AddAnswer::Ready) => {
-                    if let Some(publication) = self.publications.get_mut(&id) {
-                        publication.ready = true;
-                    }
-                    if let Some(subscription) = self.subscriptions.get_mut(&id) {
-                        subscription.ready = true;
-                    }
-                    AsyncAddPoll::Ready
-                }
-                Some(AddAnswer::Unknown) | None => AsyncAddPoll::Unknown,
-                Some(AddAnswer::Failed(error)) => AsyncAddPoll::Failed(error),
-            }
-        }
-
-        fn async_remove_subscription(
-            &mut self,
-            registration_id: i64,
-            _timeout: Duration,
-        ) -> Result<(), CommandError> {
-            self.calls
-                .push(format!("async_remove_subscription({registration_id})"));
-            self.subscriptions.remove(&registration_id);
-            self.pending.remove(&registration_id);
-            Ok(())
-        }
-
-        fn async_remove_publication(
-            &mut self,
-            registration_id: i64,
-            _timeout: Duration,
-        ) -> Result<(), CommandError> {
-            self.calls
-                .push(format!("async_remove_publication({registration_id})"));
-            self.publications.remove(&registration_id);
-            self.pending.remove(&registration_id);
-            Ok(())
-        }
-
-        fn subscription_present(&self, registration_id: i64) -> bool {
-            self.subscriptions.contains_key(&registration_id)
-        }
-
-        fn subscription_channel(&self, registration_id: i64) -> Option<String> {
-            self.subscriptions
-                .get(&registration_id)
-                .map(|subscription| subscription.channel.clone())
-        }
-
-        fn subscription_resolved_endpoint(&self, registration_id: i64) -> Option<String> {
-            self.subscriptions
-                .get(&registration_id)
-                .and_then(|subscription| subscription.resolved.clone())
-        }
-
-        fn publication_present(&self, _kind: PublicationKind, registration_id: i64) -> bool {
-            self.publications
-                .get(&registration_id)
-                .is_some_and(|publication| publication.ready)
-        }
-
-        fn publication_is_connected(&self, _kind: PublicationKind, registration_id: i64) -> bool {
-            self.publications
-                .get(&registration_id)
-                .is_some_and(|publication| publication.connected)
-        }
-
-        fn offer(
-            &self,
-            _kind: PublicationKind,
-            registration_id: i64,
-            payload: &[u8],
-        ) -> Option<Appended> {
-            // `offer` is `&self` on the trait (the reference's is too), so the
-            // recording of what was offered happens through interior
-            // mutability-free means: the tests read `offered` after the fact
-            // through `&mut self` only. Kept simple by returning a position.
-            if self.publications.contains_key(&registration_id) {
-                self.offered.borrow_mut().push(payload.to_vec());
-                Some(Appended::Ok {
-                    position: Position::from_raw(i64::from(payload.len() as u32)),
-                    term_offset: 0,
-                })
-            } else {
-                None
-            }
-        }
-
-        fn poll_egress(
-            &mut self,
-            _subscription_id: i64,
-            _fragment_limit: usize,
-            handler: &mut dyn for<'a> FnMut(Message<'a>) -> Action,
-        ) -> usize {
-            self.calls.push("poll_egress".to_owned());
-
-            let Some(bytes) = self.egress.pop_front() else {
-                return 0;
-            };
-
-            let message = Message {
-                header: deepmsg_client::fragment_assembler::MessageHeader {
-                    session_id: 0,
-                    stream_id: 102,
-                    term_offset: 0,
-                    flags: 0,
-                    position: 0,
-                    frame_length: 0,
-                    fragmented_frame_length: 0,
-                    image_registration_id: 11,
-                },
-                payload: &bytes,
-            };
-
-            let _ = handler(message);
-            1
-        }
-    }
+    use crate::test_client::{AddAnswer, RecordingClient};
 
     fn context() -> AeronClusterContext {
         AeronClusterContext::default()
@@ -1755,7 +1474,12 @@ mod tests {
             panic!("the connect concluded");
         };
 
-        assert_eq!(publication, session.ingress_publication().registration_id());
+        assert_eq!(
+            Some(publication),
+            session
+                .ingress_publication()
+                .map(crate::cluster::IngressPublication::registration_id)
+        );
         assert_eq!(1, session.egress_subscription());
         assert_eq!(5, session.leadership_term_id());
         assert_eq!(2, session.leader_member_id());

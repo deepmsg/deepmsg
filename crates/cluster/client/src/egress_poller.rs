@@ -39,11 +39,11 @@
 
 use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::{Action, Message};
+use deepmsg_codec::cluster::SBE_SCHEMA_ID;
 use deepmsg_codec::cluster::challenge_codec::{
     ChallengeDecoder, SBE_BLOCK_LENGTH as CHALLENGE_BLOCK_LENGTH,
 };
 use deepmsg_codec::cluster::event_code::EventCode;
-use deepmsg_codec::cluster::message_header_codec::{self, MessageHeaderDecoder};
 use deepmsg_codec::cluster::new_leader_event_codec::{
     NewLeaderEventDecoder, SBE_BLOCK_LENGTH as NEW_LEADER_EVENT_BLOCK_LENGTH,
 };
@@ -53,7 +53,8 @@ use deepmsg_codec::cluster::session_event_codec::{
 use deepmsg_codec::cluster::session_message_header_codec::{
     SBE_BLOCK_LENGTH as SESSION_MESSAGE_HEADER_BLOCK_LENGTH, SessionMessageHeaderDecoder,
 };
-use deepmsg_codec::cluster::{ReadBuf, SBE_SCHEMA_ID};
+
+use crate::sbe::{holds, holds_var, sbe_header, var_slice};
 
 use crate::client_ops::ClientOps;
 
@@ -389,40 +390,6 @@ impl deepmsg_client::fragment_assembler::ControlledHandler for EgressPoller {
     }
 }
 
-/// The SBE header of a message, or `None` when the payload cannot hold one.
-///
-/// The reference wraps without a length check and lets a short buffer throw.
-/// This build's decoders panic instead (see the module note), so the bound is
-/// checked here.
-fn sbe_header(payload: &[u8]) -> Option<MessageHeaderDecoder<ReadBuf<'_>>> {
-    if payload.len() < message_header_codec::ENCODED_LENGTH {
-        return None;
-    }
-
-    Some(MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0))
-}
-
-/// Whether a payload is long enough for a template's fixed part.
-fn holds(payload: &[u8], block_length: u16) -> bool {
-    payload.len() >= message_header_codec::ENCODED_LENGTH + usize::from(block_length)
-}
-
-/// The same, plus the four-byte length prefix a variable field starts with.
-fn holds_var(payload: &[u8], block_length: u16) -> bool {
-    payload.len() >= message_header_codec::ENCODED_LENGTH + usize::from(block_length) + 4
-}
-
-/// A variable field's bytes, when the coordinates are inside the payload.
-///
-/// The generated `*_slice` would panic on a length that runs past the end; a
-/// message that says so is not one this poller reads.
-fn var_slice(payload: &[u8], (offset, length): (usize, usize)) -> Option<&[u8]> {
-    offset
-        .checked_add(length)
-        .filter(|end| *end <= payload.len())
-        .map(|_| &payload[offset..offset + length])
-}
-
 #[cfg(test)]
 mod tests {
     use deepmsg_codec::archive::WriteBuf as ArchiveWriteBuf;
@@ -430,6 +397,7 @@ mod tests {
     use deepmsg_codec::archive::control_response_codec::ControlResponseEncoder;
     use deepmsg_codec::archive::message_header_codec as archive_message_header_codec;
     use deepmsg_codec::cluster::WriteBuf;
+    use deepmsg_codec::cluster::message_header_codec;
     use deepmsg_codec::cluster::session_message_header_codec::SessionMessageHeaderEncoder;
 
     use super::*;

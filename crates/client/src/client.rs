@@ -1872,6 +1872,26 @@ impl Client {
         Some(publication.offer(limit, payload))
     }
 
+    /// The same, for a message made of **two slices**, on an exclusive
+    /// publication: the cluster client's ingress write.
+    ///
+    /// # Errors
+    ///
+    /// [`None`] when this client holds no exclusive publication under that
+    /// registration id; see [`Appended`](deepmsg_core::logbuffer::append::Appended)
+    /// for the rest.
+    pub fn offer_two_slices_exclusive(
+        &self,
+        registration_id: i64,
+        first: &[u8],
+        second: &[u8],
+    ) -> Option<deepmsg_core::logbuffer::append::Appended> {
+        let publication = self.exclusive_publication(registration_id)?;
+        let limit = self.position_limit(publication.position_limit_counter_id());
+
+        Some(publication.offer_two_slices(limit, first, second))
+    }
+
     /// Offer a **block of whole frames** to an exclusive publication.
     ///
     /// The archive's replay path and nothing else (`Publication.offerBlock`,
@@ -3087,6 +3107,25 @@ impl Client {
         let limit = self.position_limit(publication.position_limit_counter_id());
 
         Some(publication.offer(limit, payload))
+    }
+
+    /// The same, for a message made of **two slices**: `first` at the front of
+    /// the payload, `second` immediately after, with nothing joining them in a
+    /// buffer of their own (`Publication.offer(bufferOne, …, bufferTwo, …)`).
+    ///
+    /// `None` when this client holds no concurrent publication under that
+    /// registration id; see [`Appended`](deepmsg_core::logbuffer::append::Appended)
+    /// for the rest.
+    pub fn offer_two_slices(
+        &self,
+        registration_id: i64,
+        first: &[u8],
+        second: &[u8],
+    ) -> Option<deepmsg_core::logbuffer::append::Appended> {
+        let publication = self.publication(registration_id)?;
+        let limit = self.position_limit(publication.position_limit_counter_id());
+
+        Some(publication.offer_two_slices(limit, first, second))
     }
 
     /// How much room is left before this publication is back-pressured

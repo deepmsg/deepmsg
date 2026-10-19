@@ -143,6 +143,33 @@ impl Publication {
         appender.append(self.session_id, self.stream_id, position_limit, payload)
     }
 
+    /// Append a message made of **two slices** — `first` at the front of the
+    /// payload, `second` after it — as one message.
+    ///
+    /// The reference's `Publication.offer(bufferOne, offsetOne, lengthOne,
+    /// bufferTwo, offsetTwo, lengthTwo, …)`, which the cluster client uses for
+    /// its resident 32-byte session header and the caller's payload
+    /// (`AeronCluster.java:451-458`). Nothing joins the two in a buffer of
+    /// their own: the term receives both, back to back.
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`], and [`Publication::offer`] for what each one means —
+    /// this is the same append.
+    pub fn offer_two_slices(&self, position_limit: i64, first: &[u8], second: &[u8]) -> Appended {
+        let Some(appender) = self.appender() else {
+            return Appended::Malformed;
+        };
+
+        appender.append_two_slices(
+            self.session_id,
+            self.stream_id,
+            position_limit,
+            first,
+            second,
+        )
+    }
+
     /// Claim `length` **payload** bytes and write into them without copying.
     ///
     /// The one thing a publication with more than one producer could not do:
@@ -579,6 +606,40 @@ impl ExclusivePublication {
             // As in `try_claim`: both "try again" answers say this publication's
             // cached term is not the log's current one, and re-seeding is how the
             // cache hears the log's answer.
+            Appended::EndOfLog | Appended::MidRotation => self.seed_from_log(),
+            Appended::Ok { position, .. } => self.advance_to(position),
+            _ => {}
+        }
+
+        outcome
+    }
+
+    /// The same, for a message made of **two slices**: `first` at the front of
+    /// the payload, `second` immediately after.
+    ///
+    /// The door the cluster client's ingress needs (`AeronCluster.java:451`),
+    /// and the exact counterpart of [`ExclusivePublication::offer`] — same
+    /// append, same re-seeding, two sources.
+    ///
+    /// # Errors
+    ///
+    /// As [`ExclusivePublication::offer`].
+    pub fn offer_two_slices(&self, position_limit: i64, first: &[u8], second: &[u8]) -> Appended {
+        let Some(appender) = self.appender() else {
+            return Appended::Malformed;
+        };
+
+        let outcome = appender.append_exclusive_two_slices(
+            self.session_id,
+            self.stream_id,
+            position_limit,
+            self.term_id.get(),
+            self.term_offset.get(),
+            first,
+            second,
+        );
+
+        match outcome {
             Appended::EndOfLog | Appended::MidRotation => self.seed_from_log(),
             Appended::Ok { position, .. } => self.advance_to(position),
             _ => {}

@@ -250,7 +250,7 @@ unit	ElectionTest	shouldThrowNonZeroLogPositionAndNullRecordingIdSpecified	B	P3-
 unit	ElectionTest	shouldSendCommitPositionAndNewLeadershipTermEventsWithTheSameLeadershipTerm	B	P3-5b	unit			should_send_commit_position_and_new_leadership_term_events_with_the_same_leadership_term
 unit	ElectionTest	notifiedCommitPositionCannotGoBackwardsUponReceivingCommitPosition	B	P3-5b	unit			notified_commit_position_cannot_go_backwards_upon_receiving_commit_position
 unit	ElectionTest	notifiedCommitPositionCannotGoBackwardsUponReceivingNewLeadershipTerm	B	P3-5b	unit			notified_commit_position_cannot_go_backwards_upon_receiving_new_leadership_term
-unit	SessionEventCodecCompatibilityTest	readingVersion12UsingVersion5Codec	B	P3-3b	unit			
+unit	SessionEventCodecCompatibilityTest	readingVersion12UsingVersion5Codec	B	P3-3b	unit			egress::compatibility_tests::an_older_acting_version_reads_the_required_fields_and_skips_the_optional_ones (no v5/v12 codecs are generated: the property is stated on the current decoder and an older acting version)
 unit	StandbySnapshotReplicatorTest	shouldReplicateStandbySnapshots	-	-	unit		n/a:premium	
 unit	StandbySnapshotReplicatorTest	shouldPassSignalsToRecordingReplication	-	-	unit		n/a:premium	
 unit	StandbySnapshotReplicatorTest	shouldHandleNoStandbySnapshots	-	-	unit		n/a:premium	
@@ -274,22 +274,22 @@ unit	AeronClusterContextTest	clientNameShouldHandleEmptyValue	B	P3-3a	unit			con
 unit	AeronClusterContextTest	clientNameShouldReturnAssignedValue	B	P3-3a	unit			context::tests::client_name_is_the_assigned_value
 unit	AeronClusterContextTest	clientNameCanBeSetViaSystemProperty	B	P3-3a	unit			context::tests::the_client_name_is_read_from_the_properties (a Properties map, not the process)
 unit	AeronClusterContextTest	clientNameMustNotExceedMaxLength	B	P3-3a	unit			context::tests::a_client_name_longer_than_the_driver_allows_is_refused
-unit	AeronClusterTest	shouldStayConnectedAfterSuccessfulFailover	B	P3-3b	unit			
-unit	AeronClusterTest	shouldRetryNewLeaderIngressPublicationWhenSendChannelEndpointIsClosing	B	P3-3b	unit			
-unit	AeronClusterTest	shouldCloseItselfWhenDisconnectedForLongerThanNewLeaderTimeout	B	P3-3b	unit			
-unit	AeronClusterTest	shouldCloseItselfWhenUnableToSendMessageForLongerThanNewLeaderConnectionTimeout	B	P3-3b	unit			
-unit	AeronClusterTest	shouldCloseIngressPublicationWhenEgressImageCloses	B	P3-3b	unit			
-unit	AeronClusterTest	shouldCloseItselfAfterReachingMaxPositionOnTheIngressPublication	B	P3-3b	unit			
-unit	EgressAdapterTest	onFragmentShouldDelegateToEgressListenerOnUnknownSchemaId	B	P3-3b	unit			
-unit	EgressAdapterTest	defaultEgressListenerBehaviourShouldThrowClusterExceptionOnUnknownSchemaId	B	P3-3b	unit			
-unit	EgressAdapterTest	onFragmentShouldInvokeOnMessageCallbackIfSessionIdMatches	B	P3-3b	unit			
-unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnSessionMessage	B	P3-3b	unit			
-unit	EgressAdapterTest	onFragmentShouldInvokeOnSessionEventCallbackIfSessionIdMatches	B	P3-3b	unit			
-unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnSessionEvent	B	P3-3b	unit			
-unit	EgressAdapterTest	onFragmentShouldInvokeOnNewLeaderCallbackIfSessionIdMatches	B	P3-3b	unit			
-unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnNewLeader	B	P3-3b	unit			
-unit	EgressAdapterTest	onFragmentShouldInvokeOnAdminResponseCallbackIfSessionIdMatches	B	P3-3b	unit			
-unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnAdminResponse	B	P3-3b	unit			
+unit	AeronClusterTest	shouldStayConnectedAfterSuccessfulFailover	B	P3-3b	unit			cluster::tests::a_session_stays_connected_across_a_successful_failover
+unit	AeronClusterTest	shouldRetryNewLeaderIngressPublicationWhenSendChannelEndpointIsClosing	B	P3-3b	unit			cluster::tests::a_closing_send_channel_endpoint_is_retried
+unit	AeronClusterTest	shouldCloseItselfWhenDisconnectedForLongerThanNewLeaderTimeout	B	P3-3b	unit			cluster::tests::a_session_closes_when_disconnected_past_the_new_leader_timeout
+unit	AeronClusterTest	shouldCloseItselfWhenUnableToSendMessageForLongerThanNewLeaderConnectionTimeout	B	P3-3b	unit			cluster::tests::a_session_closes_when_the_new_leader_never_connects
+unit	AeronClusterTest	shouldCloseIngressPublicationWhenEgressImageCloses	B	P3-3b	unit			cluster::tests::a_closed_egress_image_closes_the_ingress_publication
+unit	AeronClusterTest	shouldCloseItselfAfterReachingMaxPositionOnTheIngressPublication	B	P3-3b	unit			cluster::tests::a_publication_at_its_maximum_position_pends_close
+unit	EgressAdapterTest	onFragmentShouldDelegateToEgressListenerOnUnknownSchemaId	B	P3-3b	unit			egress::tests::an_unknown_schema_goes_to_the_extension_listener
+unit	EgressAdapterTest	defaultEgressListenerBehaviourShouldThrowClusterExceptionOnUnknownSchemaId	B	P3-3b	unit			egress::tests::an_unknown_schema_with_no_extension_is_the_references_error
+unit	EgressAdapterTest	onFragmentShouldInvokeOnMessageCallbackIfSessionIdMatches	B	P3-3b	unit			egress::tests::a_session_message_reaches_the_listener
+unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnSessionMessage	B	P3-3b	unit			egress::tests::a_session_message_for_another_session_is_a_no_op
+unit	EgressAdapterTest	onFragmentShouldInvokeOnSessionEventCallbackIfSessionIdMatches	B	P3-3b	unit			egress::tests::a_session_event_reaches_the_listener
+unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnSessionEvent	B	P3-3b	unit			egress::tests::a_session_event_for_another_session_is_a_no_op
+unit	EgressAdapterTest	onFragmentShouldInvokeOnNewLeaderCallbackIfSessionIdMatches	B	P3-3b	unit			egress::tests::a_new_leader_reaches_the_listener
+unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnNewLeader	B	P3-3b	unit			egress::tests::a_new_leader_for_another_session_is_a_no_op
+unit	EgressAdapterTest	onFragmentShouldInvokeOnAdminResponseCallbackIfSessionIdMatches	B	P3-3b	unit			egress::tests::an_admin_response_reaches_the_listener
+unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnAdminResponse	B	P3-3b	unit			egress::tests::an_admin_response_for_another_session_is_a_no_op
 unit	EgressPollerTest	shouldIgnoreUnknownMessageSchema	B	P3-3a	unit			egress_poller::tests::an_unknown_schema_is_stepped_over
 unit	EgressPollerTest	shouldHandleSessionMessage	B	P3-3a	unit			egress_poller::tests::a_session_message_fills_the_slot_and_a_full_slot_aborts
 unit	CborClusterEventCodecTest	encodeDecodeLogElectionStateChange	-	-	unit		n/a:logging	

@@ -32,17 +32,25 @@ pub mod async_connect;
 pub(crate) mod client_ops;
 pub mod cluster;
 pub mod context;
+pub mod egress;
 pub mod egress_poller;
 pub mod error;
+pub(crate) mod sbe;
+#[cfg(test)]
+pub(crate) mod test_client;
 
 pub use async_connect::{AsyncConnect, ConnectState, Polled, connect};
-pub use cluster::{AeronCluster, IngressPublication, SessionState};
+pub use cluster::{AeronCluster, IngressPublication, SessionClaim, SessionState};
 pub use context::{
     AeronClusterContext, CLIENT_NAME_PROP_NAME, CredentialsSupplier, EGRESS_CHANNEL_PROP_NAME,
     EGRESS_STREAM_ID_DEFAULT, EGRESS_STREAM_ID_PROP_NAME, INGRESS_CHANNEL_PROP_NAME,
     INGRESS_ENDPOINTS_PROP_NAME, INGRESS_STREAM_ID_DEFAULT, INGRESS_STREAM_ID_PROP_NAME,
-    MAX_CLIENT_NAME_LENGTH, MESSAGE_TIMEOUT_DEFAULT_NS, MESSAGE_TIMEOUT_PROP_NAME,
-    NullCredentialsSupplier, PROTOCOL_SEMANTIC_VERSION,
+    MAX_CLIENT_NAME_LENGTH, MESSAGE_TIMEOUT_DEFAULT_NS, MESSAGE_TIMEOUT_PROP_NAME, NanoClock,
+    NullCredentialsSupplier, PROTOCOL_SEMANTIC_VERSION, SystemNanoClock,
+};
+pub use egress::{
+    ControlledEgressAdapter, ControlledEgressListener, ControlledEgressListenerExtension,
+    EgressAdapter, EgressListener, EgressListenerExtension, SESSION_HEADER_LENGTH,
 };
 pub use egress_poller::EgressPoller;
 pub use error::ClusterClientError;
