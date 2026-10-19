@@ -140,16 +140,16 @@ system	ClusterToolTest	seedRecordingLogFromSnapshotShouldCreateANewRecordingLogF
 system	ClusterToolTest	shouldCheckForLeaderInAnyStateAfterElectionWasClosed	B	P3-8	counter,cm-object			
 system	ClusterToolTest	listMembersShouldReturnFalseIfNoMarkFileExists	B	P3-8	client			
 system	ClusterToolTest	listMembersShouldReturnFalseIfQueryTimesOut	B	P3-8	client			
-system	MultiClusteredServicesTest	shouldSupportMultipleServicesPerNode	B	P3-2c	java-injection,client		n/a:java-injection	
-system	MultiClusteredServicesTest	shouldContinueFromLogIfSnapshotThrowsException	B	P3-2c	java-injection,stub-service,counter,client		n/a:java-injection	
-system	ServiceIpcIngressMessageTest	shouldEchoServiceIpcMessages	B	P3-2c	stub-service,counter,client			
-system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicates	B	P3-2c	java-injection,stub-service,counter,client		hook:service-supplier	
-system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicatesDuringFailoverWithUncommittedPendingServiceMessages	B	P3-2c	java-injection,stub-service,counter,client		hook:service-supplier	
-system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesAndTimersWithoutDuplicatesWhenLeaderServicesAreStopped	B	P3-2c	java-injection,stub-service,counter,client		hook:service-supplier	
-system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicatesAfterAFullClusterRestart	B	P3-2c	java-injection,stub-service,counter,client		hook:service-supplier	
-system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicatesWhenClusterIsRestartedAfterTakingASnapshot	B	P3-2c	java-injection,stub-service,counter,client		n/a:java-injection	
-system	ServiceIpcIngressMessageTest	shouldHandleServiceMessagesMissedOnTheFollowerWhenSnapshot	B	P3-2c	stub-service,counter,client			
-system	TestClusterTest	testCustomAeronDirectory	B	P3-2c	counter,client		n/a:fixture-self-test	
+system	MultiClusteredServicesTest	shouldSupportMultipleServicesPerNode	B	P3-2c	java-injection,client		n/a:java-injection	two_services_on_one_node_answer_every_message_in_process, ..._external, the_reference_containers_answer_the_same_way (single-node form; the three-node form is deferred)
+system	MultiClusteredServicesTest	shouldContinueFromLogIfSnapshotThrowsException	B	P3-2c	java-injection,stub-service,counter,client		n/a:java-injection	a_snapshot_that_fails_ends_that_service_and_the_cluster_carries_on (in-process only; external records n/a:external-injection)
+system	ServiceIpcIngressMessageTest	shouldEchoServiceIpcMessages	B	P3-2c	stub-service,counter,client			a_service_message_round_trips_in_process, ..._external, the_reference_container_round_trips_a_service_message_the_same_way (single node; the three-node first round is in service_messages_survive_a_failover_*)
+system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicates	B	P3-2c	java-injection,stub-service,counter,client		hook:service-supplier	a_service_message_round_trips_* (10 messages, exactly once) and the first round of service_messages_survive_a_failover_*
+system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicatesDuringFailoverWithUncommittedPendingServiceMessages	B	P3-2c	java-injection,stub-service,counter,client		hook:service-supplier	service_messages_survive_a_failover_* (weakened: the probe waits for each answer, so no message is pending when the leader dies)
+system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesAndTimersWithoutDuplicatesWhenLeaderServicesAreStopped	B	P3-2c	java-injection,stub-service,counter,client		hook:service-supplier	(deferred: the timer half needs client-scheduled timers across a leader stop; the service-message half is service_messages_survive_a_failover_*)
+system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicatesAfterAFullClusterRestart	B	P3-2c	java-injection,stub-service,counter,client		hook:service-supplier	service_messages_survive_a_full_cluster_restart_in_process, ..._external
+system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicatesWhenClusterIsRestartedAfterTakingASnapshot	B	P3-2c	java-injection,stub-service,counter,client		n/a:java-injection	service_messages_survive_a_snapshot_and_a_restart_in_process, ..._external
+system	ServiceIpcIngressMessageTest	shouldHandleServiceMessagesMissedOnTheFollowerWhenSnapshot	B	P3-2c	stub-service,counter,client			(deferred: needs a follower to miss a service message, which needs an injected buggy business)
+system	TestClusterTest	testCustomAeronDirectory	B	P3-2c	counter,client		n/a:fixture-self-test	(n/a:fixture-self-test)
 unit	ClusterBackupAgentTest	shouldReturnReplayStartPositionIfAlreadyExisting	B	P3-9	unit			
 unit	ClusterBackupAgentTest	shouldReturnNullPositionIfLastTermIsNullAndSnapshotsIsEmpty	B	P3-9	unit			
 unit	ClusterBackupAgentTest	shouldLargestPositionLessThanOrEqualToInitialReplayPosition	B	P3-9	unit			

@@ -257,6 +257,40 @@ impl ClusterMarkFile {
         Ok(file)
     }
 
+    /// Map an existing mark file **without adopting it**: nothing is written,
+    /// no liveness rule is applied, and no version is checked.
+    ///
+    /// The reference has no direct counterpart — its components always adopt
+    /// (`create`) — but a reader outside the component needs the header without
+    /// stamping its own pid over it: a test harness deciding that a container
+    /// has started, or a tool reporting what a cluster's components are.
+    ///
+    /// The mapping is read-write because the header accessors read through it;
+    /// **writing is possible and wrong** — the component that owns the file is
+    /// the one that may signal it. [`Self::is_active`] is the read-only check a
+    /// liveness decision should use.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterMarkError::Io`] when the file cannot be mapped, or
+    /// [`ClusterMarkError::Uninitialised`] when it is shorter than a header.
+    pub fn open(path: &Path) -> Result<Self, ClusterMarkError> {
+        let mapping = MappedFile::open_readwrite(path)?;
+        let error_buffer_length = {
+            let buffer = mapping
+                .region(0, HEADER_LENGTH)
+                .ok_or(ClusterMarkError::Uninitialised)?;
+            usize::try_from(buffer.load_i32(ERROR_BUFFER_LENGTH_FIELD).unwrap_or(0))
+                .map_err(|_| ClusterMarkError::Uninitialised)?
+        };
+
+        Ok(Self {
+            mapping,
+            path: path.to_path_buf(),
+            error_buffer_length,
+        })
+    }
+
     /// Decide whether this process may take over an existing file; answer the
     /// `candidateTermId` to inherit.
     fn adopt_existing(
@@ -724,5 +758,109 @@ mod tests {
         let big = "x".repeat(HEADER_LENGTH);
         assert!(check_header_length(&[&big]).is_err());
         assert!(check_header_length(&["a", "b"]).is_ok());
+    }
+
+    /// A mark file path of its own, beside the system temp directory.
+    fn scratch_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "deepmsg-mark-{name}-{}-{}.dat",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.subsec_nanos())
+        ))
+    }
+
+    #[test]
+    fn a_file_can_be_opened_without_adopting_it() {
+        let path = scratch_path("read-only");
+        let file = ClusterMarkFile::create(
+            &path,
+            ClusterComponentType::CONTAINER,
+            ERROR_BUFFER_MIN_LENGTH,
+            PAGE_MIN_SIZE,
+            1_000,
+            4_242,
+        )
+        .expect("the file is created");
+        file.set_service_id(3);
+        file.set_cluster_id(8);
+        file.signal_ready(1_001).expect("ready");
+        drop(file);
+
+        let opened = ClusterMarkFile::open(&path).expect("the file opens read-only");
+
+        assert_eq!(
+            opened.component_type(),
+            Some(ClusterComponentType::CONTAINER)
+        );
+        assert_eq!(opened.service_id(), Some(3));
+        assert_eq!(opened.cluster_id(), Some(8));
+        assert_eq!(opened.version(), Some(SEMANTIC_VERSION));
+        // The creator's pid, unchanged: an adopting `create` would have stamped
+        // this process's own.
+        assert_eq!(opened.pid(), Some(4_242));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_backup_file_may_be_taken_over_by_a_consensus_module_and_only_by_one() {
+        // The reference's rule (`ClusterMarkFile.java:136-260`): a backup's mark
+        // file is a consensus module's in waiting; a container may not inherit
+        // it. There was no test for this before P3-2c's fixture needed the
+        // distinction (Q5).
+        let module_path = scratch_path("backup-to-module");
+        let backup = ClusterMarkFile::create(
+            &module_path,
+            ClusterComponentType::BACKUP,
+            ERROR_BUFFER_MIN_LENGTH,
+            PAGE_MIN_SIZE,
+            1_000,
+            1,
+        )
+        .expect("a backup file is created");
+        backup.signal_terminated().expect("terminated");
+        drop(backup);
+
+        ClusterMarkFile::create(
+            &module_path,
+            ClusterComponentType::CONSENSUS_MODULE,
+            ERROR_BUFFER_MIN_LENGTH,
+            PAGE_MIN_SIZE,
+            2_000,
+            2,
+        )
+        .expect("a consensus module inherits a backup's file");
+        let _ = std::fs::remove_file(&module_path);
+
+        let container_path = scratch_path("backup-to-container");
+        let backup = ClusterMarkFile::create(
+            &container_path,
+            ClusterComponentType::BACKUP,
+            ERROR_BUFFER_MIN_LENGTH,
+            PAGE_MIN_SIZE,
+            1_000,
+            1,
+        )
+        .expect("a backup file is created");
+        backup.signal_terminated().expect("terminated");
+        drop(backup);
+
+        assert!(matches!(
+            ClusterMarkFile::create(
+                &container_path,
+                ClusterComponentType::CONTAINER,
+                ERROR_BUFFER_MIN_LENGTH,
+                PAGE_MIN_SIZE,
+                2_000,
+                2,
+            ),
+            Err(ClusterMarkError::ComponentType {
+                existing: ClusterComponentType::BACKUP,
+                required: ClusterComponentType::CONTAINER,
+            })
+        ));
+        let _ = std::fs::remove_file(&container_path);
     }
 }

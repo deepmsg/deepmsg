@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 
 use deepmsg_archive::client::ArchiveContext;
+use deepmsg_archive::server::config::ThreadNaming;
 use deepmsg_cluster_common::config::{ConfigError, Properties};
 
 /// `aeron.cluster.id` (`ConsensusModule.java`).
@@ -28,8 +29,22 @@ pub const SERVICE_ID_DEFAULT: i32 = 0;
 pub const MAX_SERVICE_COUNT: i32 = 10;
 /// `aeron.cluster.service.name` (`:240`).
 pub const SERVICE_NAME_PROP_NAME: &str = "aeron.cluster.service.name";
-/// `SERVICE_NAME_DEFAULT` (`:246`).
+/// `SERVICE_NAME_DEFAULT` (`:246`) — the name the reference's static accessor
+/// falls back to. `ClusteredServiceContainer.Context` itself does **not** use
+/// it: its field starts from the raw system property (`:755`) and is replaced
+/// by the computed thread name when empty (`:926-930`). See
+/// [`container_thread_name`].
 pub const SERVICE_NAME_DEFAULT: &str = "clustered-service";
+/// `deepmsg.cluster.service`: this build's name for **which compiled-in
+/// business to run** (`services::by_name`).
+///
+/// The reference has no such property — it loads a class named by
+/// [`SERVICE_CLASS_NAME_PROP_NAME`]. A deployment that migrates from Java keeps
+/// `aeron.cluster.service.name` as its role name and picks the business here.
+pub const SERVICE_REGISTRY_PROP_NAME: &str = "deepmsg.cluster.service";
+/// `aeron.thread.naming` (`CommonContext.java:534`), which picks between the
+/// two spellings of the container's thread name (`:926-930`).
+pub const THREAD_NAMING_PROP_NAME: &str = "aeron.thread.naming";
 /// `aeron.cluster.service.class.name` (`:252`) — names a Java class, refused.
 pub const SERVICE_CLASS_NAME_PROP_NAME: &str = "aeron.cluster.service.class.name";
 /// `aeron.cluster.control.channel` (`:282`).
@@ -149,8 +164,16 @@ pub struct ServiceContainerConfig {
     pub cluster_id: i32,
     /// `aeron.cluster.service.id`, `0..MAX_SERVICE_COUNT`.
     pub service_id: i32,
-    /// `aeron.cluster.service.name`; the agent's role name.
+    /// `aeron.cluster.service.name`; the agent's role name and (when the
+    /// property was empty) the computed thread name.
     pub service_name: String,
+    /// `deepmsg.cluster.service`: which compiled-in business to run. `None`
+    /// when the property was absent — the binary refuses that rather than
+    /// guessing a business.
+    pub service: Option<String>,
+    /// `aeron.thread.naming`: which spelling of the container's thread name
+    /// applies (`:926-930`).
+    pub thread_naming: ThreadNaming,
     /// `aeron.dir`.
     pub aeron_dir: PathBuf,
     /// `aeron.cluster.dir`.
@@ -236,6 +259,19 @@ impl ServiceContainerConfig {
         }
 
         let cluster_id = int(CLUSTER_ID_PROP_NAME, CLUSTER_ID_DEFAULT)?;
+        let thread_naming = match properties.get(THREAD_NAMING_PROP_NAME) {
+            None => ThreadNaming::DEFAULT,
+            Some(value) => ThreadNaming::parse(value).ok_or_else(|| ConfigProblem::Value {
+                name: THREAD_NAMING_PROP_NAME,
+                value: value.to_owned(),
+            })?,
+        };
+        // `Context.conclude` (`:755`, `:926-930`): the property's value, or —
+        // when it is absent **or empty** — the name computed from the ids.
+        let service_name = match properties.get(SERVICE_NAME_PROP_NAME) {
+            None | Some("") => container_thread_name(cluster_id, service_id, thread_naming),
+            Some(name) => name.to_owned(),
+        };
         let archive_control_response_stream_id = int(
             ARCHIVE_CONTROL_RESPONSE_STREAM_ID_PROP_NAME,
             ARCHIVE_CONTROL_RESPONSE_STREAM_ID_DEFAULT,
@@ -264,10 +300,11 @@ impl ServiceContainerConfig {
         Ok(Self {
             cluster_id,
             service_id,
-            service_name: properties
-                .get(SERVICE_NAME_PROP_NAME)
-                .unwrap_or(SERVICE_NAME_DEFAULT)
-                .to_owned(),
+            service_name,
+            service: properties
+                .get(SERVICE_REGISTRY_PROP_NAME)
+                .map(str::to_owned),
+            thread_naming,
             aeron_dir,
             cluster_dir,
             mark_file_dir: properties.get(MARK_FILE_DIR_PROP_NAME).map(PathBuf::from),
@@ -341,6 +378,21 @@ impl ServiceContainerConfig {
     }
 }
 
+/// What `aeron.cluster.service.name` becomes when it is absent or empty
+/// (`ClusteredServiceContainer.java:926-930`): `aeron-cl-cs-<serviceId>` under
+/// `aeron.thread.naming=new`, `clustered-service-<clusterId>-<serviceId>` under
+/// `classic` (the default).
+///
+/// The same value is the container's Aeron client name (`:942`, `:1042`) and
+/// the thread the agent runs on.
+#[must_use]
+pub fn container_thread_name(cluster_id: i32, service_id: i32, naming: ThreadNaming) -> String {
+    match naming {
+        ThreadNaming::New => format!("aeron-cl-cs-{service_id}"),
+        ThreadNaming::Classic => format!("clustered-service-{cluster_id}-{service_id}"),
+    }
+}
+
 /// Where a client looks for a driver when nothing says
 /// (`aeron_default_path`, `aeron_utility.c`).
 ///
@@ -372,7 +424,12 @@ mod tests {
 
         assert_eq!(config.cluster_id, 0);
         assert_eq!(config.service_id, 0);
-        assert_eq!(config.service_name, "clustered-service");
+        // `Context.conclude` computes the name when the property is empty
+        // (`:926-930`); `classic` is the default naming (`CommonContext.java:547`).
+        assert_eq!(config.service_name, "clustered-service-0-0");
+        assert_eq!(config.thread_naming, ThreadNaming::Classic);
+        // No business is picked for you: the binary refuses an absent name.
+        assert_eq!(config.service, None);
         assert_eq!(config.control_channel, "aeron:ipc?term-length=128k");
         assert_eq!(config.service_stream_id, 104);
         assert_eq!(config.consensus_module_stream_id, 105);
@@ -428,5 +485,66 @@ mod tests {
                 .to_string_lossy()
                 .ends_with("cluster-mark-service-0.dat")
         );
+    }
+
+    #[test]
+    fn an_empty_service_name_is_the_computed_one_under_both_namings() {
+        let mut classic = Properties::new();
+        classic
+            .apply_args([
+                "-Daeron.cluster.id=8".to_owned(),
+                "-Daeron.cluster.service.id=2".to_owned(),
+            ])
+            .expect("two -D arguments");
+        let config = ServiceContainerConfig::from_properties(&classic).expect("parses");
+        assert_eq!(config.service_name, "clustered-service-8-2");
+
+        let mut new = Properties::new();
+        new.apply_args([
+            "-Daeron.cluster.id=8".to_owned(),
+            "-Daeron.cluster.service.id=2".to_owned(),
+            "-Daeron.thread.naming=new".to_owned(),
+        ])
+        .expect("three -D arguments");
+        let config = ServiceContainerConfig::from_properties(&new).expect("parses");
+        assert_eq!(config.service_name, "aeron-cl-cs-2");
+    }
+
+    #[test]
+    fn an_explicit_service_name_wins_over_the_computed_one() {
+        let mut properties = Properties::new();
+        properties
+            .apply_args(["-Daeron.cluster.service.name=my-service".to_owned()])
+            .expect("a -D argument");
+
+        let config = ServiceContainerConfig::from_properties(&properties).expect("parses");
+        assert_eq!(config.service_name, "my-service");
+    }
+
+    #[test]
+    fn an_unknown_thread_naming_is_refused() {
+        let mut properties = Properties::new();
+        properties
+            .apply_args(["-Daeron.thread.naming=Classic".to_owned()])
+            .expect("a -D argument");
+
+        assert!(matches!(
+            ServiceContainerConfig::from_properties(&properties),
+            Err(ConfigProblem::Value {
+                name: THREAD_NAMING_PROP_NAME,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_service_registry_name_is_read_verbatim() {
+        let mut properties = Properties::new();
+        properties
+            .apply_args(["-Ddeepmsg.cluster.service=basic-auction".to_owned()])
+            .expect("a -D argument");
+
+        let config = ServiceContainerConfig::from_properties(&properties).expect("parses");
+        assert_eq!(config.service.as_deref(), Some("basic-auction"));
     }
 }

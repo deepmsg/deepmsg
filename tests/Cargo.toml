@@ -23,6 +23,7 @@ deepmsg-driver = { path = "../crates/driver" }
 deepmsg-cnc = { path = "../crates/cnc" }
 deepmsg-codec = { path = "../crates/codec" }
 deepmsg-codec-cluster = { path = "../crates/codec/cluster" }
+deepmsg-codec-cluster-mark = { path = "../crates/codec/cluster-mark" }
 deepmsg-archive = { path = "../crates/archive" }
 deepmsg-cluster = { path = "../crates/cluster/consensus" }
 deepmsg-cluster-common = { path = "../crates/cluster/common" }
@@ -676,6 +677,39 @@ required-features = ["interop"]
 [[test]]
 name = "cluster_lc4a_smoke"
 path = "interop/cluster_lc4a_smoke.rs"
+required-features = ["interop"]
+
+# P3-2c: a client message offered back through a service message comes back
+# once. Needs the reference jar and the fork's Java probes.
+[[test]]
+name = "cluster_lc4a_service_messages"
+path = "interop/cluster_lc4a_service_messages.rs"
+required-features = ["interop"]
+
+# P3-2c: two containers on one node both answer every message. Needs the
+# reference jar and the fork's Java probes.
+[[test]]
+name = "cluster_lc4a_multi_service"
+path = "interop/cluster_lc4a_multi_service.rs"
+required-features = ["interop"]
+
+# P3-2c: three nodes elect, and a new leader serves after the old one stops.
+[[test]]
+name = "cluster_lc4a_failover"
+path = "interop/cluster_lc4a_failover.rs"
+required-features = ["interop"]
+
+# P3-2c: session open, close and timeout, read through the test business.
+[[test]]
+name = "cluster_lc4a_sessions"
+path = "interop/cluster_lc4a_sessions.rs"
+required-features = ["interop"]
+
+# P3-2c: a business whose snapshot throws ends its container and the cluster
+# carries on.
+[[test]]
+name = "cluster_lc4a_snapshot_failure"
+path = "interop/cluster_lc4a_snapshot_failure.rs"
 required-features = ["interop"]
 
 # P3-2b: the snapshot is taken, survives a restart, and is byte-identical to the

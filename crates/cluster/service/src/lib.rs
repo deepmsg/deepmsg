@@ -83,4 +83,4 @@ pub use config::ServiceContainerConfig;
 pub use error::ContainerError;
 pub use role::{Role, TimeUnit};
 pub use service::{ClusteredService, LogHeader, SessionId};
-pub use services::BasicAuction;
+pub use services::{BasicAuction, EchoService, NoopService};
