@@ -157,6 +157,8 @@ impl SnapshotCluster {
             cluster_id: CLUSTER_ID,
             service_id,
             service_name: format!("basic-auction-{service_id}"),
+            service: Some("basic-auction".to_owned()),
+            thread_naming: deepmsg_archive::server::config::ThreadNaming::Classic,
             aeron_dir: self.aeron_dir().to_path_buf(),
             cluster_dir: self.cluster.path().to_path_buf(),
             mark_file_dir: None,

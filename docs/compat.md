@@ -1340,6 +1340,19 @@ the acceptance test plays the service with a raw client.
 | Entry-iterator order | descending slot order with one wrap, not `forEachLong`'s ascending order | `org.agrona.collections.Long2LongHashMap$AbstractIterator` (2.6.1) | `common/tests/agrona_entry_order.rs` against `agrona-entry-order.tsv` (printed by the jar) |
 | `POLL_LIMIT` | 20; a wheel `poll` can return **more** than 20 (it loops while the tick time is behind), a heap `poll` cannot | `TimerService.java:57`, `WheelTimerService.java:57-74` | `priority_heap_timer_service.rs::poll_should_stop_after_poll_limit_is_reached`; the wheel's loop is `timer/wheel.rs::the_service_poll_walks_the_ticks_in_order_within_one_call` |
 
+## The service container's process and its businesses (P3-2c)
+
+`deepmsg-clustered-service-container` is the reference's
+`ClusteredServiceContainer.main` (`ClusteredServiceContainer.java:97-112`): a
+properties-driven process that joins a consensus module over the control
+channel above and runs one business.
+
+| Contract | Value | Reference source | Pinned by |
+|---|---|---|---|
+| Business selection | `deepmsg.cluster.service` names one compiled-in business — `echo`, `basic-auction`, `noop`. An absent name, or one the registry does not know, is a refused start that lists the three. **This name is this build's**; the reference loads a Java class. | `ClusteredServiceContainer.java:673-687` (the shape being replaced) | `crates/cluster/service/tests/container_binary.rs` |
+| A Java class name | `aeron.cluster.service.class.name` is refused **by name**; this build has no class loader | `ClusteredServiceContainer.java:253` | `container_binary.rs::a_java_class_name_is_refused_by_name` |
+| Container thread name | `aeron-cl-cs-<serviceId>` under `aeron.thread.naming=new`, `clustered-service-<clusterId>-<serviceId>` under `classic` (the default, `CommonContext.java:547`); the same value is the Aeron client name | `ClusteredServiceContainer.java:113`, `:926-930`, `:942`, `:1042` | `config::tests::an_empty_service_name_is_the_computed_one_under_both_namings` |
+
 ## A consensus module's snapshot, and its log replay (P3-4d)
 
 | Contract | Value | Reference source | Pinned by |

@@ -141,6 +141,8 @@ impl Lc4a {
             cluster_id: CLUSTER_ID,
             service_id: 0,
             service_name: "cluster-echo".to_owned(),
+            service: Some("echo".to_owned()),
+            thread_naming: deepmsg_archive::server::config::ThreadNaming::Classic,
             aeron_dir: self.aeron_dir().to_path_buf(),
             cluster_dir: self.cluster.path().to_path_buf(),
             mark_file_dir: None,
