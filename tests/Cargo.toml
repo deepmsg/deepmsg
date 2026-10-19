@@ -679,6 +679,13 @@ name = "cluster_lc4a_smoke"
 path = "interop/cluster_lc4a_smoke.rs"
 required-features = ["interop"]
 
+# P3-2c: a client message offered back through a service message comes back
+# once. Needs the reference jar and the fork's Java probes.
+[[test]]
+name = "cluster_lc4a_service_messages"
+path = "interop/cluster_lc4a_service_messages.rs"
+required-features = ["interop"]
+
 # P3-2b: the snapshot is taken, survives a restart, and is byte-identical to the
 # Java twin's. Needs the reference jar and the fork's Java probes.
 [[test]]
