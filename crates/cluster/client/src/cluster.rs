@@ -840,7 +840,6 @@ impl AeronCluster {
                 leader.leader_member_id,
                 &leader.ingress_endpoints,
             )?;
-            work += 1;
         }
 
         // `AC:603-607`: an egress image that has closed is a lost leader. The
@@ -1026,7 +1025,6 @@ impl AeronCluster {
                 leader.leader_member_id,
                 &leader.ingress_endpoints,
             )?;
-            work += 1;
         }
 
         if matches!(
@@ -1501,7 +1499,11 @@ mod tests {
             );
 
             advance(&h.clock, NEW_LEADER_TIMEOUT_NS - 1);
-            poll(&mut h.session, &mut h.client, new_leader_event());
+            assert_eq!(
+                1,
+                poll(&mut h.session, &mut h.client, new_leader_event()),
+                "the event is one fragment, and the poll counts fragments"
+            );
             assert_eq!(SessionState::AwaitNewLeaderConnection, h.session.state());
             assert_eq!(
                 vec![format!(
@@ -1540,7 +1542,7 @@ mod tests {
         let mut h = harness();
         h.client.fail_next_add_polls(1);
 
-        poll(&mut h.session, &mut h.client, new_leader_event());
+        assert_eq!(1, poll(&mut h.session, &mut h.client, new_leader_event()));
 
         assert_eq!(SessionState::AwaitNewLeaderConnection, h.session.state());
         assert!(!h.session.is_closed());
