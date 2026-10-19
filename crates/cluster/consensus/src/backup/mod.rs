@@ -24,6 +24,7 @@
 //! the backup side. Neither half is useful without the other, which is why the
 //! card covers both.
 
+pub mod context;
 pub mod log_source_validator;
 pub mod snapshot_replication;
 
@@ -142,6 +143,43 @@ impl SourceType {
             other => Err(ClusterError::Cluster(format!(
                 "ClusterBackup.Context.sourceType={other} is not valid. \
                  Must be one of: [ANY, LEADER, FOLLOWER]"
+            ))),
+        }
+    }
+}
+
+/// `ClusterBackup.Configuration.ReplayStart` (`ClusterBackup.java:538-549`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReplayStart {
+    /// Start from the earliest available position in the cluster log.
+    #[default]
+    Beginning,
+    /// Start from the log position of the most recent snapshot.
+    LatestSnapshot,
+}
+
+impl ReplayStart {
+    /// The property's spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Beginning => "BEGINNING",
+            Self::LatestSnapshot => "LATEST_SNAPSHOT",
+        }
+    }
+
+    /// `ReplayStart.valueOf` (`ClusterBackup.java:569-578`).
+    ///
+    /// # Errors
+    ///
+    /// The value is neither `BEGINNING` nor `LATEST_SNAPSHOT`.
+    pub fn parse(value: &str) -> Result<Self, ClusterError> {
+        match value {
+            "BEGINNING" => Ok(Self::Beginning),
+            "LATEST_SNAPSHOT" => Ok(Self::LatestSnapshot),
+            other => Err(ClusterError::Cluster(format!(
+                "{name}={other} is not a ReplayStart",
+                name = crate::backup::context::INITIAL_REPLAY_START_PROP_NAME
             ))),
         }
     }
