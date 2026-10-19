@@ -338,3 +338,83 @@ pub trait ClusteredService {
         0
     }
 }
+
+/// A business chosen at run time, behind the trait object the registry hands
+/// out (`services::by_name`).
+///
+/// The container's agent is generic over its business; a binary that reads the
+/// name from a properties file has no static type to give it. This is the
+/// forwarding implementation that makes `ClusteredServiceAgent<Box<dyn
+/// ClusteredService>>` the binary's instantiation.
+impl ClusteredService for Box<dyn ClusteredService> {
+    fn on_start(
+        &mut self,
+        cluster: &mut Cluster<'_>,
+        snapshot: Option<&mut SnapshotReader<'_>>,
+    ) -> Result<(), ContainerError> {
+        (**self).on_start(cluster, snapshot)
+    }
+
+    fn on_session_open(
+        &mut self,
+        cluster: &mut Cluster<'_>,
+        session: SessionId,
+        timestamp: i64,
+    ) -> Result<(), ContainerError> {
+        (**self).on_session_open(cluster, session, timestamp)
+    }
+
+    fn on_session_close(
+        &mut self,
+        cluster: &mut Cluster<'_>,
+        session: SessionId,
+        timestamp: i64,
+        reason: CloseReason,
+    ) -> Result<(), ContainerError> {
+        (**self).on_session_close(cluster, session, timestamp, reason)
+    }
+
+    fn on_session_message(
+        &mut self,
+        cluster: &mut Cluster<'_>,
+        session: Option<SessionId>,
+        timestamp: i64,
+        payload: &[u8],
+        header: &LogHeader,
+    ) -> Result<(), ContainerError> {
+        (**self).on_session_message(cluster, session, timestamp, payload, header)
+    }
+
+    fn on_timer_event(
+        &mut self,
+        cluster: &mut Cluster<'_>,
+        correlation_id: i64,
+        timestamp: i64,
+    ) -> Result<(), ContainerError> {
+        (**self).on_timer_event(cluster, correlation_id, timestamp)
+    }
+
+    fn on_take_snapshot(&mut self, writer: &mut SnapshotWriter<'_>) -> Result<(), ContainerError> {
+        (**self).on_take_snapshot(writer)
+    }
+
+    fn on_role_change(&mut self, new_role: Role) -> Result<(), ContainerError> {
+        (**self).on_role_change(new_role)
+    }
+
+    fn on_terminate(&mut self, cluster: &mut Cluster<'_>) -> Result<(), ContainerError> {
+        (**self).on_terminate(cluster)
+    }
+
+    fn on_new_leadership_term_event(
+        &mut self,
+        cluster: &mut Cluster<'_>,
+        event: &NewLeadershipTermEvent,
+    ) -> Result<(), ContainerError> {
+        (**self).on_new_leadership_term_event(cluster, event)
+    }
+
+    fn do_background_work(&mut self, now_ns: i64) -> usize {
+        (**self).do_background_work(now_ns)
+    }
+}

@@ -39,7 +39,7 @@ use deepmsg_client::client::Client;
 use deepmsg_cluster_common::counters::{self, CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID};
 use deepmsg_cluster_service::{ClusteredServiceAgent, ContainerError, ServiceContainerConfig};
 use deepmsg_tests::aeron_tests;
-use deepmsg_tests::cluster_service_echo::EchoService;
+use deepmsg_tests::cluster_service_echo::EchoServiceWithTermination;
 use deepmsg_tests::driver::{self, AGRONA_JVM_ARGS, ReferenceDriver};
 use deepmsg_tests::java;
 use deepmsg_tests::temp::TempDir;
@@ -206,7 +206,7 @@ impl Lc4a {
 
     /// Start the container on a thread of this process.
     fn start_container(&self) -> Container {
-        let (service, terminated) = EchoService::new();
+        let (service, terminated) = EchoServiceWithTermination::new();
         let config = self.config();
         let (started_tx, started_rx) = mpsc::channel();
 
