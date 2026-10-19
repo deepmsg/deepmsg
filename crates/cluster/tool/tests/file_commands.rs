@@ -275,3 +275,44 @@ fn the_tool_properties_are_the_references_defaults() {
     assert_eq!(properties.replay_channel, "aeron:ipc");
     assert_eq!(properties.replay_stream_id, 103);
 }
+
+#[test]
+fn backup_query_without_a_mark_file_fails() {
+    let dir = scratch("backup-empty");
+    let mut out = Vec::new();
+    assert_eq!(
+        ClusterTool::default().backup_query(&dir, &mut out, None),
+        FAILURE
+    );
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "cluster-mark.dat does not exist.\n"
+    );
+}
+
+#[test]
+fn backup_query_on_a_consensus_module_is_not_a_backup_node() {
+    let dir = scratch("backup-not-a-backup");
+    let _mark_file = consensus_module_mark_file(&dir, "/tmp/aeron-dir");
+    let mut out = Vec::new();
+    assert_eq!(
+        ClusterTool::default().backup_query(&dir, &mut out, None),
+        FAILURE
+    );
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "not a cluster backup node\n"
+    );
+}
+
+#[test]
+fn describe_latest_cm_snapshot_without_a_recording_log_says_snapshot_not_found() {
+    let dir = scratch("describe-snapshot-missing");
+    let _mark_file = consensus_module_mark_file(&dir, "/tmp/aeron-dir");
+    let mut out = Vec::new();
+    assert_eq!(
+        ClusterTool::default().describe_latest_cm_snapshot(&dir, &mut out),
+        FAILURE
+    );
+    assert_eq!(String::from_utf8(out).unwrap(), "Snapshot not found\n");
+}

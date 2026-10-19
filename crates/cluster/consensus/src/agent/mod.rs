@@ -859,7 +859,9 @@ impl ConsensusModuleAgent {
         {
             let leadership_term_id = self.leadership_term_id;
             let member_id = self.config.member_id;
-            let leader_member_id = self.members[self.this_member_index].id;
+            // The leader the election recorded, not this member: a redirect
+            // names where the leader is (`sendRedirects`).
+            let leader_member_id = self.leader_member_id();
             let ingress_endpoints = self.ingress_endpoints.as_str();
             let clock = self.clock;
 
@@ -957,7 +959,10 @@ impl ConsensusModuleAgent {
     fn process_open_sessions(&mut self, now_ns: i64) -> Result<usize, ClusterError> {
         let leadership_term_id = self.leadership_term_id;
         let member_id = self.config.member_id;
-        let leader_member_id = self.members[self.this_member_index].id;
+        // `onClusterMembersQuery` answers with `leaderMember.id()`
+        // (`ConsensusModuleAgent.java:1271-1279`) — the member the election
+        // said leads, which every member records in `updateMemberDetails`.
+        let leader_member_id = self.leader_member_id();
         let ingress_endpoints = self.ingress_endpoints.as_str();
         let clock = self.clock;
 
@@ -1336,10 +1341,14 @@ impl ConsensusModuleAgent {
     /// follower learns the id from the log replication (`P3-6b`), so until
     /// then this answers the local id — the only member there is.
     fn leader_member_id(&self) -> i32 {
+        // `-1` before a term names one, like the reference's null
+        // `leaderMember`; answering with this member's own id would make a
+        // follower claim the leadership (`ClusterTool` reads exactly this
+        // from the members query).
         self.members
             .iter()
             .find(|member| member.is_leader)
-            .map_or(self.config.member_id, |member| member.id)
+            .map_or(-1, |member| member.id)
     }
 
     /// The reference's `ctx.countedErrorHandler().onError(...)`: one on counter
@@ -4632,7 +4641,9 @@ impl ConsensusModuleAgent {
         if !deferred_closes.is_empty() || !deferred_admins.is_empty() {
             let leadership_term_id = self.leadership_term_id;
             let member_id = self.config.member_id;
-            let leader_member_id = self.members[self.this_member_index].id;
+            // The leader the election recorded, not this member: a redirect
+            // names where the leader is (`sendRedirects`).
+            let leader_member_id = self.leader_member_id();
             let clock = self.clock;
             let Self {
                 client,
@@ -5176,7 +5187,7 @@ impl ConsensusModuleAgent {
 
         let leadership_term_id = self.leadership_term_id;
         let member_id = self.config.member_id;
-        let leader_member_id = self.members[self.this_member_index].id;
+        let leader_member_id = self.leader_member_id();
         let state = self.state;
         let now_ns = self.clock.time_nanos();
         let clock = self.clock;

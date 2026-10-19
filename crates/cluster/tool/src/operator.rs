@@ -19,6 +19,9 @@ use deepmsg_cluster::election::state::ElectionState;
 use deepmsg_cluster::persist::recording_log::{
     CONSENSUS_MODULE_SERVICE_ID, Entry, RecordingExtent, RecordingLog, RecoveryPlan,
 };
+use deepmsg_cluster::snapshot::adapter::{
+    ConsensusModuleSnapshotAdapter, SnapshotLoadHandler, SnapshotSession,
+};
 use deepmsg_cluster::state::ModuleState;
 use deepmsg_cluster_common::counters::{
     CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID, CLUSTER_ELECTION_STATE_TYPE_ID,
@@ -34,9 +37,11 @@ use deepmsg_codec_cluster::cluster_members_extended_response_codec::{
 use deepmsg_codec_cluster::cluster_members_response_codec::{
     ClusterMembersResponseDecoder, SBE_TEMPLATE_ID as MEMBERS_RESPONSE_TEMPLATE_ID,
 };
+use deepmsg_codec_cluster::cluster_time_unit::ClusterTimeUnit;
 use deepmsg_codec_cluster::message_header_codec::{
     ENCODED_LENGTH as MESSAGE_HEADER_LENGTH, MessageHeaderDecoder,
 };
+use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
 use deepmsg_core::buffer::ReadWrite;
 
 use crate::mark_files;
@@ -44,6 +49,9 @@ use crate::properties::ToolProperties;
 
 /// How long a command-level wait polls between looks.
 const WAIT_STEP: Duration = Duration::from_millis(1);
+
+/// How long a snapshot replay may take before the tool gives up.
+const SNAPSHOT_REPLAY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The timeout every add-publication/add-subscription uses; the cluster's own
 /// `COMMAND_TIMEOUT` shape.
@@ -308,12 +316,6 @@ impl ClusterTool {
     }
 
     // -- commands the later commits of this card fill in -------------------
-
-    /// A command this build has not wired yet. Never reached once P3-8 closes.
-    fn not_yet(&self, out: &mut dyn Write, name: &str) -> i32 {
-        let _ = writeln!(out, "{name}: not implemented yet");
-        FAILURE
-    }
 
     /// `sortRecordingLog` (`ClusterToolOperator.java:173-192`). A file already
     /// in the view's order, an unreadable one, or none at all is `FAILURE`.
@@ -646,19 +648,176 @@ impl ClusterTool {
 
     /// `describeLatestConsensusModuleSnapshot`
     /// (`ClusterToolOperator.java:773-843`).
-    pub fn describe_latest_cm_snapshot(&self, _cluster_dir: &Path, out: &mut dyn Write) -> i32 {
-        self.not_yet(out, "describe-latest-cm-snapshot")
+    pub fn describe_latest_cm_snapshot(&self, cluster_dir: &Path, out: &mut dyn Write) -> i32 {
+        let Some(entry) = latest_consensus_module_snapshot(cluster_dir) else {
+            let _ = writeln!(out, "Snapshot not found");
+            return FAILURE;
+        };
+        let mark_file = match mark_files::open_mark_file(cluster_dir, self.properties.timeout_ms) {
+            Ok(mark_file) => mark_file,
+            Err(message) => {
+                let _ = writeln!(out, "{message}");
+                return FAILURE;
+            }
+        };
+        let aeron_dir = mark_file.var_data(0).unwrap_or_default();
+        let member_id = mark_file.member_id().unwrap_or(-1);
+
+        match self.replay_snapshot(&aeron_dir, entry.recording_id, out) {
+            Ok(length) => {
+                let _ = writeln!(
+                    out,
+                    "Consensus Module Snapshot End: memberId={member_id} \
+                     recordingId={} length={length}",
+                    entry.recording_id
+                );
+                SUCCESS
+            }
+            Err(message) => {
+                let _ = writeln!(out, "{message}");
+                FAILURE
+            }
+        }
+    }
+
+    /// Replay the snapshot recording on the tool's channel and print what the
+    /// adapter decodes; answers the image's final position
+    /// (`ClusterToolOperator.java:773-843`).
+    fn replay_snapshot(
+        &self,
+        aeron_dir: &str,
+        recording_id: i64,
+        out: &mut dyn Write,
+    ) -> Result<i64, String> {
+        let mut client =
+            Client::connect(Path::new(aeron_dir)).map_err(|error| error.to_string())?;
+        let mut context = self.archive_context();
+        context.aeron_dir = aeron_dir.to_owned();
+        let mut archive = Archive::connect(
+            &context,
+            &mut client,
+            &mut NoCredentials,
+            Handlers::default(),
+        )
+        .map_err(|error| error.to_string())?;
+
+        let params = deepmsg_archive::client::proxy::ReplayParams {
+            position: 0,
+            length: -1,
+            ..deepmsg_archive::client::proxy::ReplayParams::default()
+        };
+        let subscription = archive
+            .replay(
+                &mut client,
+                recording_id,
+                &self.properties.replay_channel,
+                self.properties.replay_stream_id,
+                &params,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let mut adapter = ConsensusModuleSnapshotAdapter::new();
+        let mut printer = SnapshotPrinter::new();
+        let deadline = Instant::now() + SNAPSHOT_REPLAY_TIMEOUT;
+        loop {
+            let image = client.subscription(subscription).and_then(|subscription| {
+                subscription
+                    .images()
+                    .first()
+                    .map(|image| image.registration_id())
+            });
+            let Some(image_registration_id) = image else {
+                client.poll();
+                if Instant::now() > deadline {
+                    return Err("snapshot replay never started".to_owned());
+                }
+                std::thread::sleep(WAIT_STEP);
+                continue;
+            };
+
+            adapter
+                .poll(
+                    &mut client,
+                    subscription,
+                    image_registration_id,
+                    &mut printer,
+                )
+                .map_err(|error| error.to_string())?;
+            if adapter.is_done() {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err("snapshot ended unexpectedly".to_owned());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let length = client
+            .subscription(subscription)
+            .and_then(|subscription| subscription.images().first().map(|image| image.position()))
+            .unwrap_or(0);
+        let _ = printer.flush(out);
+        Ok(length)
     }
 
     /// `printNextBackupQuery` / `nextBackupQuery`
     /// (`ClusterToolOperator.java:356-418`).
     pub fn backup_query(
         &self,
-        _cluster_dir: &Path,
+        cluster_dir: &Path,
         out: &mut dyn Write,
-        _delay_ms: Option<i64>,
+        delay_ms: Option<i64>,
     ) -> i32 {
-        self.not_yet(out, "backup-query")
+        if !mark_files::mark_file_exists(cluster_dir) && self.properties.timeout_ms <= 0 {
+            let _ = writeln!(out, "cluster-mark.dat does not exist.");
+            return FAILURE;
+        }
+        let mark_file = match mark_files::open_mark_file(cluster_dir, self.properties.timeout_ms) {
+            Ok(mark_file) => mark_file,
+            Err(message) => {
+                let _ = writeln!(out, "{message}");
+                return FAILURE;
+            }
+        };
+        if mark_file.component_type() != Some(ClusterComponentType::BACKUP) {
+            let _ = writeln!(out, "not a cluster backup node");
+            return FAILURE;
+        }
+        let Ok(control) = control_properties(&mark_file) else {
+            let _ = writeln!(out, "cluster-mark.dat does not describe a driver");
+            return FAILURE;
+        };
+        let cluster_id = mark_file.cluster_id().unwrap_or(0);
+        let now_ms = deepmsg_core::clock::epoch_millis();
+
+        let deadline_ms = match delay_ms {
+            Some(delay_ms) => {
+                let deadline = now_ms.saturating_add(delay_ms);
+                if !write_backup_deadline(&control, cluster_id, deadline) {
+                    return FAILURE;
+                }
+                deadline
+            }
+            None => read_backup_deadline(&control, cluster_id).unwrap_or(-1),
+        };
+
+        // `%2$tF %1$tH:%1$tM:%1$tS … next: %2$tF %2$tH:%2$tM:%2$tS`
+        // (`ClusterToolOperator.java:369`, `:406`): the deadline's date opens
+        // the line and the current time of day follows it.
+        let setting = if delay_ms.is_some() {
+            "setting next"
+        } else {
+            "next"
+        };
+        let _ = writeln!(
+            out,
+            "{} {} {setting}: {} {}",
+            crate::date_time::date_time(deadline_ms),
+            crate::date_time::time_of_day(now_ms),
+            crate::date_time::date_time(deadline_ms),
+            crate::date_time::time_of_day(deadline_ms),
+        );
+        SUCCESS
     }
 }
 
@@ -1042,6 +1201,180 @@ fn decode_members_response(payload: &[u8], correlation_id: i64) -> Option<Cluste
     }
 
     None
+}
+
+/// The next backup query's deadline (counter 210), if a backup allocated one.
+fn read_backup_deadline(control: &ControlProperties, cluster_id: i32) -> Option<i64> {
+    let cnc = CncFile::open(Path::new(&control.aeron_dir), Duration::from_millis(0)).ok()?;
+    let counters = cnc.counters()?;
+    let counter_id = find_cluster_counter(
+        &counters,
+        deepmsg_cluster_common::counters::CLUSTER_BACKUP_QUERY_DEADLINE_TYPE_ID,
+        cluster_id,
+    )?;
+    counters.value(counter_id)
+}
+
+/// Write the next backup query's deadline (`ClusterToolOperator.java:391-418`).
+fn write_backup_deadline(control: &ControlProperties, cluster_id: i32, deadline_ms: i64) -> bool {
+    let Ok(cnc) = CncFile::open_writable(Path::new(&control.aeron_dir), COMMAND_TIMEOUT) else {
+        return false;
+    };
+    let Some(counters) = cnc.counters_writable() else {
+        return false;
+    };
+    let Some(counter_id) = find_cluster_counter(
+        &counters,
+        deepmsg_cluster_common::counters::CLUSTER_BACKUP_QUERY_DEADLINE_TYPE_ID,
+        cluster_id,
+    ) else {
+        return false;
+    };
+    counters.set_value(counter_id, deadline_ms).is_some()
+}
+
+/// `findLatestValidSnapshot` (`ClusterToolOperator.java:941-947`): the newest
+/// valid consensus-module snapshot in the recording log.
+fn latest_consensus_module_snapshot(cluster_dir: &Path) -> Option<Entry> {
+    let path = cluster_dir.join(deepmsg_cluster::persist::recording_log::FILENAME);
+    if !path.exists() {
+        return None;
+    }
+    let log = RecordingLog::open(&path).ok()?;
+    log.entries()
+        .iter()
+        .rev()
+        .find(|entry| {
+            entry.is_valid
+                && entry.entry_type == deepmsg_cluster::persist::recording_log::ENTRY_TYPE_SNAPSHOT
+                && entry.service_id == CONSENSUS_MODULE_SERVICE_ID
+        })
+        .cloned()
+}
+
+/// `ConsensusModuleSnapshotPrinter` (`ConsensusModuleSnapshotPrinter.java`).
+///
+/// The reference also hex-dumps the raw bytes of the end marker and the
+/// consensus-module state. This build's adapter hands its listener decoded
+/// fields and not the buffers, so those two dumps are omitted; every line
+/// that carries a value is the reference's, and `docs/compat.md` records the
+/// difference with this card.
+struct SnapshotPrinter {
+    lines: Vec<String>,
+}
+
+impl SnapshotPrinter {
+    fn new() -> Self {
+        Self { lines: Vec::new() }
+    }
+
+    fn flush(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        for line in &self.lines {
+            writeln!(out, "{line}")?;
+        }
+        Ok(())
+    }
+}
+
+/// `TimeUnit.toString()` for a snapshot's unit (`MILLISECONDS`, not `MILLIS`).
+fn time_unit_name(time_unit: ClusterTimeUnit) -> &'static str {
+    match time_unit {
+        ClusterTimeUnit::MILLIS => "MILLISECONDS",
+        ClusterTimeUnit::MICROS => "MICROSECONDS",
+        ClusterTimeUnit::NANOS => "NANOSECONDS",
+        ClusterTimeUnit::NullVal => "NullVal",
+    }
+}
+
+impl SnapshotLoadHandler for SnapshotPrinter {
+    fn on_load_begin_snapshot(
+        &mut self,
+        app_version: i32,
+        time_unit: ClusterTimeUnit,
+    ) -> Result<(), deepmsg_cluster::ClusterError> {
+        self.lines.push(format!(
+            "Snapshot: appVersion={app_version} timeUnit={}",
+            time_unit_name(time_unit)
+        ));
+        Ok(())
+    }
+
+    fn on_load_end_snapshot(&mut self) -> Result<(), deepmsg_cluster::ClusterError> {
+        self.lines.push("End Snapshot".to_owned());
+        Ok(())
+    }
+
+    fn on_load_cluster_session(
+        &mut self,
+        session: SnapshotSession,
+    ) -> Result<(), deepmsg_cluster::ClusterError> {
+        self.lines.push(format!(
+            "Cluster Session: clusterSessionId={} correlationId={} openedLogPosition={} \
+             timeOfLastActivity={} closeReason={} responseStreamId={} responseChannel={}",
+            session.cluster_session_id,
+            session.correlation_id,
+            session.opened_log_position,
+            session.time_of_last_activity,
+            session.close_reason,
+            session.response_stream_id,
+            session.response_channel,
+        ));
+        Ok(())
+    }
+
+    fn on_load_timer(
+        &mut self,
+        correlation_id: i64,
+        deadline: i64,
+    ) -> Result<(), deepmsg_cluster::ClusterError> {
+        self.lines.push(format!(
+            "Timer: correlationId={correlation_id} deadline={deadline}"
+        ));
+        Ok(())
+    }
+
+    fn on_load_consensus_module_state(
+        &mut self,
+        next_session_id: i64,
+        next_service_session_id: i64,
+        log_service_session_id: i64,
+        pending_message_capacity: i32,
+    ) -> Result<(), deepmsg_cluster::ClusterError> {
+        self.lines.push(format!(
+            "Consensus Module State: nextSessionId={next_session_id} \
+             nextServiceSessionId={next_service_session_id} \
+             logServiceSessionId={log_service_session_id} \
+             pendingMessageCapacity={pending_message_capacity}"
+        ));
+        Ok(())
+    }
+
+    fn on_load_pending_message_tracker(
+        &mut self,
+        next_service_session_id: i64,
+        log_service_session_id: i64,
+        pending_message_capacity: i32,
+        service_id: i32,
+    ) -> Result<(), deepmsg_cluster::ClusterError> {
+        self.lines.push(format!(
+            "Pending Message Tracker: nextServiceSessionId={next_service_session_id} \
+             logServiceSessionId={log_service_session_id} \
+             pendingMessageCapacity={pending_message_capacity} serviceId={service_id}"
+        ));
+        Ok(())
+    }
+
+    fn on_load_pending_message(
+        &mut self,
+        cluster_session_id: i64,
+        message: &[u8],
+    ) -> Result<(), deepmsg_cluster::ClusterError> {
+        self.lines.push(format!(
+            "Pending Message: length={} clusterSessionId={cluster_session_id}",
+            message.len()
+        ));
+        Ok(())
+    }
 }
 
 /// `listRecording`: one extent, or `None` when the archive does not know it.

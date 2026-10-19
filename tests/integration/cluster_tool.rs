@@ -9,10 +9,15 @@
 
 use std::sync::mpsc;
 
+use deepmsg_client::client::Client;
 use deepmsg_cluster::state::ModuleState;
-use deepmsg_cluster_common::counters::CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID;
+use deepmsg_cluster_common::counters::{
+    self, CLUSTER_BACKUP_QUERY_DEADLINE_TYPE_ID, CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID,
+};
+use deepmsg_cluster_common::mark::{self, ClusterMarkFile, ERROR_BUFFER_MIN_LENGTH};
 use deepmsg_cluster_tool::ClusterTool;
 use deepmsg_cluster_tool::operator::FAILURE;
+use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
 use deepmsg_tests::cluster_harness::{
     ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters, Ports, ROLE_LEADER, announce_skip,
     await_launched, members, wait_until,
@@ -146,6 +151,24 @@ fn the_tool_operates_a_three_node_cluster() {
         counters[leader].snapshot_count().unwrap_or(0) > before
     });
 
+    // ---- describe-latest-cm-snapshot --------------------------------------
+    let mut out = Vec::new();
+    assert_eq!(
+        0,
+        tool.describe_latest_cm_snapshot(nodes[leader].cluster_dir(), &mut out)
+    );
+    let snapshot = text(&out);
+    assert!(
+        snapshot.contains("Snapshot: appVersion=1 timeUnit=MILLISECONDS"),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot.contains(&format!(
+            "Consensus Module Snapshot End: memberId={leader} recordingId="
+        )),
+        "{snapshot}"
+    );
+
     // ---- suspend, and a snapshot that must be refused ---------------------
     let mut out = Vec::new();
     assert_eq!(
@@ -195,6 +218,61 @@ fn the_tool_operates_a_three_node_cluster() {
         counters[leader].value(CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID)
             == Some(i64::from(ModuleState::Active.code()))
     });
+
+    // ---- backup-query on a BACKUP mark file --------------------------------
+    let backup_dir = std::env::temp_dir().join(format!(
+        "deepmsg-cluster-tool-backup-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    std::fs::create_dir_all(&backup_dir).unwrap();
+    let now_ms = deepmsg_core::clock::epoch_millis();
+    let backup_mark = ClusterMarkFile::create(
+        &backup_dir.join(mark::FILENAME),
+        ClusterComponentType::BACKUP,
+        ERROR_BUFFER_MIN_LENGTH,
+        4096,
+        now_ms,
+        i64::from(std::process::id()),
+    )
+    .unwrap();
+    backup_mark.set_cluster_id(7);
+    backup_mark
+        .write_var_data(&[
+            &nodes[leader].aeron_dir().to_string_lossy(),
+            "aeron:ipc?term-length=128k",
+            "",
+            "",
+            "",
+            "",
+        ])
+        .unwrap();
+    backup_mark.signal_ready(now_ms).unwrap();
+
+    let mut operator = Client::connect(nodes[leader].aeron_dir()).expect("the operator connects");
+    let spec = counters::cluster_counter("ClusterBackup next query deadline in ms", 7)
+        .expect("the counter spec");
+    let counter = operator
+        .add_counter(
+            CLUSTER_BACKUP_QUERY_DEADLINE_TYPE_ID,
+            spec.key(),
+            spec.label(),
+            std::time::Duration::from_secs(5),
+        )
+        .expect("the deadline counter is allocated");
+    operator
+        .counters_writable()
+        .expect("writable counters")
+        .set_value(counter.counter_id(), 1_700_000_000_000)
+        .unwrap();
+
+    let mut out = Vec::new();
+    assert_eq!(0, tool.backup_query(&backup_dir, &mut out, None));
+    assert!(text(&out).contains("next: "), "{}", text(&out));
+
+    let mut out = Vec::new();
+    assert_eq!(0, tool.backup_query(&backup_dir, &mut out, Some(5_000)));
+    assert!(text(&out).contains("setting next: "), "{}", text(&out));
 
     for mut node in nodes {
         node.stop();
