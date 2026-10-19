@@ -29,6 +29,9 @@
 //!   `deepmsg-clustered-service-container` binary and decides it is ready from
 //!   its **mark file**. A Java container is always `External`: a Java object
 //!   cannot live in this process.
+//! * `service_id` — a node may run several containers in a multi-service
+//!   deployment; every spec with the same `id` shares that node's directories
+//!   and process.
 //!
 //! **Every scenario runs in both modes.** They are two different startup paths —
 //! the second is the one LC-3 and a deployment take — and a mode that is never
@@ -51,12 +54,11 @@ use std::time::{Duration, Instant};
 use deepmsg_client::client::Client;
 use deepmsg_cluster_common::counters::{self, CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID};
 use deepmsg_cluster_common::mark::{ClusterMarkFile, SEMANTIC_VERSION};
-use deepmsg_cluster_service::SessionId;
 use deepmsg_cluster_service::service::{LogHeader, SnapshotReader, SnapshotWriter};
 use deepmsg_cluster_service::services;
 use deepmsg_cluster_service::{
     ClusteredService, ClusteredServiceAgent, ContainerError, Role, ServiceContainerConfig,
-    ShutdownHandle,
+    SessionId, ShutdownHandle,
 };
 use deepmsg_codec_cluster::close_reason::CloseReason;
 use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
@@ -111,12 +113,12 @@ pub enum ProcessMode {
     External,
 }
 
-/// One member of the cluster: a node, and the container that runs on it.
+/// One container of the cluster: a node, a service id, and who runs it.
 #[derive(Clone, Copy, Debug)]
 pub struct MemberSpec {
-    /// `aeron.cluster.member.id`.
+    /// `aeron.cluster.member.id` of the node it runs on.
     pub id: i32,
-    /// `aeron.cluster.service.id` for the container on this node.
+    /// `aeron.cluster.service.id`.
     pub service_id: i32,
     /// Who runs the consensus module.
     pub node: NodeImpl,
@@ -164,7 +166,7 @@ impl MemberSpec {
         }
     }
 
-    /// A second container on the same node, with its own service id.
+    /// A container with its own service id on the same node.
     #[must_use]
     pub const fn with_service_id(mut self, service_id: i32) -> Self {
         self.service_id = service_id;
@@ -248,20 +250,27 @@ impl Options {
 
 /// A running cluster of members whose containers this fixture owns.
 pub struct TestCluster {
-    members: Vec<Member>,
+    nodes: Vec<Node>,
+    containers: Vec<ContainerSlot>,
     options: Options,
     jar: PathBuf,
     classes: TempDir,
 }
 
-struct Member {
-    spec: MemberSpec,
+/// One node: its directories, its process, and how many containers it expects.
+struct Node {
+    id: i32,
     aeron: TempDir,
     cluster: TempDir,
     archive: TempDir,
-    /// How many containers this node expects.
     service_count: i32,
-    node: Option<Process>,
+    process: Option<Process>,
+}
+
+/// One container of the table, attached to a node.
+struct ContainerSlot {
+    spec: MemberSpec,
+    node: usize,
     container: Option<Container>,
 }
 
@@ -318,22 +327,42 @@ impl TestCluster {
         let jar = driver::locate_aeron_all()?;
         let classes = compile_probes(&options.probes)?;
 
-        let mut cluster = Self {
-            members: members
-                .iter()
-                .map(|spec| Member {
+        let mut nodes: Vec<Node> = Vec::new();
+        for member in members {
+            if nodes.iter().any(|node| node.id == member.id) {
+                continue;
+            }
+            nodes.push(Node {
+                id: member.id,
+                aeron: TempDir::new(&format!("{test_name}-{}-aeron", member.id)),
+                cluster: TempDir::new(&format!("{test_name}-{}-cluster", member.id)),
+                archive: TempDir::new(&format!("{test_name}-{}-archive", member.id)),
+                service_count: i32::try_from(
+                    members.iter().filter(|other| other.id == member.id).count(),
+                )
+                .expect("a node's service count fits an i32"),
+                process: None,
+            });
+        }
+
+        let containers = members
+            .iter()
+            .map(|spec| {
+                let node = nodes
+                    .iter()
+                    .position(|candidate| candidate.id == spec.id)
+                    .expect("every spec's node was created");
+                ContainerSlot {
                     spec: *spec,
-                    aeron: TempDir::new(&format!("{test_name}-{}-aeron", spec.id)),
-                    cluster: TempDir::new(&format!("{test_name}-{}-cluster", spec.id)),
-                    archive: TempDir::new(&format!("{test_name}-{}-archive", spec.id)),
-                    service_count: i32::try_from(
-                        members.iter().filter(|other| other.id == spec.id).count(),
-                    )
-                    .expect("a member's service count fits an i32"),
-                    node: None,
+                    node,
                     container: None,
-                })
-                .collect(),
+                }
+            })
+            .collect();
+
+        let mut cluster = Self {
+            nodes,
+            containers,
             options,
             jar,
             classes,
@@ -355,21 +384,21 @@ impl TestCluster {
         self.classes.path()
     }
 
-    /// A member's driver directory (`aeron.dir`).
+    /// A node's driver directory (`aeron.dir`).
     #[must_use]
     pub fn aeron_dir(&self, member: i32) -> &Path {
-        self.member(member).aeron.path()
+        self.node(member).aeron.path()
     }
 
-    /// A member's cluster directory (`aeron.cluster.dir`).
+    /// A node's cluster directory (`aeron.cluster.dir`).
     #[must_use]
     pub fn cluster_dir(&self, member: i32) -> &Path {
-        self.member(member).cluster.path()
+        self.node(member).cluster.path()
     }
 
-    /// A client onto one member's driver, waiting for its CnC file.
+    /// A client onto the first node's driver, waiting for its CnC file.
     pub fn client(&self) -> Client {
-        let aeron_dir = self.aeron_dir(self.members[0].spec.id);
+        let aeron_dir = self.nodes[0].aeron.path();
         let deadline = Instant::now() + DEADLINE;
         loop {
             match Client::connect(aeron_dir) {
@@ -380,7 +409,7 @@ impl TestCluster {
                 }
                 Err(error) => panic!(
                     "no client onto the Java driver: {error}\nnode log:\n{}",
-                    self.node_log(self.members[0].spec.id)
+                    self.node_log(self.nodes[0].id)
                 ),
             }
         }
@@ -404,7 +433,7 @@ impl TestCluster {
         }
         panic!(
             "the cluster never became ACTIVE\nnode log:\n{}\n{}",
-            self.node_log(self.members[0].spec.id),
+            self.node_log(self.nodes[0].id),
             self.container_logs()
         );
     }
@@ -420,10 +449,10 @@ impl TestCluster {
         java::run_probe(&self.jar, self.classes.path(), class, args)
     }
 
-    /// Stop one member's container, asserting the way it was asked to stop.
-    pub fn stop_container(&mut self, member: i32) {
-        let index = self.index_of(member);
-        if let Some(container) = self.members[index].container.take() {
+    /// Stop one container, asserting the way it was asked to stop.
+    pub fn stop_container(&mut self, member: i32, service_id: i32) {
+        let index = self.slot_index(member, service_id);
+        if let Some(container) = self.containers[index].container.take() {
             match container {
                 Container::InProcess {
                     shutdown,
@@ -433,19 +462,25 @@ impl TestCluster {
                     shutdown.stop();
                     match thread.join() {
                         Ok(Ok(())) => {}
-                        Ok(Err(error)) => panic!("member {member}'s container failed: {error}"),
-                        Err(_) => panic!("member {member}'s container thread panicked"),
+                        Ok(Err(error)) => {
+                            panic!(
+                                "member {member} service {service_id}'s container failed: {error}"
+                            )
+                        }
+                        Err(_) => panic!("member {member} service {service_id}'s thread panicked"),
                     }
                     assert!(
                         terminated.load(std::sync::atomic::Ordering::Acquire),
-                        "member {member}'s `on_terminate` ran when the container was stopped"
+                        "member {member} service {service_id}'s `on_terminate` ran when the \
+                         container was stopped"
                     );
                 }
                 Container::External(mut process) => {
                     let status = process.stop().expect("the container stops");
                     assert!(
                         status.success(),
-                        "member {member}'s container exited with {status}\ncontainer log:\n{}",
+                        "member {member} service {service_id}'s container exited with \
+                         {status}\ncontainer log:\n{}",
                         process.log_tail(80)
                     );
                 }
@@ -453,7 +488,8 @@ impl TestCluster {
                     let status = process.stop().expect("the Java container stops");
                     assert!(
                         status.success() || status.code() == Some(143),
-                        "member {member}'s Java container exited with {status}\ncontainer log:\n{}",
+                        "member {member} service {service_id}'s Java container exited with \
+                         {status}\ncontainer log:\n{}",
                         process.log_tail(80)
                     );
                 }
@@ -461,71 +497,91 @@ impl TestCluster {
         }
     }
 
-    /// Start one member's container again over the same directories.
-    pub fn start_container(&mut self, member: i32) {
-        let index = self.index_of(member);
+    /// Start one container again over the same directories.
+    pub fn start_container(&mut self, member: i32, service_id: i32) {
+        let index = self.slot_index(member, service_id);
         let container = self.spawn_container(index);
-        self.members[index].container = Some(container);
+        self.containers[index].container = Some(container);
     }
 
-    /// Stop a member's container and node, then start both again over the same
-    /// directories — what a recovery plan is built from is the on-disk
+    /// Stop every container of a node and the node, then start both again over
+    /// the same directories — what a recovery plan is built from is the on-disk
     /// `recording.log`, and the recovery-state counter is allocated once, at
     /// that startup.
     pub fn restart_node(&mut self, member: i32) {
-        self.stop_container(member);
-        let index = self.index_of(member);
-        if let Some(mut node) = self.members[index].node.take() {
-            let status = node.stop().expect("the Java node stops");
+        let slots: Vec<usize> = self
+            .containers
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.spec.id == member)
+            .map(|(index, _)| index)
+            .collect();
+        for index in &slots {
+            let slot = &self.containers[*index];
+            let (member, service_id) = (slot.spec.id, slot.spec.service_id);
+            self.stop_container(member, service_id);
+        }
+
+        let node_index = self.node_index(member);
+        if let Some(mut process) = self.nodes[node_index].process.take() {
+            let status = process.stop().expect("the Java node stops");
             assert!(
                 status.success() || status.code() == Some(143),
                 "member {member}'s Java node exited with {status}\nnode log:\n{}",
-                node.log_tail(80)
+                process.log_tail(80)
             );
         }
-        self.start_node(index);
-        self.start_container(member);
+        self.start_node(node_index);
+        for index in slots {
+            let container = self.spawn_container(index);
+            self.containers[index].container = Some(container);
+        }
     }
 
     /// Stop every container, then every node.
     pub fn shutdown(&mut self) {
-        let ids: Vec<i32> = self.members.iter().map(|member| member.spec.id).collect();
-        for spec in ids {
-            self.stop_container(spec);
+        let slots: Vec<(i32, i32)> = self
+            .containers
+            .iter()
+            .map(|slot| (slot.spec.id, slot.spec.service_id))
+            .collect();
+        for (member, service_id) in slots {
+            self.stop_container(member, service_id);
         }
-        for member in &mut self.members {
-            if let Some(mut node) = member.node.take() {
-                let status = node.stop().expect("the Java node stops");
+
+        for node in &mut self.nodes {
+            if let Some(mut process) = node.process.take() {
+                let status = process.stop().expect("the Java node stops");
                 assert!(
                     status.success() || status.code() == Some(143),
                     "member {}'s Java node exited with {status}\nnode log:\n{}",
-                    member.spec.id,
-                    node.log_tail(80)
+                    node.id,
+                    process.log_tail(80)
                 );
             }
         }
     }
 
-    /// The last lines of a member's node output.
+    /// The last lines of a node's output.
     #[must_use]
     pub fn node_log(&self, member: i32) -> String {
-        self.member(member)
-            .node
+        self.node(member)
+            .process
             .as_ref()
-            .map_or_else(String::new, |node| node.log_tail(80))
+            .map_or_else(String::new, |process| process.log_tail(80))
     }
 
     /// The last lines of every container's output, for a failure message.
     #[must_use]
     pub fn container_logs(&self) -> String {
-        self.members
+        self.containers
             .iter()
-            .filter_map(|member| match &member.container {
+            .filter_map(|slot| match &slot.container {
                 Some(Container::External(process)) | Some(Container::Java(process)) => {
                     Some(format!(
                         "member {} service {} container log:\n{}",
-                        member.spec.id,
-                        member.spec.service_id,
+                        slot.spec.id,
+                        slot.spec.service_id,
                         process.log_tail(60)
                     ))
                 }
@@ -535,32 +591,34 @@ impl TestCluster {
             .join("\n")
     }
 
-    /// The config a container of this member runs with.
+    /// The config a container runs with.
     #[must_use]
-    pub fn container_config(&self, member: i32) -> ServiceContainerConfig {
-        let member = self.member(member);
+    pub fn container_config(&self, member: i32, service_id: i32) -> ServiceContainerConfig {
+        let index = self.slot_index(member, service_id);
+        let slot = &self.containers[index];
+        let node = &self.nodes[slot.node];
 
         ServiceContainerConfig {
             cluster_id: self.options.cluster_id,
-            service_id: member.spec.service_id,
+            service_id: slot.spec.service_id,
             service_name: deepmsg_cluster_service::config::container_thread_name(
                 self.options.cluster_id,
-                member.spec.service_id,
+                slot.spec.service_id,
                 deepmsg_archive::server::config::ThreadNaming::Classic,
             ),
-            service: match member.spec.service {
+            service: match slot.spec.service {
                 ServiceImpl::Rust(name) => Some((*name).to_owned()),
                 ServiceImpl::Java(class) => Some((*class).to_owned()),
             },
             thread_naming: deepmsg_archive::server::config::ThreadNaming::Classic,
-            aeron_dir: member.aeron.path().to_path_buf(),
-            cluster_dir: member.cluster.path().to_path_buf(),
+            aeron_dir: node.aeron.path().to_path_buf(),
+            cluster_dir: node.cluster.path().to_path_buf(),
             mark_file_dir: None,
             control_channel: self.options.control_channel.clone(),
             service_stream_id: self.options.service_stream_id,
             consensus_module_stream_id: self.options.consensus_module_stream_id,
             log_fragment_limit: 50,
-            responding_service: member.spec.responder,
+            responding_service: slot.spec.responder,
             error_buffer_length: 1024 * 1024,
             idle_strategy: "org.agrona.concurrent.BackoffIdleStrategy".to_owned(),
             app_version: 1,
@@ -573,61 +631,68 @@ impl TestCluster {
             archive_control_response_stream_id: self.options.cluster_id * 100
                 + 100
                 + 20
-                + (member.spec.service_id + 1),
+                + (slot.spec.service_id + 1),
             snapshot_duration_threshold_ns: 1_000_000_000,
         }
     }
 
     /// Every member's spec.
     pub fn members(&self) -> impl Iterator<Item = &MemberSpec> {
-        self.members.iter().map(|member| &member.spec)
+        self.containers.iter().map(|slot| &slot.spec)
     }
 
-    fn index_of(&self, member: i32) -> usize {
-        self.members
+    fn node_index(&self, member: i32) -> usize {
+        self.nodes
             .iter()
-            .position(|candidate| candidate.spec.id == member)
+            .position(|node| node.id == member)
             .unwrap_or_else(|| panic!("no member {member}"))
     }
 
-    fn member(&self, member: i32) -> &Member {
-        &self.members[self.index_of(member)]
+    fn node(&self, member: i32) -> &Node {
+        &self.nodes[self.node_index(member)]
+    }
+
+    fn slot_index(&self, member: i32, service_id: i32) -> usize {
+        self.containers
+            .iter()
+            .position(|slot| slot.spec.id == member && slot.spec.service_id == service_id)
+            .unwrap_or_else(|| panic!("no member {member} service {service_id}"))
     }
 
     fn start_all(&mut self) {
-        for index in 0..self.members.len() {
+        for index in 0..self.nodes.len() {
             self.start_node(index);
         }
-        for index in 0..self.members.len() {
+        for index in 0..self.containers.len() {
             let container = self.spawn_container(index);
-            self.members[index].container = Some(container);
+            self.containers[index].container = Some(container);
         }
     }
 
     fn start_node(&mut self, index: usize) {
-        let node = self.spawn_java_node(index);
-        self.members[index].node = Some(node);
+        let process = self.spawn_java_node(index);
+        self.nodes[index].process = Some(process);
     }
 
     fn spawn_java_node(&self, index: usize) -> Process {
-        let member = &self.members[index];
+        let node = &self.nodes[index];
         let mut args: Vec<String> = AGRONA_JVM_ARGS
             .iter()
             .map(|arg| (*arg).to_string())
             .collect();
-        args.push(format!("-Daeron.dir={}", member.aeron.path().display()));
+        args.push(format!("-Daeron.dir={}", node.aeron.path().display()));
         args.push(format!(
             "-Daeron.cluster.dir={}",
-            member.cluster.path().display()
+            node.cluster.path().display()
         ));
         args.push(format!(
             "-Daeron.archive.dir={}",
-            member.archive.path().display()
+            node.archive.path().display()
         ));
         args.push("-Daeron.archive.control.channel=aeron:udp?endpoint=localhost:0".to_owned());
         args.push("-Daeron.archive.replication.channel=aeron:udp?endpoint=localhost:0".to_owned());
         args.push(format!("-Daeron.cluster.id={}", self.options.cluster_id));
-        args.push(format!("-Daeron.cluster.member.id={}", member.spec.id));
+        args.push(format!("-Daeron.cluster.member.id={}", node.id));
         args.push(format!(
             "-Daeron.cluster.members={}",
             self.options.members_string()
@@ -651,7 +716,7 @@ impl TestCluster {
         args.push("-Daeron.cluster.replication.channel=aeron:udp?endpoint=localhost:0".to_owned());
         args.push(format!(
             "-Daeron.cluster.service.count={}",
-            member.service_count
+            node.service_count
         ));
         args.push("-Daeron.threading.mode=SHARED".to_owned());
         args.push("-Daeron.print.configuration=false".to_owned());
@@ -659,28 +724,22 @@ impl TestCluster {
         args.push(self.jar.to_string_lossy().into_owned());
         args.push("io.aeron.cluster.ClusteredMediaDriver".to_owned());
 
-        let process_dir = member.cluster.path().join("java-node-process");
-        let log = member.cluster.path().join("java-node.log");
-        let _ = process_dir;
-        Process::spawn(Path::new("java"), &log, &args, &[]).unwrap_or_else(|error| {
-            panic!(
-                "member {}'s Java node did not start: {error}",
-                member.spec.id
-            )
-        })
+        let log = node.cluster.path().join("java-node.log");
+        Process::spawn(Path::new("java"), &log, &args, &[])
+            .unwrap_or_else(|error| panic!("member {}'s Java node did not start: {error}", node.id))
     }
 
     fn spawn_container(&self, index: usize) -> Container {
-        let member = &self.members[index];
-        match member.spec.service {
+        let slot = &self.containers[index];
+        match slot.spec.service {
             ServiceImpl::Rust(name) => {
                 let service = services::by_name(name).unwrap_or_else(|| {
                     panic!(
-                        "member {} asks for a business this build does not have: {name}",
-                        member.spec.id
+                        "member {} service {} asks for a business this build does not have: {name}",
+                        slot.spec.id, slot.spec.service_id
                     )
                 });
-                match member.spec.mode {
+                match slot.spec.mode {
                     ProcessMode::InProcess => self.spawn_in_process(index, service),
                     ProcessMode::External => {
                         Container::External(self.spawn_external_container(index))
@@ -696,8 +755,10 @@ impl TestCluster {
         index: usize,
         service: Box<dyn ClusteredService + Send>,
     ) -> Container {
-        let member_id = self.members[index].spec.id;
-        let config = self.container_config(member_id);
+        let slot = &self.containers[index];
+        let member_id = slot.spec.id;
+        let service_id = slot.spec.service_id;
+        let config = self.container_config(member_id, service_id);
         let terminated = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&terminated);
         let observed = Observed {
@@ -723,11 +784,11 @@ impl TestCluster {
                 match agent.do_work() {
                     Ok(_) => {}
                     Err(ContainerError::AgentTermination(message)) => {
-                        eprintln!("member {member_id}'s container stopped: {message}");
+                        eprintln!("member {member_id} service {service_id} stopped: {message}");
                         break;
                     }
                     Err(error) => {
-                        eprintln!("member {member_id}'s container failed: {error}");
+                        eprintln!("member {member_id} service {service_id} failed: {error}");
                         outcome = Err(error.to_string());
                         break;
                     }
@@ -743,7 +804,7 @@ impl TestCluster {
             .recv_timeout(DEADLINE)
             .expect("the container reported its start")
             .unwrap_or_else(|error| {
-                panic!("member {member_id}'s container did not start: {error}")
+                panic!("member {member_id} service {service_id}'s container did not start: {error}")
             });
 
         Container::InProcess {
@@ -754,15 +815,15 @@ impl TestCluster {
     }
 
     fn spawn_external_container(&self, index: usize) -> Process {
-        let member = &self.members[index];
-        let member_id = member.spec.id;
+        let slot = &self.containers[index];
+        let (member_id, service_id) = (slot.spec.id, slot.spec.service_id);
         let binary = driver::locate_tool(CONTAINER_ENV, DEFAULT_CONTAINER).unwrap_or_else(|| {
             panic!(
                 "no {DEFAULT_CONTAINER}; build it with `cargo build --workspace --bins` or set \
                  {CONTAINER_ENV}"
             )
         });
-        let config = self.container_config(member.spec.id);
+        let config = self.container_config(member_id, service_id);
         let mut args = vec![
             format!("-Daeron.dir={}", config.aeron_dir.display()),
             format!("-Daeron.cluster.dir={}", config.cluster_dir.display()),
@@ -817,19 +878,20 @@ impl TestCluster {
                 - (config.cluster_id * 100 + 100 + (config.service_id + 1))
         ));
 
-        let log = member
+        let log = self.nodes[slot.node]
             .cluster
             .path()
-            .join(format!("our-service-{}.log", member.spec.service_id));
+            .join(format!("our-service-{service_id}.log"));
         let process = Process::spawn(&binary, &log, &args, &[]).unwrap_or_else(|error| {
-            panic!("member {member_id}'s container did not start: {error}")
+            panic!("member {member_id} service {service_id}'s container did not start: {error}")
         });
-        self.await_container_ready(member, process)
+        self.await_container_ready(index, process)
     }
 
     fn spawn_java_container(&self, index: usize, class: &'static str) -> Process {
-        let member = &self.members[index];
-        let member_id = member.spec.id;
+        let slot = &self.containers[index];
+        let (member_id, service_id) = (slot.spec.id, slot.spec.service_id);
+        let node = &self.nodes[slot.node];
         let mut args: Vec<String> = AGRONA_JVM_ARGS
             .iter()
             .map(|arg| (*arg).to_string())
@@ -838,58 +900,61 @@ impl TestCluster {
         args.extend([
             format!("{}:{}", self.jar.display(), self.classes.path().display()),
             "ClusterServiceContainerProbe".to_owned(),
-            member.aeron.path().display().to_string(),
-            member.cluster.path().display().to_string(),
+            node.aeron.path().display().to_string(),
+            node.cluster.path().display().to_string(),
             self.options.cluster_id.to_string(),
-            member.spec.service_id.to_string(),
+            service_id.to_string(),
             class.to_owned(),
-            member.spec.responder.to_string(),
+            slot.spec.responder.to_string(),
             self.options.control_channel.clone(),
         ]);
 
-        let log = member
+        let log = node
             .cluster
             .path()
-            .join(format!("java-service-{}.log", member.spec.service_id));
+            .join(format!("java-service-{service_id}.log"));
         let process = Process::spawn(Path::new("java"), &log, &args, &[]).unwrap_or_else(|error| {
-            panic!("member {member_id}'s Java container did not start: {error}")
+            panic!(
+                "member {member_id} service {service_id}'s Java container did not start: {error}"
+            )
         });
-        self.await_container_ready(member, process)
+        self.await_container_ready(index, process)
     }
 
     /// Wait for an external (our binary or Java) container's mark file to say
     /// it is up, watching the process as we go.
-    fn await_container_ready(&self, member: &Member, mut process: Process) -> Process {
-        let config = self.container_config(member.spec.id);
-        let path = config.mark_file_path();
+    fn await_container_ready(&self, index: usize, mut process: Process) -> Process {
+        let slot = &self.containers[index];
+        let (member_id, service_id) = (slot.spec.id, slot.spec.service_id);
+        let path = self
+            .container_config(member_id, service_id)
+            .mark_file_path();
         let deadline = Instant::now() + DEADLINE;
 
         loop {
             if let Ok(mark) = ClusterMarkFile::open(&path) {
                 let now = epoch_millis();
-                let is_ours = mark.component_type() == Some(ClusterComponentType::CONTAINER)
-                    && mark.service_id() == Some(member.spec.service_id)
+                let ready = mark.component_type() == Some(ClusterComponentType::CONTAINER)
+                    && mark.service_id() == Some(service_id)
                     && mark.cluster_id() == Some(self.options.cluster_id)
                     && mark.version() == Some(SEMANTIC_VERSION)
                     && ClusterMarkFile::is_active(&path, now, 10_000);
-                if is_ours {
+                if ready {
                     return process;
                 }
             }
 
             if let Some(status) = process.try_wait().expect("the container is waitable") {
                 panic!(
-                    "member {}'s container exited with {status} before its mark file was \
-                     ready\ncontainer log:\n{}",
-                    member.spec.id,
+                    "member {member_id} service {service_id}'s container exited with {status} \
+                     before its mark file was ready\ncontainer log:\n{}",
                     process.log_tail(80)
                 );
             }
             assert!(
                 Instant::now() < deadline,
-                "member {}'s container never signalled ready in its mark file ({})\ncontainer \
-                 log:\n{}",
-                member.spec.id,
+                "member {member_id} service {service_id}'s container never signalled ready in its \
+                 mark file ({})\ncontainer log:\n{}",
                 path.display(),
                 process.log_tail(80)
             );
