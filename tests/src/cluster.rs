@@ -49,6 +49,7 @@
 //! previous run's file, and a test that waited for existence would read the dead
 //! one and call the new process started.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -184,6 +185,11 @@ impl MemberSpec {
     }
 
     /// Our test business on a Java node, in process.
+    ///
+    /// `service` is `test-service` (echo, plus the reference's test-business
+    /// observables) or `sequence-service` (the same echo, and every session
+    /// message's first eight bytes checked against that session's next
+    /// sequence number).
     #[must_use]
     pub const fn test_container(id: i32, service: &'static str) -> Self {
         Self {
@@ -282,6 +288,86 @@ impl Options {
         self.members.clone().unwrap_or_else(|| {
             "0,localhost:0,localhost:0,localhost:0,localhost:0,localhost:0".to_owned()
         })
+    }
+}
+
+/// The reference's port scheme for a multi-node cluster: every member owns a
+/// block of [`PORTS_PER_NODE`], with the archive control channel, the client
+/// facing ingress, the member facing consensus and the log at fixed offsets
+/// inside it (`ClusterConfig.java:42-67`).
+///
+/// A cluster and its client must agree on these numbers twice over: the members
+/// are told `id,ingress,consensus,log,catchup,archive` (which is how a member
+/// binds its endpoints), and a client that names `ingressEndpoints` is told
+/// `id=endpoint` instead. Both spellings are produced here so a scenario
+/// cannot get one of them from a different base than the other.
+#[derive(Clone, Copy, Debug)]
+pub struct ClusterPorts {
+    base: u16,
+}
+
+/// `ClusterConfig.PORTS_PER_NODE`.
+pub const PORTS_PER_NODE: u16 = 100;
+/// The offset of a member's archive control port (`ClusterConfig.java:47`).
+pub const ARCHIVE_CONTROL_PORT_OFFSET: u16 = 1;
+/// The offset of a member's ingress port (`:52`).
+pub const CLIENT_FACING_PORT_OFFSET: u16 = 2;
+/// The offset of a member's consensus port (`:57`).
+pub const MEMBER_FACING_PORT_OFFSET: u16 = 3;
+/// The offset of a member's log port (`:62`).
+pub const LOG_PORT_OFFSET: u16 = 4;
+
+impl ClusterPorts {
+    /// A cluster whose first member's block starts at `base`.
+    #[must_use]
+    pub const fn new(base: u16) -> Self {
+        Self { base }
+    }
+
+    /// One port in a member's block.
+    #[must_use]
+    pub fn endpoint(&self, member: i32, offset: u16) -> String {
+        format!(
+            "localhost:{}",
+            self.base + u16::try_from(member).expect("a member id") * PORTS_PER_NODE + offset
+        )
+    }
+
+    /// Where a member's clients connect (`:52`).
+    #[must_use]
+    pub fn ingress_endpoint(&self, member: i32) -> String {
+        self.endpoint(member, CLIENT_FACING_PORT_OFFSET)
+    }
+
+    /// The reference's `aeron.cluster.members`:
+    /// `id,ingress,consensus,log,catchup,archive` per member, `|` between them.
+    ///
+    /// The catch-up endpoint is left at port zero: the reference's own scheme
+    /// assigns it from the same block, and nothing in these scenarios uses it.
+    #[must_use]
+    pub fn members_string(&self, members: i32) -> String {
+        (0..members)
+            .map(|member| {
+                format!(
+                    "{member},{},{},{},localhost:0,{}",
+                    self.endpoint(member, CLIENT_FACING_PORT_OFFSET),
+                    self.endpoint(member, MEMBER_FACING_PORT_OFFSET),
+                    self.endpoint(member, LOG_PORT_OFFSET),
+                    self.endpoint(member, ARCHIVE_CONTROL_PORT_OFFSET),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    /// What a client's `ingressEndpoints` names: `id=endpoint`, comma
+    /// separated (`AeronCluster.parseIngressEndpoints`, `AC:735-756`).
+    #[must_use]
+    pub fn ingress_endpoints(&self, members: i32) -> String {
+        (0..members)
+            .map(|member| format!("{member}={}", self.ingress_endpoint(member)))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -964,7 +1050,16 @@ impl TestCluster {
             args.push(format!("-D{name}={value}"));
         }
         args.push("-cp".to_owned());
-        args.push(self.jar.to_string_lossy().into_owned());
+        // The probes are on the node's classpath too: a Java node loads its
+        // authenticator supplier **by class name** from a property
+        // (`ConsensusModule.java:807`), which is how a scenario gives a
+        // three-node cluster a challenge/response authenticator without a
+        // custom node main.
+        args.push(format!(
+            "{}:{}",
+            self.jar.display(),
+            self.classes.path().display()
+        ));
         args.push("io.aeron.cluster.ClusteredMediaDriver".to_owned());
 
         let log = node.cluster.path().join("java-node.log");
@@ -991,12 +1086,16 @@ impl TestCluster {
                 (container, None)
             }
             ServiceImpl::Test(name) => {
-                assert_eq!(
-                    name, "test-service",
-                    "no test business called `{name}`; the fixture has one"
+                assert!(
+                    name == "test-service" || name == "sequence-service",
+                    "no test business called `{name}`; the fixture has `test-service` and \
+                     `sequence-service`"
                 );
                 let state = Arc::new(TestServiceState::default());
-                let service = Box::new(TestService::new(Arc::clone(&state)));
+                let service = Box::new(TestService::new(
+                    Arc::clone(&state),
+                    name == "sequence-service",
+                ));
                 let container = self.spawn_in_process(index, service);
                 (container, Some(state))
             }
@@ -1241,6 +1340,16 @@ pub struct TestServiceState {
     close_reasons: Mutex<Vec<CloseReason>>,
     fail_next_snapshot: AtomicBool,
     terminated: AtomicBool,
+    /// The messages whose first eight bytes were not the session's next
+    /// sequence number — a gap, a repeat, or a payload too short to hold one.
+    ///
+    /// The reference's `SequenceCheckingService` counts the same thing
+    /// (`ClusterSessionReliabilityTest.java:267-309`), and it is the assertion
+    /// two kinds of case need: "the session was closed before messages could be
+    /// lost silently" and "a failover neither lost nor repeated one".
+    out_of_sequence: AtomicUsize,
+    /// The next sequence number the business expects from each session.
+    next_sequence: Mutex<HashMap<SessionId, u64>>,
 }
 
 impl TestServiceState {
@@ -1248,6 +1357,12 @@ impl TestServiceState {
     #[must_use]
     pub fn messages(&self) -> usize {
         self.messages.load(Ordering::Acquire)
+    }
+
+    /// Messages that were not the session's next sequence number.
+    #[must_use]
+    pub fn out_of_sequence(&self) -> usize {
+        self.out_of_sequence.load(Ordering::Acquire)
     }
 
     /// `on_session_open` calls.
@@ -1287,13 +1402,44 @@ impl TestServiceState {
 struct TestService {
     inner: deepmsg_cluster_service::EchoService,
     state: Arc<TestServiceState>,
+    /// Whether the first eight bytes of every session message are that
+    /// session's sequence number, little endian.
+    ///
+    /// On only for the fixture's `sequence-service`: the other cases send
+    /// whatever they like, and reading "hello cluster" as a sequence would
+    /// count a gap on every message.
+    check_sequence: bool,
 }
 
 impl TestService {
-    fn new(state: Arc<TestServiceState>) -> Self {
+    fn new(state: Arc<TestServiceState>, check_sequence: bool) -> Self {
         Self {
             inner: deepmsg_cluster_service::EchoService::new(),
             state,
+            check_sequence,
+        }
+    }
+
+    /// `SequenceCheckingService.onSessionMessage` (`CSR:278-296`): the message's
+    /// first eight bytes against what this session owes next.
+    fn check_one_sequence(&self, session: SessionId, payload: &[u8]) {
+        let sequence = payload
+            .get(..8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes);
+
+        let mut next = self.state.next_sequence.lock().expect("the sequence lock");
+        let expected = next.entry(session).or_insert(0);
+
+        if sequence != Some(*expected) {
+            self.state.out_of_sequence.fetch_add(1, Ordering::AcqRel);
+        }
+
+        // A message with no sequence in it still moves nothing: the next
+        // message is judged against the same expectation, so one malformed
+        // payload counts as one failure rather than poisoning the session.
+        if let Some(sequence) = sequence {
+            *expected = sequence.wrapping_add(1);
         }
     }
 }
@@ -1314,6 +1460,15 @@ impl ClusteredService for TestService {
         timestamp: i64,
     ) -> Result<(), ContainerError> {
         self.state.session_opens.fetch_add(1, Ordering::AcqRel);
+
+        if self.check_sequence {
+            self.state
+                .next_sequence
+                .lock()
+                .expect("the sequence lock")
+                .insert(session, 0);
+        }
+
         self.inner.on_session_open(cluster, session, timestamp)
     }
 
@@ -1330,6 +1485,15 @@ impl ClusteredService for TestService {
             .lock()
             .expect("the reasons lock")
             .push(reason);
+
+        if self.check_sequence {
+            self.state
+                .next_sequence
+                .lock()
+                .expect("the sequence lock")
+                .remove(&session);
+        }
+
         self.inner
             .on_session_close(cluster, session, timestamp, reason)
     }
@@ -1343,6 +1507,13 @@ impl ClusteredService for TestService {
         header: &LogHeader,
     ) -> Result<(), ContainerError> {
         self.state.messages.fetch_add(1, Ordering::AcqRel);
+
+        if self.check_sequence {
+            if let Some(session) = session {
+                self.check_one_sequence(session, payload);
+            }
+        }
+
         self.inner
             .on_session_message(cluster, session, timestamp, payload, header)
     }

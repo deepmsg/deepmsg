@@ -27,20 +27,10 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use deepmsg_cluster_common::counters::CLUSTER_NODE_ROLE_TYPE_ID;
-use deepmsg_tests::cluster::{MemberSpec, Options, ProcessMode, TestCluster};
+use deepmsg_tests::cluster::{ClusterPorts, MemberSpec, Options, ProcessMode, TestCluster};
 
 const CLUSTER_ID: i32 = 13;
 const MEMBERS: i32 = 3;
-/// `ClusterConfig.PORTS_PER_NODE`.
-const PORTS_PER_NODE: u16 = 100;
-/// The offset of a member's archive control port (`:47`).
-const ARCHIVE_CONTROL_PORT_OFFSET: u16 = 1;
-/// The offset of a member's ingress port (`:52`).
-const CLIENT_FACING_PORT_OFFSET: u16 = 2;
-/// The offset of a member's consensus port (`:57`).
-const MEMBER_FACING_PORT_OFFSET: u16 = 3;
-/// The offset of a member's log port (`:62`).
-const LOG_PORT_OFFSET: u16 = 4;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -50,33 +40,10 @@ fn next_port_base() -> u16 {
     NEXT.fetch_add(1_000, Ordering::Relaxed)
 }
 
-fn member_endpoint(base: u16, member: i32, offset: u16) -> String {
-    format!(
-        "localhost:{}",
-        base + u16::try_from(member).expect("a member id") * PORTS_PER_NODE + offset
-    )
-}
-
-/// `id,ingress,consensus,log,catchup,archive` per member, `|` between members.
-fn members_string(base: u16) -> String {
-    (0..MEMBERS)
-        .map(|member| {
-            format!(
-                "{member},{},{},{},localhost:0,{}",
-                member_endpoint(base, member, CLIENT_FACING_PORT_OFFSET),
-                member_endpoint(base, member, MEMBER_FACING_PORT_OFFSET),
-                member_endpoint(base, member, LOG_PORT_OFFSET),
-                member_endpoint(base, member, ARCHIVE_CONTROL_PORT_OFFSET),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
 fn options(base: u16) -> Options {
     Options {
         cluster_id: CLUSTER_ID,
-        members: Some(members_string(base)),
+        members: Some(ClusterPorts::new(base).members_string(MEMBERS)),
         ingress_channel: "aeron:udp?term-length=64k".to_owned(),
         consensus_channel: "aeron:udp?term-length=64k".to_owned(),
         log_channel: "aeron:udp?term-length=64k".to_owned(),
