@@ -72,6 +72,15 @@ pub struct MessageHeader {
     /// (`aeron_logbuffer_compute_fragmented_length`, called at
     /// `aeron_fragment_assembler.h:120-121`).
     pub fragmented_frame_length: i32,
+    /// The image the message came from, by its publication registration id.
+    ///
+    /// The reference's handler gets this as `Header.context()` — the `Image`
+    /// object — and the cluster client keeps it as the identity of the
+    /// connection its egress answers arrived on (`AeronCluster.java:283`,
+    /// `:298`). A fragmented message takes the **first** fragment's image, the
+    /// same rule as its session and stream: a message whose pieces arrived on
+    /// two images is not a message either implementation can place.
+    pub image_registration_id: i64,
 }
 
 /// One whole message.
@@ -344,6 +353,7 @@ impl FragmentAssembler {
                 self.passthrough.len(),
                 self.passthrough.len(),
             ),
+            image_registration_id: fragment.image_registration_id(),
         };
 
         self.delivered += 1;
@@ -392,6 +402,7 @@ impl FragmentAssembler {
                 builder.buffer.len(),
                 fragment.payload_length(),
             ),
+            image_registration_id: fragment.image_registration_id(),
         });
         builder.next_term_offset = Some(next_term_offset);
     }
@@ -627,6 +638,7 @@ mod tests {
                 position: 0,
                 frame_length: 0,
                 fragmented_frame_length: 0,
+                image_registration_id: 0,
             },
             payload: b"hello",
         };
@@ -634,6 +646,9 @@ mod tests {
         assert_eq!(Action::Break, deliver(&mut closure, message));
         assert_eq!(5, seen.get());
     }
+
+    /// The image the test fragments claim to have arrived on.
+    const IMAGE_REGISTRATION_ID: i64 = 42;
 
     /// The smallest legal term length, so the fixture stays small.
     const TERM_LENGTH: i32 = 64 * 1024;
@@ -746,6 +761,7 @@ mod tests {
             let fragment = Fragment::new(
                 frame::Frame::new(&view, self.frames[index]),
                 i64::from(i32::try_from(self.frames[index]).expect("a term fits an i32")),
+                IMAGE_REGISTRATION_ID,
             );
 
             assembler.push_controlled(&fragment, handler)
@@ -777,6 +793,7 @@ mod tests {
             let fragment = Fragment::new(
                 frame::Frame::new(&view, offset),
                 i64::from(i32::try_from(offset).expect("a term fits an i32")),
+                IMAGE_REGISTRATION_ID,
             );
 
             assembler.push(&fragment, handler);
@@ -798,6 +815,43 @@ mod tests {
 
         assert_eq!(vec![(7, b"hello".to_vec())], seen);
         assert_eq!(0, assembler.abandoned());
+    }
+
+    /// A message remembers which image it came from, whole or assembled.
+    ///
+    /// The reference's handler gets the image as `Header.context()`, and a
+    /// cluster client keeps it as the identity of the connection its answer
+    /// arrived on (`AeronCluster.java:283`, `:298`). Both paths must set it —
+    /// the passthrough buffer for a whole message and a builder for an
+    /// assembled one — and an assembled message takes the **first** fragment's
+    /// image, the same rule as its session and stream.
+    #[test]
+    fn a_message_carries_the_image_it_came_from() {
+        let mut log = Log::new();
+        log.write(7, 1, b"hello");
+
+        let mut assembler = FragmentAssembler::new();
+        let mut seen = Vec::new();
+        {
+            let mut handler =
+                |message: Message<'_>| seen.push(message.header.image_registration_id);
+            log.push_into(0, &mut assembler, &mut handler);
+        }
+
+        let (log, _payload) = a_two_frame_message();
+        let mut assembler = FragmentAssembler::new();
+        {
+            let mut handler =
+                |message: Message<'_>| seen.push(message.header.image_registration_id);
+            log.push_into(0, &mut assembler, &mut handler);
+            log.push_into(1, &mut assembler, &mut handler);
+        }
+
+        assert_eq!(
+            vec![IMAGE_REGISTRATION_ID, IMAGE_REGISTRATION_ID],
+            seen,
+            "one whole message and one assembled message, both from the test image"
+        );
     }
 
     /// Two frames of one message, for the tests that need a message assembled
