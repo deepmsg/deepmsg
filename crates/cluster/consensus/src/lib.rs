@@ -37,6 +37,7 @@
 #![deny(clippy::disallowed_types)]
 
 pub mod agent;
+pub mod backup;
 pub mod clock;
 pub mod config;
 pub mod consensus;
