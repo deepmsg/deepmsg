@@ -274,6 +274,7 @@ dependencies = [
  "deepmsg-client",
  "deepmsg-cluster-common",
  "deepmsg-codec",
+ "deepmsg-core",
 ]
 
 [[package]]
