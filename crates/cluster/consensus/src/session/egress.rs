@@ -18,11 +18,16 @@
 //! how many times. [`EgressSession`] is that mock surface: the id, the
 //! correlation id, the maximum payload length, and the two writes.
 
+use crate::persist::recording_log::{Entry, Snapshot};
 use deepmsg_codec_cluster::WriteBuf;
 use deepmsg_codec_cluster::admin_request_type::AdminRequestType;
 use deepmsg_codec_cluster::admin_response_code::AdminResponseCode;
 use deepmsg_codec_cluster::admin_response_codec::{
     AdminResponseEncoder, SBE_BLOCK_LENGTH as ADMIN_RESPONSE_BLOCK_LENGTH,
+};
+use deepmsg_codec_cluster::backup_response_codec::{
+    SBE_BLOCK_LENGTH as BACKUP_RESPONSE_BLOCK_LENGTH, encoder::BackupResponseEncoder,
+    encoder::SnapshotsEncoder,
 };
 use deepmsg_codec_cluster::challenge_codec::{
     ChallengeEncoder, SBE_BLOCK_LENGTH as CHALLENGE_BLOCK_LENGTH,
@@ -47,6 +52,10 @@ const INITIAL_BUFFER_LENGTH: usize = 4 * 1024;
 /// Every variable-length field in schema 111 is a 4-byte length followed by the
 /// bytes (`varAsciiEncoding` / `varDataEncoding`).
 const VAR_DATA_HEADER_LENGTH: usize = 4;
+
+/// `snapshots` group block length (`backup_response_codec.rs:300`): recording
+/// id, term, term base, log position, timestamp and service id.
+const SNAPSHOT_BLOCK_LENGTH: usize = 44;
 
 /// A session seen as an egress destination (`ClusterSession.responsePublication`,
 /// `tryClaim`, `offer`).
@@ -120,6 +129,84 @@ impl EgressPublisher {
                 .version(crate::config::PROTOCOL_SEMANTIC_VERSION)
                 .leader_heartbeat_timeout_ns(self.leader_heartbeat_timeout_ns)
                 .detail(detail.as_bytes());
+        }
+
+        Ok(self.send(session, length, max_payload_length))
+    }
+
+    /// `backupResponse` (`ConsensusPublisher.java:482-523`): the answer to a
+    /// backup query, as a session message.
+    ///
+    /// The reference writes it through `sendSession`, which is the same claim
+    /// or offer this publisher's other senders make — the difference is only
+    /// which publication the session hands it.
+    ///
+    /// # Errors
+    ///
+    /// Never refused for want of a publication: a session without one answers
+    /// `false`, which the caller reads as "not yet".
+    #[allow(clippy::too_many_arguments)] // one per field the reference's call takes
+    pub fn send_backup_response(
+        &mut self,
+        session: &dyn EgressSession,
+        commit_position_counter_id: i32,
+        leader_member_id: i32,
+        member_id: i32,
+        last_entry: &Entry,
+        cluster_members: &str,
+        snapshots: Option<&[Snapshot]>,
+    ) -> Result<bool, crate::ClusterError> {
+        let Some(max_payload_length) = session.max_payload_length() else {
+            return Ok(false);
+        };
+
+        let snapshots: &[Snapshot] = snapshots.unwrap_or(&[]);
+        let length = MESSAGE_HEADER_LENGTH
+            + usize::from(BACKUP_RESPONSE_BLOCK_LENGTH)
+            + VAR_DATA_HEADER_LENGTH
+            + snapshots.len() * SNAPSHOT_BLOCK_LENGTH
+            + VAR_DATA_HEADER_LENGTH
+            + cluster_members.len();
+        self.size_buffer(length);
+
+        {
+            let encoder = BackupResponseEncoder::default().wrap(
+                WriteBuf::new(&mut self.buffer[..length]),
+                MESSAGE_HEADER_LENGTH,
+            );
+            let mut header = encoder.header(0);
+            let mut message = header.parent().expect("the encoder just wrapped");
+            message
+                .correlation_id(session.correlation_id())
+                .log_recording_id(last_entry.recording_id)
+                .log_leadership_term_id(last_entry.leadership_term_id)
+                .log_term_base_log_position(last_entry.term_base_log_position)
+                .last_leadership_term_id(last_entry.leadership_term_id)
+                .last_term_base_log_position(last_entry.term_base_log_position)
+                .commit_position_counter_id(commit_position_counter_id)
+                .leader_member_id(leader_member_id)
+                .member_id(member_id);
+
+            #[allow(clippy::cast_possible_truncation)] // a snapshot set is small
+            let count = snapshots.len() as u16;
+            let mut group = message.snapshots_encoder(count, SnapshotsEncoder::default());
+
+            for snapshot in snapshots {
+                group
+                    .advance()
+                    .expect("the group has room")
+                    .expect("an index");
+                group
+                    .recording_id(snapshot.recording_id)
+                    .leadership_term_id(snapshot.leadership_term_id)
+                    .term_base_log_position(snapshot.term_base_log_position)
+                    .log_position(snapshot.log_position)
+                    .timestamp(snapshot.timestamp)
+                    .service_id(snapshot.service_id);
+            }
+
+            let mut message = group.parent().expect("the group has a parent");
+            message.cluster_members(cluster_members.as_bytes());
         }
 
         Ok(self.send(session, length, max_payload_length))
