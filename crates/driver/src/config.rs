@@ -887,19 +887,29 @@ pub struct DriverConfig {
     /// no limit at all, `INT32_MAX`,
     /// `aeron-driver/src/main/c/aeron_driver_context.c:249`).
     pub stream_session_limit: usize,
-    /// Withhold one data frame in every this many from every send endpoint, so
+    /// What to withhold on the **send** side (`debug.send.data.loss.…`), so
     /// that a test can exercise loss recovery on a wire that does not lose
-    /// anything (`debug.send.data.loss.drop.every`).
+    /// anything.
     ///
-    /// **This has no counterpart in the reference.** Its debug loss surface is
+    /// Two rules, one at a time: a rate (`drop.every`, one datagram in every
+    /// this many) and a **blackout** (`pass.first` + `hold.millis`, everything
+    /// for a while once the endpoint has sent that many datagrams carrying a
+    /// `DATA` frame). The blackout is here for the cluster reliability cases,
+    /// whose fault is "the client's sends stop arriving **after** the session
+    /// is up": a rate has no moment, and a blackout anchored on the endpoint's
+    /// first datagram would spend itself on the handshakes a cluster connect
+    /// makes.
+    ///
+    /// **Neither has a counterpart in the reference.** Its debug loss surface is
     /// eight `AERON_DEBUG_{SEND,RECEIVE}_{DATA,CONTROL}_LOSS_{RATE,SEED}`
     /// variables read by an installer that only a C++ test calls
     /// (`media/aeron_debug_channel_endpoint_configuration.h:22-29`,
     /// `.c:126-172`) — a driver started as a process, which every interop test
-    /// here is, has no way in. This build's own spelling is therefore a property of its own,
-    /// and its value is a count rather than a rate: `None` injects nothing.
-    /// `docs/compat.md` records the difference.
-    pub data_loss_drop_every: Option<u64>,
+    /// here is, has no way in. This build's own spelling is therefore a property
+    /// of its own, and its values are counts and a duration rather than rates
+    /// and seeds: `None` injects nothing. `docs/compat.md` records the
+    /// difference.
+    pub send_data_loss: Option<crate::media::loss_generator::SendDataLoss>,
     /// What to drop on the **receive** side
     /// (`debug.receive.data.loss.…`), so that a test can put loss *under a
     /// subscriber* rather than under a sender.
@@ -919,7 +929,7 @@ pub struct DriverConfig {
     /// `aeron_loss_generator_…_enable` on a running one; a driver here is a
     /// process of its own, so what it drops is decided **before it starts** and
     /// cannot be changed while a case runs. `docs/compat.md` records the
-    /// difference, as it does for `data_loss_drop_every`.
+    /// difference, as it does for `send_data_loss`.
     pub receive_data_loss: Option<crate::media::receive_loss::Spec>,
     /// Hold every resolution this many milliseconds before it is answered
     /// (`debug.resolver.delay.millis`), so that a test can put a name that
@@ -933,7 +943,7 @@ pub struct DriverConfig {
     /// are being resolved — is otherwise only observable on a host whose
     /// resolver happens to be slow, which is a test that passes on the days it
     /// is not. Zero, the default, delays nothing. `docs/compat.md` records the
-    /// difference, as it does for `data_loss_drop_every`.
+    /// difference, as it does for `send_data_loss`.
     pub debug_resolver_delay_ms: u64,
     /// Which resolver this driver builds and keeps
     /// (`aeron.name.resolver.supplier`, `AERON_NAME_RESOLVER_SUPPLIER`,
@@ -1159,7 +1169,7 @@ impl Default for DriverConfig {
             retransmit_unicast_delay_ns: RETRANSMIT_UNICAST_DELAY_NS_DEFAULT,
             retransmit_unicast_linger_ns: RETRANSMIT_UNICAST_LINGER_NS_DEFAULT,
             max_resend: MAX_RESEND_DEFAULT,
-            data_loss_drop_every: None,
+            send_data_loss: None,
             receive_data_loss: None,
             debug_resolver_delay_ms: 0,
             stream_session_limit: STREAM_SESSION_LIMIT_DEFAULT,
@@ -1904,22 +1914,7 @@ impl DriverConfig {
             }
         }
 
-        if let Some(value) = get(&Setting::DATA_LOSS_DROP_EVERY) {
-            // Zero is "inject nothing", the same as leaving it unset; one
-            // would withhold every frame, which no test means and a typo can
-            // produce. A rate of one is refused here rather than obeyed, and
-            // a negative count falls out of the conversion the same way.
-            match u64::try_from(parse_count(&Setting::DATA_LOSS_DROP_EVERY, &value)?) {
-                Ok(0) => {}
-                Ok(1) | Err(_) => {
-                    return Err(ConfigError::OutOfRange {
-                        name: Setting::DATA_LOSS_DROP_EVERY.property,
-                        value,
-                    });
-                }
-                Ok(drop_every) => config.data_loss_drop_every = Some(drop_every),
-            }
-        }
+        config.send_data_loss = send_data_loss(&get)?;
 
         config.receive_data_loss = receive_data_loss(&get)?;
 
@@ -2825,14 +2820,47 @@ impl Setting {
     /// `deepmsg.debug.send.data.loss.drop.every`: withhold one data frame in
     /// every this many from each send endpoint.
     ///
-    /// The one setting here with no reference variable to borrow, so it
-    /// names its own — the same string the `DEEPMSG_` derivation produces,
-    /// spelled out because the table is where a reader looks for a setting's
-    /// names. See [`DriverConfig::data_loss_drop_every`] for why the
-    /// reference's eight `AERON_DEBUG_*` variables are not what this reads.
-    const DATA_LOSS_DROP_EVERY: Self = Self {
+    /// The first of the send-side family, and the one setting here with no
+    /// reference variable to borrow, so it names its own — the same string the
+    /// `DEEPMSG_` derivation produces, spelled out because the table is where a
+    /// reader looks for a setting's names. See [`DriverConfig::send_data_loss`]
+    /// for why the reference's eight `AERON_DEBUG_*` variables are not what
+    /// this reads.
+    const SEND_LOSS_DROP_EVERY: Self = Self {
         property: "debug.send.data.loss.drop.every",
         env: "DEEPMSG_DEBUG_SEND_DATA_LOSS_DROP_EVERY",
+    };
+    /// `deepmsg.debug.send.data.loss.pass.first`: how many datagrams that carry
+    /// a `DATA` frame a **blackout** lets through before it starts.
+    ///
+    /// The send-side counterpart of the receive family's `pass.first`, and it
+    /// counts the same kind of thing for the same reason: what a test wants to
+    /// name is a moment **after the connection**, and the datagrams before that
+    /// moment are the handshakes. A `DATA`-only heartbeat is not counted —
+    /// `EOS` and `REVOKE` ride those, and they say a session is alive, not that
+    /// it has anything to lose.
+    ///
+    /// **No counterpart in the reference**; it switches its
+    /// `PortLossGenerator` on from the test's thread instead
+    /// (`aeron-test-support/.../PortLossGenerator.java:32-37`).
+    /// `docs/compat.md` records the difference.
+    const SEND_LOSS_PASS_FIRST: Self = Self {
+        property: "debug.send.data.loss.pass.first",
+        env: "DEEPMSG_DEBUG_SEND_DATA_LOSS_PASS_FIRST",
+    };
+    /// `deepmsg.debug.send.data.loss.hold.millis`: how long the blackout
+    /// withholds, from the datagram that opens it.
+    ///
+    /// A duration rather than a count for the reason the receive side's
+    /// `until.millis` gives: withholding everything stops the frames arriving,
+    /// so a frame budget stalls with the budget unspent. This one is measured
+    /// from **the opening datagram**, not from the stream's first: a send
+    /// endpoint has no stream to name — the rule is attached to the endpoint
+    /// before it has a publication — and "for this long after the trigger" is
+    /// what a test means.
+    const SEND_LOSS_HOLD_MILLIS: Self = Self {
+        property: "debug.send.data.loss.hold.millis",
+        env: "DEEPMSG_DEBUG_SEND_DATA_LOSS_HOLD_MILLIS",
     };
     /// `deepmsg.debug.resolver.delay.millis`: hold every resolution this long
     /// before answering it.
@@ -3568,6 +3596,91 @@ fn property(properties: &[(String, String)], name: &str) -> Option<String> {
 /// The reference compares a prefix, so `turnip` is `true` and `offside` is
 /// `false`; this accepts the six whole words instead. The divergence can only
 /// turn a typo into an error, never a value into a different value.
+/// Read the send-side loss settings into the one rule they name.
+///
+/// **Two rules, and one at a time**: a rate (`drop.every`) and a blackout
+/// (`pass.first` + `hold.millis`). Both at once is a refusal rather than a
+/// precedence, for the reason the receive-side reader gives below.
+fn send_data_loss(
+    get: &impl Fn(&Setting) -> Option<String>,
+) -> Result<Option<crate::media::loss_generator::SendDataLoss>, ConfigError> {
+    let mut drop_every = None;
+
+    if let Some(value) = get(&Setting::SEND_LOSS_DROP_EVERY) {
+        // Zero is "inject nothing", the same as leaving it unset; one would
+        // withhold every frame, which no test means and a typo can produce. A
+        // rate of one is refused here rather than obeyed, and a negative count
+        // falls out of the conversion the same way.
+        match u64::try_from(parse_count(&Setting::SEND_LOSS_DROP_EVERY, &value)?) {
+            Ok(0) => {}
+            Ok(1) | Err(_) => {
+                return Err(ConfigError::OutOfRange {
+                    name: Setting::SEND_LOSS_DROP_EVERY.property,
+                    value,
+                });
+            }
+            Ok(every) => drop_every = Some(every),
+        }
+    }
+
+    let mut pass_first = None;
+
+    if let Some(value) = get(&Setting::SEND_LOSS_PASS_FIRST) {
+        pass_first = Some(match parse_count(&Setting::SEND_LOSS_PASS_FIRST, &value) {
+            Ok(count) if count >= 0 => u64::try_from(count).unwrap_or(0),
+            _ => {
+                return Err(ConfigError::OutOfRange {
+                    name: Setting::SEND_LOSS_PASS_FIRST.property,
+                    value,
+                });
+            }
+        });
+    }
+
+    let mut hold_ms = None;
+
+    if let Some(value) = get(&Setting::SEND_LOSS_HOLD_MILLIS) {
+        // Zero is "no blackout", the same as leaving it unset — and a blackout
+        // that withholds for no time at all is a rule that says nothing, so a
+        // `pass.first` beside it is refused rather than silently ignored.
+        match u64::try_from(parse_count(&Setting::SEND_LOSS_HOLD_MILLIS, &value)?) {
+            Ok(0) => {}
+            Ok(hold) => hold_ms = Some(hold),
+            Err(_) => {
+                return Err(ConfigError::OutOfRange {
+                    name: Setting::SEND_LOSS_HOLD_MILLIS.property,
+                    value,
+                });
+            }
+        }
+    }
+
+    if pass_first.is_some() && hold_ms.is_none() {
+        return Err(ConfigError::ConflictingSettings {
+            first: Setting::SEND_LOSS_PASS_FIRST.property,
+            second: Setting::SEND_LOSS_HOLD_MILLIS.property,
+        });
+    }
+
+    if drop_every.is_some() && hold_ms.is_some() {
+        return Err(ConfigError::ConflictingSettings {
+            first: Setting::SEND_LOSS_DROP_EVERY.property,
+            second: Setting::SEND_LOSS_HOLD_MILLIS.property,
+        });
+    }
+
+    Ok(match (drop_every, hold_ms) {
+        (Some(every), None) => {
+            Some(crate::media::loss_generator::SendDataLoss::EveryNthDatagram(every))
+        }
+        (None, Some(hold_ms)) => Some(crate::media::loss_generator::SendDataLoss::Blackout {
+            pass_first: pass_first.unwrap_or(0),
+            hold: Duration::from_millis(hold_ms),
+        }),
+        _ => None,
+    })
+}
+
 /// Read the receive-side loss settings into the one rule they name.
 ///
 /// **At most one rule**, and a second one is a refusal rather than a precedence:
@@ -4472,23 +4585,25 @@ mod tests {
 
     #[test]
     fn a_loss_generator_is_installed_only_when_a_frame_count_was_asked_for() {
+        use crate::media::loss_generator::SendDataLoss;
+
         // The one setting with no reference variable behind it: our property,
         // our spelling, and a count rather than the reference's rate.
         assert_eq!(
-            Some(8),
+            Some(SendDataLoss::EveryNthDatagram(8)),
             resolve_with_env(
                 &[("deepmsg.dir", "/tmp/aeron")],
                 &[("DEEPMSG_DEBUG_SEND_DATA_LOSS_DROP_EVERY", "8")]
             )
             .expect("a config")
-            .data_loss_drop_every
+            .send_data_loss
         );
 
         assert_eq!(
             Option::None,
             resolve(&[("deepmsg.dir", "/tmp/aeron")])
                 .expect("a config")
-                .data_loss_drop_every,
+                .send_data_loss,
             "a driver nobody configured injects nothing"
         );
 
@@ -4499,9 +4614,66 @@ mod tests {
                 ("deepmsg.debug.send.data.loss.drop.every", "0")
             ])
             .expect("a config")
-            .data_loss_drop_every,
+            .send_data_loss,
             "zero is the same as unset"
         );
+    }
+
+    /// The send-side blackout: the two settings that name it, the default
+    /// `pass.first` of zero, and that a rate and a blackout are two rules.
+    #[test]
+    fn the_send_loss_settings_become_one_rule() {
+        use crate::media::loss_generator::SendDataLoss;
+
+        let config = resolve(&[
+            ("deepmsg.dir", "/tmp/aeron"),
+            ("deepmsg.debug.send.data.loss.pass.first", "6"),
+            ("deepmsg.debug.send.data.loss.hold.millis", "2000"),
+        ])
+        .expect("a budget and a hold are one rule");
+
+        assert_eq!(
+            Some(SendDataLoss::Blackout {
+                pass_first: 6,
+                hold: Duration::from_millis(2000),
+            }),
+            config.send_data_loss
+        );
+
+        // A hold on its own opens on the first datagram that carries a message,
+        // which is `pass.first` of zero.
+        assert_eq!(
+            Some(SendDataLoss::Blackout {
+                pass_first: 0,
+                hold: Duration::from_millis(1000),
+            }),
+            resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("deepmsg.debug.send.data.loss.hold.millis", "1000"),
+            ])
+            .expect("a hold alone is a rule")
+            .send_data_loss
+        );
+
+        // A budget without a hold asks for nothing to withhold, which is a
+        // mistake rather than a rule.
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("deepmsg.debug.send.data.loss.pass.first", "6"),
+            ]),
+            Err(ConfigError::ConflictingSettings { .. })
+        ));
+
+        // And a rate beside a blackout is two rules, which is refused.
+        assert!(matches!(
+            resolve(&[
+                ("deepmsg.dir", "/tmp/aeron"),
+                ("deepmsg.debug.send.data.loss.drop.every", "4"),
+                ("deepmsg.debug.send.data.loss.hold.millis", "2000"),
+            ]),
+            Err(ConfigError::ConflictingSettings { .. })
+        ));
     }
 
     /// The receive-side family: which settings make which rule, and that two

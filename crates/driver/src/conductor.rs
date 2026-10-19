@@ -1042,8 +1042,8 @@ impl Conductor {
                 // generator of its own. Nothing is attached unless the driver
                 // was configured to inject loss.
                 let mut endpoints = SendChannelEndpoints::new();
-                if let Some(drop_every) = config.data_loss_drop_every {
-                    endpoints.attach_data_loss_generator(drop_every);
+                if let Some(loss) = config.send_data_loss {
+                    endpoints.attach_data_loss_generator(loss);
                 }
                 // The range the manager hands ports out of, set once at
                 // start-up (`aeron_wildcard_port_manager_set_range`, called

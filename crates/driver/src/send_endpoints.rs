@@ -46,7 +46,7 @@ use std::net::SocketAddr;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
 use crate::channel_validation;
-use crate::media::loss_generator::EveryNthDatagram;
+use crate::media::loss_generator::SendDataLoss;
 use crate::media::send_endpoint::{self, EndpointStatus, SendChannelEndpoint};
 use crate::port_manager::{PortRange, WildcardPortManager};
 use crate::sys;
@@ -240,17 +240,16 @@ impl std::error::Error for EndpointError {}
 pub struct SendChannelEndpoints {
     entries: Vec<SendChannelEndpointEntry>,
     next_id: u64,
-    /// The loss the driver was configured to inject: one outgoing datagram
-    /// in every `data_loss_drop_every` is withheld from every endpoint made
-    /// from here on. `None` — the driver nobody configured — is every
-    /// deployment.
+    /// The loss the driver was configured to inject: the rule every endpoint
+    /// made from here on gets a generator for. `None` — the driver nobody
+    /// configured — is every deployment.
     ///
     /// The reference keeps this on the driver *context*, as a supplier each
     /// endpoint's create calls
     /// (`aeron_driver_context.h:384-387`,
     /// `media/aeron_send_channel_endpoint.c:237-240`); the registry is what
     /// plays that part here.
-    data_loss_drop_every: Option<u64>,
+    data_loss: Option<SendDataLoss>,
     /// `aeron.driver.connect`, set once at start-up: whether a send endpoint
     /// whose channel names an explicit endpoint connects its socket to it
     /// (`aeron_driver_context.c:527,668` read into `context->connect_enabled`,
@@ -288,7 +287,7 @@ impl SendChannelEndpoints {
         Self {
             entries: Vec::new(),
             next_id: 1,
-            data_loss_drop_every: None,
+            data_loss: None,
             connect_enabled: crate::config::DRIVER_CONNECT_DEFAULT,
             transport_bindings: crate::media::TransportBindings::Default,
             sender_port_manager: WildcardPortManager::sender(),
@@ -312,8 +311,8 @@ impl SendChannelEndpoints {
     /// set once, at start-up, before anything can be created. Each endpoint
     /// gets its own generator, so each counts its own datagrams — which is
     /// what the reference's per-endpoint attach does too.
-    pub fn attach_data_loss_generator(&mut self, drop_every: u64) {
-        self.data_loss_drop_every = Some(drop_every);
+    pub fn attach_data_loss_generator(&mut self, loss: SendDataLoss) {
+        self.data_loss = Some(loss);
     }
 
     /// Whether the endpoints made from here on connect their sockets to the
@@ -528,8 +527,8 @@ impl SendChannelEndpoints {
 
         // The supplier's call (`media/aeron_send_channel_endpoint.c:237-240`):
         // a fresh generator per endpoint, so each counts its own datagrams.
-        if let Some(drop_every) = self.data_loss_drop_every {
-            endpoint.set_data_loss_generator(Box::new(EveryNthDatagram::new(drop_every)));
+        if let Some(loss) = &self.data_loss {
+            endpoint.set_data_loss_generator(loss.generator());
         }
 
         // The status the counter holds: `ACTIVE` once the socket is there,
