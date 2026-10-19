@@ -73,6 +73,7 @@ pub mod role;
 pub mod service;
 pub mod services;
 pub mod session;
+pub mod snapshot;
 
 pub use agent::{ClusteredServiceAgent, ShutdownHandle};
 pub use cluster::{ClientSession, Cluster, SessionInfo};
