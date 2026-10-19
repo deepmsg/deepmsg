@@ -176,6 +176,8 @@ fn invalidate_latest_snapshot_prints_the_reference_line() {
     let path = dir.join(deepmsg_cluster::persist::recording_log::FILENAME);
     {
         let mut log = RecordingLog::open(&path).unwrap();
+        log.append_term(1, 0, 100, 1, 10, CONSENSUS_MODULE_SERVICE_ID)
+            .unwrap();
         log.append_snapshot(1, 0, 100, 2, 11, CONSENSUS_MODULE_SERVICE_ID)
             .unwrap();
     }
@@ -191,7 +193,7 @@ fn invalidate_latest_snapshot_prints_the_reference_line() {
     );
 
     let reopened = RecordingLog::open(&path).unwrap();
-    assert!(!reopened.entries()[0].is_valid);
+    assert!(!reopened.entries()[1].is_valid);
 }
 
 #[test]

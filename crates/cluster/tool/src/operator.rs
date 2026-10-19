@@ -13,7 +13,9 @@ use deepmsg_archive::client::context::ArchiveContext;
 use deepmsg_archive::client::descriptor_poller::RecordingDescriptor;
 use deepmsg_archive::client::{Archive, Handlers, NoCredentials};
 use deepmsg_client::client::Client;
-use deepmsg_cluster::persist::recording_log::{Entry, RecordingExtent, RecordingLog, RecoveryPlan};
+use deepmsg_cluster::persist::recording_log::{
+    CONSENSUS_MODULE_SERVICE_ID, Entry, RecordingExtent, RecordingLog, RecoveryPlan,
+};
 
 use crate::mark_files;
 use crate::properties::ToolProperties;
@@ -284,18 +286,96 @@ impl ClusterTool {
         FAILURE
     }
 
-    /// `sortRecordingLog` (`ClusterToolOperator.java:173-192`).
-    pub fn sort_recording_log(&self, _cluster_dir: &Path, out: &mut dyn Write) -> i32 {
-        self.not_yet(out, "sort-recording-log")
+    /// `sortRecordingLog` (`ClusterToolOperator.java:173-192`). A file already
+    /// in the view's order, an unreadable one, or none at all is `FAILURE`.
+    pub fn sort_recording_log(&self, cluster_dir: &Path, out: &mut dyn Write) -> i32 {
+        let _ = out;
+        let path = cluster_dir.join(deepmsg_cluster::persist::recording_log::FILENAME);
+        if !path.exists() {
+            return FAILURE;
+        }
+        let Ok(log) = RecordingLog::open(&path) else {
+            return FAILURE;
+        };
+        if log.is_sorted() {
+            return FAILURE;
+        }
+        let entries = log.entries().to_vec();
+        drop(log);
+        match deepmsg_cluster::persist::recording_log::write_entries(&path, &entries) {
+            Ok(()) => SUCCESS,
+            Err(_) => FAILURE,
+        }
     }
 
-    /// `seedRecordingLogFromSnapshot` (`ClusterToolOperator.java:201-269`).
-    pub fn seed_recording_log_from_snapshot(
-        &self,
-        _cluster_dir: &Path,
-        out: &mut dyn Write,
-    ) -> i32 {
-        self.not_yet(out, "seed-recording-log-from-snapshot")
+    /// `seedRecordingLogFromSnapshot` (`ClusterToolOperator.java:201-269`): back
+    /// the log up, then keep only the run of snapshots that starts at the latest
+    /// valid consensus-module snapshot, with the term base and log position
+    /// zeroed. No such snapshot ⇒ the log is deleted (the backup remains).
+    pub fn seed_recording_log_from_snapshot(&self, cluster_dir: &Path, out: &mut dyn Write) -> i32 {
+        let path = cluster_dir.join(deepmsg_cluster::persist::recording_log::FILENAME);
+        if !path.exists() {
+            let _ = writeln!(out, "recording.log does not exist");
+            return FAILURE;
+        }
+        let Ok(log) = RecordingLog::open(&path) else {
+            return FAILURE;
+        };
+        let entries = log.entries().to_vec();
+        drop(log);
+
+        let snapshot_index = entries.iter().rposition(|entry| {
+            entry.is_valid
+                && entry.entry_type == deepmsg_cluster::persist::recording_log::ENTRY_TYPE_SNAPSHOT
+                && entry.service_id == CONSENSUS_MODULE_SERVICE_ID
+        });
+
+        if let Err(message) = backup_recording_log(&path) {
+            let _ = writeln!(out, "{message}");
+            return FAILURE;
+        }
+
+        let truncated = match snapshot_index {
+            None => Vec::new(),
+            Some(index) => {
+                let mut truncated = Vec::new();
+                let mut service_id = CONSENSUS_MODULE_SERVICE_ID;
+                for entry in entries[..=index].iter().rev() {
+                    if entry.is_valid
+                        && entry.entry_type
+                            == deepmsg_cluster::persist::recording_log::ENTRY_TYPE_SNAPSHOT
+                        && entry.service_id == service_id
+                    {
+                        truncated.push(Entry {
+                            position: 0,
+                            recording_id: entry.recording_id,
+                            leadership_term_id: entry.leadership_term_id,
+                            term_base_log_position: 0,
+                            log_position: 0,
+                            timestamp: entry.timestamp,
+                            service_id: entry.service_id,
+                            entry_type: entry.entry_type,
+                            is_valid: entry.is_valid,
+                            archive_endpoint: None,
+                            entry_index: 0,
+                        });
+                        service_id += 1;
+                    } else {
+                        break;
+                    }
+                }
+                truncated.reverse();
+                truncated
+            }
+        };
+
+        match deepmsg_cluster::persist::recording_log::write_entries(&path, &truncated) {
+            Ok(()) => SUCCESS,
+            Err(message) => {
+                let _ = writeln!(out, "{message}");
+                FAILURE
+            }
+        }
     }
 
     /// `listMembers` (`ClusterToolOperator.java:317-347`).
@@ -357,6 +437,34 @@ fn list_recording(
 }
 
 // -- the reference's `toString`s -------------------------------------------
+
+/// `ClusterToolOperator.updateRecordingLog`'s backup step
+/// (`ClusterToolOperator.java:212-226`): `recording.log.bak`, replacing what is
+/// there, **with the original's times**. The reference uses
+/// `Files.copy(..., COPY_ATTRIBUTES)`; `std::fs::copy` copies permissions only,
+/// so the modification and access times are set explicitly.
+fn backup_recording_log(path: &Path) -> Result<(), String> {
+    let backup = path.with_file_name(format!(
+        "{}.bak",
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    std::fs::copy(path, &backup).map_err(|error| error.to_string())?;
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    let mut times = std::fs::FileTimes::new();
+    if let Ok(modified) = metadata.modified() {
+        times = times.set_modified(modified);
+    }
+    if let Ok(accessed) = metadata.accessed() {
+        times = times.set_accessed(accessed);
+    }
+    std::fs::File::options()
+        .write(true)
+        .open(&backup)
+        .and_then(|file| file.set_times(times))
+        .map_err(|error| error.to_string())
+}
 
 /// `RecordingLog.toString` (`RecordingLog.java:1277-1283`).
 #[must_use]
