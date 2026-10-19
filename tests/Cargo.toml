@@ -678,6 +678,13 @@ name = "cluster_lc1_connect"
 path = "interop/cluster_lc1_connect.rs"
 required-features = ["interop"]
 
+# P3-3b's LC-1 second step: our session offers a message, reads the echo and
+# closes, and the reference cluster's service records the close.
+[[test]]
+name = "cluster_lc1_echo"
+path = "interop/cluster_lc1_echo.rs"
+required-features = ["interop"]
+
 # P3-2a's LC-4a smoke: the reference's driver, archive and consensus module in
 # one Java process, deepmsg's service container against them, and the
 # reference's own `AeronCluster` client. Needs the reference jar, a JDK and the
