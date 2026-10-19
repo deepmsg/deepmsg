@@ -71,6 +71,7 @@ pub mod log_adapter;
 pub mod proxy;
 pub mod role;
 pub mod service;
+pub mod services;
 pub mod session;
 
 pub use agent::{ClusteredServiceAgent, ShutdownHandle};
@@ -79,3 +80,4 @@ pub use config::ServiceContainerConfig;
 pub use error::ContainerError;
 pub use role::{Role, TimeUnit};
 pub use service::{ClusteredService, LogHeader, SessionId};
+pub use services::BasicAuction;

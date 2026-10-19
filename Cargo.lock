@@ -289,6 +289,7 @@ dependencies = [
 name = "deepmsg-cluster-service"
 version = "0.1.0"
 dependencies = [
+ "deepmsg-archive",
  "deepmsg-client",
  "deepmsg-cluster-common",
  "deepmsg-cnc",
