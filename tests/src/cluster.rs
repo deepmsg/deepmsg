@@ -53,7 +53,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::Client;
-use deepmsg_cluster_common::counters::{self, CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID};
+use deepmsg_cluster_common::counters::{
+    self, CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID, CLUSTER_NODE_ROLE_TYPE_ID,
+};
+
+/// `Cluster.Role.LEADER` (`counters::ROLE_LEADER` is the same value).
+const ROLE_LEADER: i64 = 2;
 use deepmsg_cluster_common::mark::{ClusterMarkFile, SEMANTIC_VERSION};
 use deepmsg_cluster_service::service::{LogHeader, SnapshotReader, SnapshotWriter};
 use deepmsg_cluster_service::services;
@@ -490,10 +495,36 @@ impl TestCluster {
         );
     }
 
-    /// One of the cluster's counters, by type id.
+    /// One of the cluster's counters, by type id, on the first node.
     #[must_use]
     pub fn counter(&self, type_id: i32) -> Option<i64> {
         counter_value(&self.client(), type_id, self.options.cluster_id)
+    }
+
+    /// The same counter read on one member's driver — the only way to ask a
+    /// multi-node cluster which member leads (`Cluster.Role` is counter 201,
+    /// per node).
+    #[must_use]
+    pub fn counter_on(&self, member: i32, type_id: i32) -> Option<i64> {
+        let client = Client::connect(self.aeron_dir(member)).ok()?;
+        counter_value(&client, type_id, self.options.cluster_id)
+    }
+
+    /// The member whose role counter says LEADER, once one does.
+    pub fn await_leader(&self) -> i32 {
+        let deadline = Instant::now() + DEADLINE;
+        while Instant::now() < deadline {
+            for node in &self.nodes {
+                if self.counter_on(node.id, CLUSTER_NODE_ROLE_TYPE_ID) == Some(ROLE_LEADER) {
+                    return node.id;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "no member ever became the leader\n{}",
+            self.container_logs()
+        );
     }
 
     /// Run one of the compiled probes and hand back what it printed.
@@ -636,6 +667,21 @@ impl TestCluster {
             let (container, test_state) = self.spawn_container(index);
             self.containers[index].container = Some(container);
             self.containers[index].test_state = test_state;
+        }
+    }
+
+    /// Stop one member's node. Its containers are the caller's to stop first:
+    /// a container outliving its node ends by itself, and a test that wants to
+    /// see the end should watch it.
+    pub fn stop_node(&mut self, member: i32) {
+        let index = self.node_index(member);
+        if let Some(mut process) = self.nodes[index].process.take() {
+            let status = process.stop().expect("the Java node stops");
+            assert!(
+                status.success() || status.code() == Some(143),
+                "member {member}'s Java node exited with {status}\nnode log:\n{}",
+                process.log_tail(80)
+            );
         }
     }
 
@@ -810,6 +856,13 @@ impl TestCluster {
             self.containers[index].container = Some(container);
             self.containers[index].test_state = test_state;
         }
+    }
+
+    /// Start one node (and wait for its driver's CnC). Its containers are the
+    /// caller's to start.
+    pub fn start_node_by_id(&mut self, member: i32) {
+        let index = self.node_index(member);
+        self.start_node(index);
     }
 
     fn start_node(&mut self, index: usize) {

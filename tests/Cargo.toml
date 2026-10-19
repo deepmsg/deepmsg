@@ -693,6 +693,12 @@ name = "cluster_lc4a_multi_service"
 path = "interop/cluster_lc4a_multi_service.rs"
 required-features = ["interop"]
 
+# P3-2c: three nodes elect, and a new leader serves after the old one stops.
+[[test]]
+name = "cluster_lc4a_failover"
+path = "interop/cluster_lc4a_failover.rs"
+required-features = ["interop"]
+
 # P3-2c: session open, close and timeout, read through the test business.
 [[test]]
 name = "cluster_lc4a_sessions"
