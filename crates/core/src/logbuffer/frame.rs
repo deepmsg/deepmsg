@@ -387,6 +387,17 @@ impl Frame<'_, ReadWrite> {
             .copy_in(self.offset + DATA_HEADER_LENGTH, payload)
     }
 
+    /// The same, for a slice that goes `offset` bytes into the payload rather
+    /// than at its front.
+    ///
+    /// The second half of a message made of two parts — the cluster client's
+    /// resident session header followed by the caller's payload — and the
+    /// counterpart of [`Frame::write_payload_from`], which takes its source
+    /// from another mapped window instead.
+    pub fn write_payload_slice_from(&self, offset: usize, src: &[u8]) -> Option<()> {
+        self.buffer.copy_in(self.payload_offset(offset)?, src)
+    }
+
     /// Store an `int64` at `offset` bytes into the payload.
     ///
     /// The other half of [`Frame::write_payload`], and the one a **claimed**

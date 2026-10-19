@@ -120,6 +120,21 @@ pub struct Appender<'a> {
 enum PayloadSource<'a, 'b> {
     Slice(&'a [u8]),
     Region(PayloadRegion<'a, 'b>),
+    /// A message made of two slices that must land as **one** message: the
+    /// first part at the front of the payload, the second immediately after.
+    ///
+    /// The cluster client's ingress is what needs it (`AeronCluster.offer`,
+    /// `AC:451-458`): a 32-byte session header it keeps resident and the
+    /// caller's payload, offered without joining them in a buffer of their
+    /// own. The reference has the same door — `Publication.offer(bufferOne,
+    /// offsetOne, lengthOne, bufferTwo, offsetTwo, lengthTwo, …)`, which its
+    /// publications answer with two `putBytes` (`ConcurrentPublication.java`
+    /// `appendUnfragmentedMessage`) — and the point of it is that no copy of
+    /// the header into the message happens.
+    ///
+    /// Fragmentation splits the **joined** bytes, not each part: a message
+    /// longer than one frame may straddle the boundary between the two.
+    TwoSlices(&'a [u8], &'a [u8]),
 }
 
 /// A message that lies in a window rather than in a slice: the window, and where
@@ -159,6 +174,7 @@ impl PayloadSource<'_, '_> {
         match self {
             Self::Slice(bytes) => bytes.len(),
             Self::Region(region) => region.length,
+            Self::TwoSlices(first, second) => first.len() + second.len(),
         }
     }
 
@@ -181,6 +197,25 @@ impl PayloadSource<'_, '_> {
             Self::Slice(bytes) => frame.write_payload(bytes.get(offset..end)?),
             Self::Region(region) => {
                 frame.write_payload_from(0, region.buffer, region.offset.checked_add(offset)?, len)
+            }
+            Self::TwoSlices(first, second) => {
+                // Either the piece starts past the first part, or it starts
+                // inside it and may run on into the second. The boundary is
+                // where the joined bytes are split, which is what makes a
+                // message longer than one frame able to straddle it.
+                if offset >= first.len() {
+                    let at = offset - first.len();
+                    frame.write_payload_slice_from(0, second.get(at..at + len)?)?;
+                } else {
+                    let from_first = (first.len() - offset).min(len);
+                    frame.write_payload_slice_from(0, first.get(offset..offset + from_first)?)?;
+
+                    let from_second = len - from_first;
+                    if from_second > 0 {
+                        frame.write_payload_slice_from(from_first, second.get(..from_second)?)?;
+                    }
+                }
+                Some(())
             }
         }
     }
@@ -395,6 +430,49 @@ impl<'a> Appender<'a> {
         position_limit: i64,
         payload: &[u8],
     ) -> Appended {
+        self.append_source(
+            session_id,
+            stream_id,
+            position_limit,
+            &PayloadSource::Slice(payload),
+        )
+    }
+
+    /// The same append, with the message in **two slices** that must land as
+    /// one message: `first` at the front of the payload, `second` after it.
+    ///
+    /// The door the cluster client's ingress needs (`AeronCluster.offer`,
+    /// `AC:451-458`): a resident session header and a caller's payload, with no
+    /// buffer joining them in between. Fragmentation splits the joined bytes,
+    /// so a message longer than one frame can straddle the boundary.
+    ///
+    /// # Errors
+    ///
+    /// As [`Appender::append`].
+    pub fn append_two_slices(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        position_limit: i64,
+        first: &[u8],
+        second: &[u8],
+    ) -> Appended {
+        self.append_source(
+            session_id,
+            stream_id,
+            position_limit,
+            &PayloadSource::TwoSlices(first, second),
+        )
+    }
+
+    /// The one body both public appends go through.
+    fn append_source(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        position_limit: i64,
+        source: &PayloadSource<'_, '_>,
+    ) -> Appended {
         // Entry, in the reference's order (`aeron_publication.c:483-494`): the
         // limit, then the term count, then the tail that count names, and only
         // then a position. The pair is checked against itself because another
@@ -428,25 +506,25 @@ impl<'a> Appender<'a> {
         // stream outranks a closed window, and whether anyone is listening
         // decides between the other two.
         if position.raw() >= position_limit {
-            return self.back_pressure(position, payload.len());
+            return self.back_pressure(position, source.len());
         }
 
         // Inside the window, and only now, the payload's *shape* matters
         // (`aeron_publication.c:499-524`): the size bounds are checked here
         // rather than before the window, so a payload too large for this
         // publication still reports back-pressure while nobody can take it.
-        if payload.len() > self.max_message_length {
+        if source.len() > self.max_message_length {
             return Appended::MessageTooLarge;
         }
 
         let partition = position::index_by_term_count(term_count);
 
-        if payload.len() > self.max_payload_length {
+        if source.len() > self.max_payload_length {
             // Fragmented: the reservation is the whole message, computed with
             // the reference's own formula so the frames below land exactly
             // where it says (`aeron_logbuffer_descriptor.h:326-334`).
             let framed_length =
-                descriptor::compute_fragmented_length(payload.len(), self.max_payload_length);
+                descriptor::compute_fragmented_length(source.len(), self.max_payload_length);
 
             return self.claim_and_place(
                 session_id,
@@ -454,13 +532,13 @@ impl<'a> Appender<'a> {
                 partition,
                 term_count,
                 term_id,
-                payload,
+                source,
                 framed_length as i64,
                 true,
             );
         }
 
-        let Some(frame_length) = i32::try_from(payload.len() + DATA_HEADER_LENGTH).ok() else {
+        let Some(frame_length) = i32::try_from(source.len() + DATA_HEADER_LENGTH).ok() else {
             return Appended::Malformed;
         };
         let aligned_length = position::align_up(frame_length, descriptor::FRAME_ALIGNMENT);
@@ -471,7 +549,7 @@ impl<'a> Appender<'a> {
             partition,
             term_count,
             term_id,
-            payload,
+            source,
             i64::from(aligned_length),
             false,
         )
@@ -495,7 +573,7 @@ impl<'a> Appender<'a> {
         partition: usize,
         term_count: i32,
         term_id: i32,
-        payload: &[u8],
+        source: &PayloadSource<'_, '_>,
         framed_length: i64,
         fragmented: bool,
     ) -> Appended {
@@ -554,10 +632,10 @@ impl<'a> Appender<'a> {
                 stream_id,
                 claimed_offset,
                 claimed_term_id,
-                &PayloadSource::Slice(payload),
+                source,
             )
         } else {
-            let Some(frame_length) = i32::try_from(payload.len() + DATA_HEADER_LENGTH).ok() else {
+            let Some(frame_length) = i32::try_from(source.len() + DATA_HEADER_LENGTH).ok() else {
                 return Appended::Malformed;
             };
 
@@ -567,7 +645,7 @@ impl<'a> Appender<'a> {
                 claimed_offset,
                 claimed_term_id,
                 frame_length,
-                &PayloadSource::Slice(payload),
+                source,
             )
         };
 
@@ -759,6 +837,36 @@ impl<'a> Appender<'a> {
             term_id,
             term_offset,
             &PayloadSource::Slice(payload),
+        )
+    }
+
+    /// The same append, with the message made of **two slices** that must land
+    /// as one message: `first` at the front of the payload, `second` after it.
+    ///
+    /// The exclusive counterpart of [`Appender::append_two_slices`] — same body,
+    /// the caller's own term id and offset.
+    ///
+    /// # Errors
+    ///
+    /// As [`Appender::append_exclusive`].
+    #[allow(clippy::too_many_arguments)] // the exclusive door's own count, plus two sources
+    pub fn append_exclusive_two_slices(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        position_limit: i64,
+        term_id: i32,
+        term_offset: i32,
+        first: &[u8],
+        second: &[u8],
+    ) -> Appended {
+        self.append_exclusive_source(
+            session_id,
+            stream_id,
+            position_limit,
+            term_id,
+            term_offset,
+            &PayloadSource::TwoSlices(first, second),
         )
     }
 
@@ -2833,5 +2941,138 @@ mod tests {
 
     const fn initial_term_id() -> i32 {
         INITIAL_TERM_ID
+    }
+}
+
+#[cfg(test)]
+mod two_part_tests {
+    use super::*;
+
+    use crate::logbuffer::frame::Frame;
+    use crate::logbuffer::scan::{Scanner, Step};
+
+    /// The smallest legal term length, so the fixture stays small.
+    const TERM_LENGTH: i32 = 64 * 1024;
+    const INITIAL_TERM_ID: i32 = 17;
+
+    #[repr(align(64))]
+    struct Aligned<const N: usize>([u8; N]);
+
+    /// A log a test owns, written through the same appender a publication uses.
+    struct Log {
+        metadata: Box<Aligned<{ descriptor::METADATA_STRUCT_LENGTH }>>,
+        term: Box<Aligned<{ TERM_LENGTH as usize }>>,
+    }
+
+    impl Log {
+        fn new() -> Self {
+            let mut log = Self {
+                metadata: Box::new(Aligned([0u8; descriptor::METADATA_STRUCT_LENGTH])),
+                term: Box::new(Aligned([0u8; TERM_LENGTH as usize])),
+            };
+
+            {
+                let meta = AtomicBuffer::from_slice_mut(&mut log.metadata.0).expect("aligned");
+                meta.store_i32_relaxed(descriptor::TERM_LENGTH_OFFSET, TERM_LENGTH)
+                    .expect("in range");
+                meta.store_i32_relaxed(descriptor::INITIAL_TERM_ID_OFFSET, INITIAL_TERM_ID)
+                    .expect("in range");
+                meta.store_i32_relaxed(
+                    descriptor::MTU_LENGTH_OFFSET,
+                    descriptor::MTU_LENGTH_DEFAULT,
+                )
+                .expect("in range");
+                meta.store_i32_relaxed(descriptor::IS_CONNECTED_OFFSET, 1)
+                    .expect("in range");
+            }
+
+            {
+                let metadata = AtomicBuffer::from_slice_mut(&mut log.metadata.0).expect("aligned");
+                let term = AtomicBuffer::from_slice_mut(&mut log.term.0).expect("aligned");
+                let appender = Appender::new(metadata, term).expect("a usable log");
+                assert!(appender.initialise_tails(INITIAL_TERM_ID));
+            }
+
+            log
+        }
+
+        fn append_two(&mut self, first: &[u8], second: &[u8]) -> Appended {
+            let metadata = AtomicBuffer::from_slice_mut(&mut self.metadata.0).expect("aligned");
+            let term = AtomicBuffer::from_slice_mut(&mut self.term.0).expect("aligned");
+            let appender = Appender::new(metadata, term).expect("a usable log");
+
+            appender.append_two_slices(1, 2, i64::MAX, first, second)
+        }
+
+        /// The payloads of the frames in the term, in order.
+        fn payloads(&self) -> Vec<Vec<u8>> {
+            let view = AtomicBuffer::from_slice(&self.term.0).expect("aligned");
+            let mut scanner = Scanner::at(&view, TERM_LENGTH as usize, 0);
+            let mut payloads = Vec::new();
+
+            loop {
+                match scanner.advance() {
+                    Step::Data { offset, .. } => {
+                        let frame = Frame::new(&view, offset);
+                        let mut bytes =
+                            vec![0u8; frame.payload_length().expect("a published frame")];
+                        frame.copy_payload(&mut bytes).expect("the frame's payload");
+                        payloads.push(bytes);
+                    }
+                    Step::Padding { .. } => {}
+                    // The rest of the term is unwritten, which is where a
+                    // scan of a log with this few frames ends.
+                    Step::NotReady { .. } | Step::End => break,
+                    other => panic!("unexpected step: {other:?}"),
+                }
+            }
+
+            payloads
+        }
+    }
+
+    /// A message in two slices lands as **one** message, in order.
+    #[test]
+    fn two_slices_become_one_message() {
+        let mut log = Log::new();
+        let header = [7u8; 32];
+        let payload = b"hello cluster";
+
+        let appended = log.append_two(&header, payload);
+        assert!(matches!(appended, Appended::Ok { .. }), "{appended:?}");
+
+        let payloads = log.payloads();
+        assert_eq!(1, payloads.len(), "one message, not two");
+        assert_eq!(32 + payload.len(), payloads[0].len());
+        assert_eq!(&header[..], &payloads[0][..32], "the first slice is first");
+        assert_eq!(payload, &payloads[0][32..], "the second follows it");
+    }
+
+    /// A message longer than one frame fragments the **joined** bytes, so it
+    /// can straddle the boundary between the two slices — the reference's own
+    /// inner loop (`ConcurrentPublication.appendFragmentedMessage`).
+    #[test]
+    fn two_slices_fragment_across_their_boundary() {
+        let mut log = Log::new();
+        let first = vec![0xAAu8; 100];
+        let second = vec![0xBBu8; 4_000];
+
+        let appended = log.append_two(&first, &second);
+        assert!(matches!(appended, Appended::Ok { .. }), "{appended:?}");
+
+        let payloads = log.payloads();
+        assert!(payloads.len() > 1, "the message took more than one frame");
+
+        let joined: Vec<u8> = payloads.concat();
+        assert_eq!(first.len() + second.len(), joined.len());
+        assert_eq!(first, joined[..first.len()]);
+        assert_eq!(second, joined[first.len()..]);
+
+        // The boundary itself: the frame that carries it takes its beginning
+        // from the first slice and its end from the second.
+        assert!(
+            payloads[0].len() > first.len(),
+            "the first frame carries the end of the first slice and the start of the second"
+        );
     }
 }
