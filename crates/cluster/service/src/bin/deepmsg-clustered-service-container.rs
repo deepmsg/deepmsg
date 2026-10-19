@@ -138,6 +138,12 @@ fn run() -> Result<(), String> {
         return Err(format!("could not install the signal handler: {error}"));
     }
 
+    // The line a harness (or an operator) can wait for. The mark file is
+    // signalled by `launch` **before** the agent has recovered, so it says
+    // "concluded", not "running"; this says the duty cycle has begun and a
+    // SIGTERM will be handled rather than killing the process.
+    println!("STARTED serviceId={}", agent.service_id());
+
     while sys::stop_signal().is_none() {
         match agent.do_work() {
             Ok(work) => idle.idle(work),

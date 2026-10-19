@@ -109,8 +109,9 @@ fn await_snapshot_recording(cluster: &TestCluster, service_id: i32) -> i64 {
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!(
-        "service {service_id} never acked a snapshot recording\nnode log:\n{}",
-        cluster.node_log(0)
+        "service {service_id} never acked a snapshot recording\nnode log:\n{}\n{}",
+        cluster.node_log(0),
+        cluster.container_logs()
     );
 }
 
@@ -282,17 +283,19 @@ fn snapshot_survives_a_restart(test_name: &str, mode: ProcessMode) {
     // recording log's force, which is the point a restart can recover from.
     await_snapshot_count(&cluster, 1);
 
-    // Stop the container and the node, and start both again in the same
-    // directories. The recovery state counter is allocated during the module's
-    // startup from the on-disk `recording.log`; only a restart sees the
-    // snapshot taken a moment ago.
-    cluster.restart_node(0);
+    // Stop the container and the node, and start the node again in the same
+    // directories — **without** the container. The recovery state counter is
+    // allocated during the module's startup from the on-disk `recording.log`
+    // and released once every service has acked, so it can only be read while
+    // the service is still down.
+    cluster.restart_node_without_containers(0);
 
     let recording_id = await_snapshot_recording(&cluster, 0);
     assert_ne!(
         recording_id, -1,
         "the recovery state names the service snapshot"
     );
+    cluster.start_container(0, 0);
 
     // A losing bid is answered with the current state, which must be the state
     // the snapshot held — not the empty auction a fresh container would have.
@@ -361,13 +364,15 @@ fn twins_agree_byte_for_byte(test_name: &str, mode: ProcessMode) {
     }
 
     // The recording ids only become readable through a recovery state, which is
-    // allocated at module startup — so stop the node (and the containers, which
-    // would otherwise hold the services' resources) and start it again over the
-    // same archive directory.
-    cluster.restart_node(0);
+    // allocated at module startup and released once the services ack — so stop
+    // the containers and the node, start the node alone, read both ids, and
+    // only then let the services come back.
+    cluster.restart_node_without_containers(0);
 
     let java_recording_id = await_snapshot_recording(&cluster, 0);
     let rust_recording_id = await_snapshot_recording(&cluster, 1);
+    cluster.start_container(0, 0);
+    cluster.start_container(0, 1);
 
     let java_snapshot = read_recording(cluster.aeron_dir(0), java_recording_id);
     let rust_snapshot = read_recording(cluster.aeron_dir(0), rust_recording_id);

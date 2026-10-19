@@ -47,8 +47,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::Client;
@@ -91,6 +92,13 @@ pub enum NodeImpl {
 pub enum ServiceImpl {
     /// A business from `deepmsg_cluster_service::services::NAMES`.
     Rust(&'static str),
+    /// A **test** business, defined here rather than in the product crate
+    /// (see [`TestService`]). Its observables are the reference's
+    /// `TestNode.TestService` ones: message count, session counts, a snapshot
+    /// that can be told to fail. `InProcess` only — the binary has no such
+    /// name, and giving the product a fault-injection business is not a trade
+    /// this fixture gets to make.
+    Test(&'static str),
     /// A Java class the reference's container loads by name.
     Java(&'static str),
 }
@@ -166,6 +174,21 @@ impl MemberSpec {
         }
     }
 
+    /// Our test business on a Java node, in process.
+    #[must_use]
+    pub const fn test_container(id: i32, service: &'static str) -> Self {
+        Self {
+            id,
+            service_id: 0,
+            node: NodeImpl::Java,
+            service: ServiceImpl::Test(service),
+            driver: DriverImpl::Java,
+            backup: false,
+            mode: ProcessMode::InProcess,
+            responder: true,
+        }
+    }
+
     /// A container with its own service id on the same node.
     #[must_use]
     pub const fn with_service_id(mut self, service_id: i32) -> Self {
@@ -214,6 +237,10 @@ pub struct Options {
     pub members: Option<String>,
     /// The Java probe sources to compile (`java/<name>.java`).
     pub probes: Vec<&'static str>,
+    /// Extra `-D` properties for the Java node — a scenario that needs a
+    /// different session timeout, say. Applied last, so a file's value is
+    /// overridden the way a JVM's `-D` is.
+    pub node_properties: Vec<(String, String)>,
 }
 
 impl Default for Options {
@@ -234,6 +261,7 @@ impl Default for Options {
             log_channel: "aeron:ipc".to_owned(),
             members: None,
             probes: Vec::new(),
+            node_properties: Vec::new(),
         }
     }
 }
@@ -272,6 +300,21 @@ struct ContainerSlot {
     spec: MemberSpec,
     node: usize,
     container: Option<Container>,
+    /// The observables of a [`ServiceImpl::Test`] business, for the test that
+    /// asked for it.
+    test_state: Option<Arc<TestServiceState>>,
+}
+
+/// How a container ended.
+#[derive(Debug)]
+pub enum ContainerExit {
+    /// It ended the way the reference calls orderly (a termination, or a
+    /// clean `SIGTERM`).
+    Ok,
+    /// Its duty cycle failed; the message is what the agent printed.
+    Failed(String),
+    /// A process's exit status, for an external container.
+    Exited(ExitStatus),
 }
 
 /// A container the fixture started, in whichever shape its mode asked for.
@@ -322,6 +365,14 @@ impl TestCluster {
                  this process",
                 member.id
             );
+            assert!(
+                !(matches!(member.service, ServiceImpl::Test(_))
+                    && member.mode != ProcessMode::InProcess),
+                "member {} asks for a test business as a process: the binary has no such name, \
+                 and this scenario records that loss (`n/a:external-injection`) rather than \
+                 teaching the product to fail on demand",
+                member.id
+            );
         }
 
         let jar = driver::locate_aeron_all()?;
@@ -356,6 +407,7 @@ impl TestCluster {
                     spec: *spec,
                     node,
                     container: None,
+                    test_state: None,
                 }
             })
             .collect();
@@ -497,18 +549,104 @@ impl TestCluster {
         }
     }
 
+    /// Whether a container is still running.
+    pub fn container_is_running(&mut self, member: i32, service_id: i32) -> bool {
+        let index = self.slot_index(member, service_id);
+        match &mut self.containers[index].container {
+            Some(Container::InProcess { thread, .. }) => !thread.is_finished(),
+            Some(Container::External(process)) | Some(Container::Java(process)) => process
+                .try_wait()
+                .expect("the container is waitable")
+                .is_none(),
+            None => false,
+        }
+    }
+
+    /// Wait until a container has ended, and answer how.
+    ///
+    /// Ends the fixture's ownership of it: a later [`Self::stop_container`] is a
+    /// no-op, which is what a scenario about a container that dies on its own
+    /// needs.
+    pub fn await_container_exit(&mut self, member: i32, service_id: i32) -> ContainerExit {
+        let index = self.slot_index(member, service_id);
+        let deadline = Instant::now() + DEADLINE;
+
+        loop {
+            let exit = match self.containers[index].container.as_mut() {
+                Some(Container::InProcess { thread, .. }) => thread.is_finished().then_some(()),
+                Some(Container::External(process)) | Some(Container::Java(process)) => process
+                    .try_wait()
+                    .expect("the container is waitable")
+                    .map(|_| ()),
+                None => panic!("member {member} service {service_id}'s container was not started"),
+            };
+
+            if exit.is_some() {
+                let container = self.containers[index].container.take();
+                return match container {
+                    Some(Container::InProcess { thread, .. }) => match thread.join() {
+                        Ok(Ok(())) => ContainerExit::Ok,
+                        Ok(Err(error)) => ContainerExit::Failed(error),
+                        Err(_) => ContainerExit::Failed("the container thread panicked".to_owned()),
+                    },
+                    Some(Container::External(mut process)) | Some(Container::Java(mut process)) => {
+                        let status = process.stop().expect("the process answers");
+                        ContainerExit::Exited(status)
+                    }
+                    None => unreachable!("the container was there a moment ago"),
+                };
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "member {member} service {service_id}'s container never ended\n{}",
+                self.container_logs()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Start one container again over the same directories.
     pub fn start_container(&mut self, member: i32, service_id: i32) {
         let index = self.slot_index(member, service_id);
-        let container = self.spawn_container(index);
+        let (container, test_state) = self.spawn_container(index);
         self.containers[index].container = Some(container);
+        self.containers[index].test_state = test_state;
     }
 
     /// Stop every container of a node and the node, then start both again over
     /// the same directories — what a recovery plan is built from is the on-disk
     /// `recording.log`, and the recovery-state counter is allocated once, at
     /// that startup.
+    ///
+    /// A test that needs to read that counter should use
+    /// [`Self::restart_node_without_containers`]: the module holds the counter
+    /// only while it waits for the services to join and ack, and a restarted
+    /// container acks the moment it is up.
     pub fn restart_node(&mut self, member: i32) {
+        self.restart_node_without_containers(member);
+        let slots: Vec<usize> = self
+            .containers
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.spec.id == member)
+            .map(|(index, _)| index)
+            .collect();
+        for index in slots {
+            let (container, test_state) = self.spawn_container(index);
+            self.containers[index].container = Some(container);
+            self.containers[index].test_state = test_state;
+        }
+    }
+
+    /// The half of [`Self::restart_node`] that stops the containers and the
+    /// node, then starts the node **alone**.
+    ///
+    /// The recovery-state counter lives only from the module's startup until
+    /// every service has acked (`ConsensusModuleAgent.java:3505-3520`), so a
+    /// test that reads a snapshot's recording id out of it has to do that while
+    /// the services are still down.
+    pub fn restart_node_without_containers(&mut self, member: i32) {
         let slots: Vec<usize> = self
             .containers
             .iter()
@@ -532,10 +670,6 @@ impl TestCluster {
             );
         }
         self.start_node(node_index);
-        for index in slots {
-            let container = self.spawn_container(index);
-            self.containers[index].container = Some(container);
-        }
     }
 
     /// Stop every container, then every node.
@@ -607,7 +741,7 @@ impl TestCluster {
                 deepmsg_archive::server::config::ThreadNaming::Classic,
             ),
             service: match slot.spec.service {
-                ServiceImpl::Rust(name) => Some((*name).to_owned()),
+                ServiceImpl::Rust(name) | ServiceImpl::Test(name) => Some((*name).to_owned()),
                 ServiceImpl::Java(class) => Some((*class).to_owned()),
             },
             thread_naming: deepmsg_archive::server::config::ThreadNaming::Classic,
@@ -641,6 +775,14 @@ impl TestCluster {
         self.containers.iter().map(|slot| &slot.spec)
     }
 
+    /// A [`ServiceImpl::Test`] business's observables, or `None` when that
+    /// container is not a test business.
+    #[must_use]
+    pub fn test_service(&self, member: i32, service_id: i32) -> Option<Arc<TestServiceState>> {
+        let index = self.slot_index(member, service_id);
+        self.containers[index].test_state.clone()
+    }
+
     fn node_index(&self, member: i32) -> usize {
         self.nodes
             .iter()
@@ -664,14 +806,55 @@ impl TestCluster {
             self.start_node(index);
         }
         for index in 0..self.containers.len() {
-            let container = self.spawn_container(index);
+            let (container, test_state) = self.spawn_container(index);
             self.containers[index].container = Some(container);
+            self.containers[index].test_state = test_state;
         }
     }
 
     fn start_node(&mut self, index: usize) {
+        // A restart over the same `aeron.dir` would leave the previous driver's
+        // CnC file in place, and a container started into that window attaches
+        // to the dead one and never joins. The cluster's own state is in
+        // `cluster.dir` and `archive.dir`; the driver's directory is the one
+        // thing a restart is free to throw away.
+        let _ = std::fs::remove_dir_all(self.nodes[index].aeron.path());
+
         let process = self.spawn_java_node(index);
         self.nodes[index].process = Some(process);
+        self.await_driver_ready(index);
+    }
+
+    /// Wait until the restarted node's driver has published a CnC file a client
+    /// can attach to, watching the process as we go.
+    fn await_driver_ready(&mut self, index: usize) {
+        let aeron_dir = self.nodes[index].aeron.path().to_path_buf();
+        let member = self.nodes[index].id;
+        let deadline = Instant::now() + DEADLINE;
+
+        loop {
+            if Client::connect(&aeron_dir).is_ok() {
+                return;
+            }
+            if let Some(status) = self.nodes[index]
+                .process
+                .as_mut()
+                .expect("the node is running")
+                .try_wait()
+                .expect("the node is waitable")
+            {
+                panic!(
+                    "member {member}'s Java node exited with {status} before its CnC was ready:\n{}",
+                    self.node_log(member)
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "member {member}'s driver never published a CnC file\n{}",
+                self.node_log(member)
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn spawn_java_node(&self, index: usize) -> Process {
@@ -720,6 +903,9 @@ impl TestCluster {
         ));
         args.push("-Daeron.threading.mode=SHARED".to_owned());
         args.push("-Daeron.print.configuration=false".to_owned());
+        for (name, value) in &self.options.node_properties {
+            args.push(format!("-D{name}={value}"));
+        }
         args.push("-cp".to_owned());
         args.push(self.jar.to_string_lossy().into_owned());
         args.push("io.aeron.cluster.ClusteredMediaDriver".to_owned());
@@ -729,7 +915,7 @@ impl TestCluster {
             .unwrap_or_else(|error| panic!("member {}'s Java node did not start: {error}", node.id))
     }
 
-    fn spawn_container(&self, index: usize) -> Container {
+    fn spawn_container(&self, index: usize) -> (Container, Option<Arc<TestServiceState>>) {
         let slot = &self.containers[index];
         match slot.spec.service {
             ServiceImpl::Rust(name) => {
@@ -739,14 +925,28 @@ impl TestCluster {
                         slot.spec.id, slot.spec.service_id
                     )
                 });
-                match slot.spec.mode {
+                let container = match slot.spec.mode {
                     ProcessMode::InProcess => self.spawn_in_process(index, service),
                     ProcessMode::External => {
                         Container::External(self.spawn_external_container(index))
                     }
-                }
+                };
+                (container, None)
             }
-            ServiceImpl::Java(class) => Container::Java(self.spawn_java_container(index, class)),
+            ServiceImpl::Test(name) => {
+                assert_eq!(
+                    name, "test-service",
+                    "no test business called `{name}`; the fixture has one"
+                );
+                let state = Arc::new(TestServiceState::default());
+                let service = Box::new(TestService::new(Arc::clone(&state)));
+                let container = self.spawn_in_process(index, service);
+                (container, Some(state))
+            }
+            ServiceImpl::Java(class) => (
+                Container::Java(self.spawn_java_container(index, class)),
+                None,
+            ),
         }
     }
 
@@ -939,7 +1139,12 @@ impl TestCluster {
                     && mark.cluster_id() == Some(self.options.cluster_id)
                     && mark.version() == Some(SEMANTIC_VERSION)
                     && ClusterMarkFile::is_active(&path, now, 10_000);
-                if ready {
+                // Both, not either: the mark file is signalled by `launch`
+                // before the agent has recovered, and a container stopped in
+                // that window is killed by the signal instead of handling it —
+                // the process's own `STARTED` line is the point after which a
+                // stop is orderly.
+                if ready && process.log_contains("STARTED") {
                     return process;
                 }
             }
@@ -960,6 +1165,160 @@ impl TestCluster {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+/// What a [`TestService`] did, as a test can read it from its own process.
+///
+/// These are the reference's `TestNode.TestService` observables
+/// (`messageCount`, the session counters, `failNextSnapshot`,
+/// `isTerminated`) — the *stub-service* assertion surface the plan's Q4c
+/// counted. They exist only in the in-process arm, which is the point: an
+/// external container's business state is not readable, and a scenario that
+/// needs it records that loss rather than pretending.
+#[derive(Default)]
+pub struct TestServiceState {
+    messages: AtomicUsize,
+    session_opens: AtomicUsize,
+    session_closes: AtomicUsize,
+    close_reasons: Mutex<Vec<CloseReason>>,
+    fail_next_snapshot: AtomicBool,
+    terminated: AtomicBool,
+}
+
+impl TestServiceState {
+    /// Every session message and service message the business saw.
+    #[must_use]
+    pub fn messages(&self) -> usize {
+        self.messages.load(Ordering::Acquire)
+    }
+
+    /// `on_session_open` calls.
+    #[must_use]
+    pub fn session_opens(&self) -> usize {
+        self.session_opens.load(Ordering::Acquire)
+    }
+
+    /// `on_session_close` calls.
+    #[must_use]
+    pub fn session_closes(&self) -> usize {
+        self.session_closes.load(Ordering::Acquire)
+    }
+
+    /// The reasons of those closes, in order (`CloseReason::CLOSE` for a
+    /// client that closed, `TIMEOUT`/`SESSION_TIMEOUT` for one that vanished).
+    #[must_use]
+    pub fn close_reasons(&self) -> Vec<CloseReason> {
+        self.close_reasons.lock().expect("the reasons lock").clone()
+    }
+
+    /// Make the next snapshot fail (`TestService.failNextSnapshot`).
+    pub fn fail_next_snapshot(&self) {
+        self.fail_next_snapshot.store(true, Ordering::Release);
+    }
+
+    /// Whether `on_terminate` ran.
+    #[must_use]
+    pub fn was_terminated(&self) -> bool {
+        self.terminated.load(Ordering::Acquire)
+    }
+}
+
+/// The reference's `TestNode.TestService`, as far as LC-4a needs it: the echo
+/// semantics of the product business, plus the counters and the snapshot
+/// failure the reference's test business carries.
+struct TestService {
+    inner: deepmsg_cluster_service::EchoService,
+    state: Arc<TestServiceState>,
+}
+
+impl TestService {
+    fn new(state: Arc<TestServiceState>) -> Self {
+        Self {
+            inner: deepmsg_cluster_service::EchoService::new(),
+            state,
+        }
+    }
+}
+
+impl ClusteredService for TestService {
+    fn on_start(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        snapshot: Option<&mut SnapshotReader<'_>>,
+    ) -> Result<(), ContainerError> {
+        self.inner.on_start(cluster, snapshot)
+    }
+
+    fn on_session_open(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        session: SessionId,
+        timestamp: i64,
+    ) -> Result<(), ContainerError> {
+        self.state.session_opens.fetch_add(1, Ordering::AcqRel);
+        self.inner.on_session_open(cluster, session, timestamp)
+    }
+
+    fn on_session_close(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        session: SessionId,
+        timestamp: i64,
+        reason: CloseReason,
+    ) -> Result<(), ContainerError> {
+        self.state.session_closes.fetch_add(1, Ordering::AcqRel);
+        self.state
+            .close_reasons
+            .lock()
+            .expect("the reasons lock")
+            .push(reason);
+        self.inner
+            .on_session_close(cluster, session, timestamp, reason)
+    }
+
+    fn on_session_message(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        session: Option<SessionId>,
+        timestamp: i64,
+        payload: &[u8],
+        header: &LogHeader,
+    ) -> Result<(), ContainerError> {
+        self.state.messages.fetch_add(1, Ordering::AcqRel);
+        self.inner
+            .on_session_message(cluster, session, timestamp, payload, header)
+    }
+
+    fn on_timer_event(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        correlation_id: i64,
+        timestamp: i64,
+    ) -> Result<(), ContainerError> {
+        self.inner
+            .on_timer_event(cluster, correlation_id, timestamp)
+    }
+
+    fn on_take_snapshot(&mut self, writer: &mut SnapshotWriter<'_>) -> Result<(), ContainerError> {
+        if self.state.fail_next_snapshot.swap(false, Ordering::AcqRel) {
+            return Err(ContainerError::Cluster(
+                "This is a simulated failure for this snapshot".to_owned(),
+            ));
+        }
+        self.inner.on_take_snapshot(writer)
+    }
+
+    fn on_role_change(&mut self, new_role: Role) -> Result<(), ContainerError> {
+        self.inner.on_role_change(new_role)
+    }
+
+    fn on_terminate(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+    ) -> Result<(), ContainerError> {
+        self.state.terminated.store(true, Ordering::Release);
+        self.inner.on_terminate(cluster)
     }
 }
 
@@ -1109,6 +1468,15 @@ impl Process {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Whether the process has printed `needle` (readiness, not liveness: the
+    /// mark file says the component concluded, this says its duty cycle has
+    /// begun).
+    fn log_contains(&self, needle: &str) -> bool {
+        std::fs::read_to_string(&self.log_path)
+            .map(|text| text.contains(needle))
+            .unwrap_or(false)
     }
 
     fn log_tail(&self, lines: usize) -> String {
