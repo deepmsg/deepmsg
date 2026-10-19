@@ -10,6 +10,8 @@ rust-version.workspace = true
 deepmsg-cluster-common = { path = "../common" }
 deepmsg-client = { path = "../../client" }
 deepmsg-codec = { path = "../../codec" }
+# The driver's error codes: `RESOURCE_TEMPORARILY_UNAVAILABLE` is an add to retry.
+deepmsg-cnc = { path = "../../cnc" }
 # `ChannelUri` (the egress channel's `rejoin=false`) and the version constants
 # the connect request's client info carries.
 deepmsg-core = { path = "../../core" }

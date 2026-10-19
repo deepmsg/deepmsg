@@ -55,6 +55,8 @@ use deepmsg_codec::cluster::session_message_header_codec::{
 };
 use deepmsg_codec::cluster::{ReadBuf, SBE_SCHEMA_ID};
 
+use crate::client_ops::ClientOps;
+
 /// The four templates this poller reads, as the reference spells them
 /// (`EP:253-317`).
 const SESSION_MESSAGE_HEADER_TEMPLATE_ID: u16 = 1;
@@ -151,6 +153,11 @@ impl EgressPoller {
     /// Answers how many messages were read, which is what a connect uses to
     /// decide whether to poll again or let the client work.
     pub fn poll(&mut self, client: &mut Client) -> usize {
+        self.poll_with(client)
+    }
+
+    /// The same, over the crate's client seam (see [`ClientOps`]).
+    pub(crate) fn poll_with(&mut self, client: &mut impl ClientOps) -> usize {
         if self.is_poll_complete {
             self.reset();
         }
@@ -160,7 +167,9 @@ impl EgressPoller {
         let subscription = self.subscription;
         let fragment_limit = self.fragment_limit;
 
-        client.poll_subscription_controlled(subscription, fragment_limit, self)
+        client.poll_egress(subscription, fragment_limit, &mut |message| {
+            self.on_message(message)
+        })
     }
 
     /// The subscription the answers arrive on.
