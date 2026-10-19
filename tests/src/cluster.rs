@@ -630,10 +630,18 @@ impl TestCluster {
     }
 
     /// The member whose role counter says LEADER, once one does.
+    ///
+    /// A member whose node was stopped is skipped: its driver's CnC file can
+    /// still carry a heartbeat inside the client's ten-second liveness window,
+    /// so a connect would succeed and read the role it had before it died —
+    /// which is how a test that stopped the leader saw it "still leading".
     pub fn await_leader(&self) -> i32 {
         let deadline = Instant::now() + DEADLINE;
         while Instant::now() < deadline {
             for node in &self.nodes {
+                if node.process.is_none() {
+                    continue;
+                }
                 if self.counter_on(node.id, CLUSTER_NODE_ROLE_TYPE_ID) == Some(ROLE_LEADER) {
                     return node.id;
                 }
