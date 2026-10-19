@@ -103,6 +103,12 @@ pub struct Entry {
     pub is_valid: bool,
     /// The archive endpoint a STANDBY_SNAPSHOT names.
     pub archive_endpoint: Option<String>,
+    /// Where the entry sits **on disk**, counted from zero in file order
+    /// (`Entry.entryIndex`). The sorted view loses that order, and
+    /// `ClusterTool sort-recording-log` is the command that needs it back: it
+    /// compares this with the position in the sorted view to decide whether the
+    /// file is already sorted (`ClusterToolOperator.java:1368-1379`).
+    pub entry_index: u32,
 }
 
 impl Entry {
@@ -296,6 +302,7 @@ impl RecordingLog {
                 entry_type: plain_type,
                 is_valid,
                 archive_endpoint,
+                entry_index: u32::try_from(self.entries.len()).unwrap_or(u32::MAX),
             };
             if entry.length() > MAX_ENTRY_LENGTH {
                 return Err(RecordingLogError::EntryTooLong {
@@ -343,6 +350,7 @@ impl RecordingLog {
             entry_type: ENTRY_TYPE_TERM,
             is_valid: true,
             archive_endpoint: None,
+            entry_index: 0,
         })
     }
 
@@ -371,6 +379,7 @@ impl RecordingLog {
             entry_type: ENTRY_TYPE_SNAPSHOT,
             is_valid: true,
             archive_endpoint: None,
+            entry_index: 0,
         })
     }
 
@@ -390,6 +399,9 @@ impl RecordingLog {
             }
         }
         entry.position = align(self.length as usize, RECORD_ALIGNMENT) as u64;
+        // The disk index (`nextEntryIndex`, `RecordingLog.java:1530`): the new
+        // entry is the last one in the file however the sorted view falls out.
+        entry.entry_index = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
         let mut bytes = vec![0_u8; entry.aligned_length()];
         bytes[0..8].copy_from_slice(&entry.recording_id.to_le_bytes());
         bytes[8..16].copy_from_slice(&entry.leadership_term_id.to_le_bytes());
@@ -998,6 +1010,7 @@ mod tests {
             entry_type: ENTRY_TYPE_TERM,
             is_valid: true,
             archive_endpoint: None,
+            entry_index: 0,
         };
         assert_eq!(entry.length(), 48);
         assert_eq!(entry.aligned_length(), 64);

@@ -204,6 +204,7 @@ fn an_oversized_endpoint_is_refused() {
         entry_type: deepmsg_cluster::persist::recording_log::ENTRY_TYPE_STANDBY_SNAPSHOT,
         is_valid: true,
         archive_endpoint: Some("x".repeat(5000)),
+        entry_index: 0,
     });
     assert!(matches!(
         result,

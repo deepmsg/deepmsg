@@ -302,6 +302,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepmsg-cluster-tool"
+version = "0.1.0"
+dependencies = [
+ "deepmsg-archive",
+ "deepmsg-client",
+ "deepmsg-cluster",
+ "deepmsg-cluster-common",
+ "deepmsg-cluster-service",
+ "deepmsg-cnc",
+ "deepmsg-codec-cluster-mark",
+ "deepmsg-core",
+]
+
+[[package]]
 name = "deepmsg-cnc"
 version = "0.1.0"
 dependencies = [

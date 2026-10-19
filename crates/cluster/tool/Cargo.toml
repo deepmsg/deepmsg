@@ -1,0 +1,20 @@
+[package]
+name = "deepmsg-cluster-tool"
+description = "deepmsg cluster: the operator's tool, the counterpart of the reference's ClusterTool (P3-8)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+deepmsg-archive = { path = "../../archive" }
+deepmsg-client = { path = "../../client" }
+deepmsg-cluster = { path = "../consensus" }
+deepmsg-cluster-common = { path = "../common" }
+deepmsg-cluster-service = { path = "../service" }
+deepmsg-cnc = { path = "../../cnc" }
+deepmsg-codec-cluster-mark = { path = "../../codec/cluster-mark" }
+deepmsg-core = { path = "../../core" }
+
+[lints]
+workspace = true
