@@ -148,8 +148,9 @@ impl Session {
 
         let session = AeronCluster::connect(context, &mut client).unwrap_or_else(|error| {
             panic!(
-                "{label}: our client did not connect: {error}\n{}",
-                diagnostics()
+                "{label}: our client did not connect: {error}\n{}\nour driver:\n{}",
+                diagnostics(),
+                driver.log_tail(40)
             )
         });
 
