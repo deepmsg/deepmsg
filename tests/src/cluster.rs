@@ -16,8 +16,9 @@
 //! * `node` — who runs the consensus module. Only [`NodeImpl::Java`] is here
 //!   today; ours is P3-6a's `cluster_harness`.
 //! * `service` — who runs the container: [`ServiceImpl::Rust`] names a business
-//!   from `deepmsg_cluster_service::services`, [`ServiceImpl::Java`] names a
-//!   Java class the reference's own container loads.
+//!   from `deepmsg_cluster_service::services`, [`ServiceImpl::Test`] one of the
+//!   fixture's own (with the reference's test-business observables, in process
+//!   only), [`ServiceImpl::Java`] a Java class the reference's container loads.
 //! * `driver` — the media driver. Only [`DriverImpl::Java`] is here today: the
 //!   reference's `ClusteredMediaDriver` starts its own.
 //! * `backup` — a backup member. **Carried from the first version and refused
@@ -26,9 +27,12 @@
 //! * `mode` — [`ProcessMode::InProcess`] runs our container on a thread of this
 //!   process (the only way to read a business's own state, which is what the
 //!   reference's in-JVM harness does); [`ProcessMode::External`] runs the
-//!   `deepmsg-clustered-service-container` binary and decides it is ready from
-//!   its **mark file**. A Java container is always `External`: a Java object
-//!   cannot live in this process.
+//!   `deepmsg-clustered-service-container` binary and waits for two signals
+//!   before calling it ready: its **mark file** and its own `STARTED` line.
+//!   The mark file alone is not enough — it is signalled before the agent has
+//!   recovered, and a container stopped in that window is killed by the signal
+//!   instead of handling it. A Java container is always `External`: a Java
+//!   object cannot live in this process.
 //! * `service_id` — a node may run several containers in a multi-service
 //!   deployment; every spec with the same `id` shares that node's directories
 //!   and process.
