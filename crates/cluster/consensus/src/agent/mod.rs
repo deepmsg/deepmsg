@@ -385,6 +385,12 @@ impl ConsensusModuleAgent {
     ) -> Result<Self, ClusterError> {
         config.conclude()?;
 
+        // `AgentRunner.startOnThread` names the thread before the first duty
+        // cycle (`ConsensusModule.java:343`); the kernel keeps 15 bytes of it.
+        deepmsg_driver::sys::set_current_thread_name(&config.agent_role_name()).map_err(
+            |error| ClusterError::Cluster(format!("could not name the agent's thread: {error}")),
+        )?;
+
         let authenticator = match components.authenticator {
             Some(authenticator) => authenticator,
             None => authenticator_for(&config.authenticator_supplier)
@@ -430,7 +436,7 @@ impl ConsensusModuleAgent {
                 &config.ingress_channel,
                 "",
                 &config.authenticator_supplier,
-                config.cluster_dir.to_string_lossy().as_ref(),
+                config.services_dir.to_string_lossy().as_ref(),
             ])
             .map_err(cluster)?;
 
@@ -871,6 +877,7 @@ impl ConsensusModuleAgent {
                 egress,
                 clock: &clock,
                 timed_out_counter: counters.timed_out_client,
+                control_toggle: counters.control_toggle,
                 leadership_term_id,
                 member_id,
                 leader_member_id,
@@ -968,6 +975,7 @@ impl ConsensusModuleAgent {
             egress,
             clock: &clock,
             timed_out_counter: counters.timed_out_client,
+            control_toggle: counters.control_toggle,
             leadership_term_id,
             member_id,
             leader_member_id,
@@ -4640,6 +4648,7 @@ impl ConsensusModuleAgent {
                 egress,
                 clock: &clock,
                 timed_out_counter: counters.timed_out_client,
+                control_toggle: counters.control_toggle,
                 leadership_term_id,
                 member_id,
                 leader_member_id,
@@ -4693,16 +4702,27 @@ fn handle_admin_request(
     }
 
     if request.request_type == AdminRequestType::SNAPSHOT {
-        // The reference switches the control toggle (`:806-816`); the toggle
-        // is P3-4e, so this answers with the reference's own failure text
-        // instead of pretending the snapshot was scheduled.
+        // `:806-816`: the switch is a compare-and-set out of `NEUTRAL`, and
+        // the answer says whether it was taken. The cluster takes the snapshot
+        // when its slow tick reads the toggle (`checkClusterControlToggle`).
+        let applied = ctx.client.counters_writable().is_some_and(|counters| {
+            ClusterControlToggle::Snapshot.toggle(&counters, ctx.control_toggle.counter_id())
+        });
         return send_admin_response(
             ctx,
             session,
             request.correlation_id,
             request.request_type,
-            AdminResponseCode::ERROR,
-            "Failed to switch ClusterControl to the ToggleState.SNAPSHOT state",
+            if applied {
+                AdminResponseCode::OK
+            } else {
+                AdminResponseCode::ERROR
+            },
+            if applied {
+                ""
+            } else {
+                "Failed to switch ClusterControl to the ToggleState.SNAPSHOT state"
+            },
         );
     }
 
@@ -5213,6 +5233,7 @@ impl ConsensusModuleAgent {
                     egress,
                     clock: &clock,
                     timed_out_counter: counters.timed_out_client,
+                    control_toggle: counters.control_toggle,
                     leadership_term_id,
                     member_id,
                     leader_member_id,

@@ -40,6 +40,16 @@ impl ToggleState {
         self as i32
     }
 
+    /// The name the reference's `ToggleState.toString()` prints.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Inactive => "INACTIVE",
+            Self::Neutral => "NEUTRAL",
+            Self::ReplicateStandbySnapshot => "REPLICATE_STANDBY_SNAPSHOT",
+            Self::ValidateRecordingLog => "VALIDATE_RECORDING_LOG",
+        }
+    }
+
     /// `ToggleState.get` (`:134-148`) without the counter.
     ///
     /// # Errors

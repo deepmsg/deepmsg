@@ -442,8 +442,8 @@ fn finish(key: Vec<u8>, label: String) -> Result<CounterSpec, CounterError> {
 ///
 /// `None` is the reference's `Aeron.NULL_VALUE`.
 #[must_use]
-pub fn find_cluster_counter(
-    counters: &CountersReader<'_>,
+pub fn find_cluster_counter<A>(
+    counters: &CountersReader<'_, A>,
     type_id: i32,
     cluster_id: i32,
 ) -> Option<i32> {
@@ -465,8 +465,8 @@ pub fn find_recovery_state(counters: &CountersReader<'_>, cluster_id: i32) -> Op
     )
 }
 
-fn find_by_key(
-    counters: &CountersReader<'_>,
+fn find_by_key<A>(
+    counters: &CountersReader<'_, A>,
     type_id: i32,
     offset: usize,
     expected: u32,

@@ -13,6 +13,7 @@ deepmsg-cluster = { path = "../consensus" }
 deepmsg-cluster-common = { path = "../common" }
 deepmsg-cluster-service = { path = "../service" }
 deepmsg-cnc = { path = "../../cnc" }
+deepmsg-codec-cluster = { path = "../../codec/cluster" }
 deepmsg-codec-cluster-mark = { path = "../../codec/cluster-mark" }
 deepmsg-core = { path = "../../core" }
 

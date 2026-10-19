@@ -21,6 +21,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use deepmsg_archive::client::context::ArchiveContext;
+use deepmsg_archive::server::config::ThreadNaming;
 use deepmsg_cluster_common::config::{ConfigError, Properties};
 use deepmsg_codec_cluster::cluster_time_unit::ClusterTimeUnit;
 
@@ -245,6 +246,22 @@ pub const fn semantic_version_major(version: i32) -> i32 {
     (version >> 16) & 0xFFFF
 }
 
+/// `CLUSTER_SERVICES_DIR_PROP_NAME` (`ClusteredServiceContainer.java:356`):
+/// where the containers' mark files are, when it is not the cluster dir.
+pub const SERVICES_DIR_PROP_NAME: &str = "aeron.cluster.services.dir";
+
+/// `THREAD_NAMING_PROP_NAME` (`CommonContext.java:534`).
+pub const THREAD_NAMING_PROP_NAME: &str = "aeron.thread.naming";
+
+/// `CLUSTER_CONSENSUS_MODULE_AGENT_ROLE_NAME_PROP_NAME`
+/// (`ConsensusModule.java:957-961`): the name of the agent's thread, empty for
+/// the computed one.
+pub const AGENT_ROLE_NAME_PROP_NAME: &str = "aeron.cluster.consensus.module.agent.role.name";
+
+/// `AERON_CLUSTER_CONSENSUS_THREAD_NAME` (`ConsensusModule.java:281`): the
+/// `new` naming's role name.
+pub const AGENT_ROLE_NAME_NEW: &str = "aeron-cl-cm";
+
 /// Why a configuration could not be settled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigProblem {
@@ -394,6 +411,16 @@ pub struct ConsensusModuleConfig {
     pub idle_strategy: String,
     /// `aeron.cluster.timer.service.supplier` (`ConsensusModule.java:935`).
     pub timer_service_supplier: String,
+    /// `aeron.cluster.services.dir`; empty when unset.
+    pub services_dir_property: Option<String>,
+    /// Where the service containers' mark files are: the property, canonical
+    /// (`ConsensusModule.java:1756-1762`), or the cluster directory.
+    pub services_dir: PathBuf,
+    /// `aeron.cluster.consensus.module.agent.role.name`; `None` when empty.
+    pub agent_role_name: Option<String>,
+    /// `aeron.thread.naming`: which spelling of the computed role name applies
+    /// (`ConsensusModule.java:1867-1871`).
+    pub thread_naming: ThreadNaming,
     /// `aeron.cluster.wheel.tick.resolution`, in nanoseconds
     /// (`ConsensusModule.java:892-898`, default 8 ms).
     pub wheel_tick_resolution_ns: i64,
@@ -402,6 +429,21 @@ pub struct ConsensusModuleConfig {
 }
 
 impl ConsensusModuleConfig {
+    /// The name of the thread the agent runs on: the property when it names
+    /// one, otherwise the computed role name (`ConsensusModule.java:1867-1871`).
+    #[must_use]
+    pub fn agent_role_name(&self) -> String {
+        if let Some(name) = &self.agent_role_name {
+            return name.clone();
+        }
+        match self.thread_naming {
+            ThreadNaming::New => AGENT_ROLE_NAME_NEW.to_owned(),
+            ThreadNaming::Classic => {
+                format!("consensus-module-{}-{}", self.cluster_id, self.member_id)
+            }
+        }
+    }
+
     /// Read the names `P3-4a` honours, with the reference's defaults.
     ///
     /// # Errors
@@ -635,6 +677,19 @@ impl ConsensusModuleConfig {
             delete_dir_on_start: false,
             app_version: APP_VERSION_DEFAULT,
             idle_strategy: idle_strategy.to_owned(),
+            services_dir_property: properties.get(SERVICES_DIR_PROP_NAME).map(str::to_owned),
+            services_dir: PathBuf::new(),
+            agent_role_name: properties
+                .get(AGENT_ROLE_NAME_PROP_NAME)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            thread_naming: match properties.get(THREAD_NAMING_PROP_NAME) {
+                None => ThreadNaming::DEFAULT,
+                Some(value) => ThreadNaming::parse(value).ok_or_else(|| ConfigProblem::Value {
+                    name: THREAD_NAMING_PROP_NAME,
+                    value: value.to_owned(),
+                })?,
+            },
             timer_service_supplier: {
                 let name = properties
                     .get(crate::timer::TIMER_SERVICE_SUPPLIER_PROP_NAME)
@@ -692,6 +747,21 @@ impl ConsensusModuleConfig {
             }
         }
 
+        // `clusterServicesDirectoryName` (`ConsensusModule.java:1756-1762`):
+        // the property, canonical, or the cluster directory's own path. Rust's
+        // `canonicalize` needs the path to exist, so it is made first.
+        self.services_dir = match self.services_dir_property.as_deref() {
+            Some(name) if !name.is_empty() => {
+                std::fs::create_dir_all(name).map_err(|error| {
+                    ConfigProblem::Directory(format!(
+                        "could not create services directory: {error}"
+                    ))
+                })?;
+                canonical(Path::new(name))?
+            }
+            _ => self.cluster_dir.clone(),
+        };
+
         if let Some(name) = &self.mark_file_dir_property {
             std::fs::create_dir_all(name).map_err(|error| {
                 ConfigProblem::Directory(format!("could not create mark file directory: {error}"))
@@ -726,5 +796,135 @@ fn canonical(path: &Path) -> Result<PathBuf, ConfigProblem> {
 impl From<ConfigProblem> for ClusterError {
     fn from(problem: ConfigProblem) -> Self {
         Self::Cluster(problem.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three names `from_properties` requires; everything else defaults.
+    fn properties() -> Properties {
+        let mut properties = Properties::new();
+        properties
+            .apply_args([
+                "-Daeron.cluster.members=0,localhost:20111,localhost:20112,localhost:20113,localhost:20114,localhost:20115".to_owned(),
+                "-Daeron.cluster.ingress.channel=aeron:udp?endpoint=localhost:20111".to_owned(),
+                "-Daeron.cluster.replication.channel=aeron:udp?endpoint=localhost:20116".to_owned(),
+                "-Daeron.cluster.id=19".to_owned(),
+                "-Daeron.cluster.member.id=7".to_owned(),
+            ])
+            .expect("the properties parse");
+        properties
+    }
+
+    #[test]
+    fn the_default_agent_role_name_is_the_classic_one() {
+        let config = ConsensusModuleConfig::from_properties(&properties()).unwrap();
+        assert_eq!("consensus-module-19-7", config.agent_role_name());
+    }
+
+    #[test]
+    fn the_new_naming_gets_the_short_agent_role_name() {
+        let mut source = properties();
+        source
+            .apply_args(["-Daeron.thread.naming=new".to_owned()])
+            .unwrap();
+        let config = ConsensusModuleConfig::from_properties(&source).unwrap();
+        assert_eq!("aeron-cl-cm", config.agent_role_name());
+    }
+
+    #[test]
+    fn an_explicit_agent_role_name_wins_in_both_namings() {
+        for naming in ["classic", "new"] {
+            let mut source = properties();
+            source
+                .apply_args([
+                    format!("-Daeron.thread.naming={naming}"),
+                    "-Daeron.cluster.consensus.module.agent.role.name=consensus-override"
+                        .to_owned(),
+                ])
+                .unwrap();
+            let config = ConsensusModuleConfig::from_properties(&source).unwrap();
+            assert_eq!("consensus-override", config.agent_role_name(), "{naming}");
+        }
+    }
+
+    #[test]
+    fn an_empty_agent_role_name_is_the_computed_one() {
+        let mut source = properties();
+        source
+            .apply_args(["-Daeron.cluster.consensus.module.agent.role.name=".to_owned()])
+            .unwrap();
+        let config = ConsensusModuleConfig::from_properties(&source).unwrap();
+        assert_eq!(None, config.agent_role_name);
+        assert_eq!("consensus-module-19-7", config.agent_role_name());
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deepmsg-cm-config-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_services_directory_is_the_cluster_directory_when_unset() {
+        let root = scratch("services-default");
+        let cluster_dir = root.join("b/./42/../c");
+        let mut source = properties();
+        source
+            .apply_args([format!(
+                "-Daeron.cluster.dir={}",
+                cluster_dir.to_string_lossy()
+            )])
+            .unwrap();
+        let mut config = ConsensusModuleConfig::from_properties(&source).unwrap();
+        config.conclude().unwrap();
+        assert_eq!(config.services_dir, config.cluster_dir);
+        assert!(config.services_dir.is_absolute());
+    }
+
+    #[test]
+    fn the_services_directory_is_resolved_from_the_property() {
+        let root = scratch("services-set");
+        let services_dir = root.join("m/n/././././o");
+        let mut source = properties();
+        source
+            .apply_args([
+                format!(
+                    "-Daeron.cluster.dir={}",
+                    root.join("b/./42/../c").to_string_lossy()
+                ),
+                format!(
+                    "-Daeron.cluster.services.dir={}",
+                    services_dir.to_string_lossy()
+                ),
+            ])
+            .unwrap();
+        let mut config = ConsensusModuleConfig::from_properties(&source).unwrap();
+        config.conclude().unwrap();
+        assert_eq!(config.services_dir, services_dir.canonicalize().unwrap());
+        assert_ne!(config.services_dir, config.cluster_dir);
+    }
+
+    #[test]
+    fn an_unknown_thread_naming_is_refused() {
+        let mut source = properties();
+        source
+            .apply_args(["-Daeron.thread.naming=loud".to_owned()])
+            .unwrap();
+        let problem = ConsensusModuleConfig::from_properties(&source).unwrap_err();
+        assert_eq!(
+            ConfigProblem::Value {
+                name: THREAD_NAMING_PROP_NAME,
+                value: "loud".to_owned()
+            },
+            problem
+        );
     }
 }

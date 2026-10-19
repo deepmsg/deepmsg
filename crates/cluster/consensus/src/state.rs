@@ -50,6 +50,20 @@ impl ModuleState {
         self as i32
     }
 
+    /// The name the reference's `State.toString()` prints — what `ClusterTool`
+    /// puts in "the state of the consensus module is SNAPSHOT".
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Init => "INIT",
+            Self::Active => "ACTIVE",
+            Self::Suspended => "SUSPENDED",
+            Self::Snapshot => "SNAPSHOT",
+            Self::Quitting => "QUITTING",
+            Self::Terminating => "TERMINATING",
+            Self::Closed => "CLOSED",
+        }
+    }
+
     /// `ConsensusModule.State.get(code)` (`ConsensusModule.java:148-178`):
     /// the state a code names, or `None` for one outside the table.
     pub fn from_code(code: i32) -> Option<Self> {

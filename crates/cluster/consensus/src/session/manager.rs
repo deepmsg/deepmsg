@@ -67,6 +67,9 @@ pub struct SessionContext<'a> {
     pub clock: &'a MillisecondClusterClock,
     /// Counter 213, the timed-out client count.
     pub timed_out_counter: Counter,
+    /// Counter 202, the cluster control toggle an admin request switches
+    /// (`ConsensusModuleAgent.java:809`).
+    pub control_toggle: Counter,
     /// The term the log records carry.
     pub leadership_term_id: i64,
     /// This member's id.

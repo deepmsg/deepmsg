@@ -311,6 +311,7 @@ dependencies = [
  "deepmsg-cluster-common",
  "deepmsg-cluster-service",
  "deepmsg-cnc",
+ "deepmsg-codec-cluster",
  "deepmsg-codec-cluster-mark",
  "deepmsg-core",
 ]
@@ -392,6 +393,7 @@ dependencies = [
  "deepmsg-cluster-client",
  "deepmsg-cluster-common",
  "deepmsg-cluster-service",
+ "deepmsg-cluster-tool",
  "deepmsg-cnc",
  "deepmsg-codec",
  "deepmsg-codec-cluster",

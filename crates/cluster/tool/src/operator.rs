@@ -8,17 +8,46 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use deepmsg_archive::client::context::ArchiveContext;
 use deepmsg_archive::client::descriptor_poller::RecordingDescriptor;
 use deepmsg_archive::client::{Archive, Handlers, NoCredentials};
 use deepmsg_client::client::Client;
+use deepmsg_cluster::control::{cluster_control, node_control};
+use deepmsg_cluster::election::state::ElectionState;
 use deepmsg_cluster::persist::recording_log::{
     CONSENSUS_MODULE_SERVICE_ID, Entry, RecordingExtent, RecordingLog, RecoveryPlan,
 };
+use deepmsg_cluster::state::ModuleState;
+use deepmsg_cluster_common::counters::{
+    CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID, CLUSTER_ELECTION_STATE_TYPE_ID,
+    CLUSTER_NODE_ROLE_TYPE_ID, find_cluster_counter,
+};
+use deepmsg_cluster_service::proxy::ConsensusModuleProxy;
+use deepmsg_cnc::counters::CountersReader;
+use deepmsg_cnc::file::CncFile;
+use deepmsg_codec_cluster::ReadBuf;
+use deepmsg_codec_cluster::cluster_members_extended_response_codec::{
+    ClusterMembersExtendedResponseDecoder, SBE_TEMPLATE_ID as EXTENDED_MEMBERS_RESPONSE_TEMPLATE_ID,
+};
+use deepmsg_codec_cluster::cluster_members_response_codec::{
+    ClusterMembersResponseDecoder, SBE_TEMPLATE_ID as MEMBERS_RESPONSE_TEMPLATE_ID,
+};
+use deepmsg_codec_cluster::message_header_codec::{
+    ENCODED_LENGTH as MESSAGE_HEADER_LENGTH, MessageHeaderDecoder,
+};
+use deepmsg_core::buffer::ReadWrite;
 
 use crate::mark_files;
 use crate::properties::ToolProperties;
+
+/// How long a command-level wait polls between looks.
+const WAIT_STEP: Duration = Duration::from_millis(1);
+
+/// The timeout every add-publication/add-subscription uses; the cluster's own
+/// `COMMAND_TIMEOUT` shape.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `ClusterToolOperator.SUCCESS`.
 pub const SUCCESS: i32 = 0;
@@ -379,18 +408,240 @@ impl ClusterTool {
     }
 
     /// `listMembers` (`ClusterToolOperator.java:317-347`).
-    pub fn list_members(&self, _cluster_dir: &Path, out: &mut dyn Write) -> i32 {
-        self.not_yet(out, "list-members")
+    pub fn list_members(&self, cluster_dir: &Path, out: &mut dyn Write) -> i32 {
+        if !mark_files::mark_file_exists(cluster_dir) && self.properties.timeout_ms <= 0 {
+            let _ = writeln!(out, "cluster-mark.dat does not exist.");
+            return FAILURE;
+        }
+        let mark_file = match mark_files::open_mark_file(cluster_dir, self.properties.timeout_ms) {
+            Ok(mark_file) => mark_file,
+            Err(message) => {
+                let _ = writeln!(out, "{message}");
+                return FAILURE;
+            }
+        };
+        let Ok(control) = control_properties(&mark_file) else {
+            let _ = writeln!(out, "cluster-mark.dat does not describe a driver");
+            return FAILURE;
+        };
+        // `Math.max(TimeUnit.SECONDS.toMillis(1), timeoutMs)` (`:326`).
+        let query_timeout_ms = self.properties.timeout_ms.max(1_000);
+        match self.query_cluster_members(&control, query_timeout_ms) {
+            Ok(membership) => {
+                let _ = writeln!(
+                    out,
+                    "currentTimeNs={}, leaderMemberId={}, memberId={}, activeMembers={}",
+                    membership.current_time_ns,
+                    membership.leader_member_id,
+                    membership.member_id,
+                    membership.active_members_text(),
+                );
+                SUCCESS
+            }
+            Err(_) => {
+                let _ = writeln!(out, "timeout waiting for response from node");
+                FAILURE
+            }
+        }
     }
 
-    /// `isLeader` (`ClusterToolOperator.java:444-488`).
-    pub fn is_leader(&self, _cluster_dir: &Path, out: &mut dyn Write) -> i32 {
-        self.not_yet(out, "is-leader")
+    /// `isLeader` (`ClusterToolOperator.java:444-488`): `0` when this node's
+    /// role is `LEADER` **and** the election has closed, `1` otherwise, `-1`
+    /// when there is no mark file.
+    pub fn is_leader(&self, cluster_dir: &Path, out: &mut dyn Write) -> i32 {
+        if !mark_files::mark_file_exists(cluster_dir) && self.properties.timeout_ms <= 0 {
+            let _ = writeln!(out, "cluster-mark.dat does not exist.");
+            return FAILURE;
+        }
+        let mark_file = match mark_files::open_mark_file(cluster_dir, self.properties.timeout_ms) {
+            Ok(mark_file) => mark_file,
+            Err(message) => {
+                let _ = writeln!(out, "{message}");
+                return FAILURE;
+            }
+        };
+        let Ok(control) = control_properties(&mark_file) else {
+            return FAILURE;
+        };
+        let cluster_id = mark_file.cluster_id().unwrap_or(0);
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(
+                u64::try_from(self.properties.timeout_ms.max(0)).unwrap_or(0),
+            );
+        loop {
+            if let Ok(cnc) = CncFile::open(
+                Path::new(&control.aeron_dir),
+                std::time::Duration::from_millis(100),
+            ) {
+                if let Some(counters) = cnc.counters() {
+                    let role =
+                        find_cluster_counter(&counters, CLUSTER_NODE_ROLE_TYPE_ID, cluster_id)
+                            .and_then(|id| counters.value(id));
+                    let election =
+                        find_cluster_counter(&counters, CLUSTER_ELECTION_STATE_TYPE_ID, cluster_id)
+                            .and_then(|id| counters.value(id));
+                    // `Cluster.Role.LEADER` is 2; `ElectionState.CLOSED` is 17
+                    // (`ElectionState.java`), which the CM mirrors.
+                    let is_leader = role == Some(2)
+                        && election == Some(i64::from(ElectionState::Closed.code()));
+                    return if is_leader { 0 } else { 1 };
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return FAILURE;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
-    /// The five switches and `validate-recording-log`.
-    pub fn toggle(&self, _cluster_dir: &Path, out: &mut dyn Write, name: &str) -> i32 {
-        self.not_yet(out, name)
+    /// The five switches and `validate-recording-log`
+    /// (`ClusterToolOperator.java:845-967`, `:995-1115`).
+    pub fn toggle(&self, cluster_dir: &Path, out: &mut dyn Write, name: &str) -> i32 {
+        let Some(command) = ToggleCommand::named(name) else {
+            let _ = writeln!(out, "Unknown command: {name}");
+            return FAILURE;
+        };
+        if self.toggle_state(cluster_dir, out, command) {
+            SUCCESS
+        } else {
+            FAILURE
+        }
+    }
+
+    fn toggle_state(
+        &self,
+        cluster_dir: &Path,
+        out: &mut dyn Write,
+        command: ToggleCommand,
+    ) -> bool {
+        if !mark_files::mark_file_exists(cluster_dir) && self.properties.timeout_ms <= 0 {
+            let _ = writeln!(out, "cluster-mark.dat does not exist.");
+            return false;
+        }
+        let mark_file = match mark_files::open_mark_file(cluster_dir, self.properties.timeout_ms) {
+            Ok(mark_file) => mark_file,
+            Err(message) => {
+                let _ = writeln!(out, "{message}");
+                return false;
+            }
+        };
+        let cluster_id = mark_file.cluster_id().unwrap_or(0);
+        let Ok(control) = control_properties(&mark_file) else {
+            let _ = writeln!(out, "cluster-mark.dat does not describe a driver");
+            return false;
+        };
+
+        let query_timeout_ms = self.properties.timeout_ms.max(1_000);
+        let membership = match self.query_cluster_members(&control, query_timeout_ms) {
+            Ok(membership) => membership,
+            Err(_) => {
+                let _ = writeln!(out, "Timed out querying cluster.");
+                return false;
+            }
+        };
+        let prefix = format!("Member [{}]: ", membership.member_id);
+
+        if command.leader_required && membership.leader_member_id != membership.member_id {
+            let _ = writeln!(
+                out,
+                "{prefix}Current node is not the leader (leaderMemberId = {}), unable to {}",
+                membership.leader_member_id,
+                command.target.name(),
+            );
+            return false;
+        }
+
+        let cnc_path = Path::new(&control.aeron_dir).join("cnc.dat");
+        if !cnc_path.exists() {
+            let absolute = std::path::absolute(&cnc_path).unwrap_or(cnc_path);
+            let _ = writeln!(
+                out,
+                "{prefix}Unable to locate media driver. C`n`C file [{}] does not exist.",
+                absolute.display()
+            );
+            return false;
+        }
+
+        let Ok(cnc) = CncFile::open_writable(
+            Path::new(&control.aeron_dir),
+            std::time::Duration::from_millis(u64::try_from(query_timeout_ms).unwrap_or(1_000)),
+        ) else {
+            let _ = writeln!(out, "{prefix}Unable to locate media driver.");
+            return false;
+        };
+        let Some(counters) = cnc.counters_writable() else {
+            let _ = writeln!(out, "{prefix}Unable to resolve state of consensus module.");
+            return false;
+        };
+
+        let state = find_cluster_counter(
+            &counters,
+            CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID,
+            cluster_id,
+        )
+        .and_then(|id| counters.value(id))
+        .and_then(|value| i32::try_from(value).ok())
+        .and_then(ModuleState::from_code);
+        let Some(state) = state else {
+            let _ = writeln!(out, "{prefix}Unable to resolve state of consensus module.");
+            return false;
+        };
+
+        if state != command.expected {
+            let _ = writeln!(
+                out,
+                "{prefix}Unable to {} as the state of the consensus module is {}, but needs to be {}",
+                command.target.name(),
+                state.name(),
+                command.expected.name(),
+            );
+            return false;
+        }
+
+        let Some(toggle_id) = find_cluster_counter(&counters, command.target.type_id(), cluster_id)
+        else {
+            let _ = writeln!(out, "{prefix}Failed to find control toggle");
+            return false;
+        };
+
+        if !command.target.toggle(&counters, toggle_id) {
+            let _ = writeln!(
+                out,
+                "{prefix}Failed to apply {}, current toggle value = {}",
+                command.target.name(),
+                command.target.name_at(&counters, toggle_id),
+            );
+            return false;
+        }
+
+        if command.wait_for_completion {
+            let timeout_ms = command.default_timeout_ms.max(self.properties.timeout_ms);
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(u64::try_from(timeout_ms.max(0)).unwrap_or(0));
+            let mut is_neutral;
+            loop {
+                is_neutral = command.target.is_neutral(&counters, toggle_id);
+                if is_neutral || std::time::Instant::now() > deadline {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            if !is_neutral {
+                let _ = writeln!(
+                    out,
+                    "{prefix}Timed out after {timeout_ms}ms waiting for {} to complete.",
+                    command.target.name()
+                );
+                return false;
+            }
+        }
+
+        let _ = writeln!(
+            out,
+            "{prefix}{} applied successfully",
+            command.target.name()
+        );
+        true
     }
 
     /// `describeLatestConsensusModuleSnapshot`
@@ -409,6 +660,388 @@ impl ClusterTool {
     ) -> i32 {
         self.not_yet(out, "backup-query")
     }
+}
+
+/// `ClusterNodeControlProperties` (`ClusterNodeControlProperties.java`): what
+/// the mark file says about the driver this component is talking to.
+struct ControlProperties {
+    aeron_dir: String,
+    control_channel: String,
+    service_stream_id: i32,
+    consensus_module_stream_id: i32,
+}
+
+/// `ClusterMarkFile.loadControlProperties` (`ClusterMarkFile.java:595-609`).
+fn control_properties(
+    mark_file: &deepmsg_cluster_common::mark::ClusterMarkFile,
+) -> Result<ControlProperties, ()> {
+    let (_, service_stream_id, consensus_module_stream_id, _) = mark_file.stream_ids().ok_or(())?;
+    Ok(ControlProperties {
+        aeron_dir: mark_file.var_data(0).ok_or(())?,
+        control_channel: mark_file.var_data(1).ok_or(())?,
+        service_stream_id,
+        consensus_module_stream_id,
+    })
+}
+
+/// The tool's copy of `ClusterMembership` (`ClusterToolOperator.ClusterMembership`).
+struct ClusterMembership {
+    current_time_ns: i64,
+    leader_member_id: i32,
+    member_id: i32,
+    /// The extended response's member list; `None` for the plain response,
+    /// which carries no list for a Java `List.toString` to print.
+    active_members: Option<Vec<MembershipMember>>,
+}
+
+impl ClusterMembership {
+    /// What `", activeMembers=" + clusterMembership.activeMembers` prints: a
+    /// Java `List.toString` for the extended response, `null` otherwise.
+    fn active_members_text(&self) -> String {
+        match &self.active_members {
+            Some(members) => format!(
+                "[{}]",
+                members
+                    .iter()
+                    .map(MembershipMember::text)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None => "null".to_owned(),
+        }
+    }
+}
+
+/// One member of the extended response, as `ClusterMember.toString` prints it.
+struct MembershipMember {
+    leadership_term_id: i64,
+    log_position: i64,
+    time_of_last_append_ns: i64,
+    member_id: i32,
+    ingress_endpoint: String,
+    consensus_endpoint: String,
+    log_endpoint: String,
+    catchup_endpoint: String,
+    archive_endpoint: String,
+}
+
+impl MembershipMember {
+    /// `ClusterMember.toString` (`ClusterMember.java:1309-1330`). The fields
+    /// the response does not carry keep the constructor's defaults, which is
+    /// what the reference's own objects have after the same decode.
+    fn text(&self) -> String {
+        let endpoints = format!(
+            "{},{},{},{},{},{}",
+            self.member_id,
+            self.ingress_endpoint,
+            self.consensus_endpoint,
+            self.log_endpoint,
+            self.catchup_endpoint,
+            self.archive_endpoint,
+        );
+        format!(
+            "ClusterMember{{id={}, isBallotSent=false, isLeader=false, leadershipTermId={}, \
+             logPosition={}, candidateTermId=-1, catchupReplaySessionId=-1, correlationId=-1, \
+             timeOfLastAppendPositionNs={}, ingressEndpoint='{}', consensusEndpoint='{}', \
+             logEndpoint='{}', catchupEndpoint='{}', archiveEndpoint='{}', endpoints='{}', \
+             publication=null, vote=null}}",
+            self.member_id,
+            self.leadership_term_id,
+            self.log_position,
+            self.time_of_last_append_ns,
+            self.ingress_endpoint,
+            self.consensus_endpoint,
+            self.log_endpoint,
+            self.catchup_endpoint,
+            self.archive_endpoint,
+            endpoints,
+        )
+    }
+}
+
+/// One switch from the command table, with the reference's four parameters
+/// (`ClusterToolOperator.java:845-967`).
+#[derive(Clone, Copy)]
+struct ToggleCommand {
+    target: ToggleTarget,
+    expected: ModuleState,
+    leader_required: bool,
+    wait_for_completion: bool,
+    default_timeout_ms: i64,
+}
+
+impl ToggleCommand {
+    fn named(name: &str) -> Option<Self> {
+        Some(match name {
+            "snapshot" => Self {
+                target: ToggleTarget::Cluster(cluster_control::ToggleState::Snapshot),
+                expected: ModuleState::Active,
+                leader_required: true,
+                wait_for_completion: true,
+                default_timeout_ms: 30_000,
+            },
+            "suspend" => Self {
+                target: ToggleTarget::Cluster(cluster_control::ToggleState::Suspend),
+                expected: ModuleState::Active,
+                leader_required: true,
+                wait_for_completion: false,
+                default_timeout_ms: 1_000,
+            },
+            "resume" => Self {
+                target: ToggleTarget::Cluster(cluster_control::ToggleState::Resume),
+                expected: ModuleState::Suspended,
+                leader_required: true,
+                wait_for_completion: true,
+                default_timeout_ms: 1_000,
+            },
+            "shutdown" => Self {
+                target: ToggleTarget::Cluster(cluster_control::ToggleState::Shutdown),
+                expected: ModuleState::Active,
+                leader_required: true,
+                wait_for_completion: false,
+                default_timeout_ms: 1_000,
+            },
+            "abort" => Self {
+                target: ToggleTarget::Cluster(cluster_control::ToggleState::Abort),
+                expected: ModuleState::Active,
+                leader_required: true,
+                wait_for_completion: false,
+                default_timeout_ms: 1_000,
+            },
+            "validate-recording-log" => Self {
+                target: ToggleTarget::Node(node_control::ToggleState::ValidateRecordingLog),
+                expected: ModuleState::Active,
+                leader_required: false,
+                wait_for_completion: true,
+                default_timeout_ms: 30_000,
+            },
+            _ => return None,
+        })
+    }
+}
+
+/// Which of the two operator toggles a command writes.
+#[derive(Clone, Copy)]
+enum ToggleTarget {
+    Cluster(cluster_control::ToggleState),
+    Node(node_control::ToggleState),
+}
+
+impl ToggleTarget {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Cluster(toggle) => toggle.name(),
+            Self::Node(toggle) => toggle.name(),
+        }
+    }
+
+    const fn type_id(self) -> i32 {
+        match self {
+            Self::Cluster(_) => cluster_control::CONTROL_TOGGLE_TYPE_ID,
+            Self::Node(_) => node_control::CONTROL_TOGGLE_TYPE_ID,
+        }
+    }
+
+    fn toggle(self, counters: &CountersReader<'_, ReadWrite>, counter_id: i32) -> bool {
+        match self {
+            Self::Cluster(toggle) => toggle.toggle(counters, counter_id),
+            Self::Node(toggle) => toggle.toggle(counters, counter_id),
+        }
+    }
+
+    fn is_neutral(self, counters: &CountersReader<'_, ReadWrite>, counter_id: i32) -> bool {
+        match self {
+            Self::Cluster(_) => {
+                counters.value(counter_id)
+                    == Some(i64::from(cluster_control::ToggleState::Neutral.code()))
+            }
+            Self::Node(_) => {
+                counters.value(counter_id)
+                    == Some(i64::from(node_control::ToggleState::Neutral.code()))
+            }
+        }
+    }
+
+    /// `ToggleState.get(counter)`: the name the failure message prints.
+    fn name_at(self, counters: &CountersReader<'_, ReadWrite>, counter_id: i32) -> String {
+        let Some(value) = counters.value(counter_id) else {
+            return "null".to_owned();
+        };
+        let code = i32::try_from(value).unwrap_or(i32::MAX);
+        match self {
+            Self::Cluster(_) => cluster_control::ToggleState::from_code(value)
+                .map_or_else(|_| code.to_string(), |toggle| toggle.name().to_owned()),
+            Self::Node(_) => node_control::ToggleState::from_code(value)
+                .map_or_else(|_| code.to_string(), |toggle| toggle.name().to_owned()),
+        }
+    }
+}
+
+/// `ConsensusModuleProxy.clusterMembersQuery` round trip
+/// (`ClusterToolOperator.java:566-631`): a publication on the consensus
+/// module's stream, a subscription on the services' stream, and one response.
+impl ClusterTool {
+    fn query_cluster_members(
+        &self,
+        control: &ControlProperties,
+        timeout_ms: i64,
+    ) -> Result<ClusterMembership, String> {
+        let mut client =
+            Client::connect(Path::new(&control.aeron_dir)).map_err(|error| error.to_string())?;
+        let subscription = client
+            .add_subscription(
+                &control.control_channel,
+                control.service_stream_id,
+                COMMAND_TIMEOUT,
+            )
+            .map_err(|error| error.to_string())?;
+        let publication = client
+            .add_publication(
+                &control.control_channel,
+                control.consensus_module_stream_id,
+                COMMAND_TIMEOUT,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let mut proxy = ConsensusModuleProxy::new(0);
+        proxy.set_publication(publication);
+        let correlation_id = client
+            .next_correlation_id()
+            .map_err(|error| error.to_string())?;
+        let timeout = Duration::from_millis(u64::try_from(timeout_ms.max(0)).unwrap_or(0));
+        let deadline = Instant::now() + timeout;
+
+        loop {
+            client.poll();
+            let bound = client
+                .subscription(subscription)
+                .is_some_and(|subscription| subscription.is_connected());
+            let connected = client
+                .publication(publication)
+                .and_then(|publication| publication.is_connected())
+                .unwrap_or(false);
+            if bound && connected {
+                break;
+            }
+            if Instant::now() > deadline {
+                return Err("Timed out querying cluster.".to_owned());
+            }
+            std::thread::sleep(WAIT_STEP);
+        }
+
+        loop {
+            if proxy
+                .cluster_members_query(&client, correlation_id)
+                .map_err(|error| error.to_string())?
+            {
+                break;
+            }
+            client.poll();
+            if Instant::now() > deadline {
+                return Err("Timed out querying cluster.".to_owned());
+            }
+            std::thread::sleep(WAIT_STEP);
+        }
+
+        loop {
+            client.poll();
+            let mut found = None;
+            client.poll_subscription(subscription, 10, |message| {
+                if let Some(membership) = decode_members_response(message.payload, correlation_id) {
+                    found = Some(membership);
+                }
+            });
+            if let Some(membership) = found {
+                return Ok(membership);
+            }
+            if Instant::now() > deadline {
+                return Err("Timed out querying cluster.".to_owned());
+            }
+            std::thread::sleep(WAIT_STEP);
+        }
+    }
+}
+
+/// One message from the services' stream, if it is the answer to
+/// `correlation_id` (`ClusterControlAdapter.Listener`).
+fn decode_members_response(payload: &[u8], correlation_id: i64) -> Option<ClusterMembership> {
+    if payload.len() < MESSAGE_HEADER_LENGTH {
+        return None;
+    }
+    let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
+
+    if header.template_id() == EXTENDED_MEMBERS_RESPONSE_TEMPLATE_ID {
+        let decoder = ClusterMembersExtendedResponseDecoder::default().header(header, 0);
+        if decoder.correlation_id() != correlation_id {
+            return None;
+        }
+        let current_time_ns = decoder.current_time_ns();
+        let leader_member_id = decoder.leader_member_id();
+        let member_id = decoder.member_id();
+
+        let mut members = Vec::new();
+        let mut group = decoder.active_members_decoder();
+        while group.advance().ok().flatten().is_some() {
+            let leadership_term_id = group.leadership_term_id();
+            let log_position = group.log_position();
+            let time_of_last_append_ns = group.time_of_last_append_ns();
+            let id = group.member_id();
+            let ingress_endpoint = {
+                let coordinates = group.ingress_endpoint_decoder();
+                String::from_utf8_lossy(group.ingress_endpoint_slice(coordinates)).into_owned()
+            };
+            let consensus_endpoint = {
+                let coordinates = group.consensus_endpoint_decoder();
+                String::from_utf8_lossy(group.consensus_endpoint_slice(coordinates)).into_owned()
+            };
+            let log_endpoint = {
+                let coordinates = group.log_endpoint_decoder();
+                String::from_utf8_lossy(group.log_endpoint_slice(coordinates)).into_owned()
+            };
+            let catchup_endpoint = {
+                let coordinates = group.catchup_endpoint_decoder();
+                String::from_utf8_lossy(group.catchup_endpoint_slice(coordinates)).into_owned()
+            };
+            let archive_endpoint = {
+                let coordinates = group.archive_endpoint_decoder();
+                String::from_utf8_lossy(group.archive_endpoint_slice(coordinates)).into_owned()
+            };
+            members.push(MembershipMember {
+                leadership_term_id,
+                log_position,
+                time_of_last_append_ns,
+                member_id: id,
+                ingress_endpoint,
+                consensus_endpoint,
+                log_endpoint,
+                catchup_endpoint,
+                archive_endpoint,
+            });
+        }
+
+        return Some(ClusterMembership {
+            current_time_ns,
+            leader_member_id,
+            member_id,
+            active_members: Some(members),
+        });
+    }
+
+    if header.template_id() == MEMBERS_RESPONSE_TEMPLATE_ID {
+        let decoder = ClusterMembersResponseDecoder::default().header(header, 0);
+        if decoder.correlation_id() != correlation_id {
+            return None;
+        }
+        let leader_member_id = decoder.leader_member_id();
+        return Some(ClusterMembership {
+            current_time_ns: 0,
+            leader_member_id,
+            member_id: -1,
+            active_members: None,
+        });
+    }
+
+    None
 }
 
 /// `listRecording`: one extent, or `None` when the archive does not know it.

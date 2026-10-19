@@ -29,6 +29,7 @@ deepmsg-cluster = { path = "../crates/cluster/consensus" }
 deepmsg-cluster-common = { path = "../crates/cluster/common" }
 deepmsg-cluster-client = { path = "../crates/cluster/client" }
 deepmsg-cluster-service = { path = "../crates/cluster/service" }
+deepmsg-cluster-tool = { path = "../crates/cluster/tool" }
 
 [[test]]
 name = "basic_roundtrip"
@@ -53,6 +54,14 @@ path = "integration/cluster_snapshot.rs"
 [[test]]
 name = "cluster_control"
 path = "integration/cluster_control.rs"
+
+[[test]]
+name = "cluster_tool"
+path = "integration/cluster_tool.rs"
+
+[[test]]
+name = "cluster_thread_naming"
+path = "integration/cluster_thread_naming.rs"
 
 [[test]]
 name = "cluster_three_nodes"
