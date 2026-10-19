@@ -13,6 +13,7 @@
 //! `ClusterEvent` is reported and work continues, `Cluster` is a broken
 //! invariant that ends the container, and `Timeout` is a deadline that passed.
 
+use deepmsg_archive::client::ArchiveError;
 use deepmsg_client::client::CommandError;
 use deepmsg_cluster_common::counters::CounterError;
 use deepmsg_cluster_common::decode::DecodeError;
@@ -83,6 +84,12 @@ impl From<CounterError> for ContainerError {
 
 impl From<MemberError> for ContainerError {
     fn from(error: MemberError) -> Self {
+        Self::Cluster(error.to_string())
+    }
+}
+
+impl From<ArchiveError> for ContainerError {
+    fn from(error: ArchiveError) -> Self {
         Self::Cluster(error.to_string())
     }
 }
