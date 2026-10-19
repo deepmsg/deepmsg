@@ -378,6 +378,7 @@ dependencies = [
  "deepmsg-cnc",
  "deepmsg-codec",
  "deepmsg-codec-cluster",
+ "deepmsg-codec-cluster-mark",
  "deepmsg-core",
  "deepmsg-driver",
 ]

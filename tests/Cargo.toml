@@ -23,6 +23,7 @@ deepmsg-driver = { path = "../crates/driver" }
 deepmsg-cnc = { path = "../crates/cnc" }
 deepmsg-codec = { path = "../crates/codec" }
 deepmsg-codec-cluster = { path = "../crates/codec/cluster" }
+deepmsg-codec-cluster-mark = { path = "../crates/codec/cluster-mark" }
 deepmsg-archive = { path = "../crates/archive" }
 deepmsg-cluster = { path = "../crates/cluster/consensus" }
 deepmsg-cluster-common = { path = "../crates/cluster/common" }

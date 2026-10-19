@@ -346,7 +346,7 @@ pub trait ClusteredService {
 /// name from a properties file has no static type to give it. This is the
 /// forwarding implementation that makes `ClusteredServiceAgent<Box<dyn
 /// ClusteredService>>` the binary's instantiation.
-impl ClusteredService for Box<dyn ClusteredService> {
+impl ClusteredService for Box<dyn ClusteredService + Send> {
     fn on_start(
         &mut self,
         cluster: &mut Cluster<'_>,

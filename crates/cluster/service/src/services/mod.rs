@@ -31,11 +31,15 @@ pub const NAMES: &[&str] = &["echo", "basic-auction", "noop"];
 
 /// The business called `name`, or `None` when the registry has no such entry.
 ///
+/// The box is `Send` because a container is a thread: the in-process half of a
+/// fixture (and any deployment that runs the agent on one) moves the business
+/// to the thread that drives it.
+///
 /// A caller that gets `None` must say so and name [`NAMES`]; this build never
 /// falls back to a default business, because a deployment that misspells a
 /// service name should not silently run a different one.
 #[must_use]
-pub fn by_name(name: &str) -> Option<Box<dyn ClusteredService>> {
+pub fn by_name(name: &str) -> Option<Box<dyn ClusteredService + Send>> {
     match name {
         "echo" => Some(Box::new(EchoService::new())),
         "basic-auction" => Some(Box::new(BasicAuction::new())),
