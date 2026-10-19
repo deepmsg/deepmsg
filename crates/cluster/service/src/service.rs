@@ -80,6 +80,17 @@ pub struct NewLeadershipTermEvent {
     pub app_version: i32,
 }
 
+/// The driver's position-limit counter for a publication
+/// (`Publication.positionLimitCounterId`): the limit every claim and offer is
+/// clamped to, read where it lives rather than carried by a caller.
+pub(crate) fn position_limit(client: &Client, publication: &ExclusivePublication) -> i64 {
+    client.counters_reader().map_or(0, |counters| {
+        counters
+            .value(publication.position_limit_counter_id())
+            .unwrap_or(0)
+    })
+}
+
 /// What the business writes its state into (`ServiceSnapshotTaker`'s
 /// publication, `onTakeSnapshot(ExclusivePublication)`).
 ///
@@ -116,14 +127,9 @@ impl<'a> SnapshotWriter<'a> {
         self.publication
     }
 
-    /// The limit a claim or an offer is clamped to: the driver's position-limit
-    /// counter for this publication (`Publication.positionLimitCounterId`).
+    /// The limit a claim or an offer is clamped to.
     fn position_limit(&self) -> i64 {
-        self.client.counters_reader().map_or(0, |counters| {
-            counters
-                .value(self.publication.position_limit_counter_id())
-                .unwrap_or(0)
-        })
+        position_limit(self.client, self.publication)
     }
 
     /// How far the recording has been written.

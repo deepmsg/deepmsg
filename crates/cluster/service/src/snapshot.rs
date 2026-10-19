@@ -82,7 +82,12 @@ pub trait SnapshotIdle {
     fn reset(&mut self);
 
     /// `IdleStrategy.idle()` and the agent invoker's poll.
-    fn idle(&mut self);
+    ///
+    /// # Errors
+    ///
+    /// Whatever the idle path reports — the container's idle runs the client's
+    /// clock tick, and a terminated client ends the snapshot.
+    fn idle(&mut self) -> Result<(), ContainerError>;
 }
 
 /// A publication and the idle strategy together.
@@ -218,7 +223,7 @@ impl<'a> ServiceSnapshotTaker<'a> {
         loop {
             match self.sink.try_claim(length, &self.buffer[..length]) {
                 SnapshotAppend::Ok => return Ok(()),
-                SnapshotAppend::Retry => self.sink.idle(),
+                SnapshotAppend::Retry => self.sink.idle()?,
                 SnapshotAppend::Fatal(reason) => {
                     return Err(ContainerError::Cluster(format!(
                         "failed to claim snapshot buffer: {reason}"
@@ -233,7 +238,7 @@ impl<'a> ServiceSnapshotTaker<'a> {
         loop {
             match self.sink.offer(&self.buffer[..length]) {
                 SnapshotAppend::Ok => return Ok(()),
-                SnapshotAppend::Retry => self.sink.idle(),
+                SnapshotAppend::Retry => self.sink.idle()?,
                 SnapshotAppend::Fatal(reason) => {
                     return Err(ContainerError::Cluster(format!(
                         "failed to offer snapshot buffer: {reason}"
@@ -533,7 +538,9 @@ mod tests {
     impl SnapshotIdle for RecordingSink {
         fn reset(&mut self) {}
 
-        fn idle(&mut self) {}
+        fn idle(&mut self) -> Result<(), ContainerError> {
+            Ok(())
+        }
     }
 
     fn session(channel: &str, principal: &[u8]) -> ContainerClientSession {

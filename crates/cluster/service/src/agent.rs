@@ -31,8 +31,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use deepmsg_archive::client::{Archive, Handlers, NoCredentials, ReplayParams};
+use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_key};
 use deepmsg_client::client::Client;
 use deepmsg_client::image::Image;
+use deepmsg_client::publication::ExclusivePublication;
+use deepmsg_core::uri::ChannelUri;
 use deepmsg_cluster_common::counters;
 use deepmsg_cluster_common::counters::recovery::RecoveryStateKey;
 use deepmsg_cluster_common::mark::{self, ClusterMarkFile};
@@ -43,18 +46,23 @@ use deepmsg_driver::idle::Strategy;
 use crate::adapter::{JoinLogEvent, ServiceAdapter, ServiceEvents};
 use crate::cluster::{AgentContext, Cluster, ClusterTime, CommitPosition, LifecycleCallback};
 use crate::config::ServiceContainerConfig;
-use crate::counters::{COMMAND_TIMEOUT, ErrorReporter};
+use crate::counters::{COMMAND_TIMEOUT, ErrorReporter, SnapshotDuration};
 use crate::error::ContainerError;
 use crate::log_adapter::{
-    BoundedLogAdapter, CLUSTER_ACTION_FLAGS_DEFAULT, LogEvent, LogHandler, LogMessage,
+    BoundedLogAdapter, CLUSTER_ACTION_FLAGS_DEFAULT, CLUSTER_ACTION_FLAGS_STANDBY_SNAPSHOT,
+    LogEvent, LogHandler, LogMessage,
 };
 use crate::proxy::ConsensusModuleProxy;
 use crate::role::{Role, TimeUnit};
 use crate::service::{
-    ClusteredService, LogHeader, NewLeadershipTermEvent, SessionId, SnapshotReader,
+    ClusteredService, LogHeader, NewLeadershipTermEvent, SessionId, SnapshotReader, SnapshotWriter,
+    position_limit,
 };
 use crate::session::{ContainerClientSession, EGRESS_COMMAND_TIMEOUT, SessionTable};
-use crate::snapshot::{ServiceSnapshotLoader, SnapshotLoadHandler, SnapshotSession};
+use crate::snapshot::{
+    ServiceSnapshotLoader, ServiceSnapshotTaker, SnapshotAppend, SnapshotIdle, SnapshotLoadHandler,
+    SnapshotSend, SnapshotSession,
+};
 
 /// `Aeron.NULL_VALUE` / `AeronArchive.NULL_POSITION`: what the reference uses
 /// for "unset" in the three positions the service stream carries.
@@ -113,6 +121,11 @@ pub struct ClusteredServiceAgent<S: ClusteredService> {
     role: Role,
     member_id: i32,
     is_service_active: bool,
+    /// `snapshotDurationTracker` (`CSA:168`), counters 236/237.
+    snapshot_duration: SnapshotDuration,
+    /// `standbySnapshotFlags` (`CSA:166`): which flag a snapshot request must
+    /// carry for this container to take one.
+    standby_snapshot_flags: i32,
     shutdown: ShutdownHandle,
 }
 
@@ -165,6 +178,12 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
 
         let error_reporter =
             ErrorReporter::allocate(&mut client, config.cluster_id, config.service_id)?;
+        let snapshot_duration = SnapshotDuration::allocate(
+            &mut client,
+            config.cluster_id,
+            config.service_id,
+            config.snapshot_duration_threshold_ns,
+        )?;
 
         let idle = Strategy::by_agrona_name(&config.idle_strategy).ok_or_else(|| {
             ContainerError::Cluster(format!(
@@ -217,6 +236,8 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
             role: Role::Follower,
             member_id: -1,
             is_service_active: false,
+            snapshot_duration,
+            standby_snapshot_flags: CLUSTER_ACTION_FLAGS_DEFAULT,
             shutdown,
         };
 
@@ -479,6 +500,129 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
         Ok((image, loader.time_unit()))
     }
 
+    /// `executeAction` (`CSA:1057-1092`): take the snapshot, then ack with its
+    /// recording id — or with a null one when it failed, which the reference
+    /// does in a `finally` before rethrowing.
+    fn execute_snapshot_action(
+        &mut self,
+        log_position: i64,
+        leadership_term_id: i64,
+    ) -> Result<(), ContainerError> {
+        let mut recording_id = NULL_POSITION;
+        let mut failure = None;
+
+        self.snapshot_duration
+            .on_snapshot_begin(deepmsg_core::clock::monotonic_nano_time());
+        match self.take_snapshot(log_position, leadership_term_id) {
+            Ok(id) => recording_id = id,
+            Err(error) => failure = Some(error),
+        }
+        self.snapshot_duration
+            .on_snapshot_end(&self.client, deepmsg_core::clock::monotonic_nano_time());
+
+        let ack_id = self.ack_id;
+        self.ack_id += 1;
+        while !self.cm_proxy.ack(
+            &self.client,
+            log_position,
+            self.cluster_time,
+            ack_id,
+            recording_id,
+        )? {
+            self.context.idle(&mut self.client, 0)?;
+        }
+
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// `onTakeSnapshot` (`CSA:988-1019`): start a recording of a publication
+    /// nobody else can write to, write the container's state and then the
+    /// business's, and wait until the archive has persisted every byte.
+    fn take_snapshot(
+        &mut self,
+        log_position: i64,
+        leadership_term_id: i64,
+    ) -> Result<i64, ContainerError> {
+        let Self {
+            client,
+            archive,
+            config,
+            context,
+            sessions,
+            service,
+            time_unit,
+            ..
+        } = self;
+
+        let archive = ensure_archive(archive, client, config)?;
+
+        let registration_id = client.add_exclusive_publication(
+            &config.snapshot_channel,
+            config.snapshot_stream_id,
+            COMMAND_TIMEOUT,
+        )?;
+        let publication = client
+            .take_exclusive_publication(registration_id)
+            .ok_or_else(|| {
+                ContainerError::Cluster("the snapshot publication did not arrive".to_owned())
+            })?;
+
+        let session_id = publication.session_id();
+        let mut channel = ChannelUri::parse(&config.snapshot_channel).map_err(|error| {
+            ContainerError::Cluster(format!(
+                "the snapshot channel {} is not one: {error}",
+                config.snapshot_channel
+            ))
+        })?;
+        channel.put("session-id", session_id.to_string());
+
+        archive
+            .start_recording(
+                client,
+                &channel.build(),
+                config.snapshot_stream_id,
+                true,
+                true,
+            )
+            .map_err(|error| {
+                ContainerError::Cluster(format!(
+                    "the snapshot recording could not start: {error}"
+                ))
+            })?;
+
+        let counter_id =
+            await_recording_counter(client, context, archive.archive_id(), session_id)?;
+        let recording_id = recording_id_from_counter(client, counter_id)?;
+
+        snapshot_state(
+            client,
+            context,
+            sessions,
+            *time_unit,
+            config.app_version,
+            &publication,
+            SnapshotAction {
+                log_position,
+                leadership_term_id,
+            },
+        )?;
+
+        {
+            let mut writer = SnapshotWriter::new(client, &publication);
+            service.on_take_snapshot(&mut writer)?;
+        }
+
+        let position = publication.position().unwrap_or(0);
+        await_recording_complete(client, context, counter_id, recording_id, position)?;
+
+        client.remove_publication(registration_id, COMMAND_TIMEOUT)?;
+
+        Ok(recording_id)
+    }
+
     // -- the duty cycle ----------------------------------------------------
 
     /// `doWork` (`CSA:247-281`).
@@ -513,6 +657,12 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
         let time_unit = self.time_unit;
         let log_position = self.log_position;
         let cluster_time = self.cluster_time;
+        let standby_snapshot_flags = self.standby_snapshot_flags;
+        // `executeAction` runs inside the log's turn in the reference
+        // (`CSA:1057`); here it is deferred until the image is no longer
+        // borrowed, the way the consensus module defers its own snapshot, and
+        // then runs before the poll's result is returned.
+        let mut snapshot_action = None;
 
         let (read, new_log_position, new_cluster_time) = {
             let Self {
@@ -540,6 +690,8 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
                 time_unit,
                 log_position,
                 cluster_time,
+                snapshot_action: &mut snapshot_action,
+                standby_snapshot_flags,
             };
 
             let read = log_adapter.poll(commit, &mut handler)?;
@@ -561,6 +713,10 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
 
         self.log_position = new_log_position;
         self.cluster_time = new_cluster_time;
+
+        if let Some(action) = snapshot_action {
+            self.execute_snapshot_action(action.log_position, action.leadership_term_id)?;
+        }
 
         if read == 0 && self.log_adapter.is_done() {
             self.close_log()?;
@@ -653,6 +809,13 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
         if self.role != Role::Leader {
             self.disconnect_egress();
         }
+
+        // `standbySnapshotFlags = activeLog.isStandby ? … : …` (`CSA:852`).
+        self.standby_snapshot_flags = if event.is_standby {
+            CLUSTER_ACTION_FLAGS_STANDBY_SNAPSHOT
+        } else {
+            CLUSTER_ACTION_FLAGS_DEFAULT
+        };
 
         let channel = format!(
             "{}|alias=log-sc-{}",
@@ -979,6 +1142,17 @@ struct EventHandler<'a, S: ClusteredService> {
     time_unit: TimeUnit,
     log_position: i64,
     cluster_time: i64,
+    /// Where a `ClusterAction(SNAPSHOT)` is parked for the agent's turn.
+    snapshot_action: &'a mut Option<SnapshotAction>,
+    /// `standbySnapshotFlags` (`CSA:166`), copied from the agent.
+    standby_snapshot_flags: i32,
+}
+
+/// One `ClusterAction(SNAPSHOT)` that passed `shouldSnapshot`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapshotAction {
+    log_position: i64,
+    leadership_term_id: i64,
 }
 
 impl<S: ClusteredService> EventHandler<'_, S> {
@@ -1149,11 +1323,13 @@ impl<S: ClusteredService> LogHandler for EventHandler<'_, S> {
                 flags,
             } => {
                 self.cluster_time = timestamp;
-                if action == ClusterAction::SNAPSHOT && flags == CLUSTER_ACTION_FLAGS_DEFAULT {
-                    return Err(ContainerError::AgentTermination(format!(
-                        "taking the service snapshot at logPosition={log_position} \
-                         leadershipTermId={leadership_term_id} is P3-2b"
-                    )));
+                if action == ClusterAction::SNAPSHOT
+                    && should_snapshot(flags, self.standby_snapshot_flags)
+                {
+                    *self.snapshot_action = Some(SnapshotAction {
+                        log_position,
+                        leadership_term_id,
+                    });
                 }
                 Ok(())
             }
@@ -1277,6 +1453,188 @@ impl SnapshotLoadHandler for SessionLoadHandler<'_> {
 
     fn on_load_end_snapshot(&mut self) -> Result<(), ContainerError> {
         Ok(())
+    }
+}
+
+/// `shouldSnapshot` (`CSA:1094-1097`): the default flags always take one, and a
+/// standby member also takes one carrying its own flag.
+const fn should_snapshot(flags: i32, standby_snapshot_flags: i32) -> bool {
+    CLUSTER_ACTION_FLAGS_DEFAULT == flags || 0 != (flags & standby_snapshot_flags)
+}
+
+/// `snapshotState` (`CSA:1041-1054`): BEGIN, every session in table order, END.
+/// The business's records follow, written by `on_take_snapshot`.
+fn snapshot_state(
+    client: &mut Client,
+    context: &mut AgentContext,
+    sessions: &SessionTable,
+    time_unit: TimeUnit,
+    app_version: i32,
+    publication: &ExclusivePublication,
+    action: SnapshotAction,
+) -> Result<(), ContainerError> {
+    let mut sink = ServiceSnapshotSink {
+        client,
+        publication,
+        context,
+    };
+    let mut taker = ServiceSnapshotTaker::new(&mut sink, time_unit, app_version);
+
+    taker.mark_begin(action.log_position, action.leadership_term_id)?;
+    for session in sessions.iter() {
+        taker.snapshot_session(session)?;
+    }
+    taker.mark_end(action.log_position, action.leadership_term_id)
+}
+
+/// The snapshot publication and the idle that drives the client between
+/// retries, as one borrow (`SnapshotTaker`'s publication + strategy + invoker).
+struct ServiceSnapshotSink<'a> {
+    client: &'a mut Client,
+    publication: &'a ExclusivePublication,
+    context: &'a mut AgentContext,
+}
+
+impl SnapshotSend for ServiceSnapshotSink<'_> {
+    fn try_claim(&self, length: usize, bytes: &[u8]) -> SnapshotAppend {
+        let limit = position_limit(self.client, self.publication);
+        match self.publication.try_claim(limit, length) {
+            Ok(claim) => {
+                let frame = claim.frame();
+                if frame.write_payload(bytes).is_none() {
+                    return SnapshotAppend::Fatal("failed to write into the claim".to_owned());
+                }
+                #[allow(clippy::cast_possible_truncation)] // bounded by the payload maximum
+                let frame_length =
+                    (deepmsg_core::logbuffer::frame::DATA_HEADER_LENGTH + length) as i32;
+                if frame.publish(frame_length).is_some() {
+                    SnapshotAppend::Ok
+                } else {
+                    SnapshotAppend::Fatal("failed to publish the claim".to_owned())
+                }
+            }
+            Err(
+                deepmsg_core::logbuffer::append::Appended::BackPressured
+                | deepmsg_core::logbuffer::append::Appended::EndOfLog
+                | deepmsg_core::logbuffer::append::Appended::MidRotation,
+            ) => SnapshotAppend::Retry,
+            Err(deepmsg_core::logbuffer::append::Appended::NotConnected) => {
+                SnapshotAppend::Fatal("publication is not connected".to_owned())
+            }
+            Err(
+                deepmsg_core::logbuffer::append::Appended::MaxPositionExceeded
+                | deepmsg_core::logbuffer::append::Appended::MessageTooLarge,
+            ) => SnapshotAppend::Fatal(format!(
+                "publication at max position: term-length={}",
+                self.publication.term_buffer_length()
+            )),
+            Err(other) => SnapshotAppend::Fatal(format!("{other:?}")),
+        }
+    }
+
+    fn offer(&self, bytes: &[u8]) -> SnapshotAppend {
+        let limit = position_limit(self.client, self.publication);
+        match self.publication.offer(limit, bytes) {
+            deepmsg_core::logbuffer::append::Appended::Ok { .. } => SnapshotAppend::Ok,
+            deepmsg_core::logbuffer::append::Appended::BackPressured
+            | deepmsg_core::logbuffer::append::Appended::EndOfLog
+            | deepmsg_core::logbuffer::append::Appended::MidRotation => SnapshotAppend::Retry,
+            deepmsg_core::logbuffer::append::Appended::NotConnected => {
+                SnapshotAppend::Fatal("publication is not connected".to_owned())
+            }
+            deepmsg_core::logbuffer::append::Appended::MaxPositionExceeded
+            | deepmsg_core::logbuffer::append::Appended::MessageTooLarge => {
+                SnapshotAppend::Fatal(format!(
+                    "publication at max position: term-length={}",
+                    self.publication.term_buffer_length()
+                ))
+            }
+            other => SnapshotAppend::Fatal(format!("{other:?}")),
+        }
+    }
+
+    fn max_payload_length(&self) -> usize {
+        self.publication.max_payload_length().unwrap_or(0)
+    }
+}
+
+impl SnapshotIdle for ServiceSnapshotSink<'_> {
+    fn reset(&mut self) {
+        self.context.reset_idle();
+    }
+
+    fn idle(&mut self) -> Result<(), ContainerError> {
+        let Self {
+            client, context, ..
+        } = self;
+        context.idle(client, 0)
+    }
+}
+
+/// `awaitRecordingCounter` (`CSA:1099-1113`): the recording's position counter,
+/// found by the publication's session once the archive has created it.
+fn await_recording_counter(
+    client: &mut Client,
+    context: &mut AgentContext,
+    archive_id: i64,
+    session_id: i32,
+) -> Result<i32, ContainerError> {
+    context.reset_idle();
+    loop {
+        if let Some(counter_id) = client
+            .counters_reader()
+            .and_then(|counters| find_counter_id_by_session(&counters, session_id, archive_id))
+        {
+            return Ok(counter_id);
+        }
+        context.idle(client, 0)?;
+    }
+}
+
+/// `RecordingPos.getRecordingId(counters, counterId)`.
+fn recording_id_from_counter(client: &Client, counter_id: i32) -> Result<i64, ContainerError> {
+    client
+        .counters_reader()
+        .and_then(|counters| counters.key(counter_id))
+        .and_then(|key| parse_key(&key))
+        .map(|identity| identity.recording_id)
+        .ok_or_else(|| {
+            ContainerError::Cluster(format!(
+                "the snapshot recording counter {counter_id} has no identity"
+            ))
+        })
+}
+
+/// `awaitRecordingComplete` (`CSA:1021-1039`): spin until the archive has
+/// persisted what was written, and stop if the recording went away first.
+fn await_recording_complete(
+    client: &mut Client,
+    context: &mut AgentContext,
+    counter_id: i32,
+    recording_id: i64,
+    position: i64,
+) -> Result<(), ContainerError> {
+    loop {
+        let value = client
+            .counters_reader()
+            .and_then(|counters| counters.value(counter_id))
+            .unwrap_or(0);
+        if value >= position {
+            return Ok(());
+        }
+
+        let active = client
+            .counters_reader()
+            .and_then(|counters| counters.key(counter_id))
+            .and_then(|key| parse_key(&key))
+            .is_some_and(|identity| identity.recording_id == recording_id);
+        if !active {
+            return Err(ContainerError::Cluster(format!(
+                "recording stopped unexpectedly: {recording_id}"
+            )));
+        }
+
+        context.idle(client, 0)?;
     }
 }
 

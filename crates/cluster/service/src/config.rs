@@ -98,6 +98,10 @@ pub const ARCHIVE_LOCAL_CONTROL_STREAM_ID_DEFAULT: i32 = 10;
 pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_PROP_NAME: &str = "aeron.archive.control.response.stream.id";
 /// `CONTROL_RESPONSE_STREAM_ID_DEFAULT` (`AeronArchive.java:2764`).
 pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_DEFAULT: i32 = 20;
+/// `SNAPSHOT_DURATION_THRESHOLD_PROP_NAME` (`ClusteredServiceContainer.java:430`).
+pub const SNAPSHOT_DURATION_THRESHOLD_PROP_NAME: &str = "aeron.cluster.service.snapshot.threshold";
+/// `SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS` (`:438`) — 1 s.
+pub const SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS: i64 = 1_000_000_000;
 /// The application version stamped into `NewLeadershipTermEvent.appVersion`.
 pub const APP_VERSION_DEFAULT: i32 = 1;
 
@@ -185,6 +189,9 @@ pub struct ServiceContainerConfig {
     /// `clusterId * 100 + 100 + controlResponseStreamId + (serviceId + 1)`
     /// (`ClusteredServiceContainer.java:1015-1020`).
     pub archive_control_response_stream_id: i32,
+    /// `aeron.cluster.service.snapshot.threshold`: how long a snapshot may take
+    /// before it is counted in counter 237.
+    pub snapshot_duration_threshold_ns: i64,
 }
 
 impl ServiceContainerConfig {
@@ -299,6 +306,10 @@ impl ServiceContainerConfig {
                 ARCHIVE_LOCAL_CONTROL_STREAM_ID_DEFAULT,
             )?,
             archive_control_response_stream_id,
+            snapshot_duration_threshold_ns: properties.duration_ns(
+                SNAPSHOT_DURATION_THRESHOLD_PROP_NAME,
+                SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS,
+            )?,
         })
     }
 
@@ -377,6 +388,7 @@ mod tests {
         assert_eq!(config.archive_local_control_stream_id, 10);
         // clusterId 0, serviceId 0, control response stream 20 ⇒ 121.
         assert_eq!(config.archive_control_response_stream_id, 121);
+        assert_eq!(config.snapshot_duration_threshold_ns, 1_000_000_000);
     }
 
     #[test]

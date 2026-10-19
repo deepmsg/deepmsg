@@ -47,8 +47,11 @@ use deepmsg_core::logbuffer::descriptor::FRAME_ALIGNMENT;
 use crate::error::ContainerError;
 use crate::proxy::SESSION_HEADER_LENGTH;
 
-/// `ConsensusModule.CLUSTER_ACTION_FLAGS_DEFAULT` (`ConsensusModule.java`).
+/// `ConsensusModule.CLUSTER_ACTION_FLAGS_DEFAULT` (`ConsensusModule.java:132`).
 pub const CLUSTER_ACTION_FLAGS_DEFAULT: i32 = 0;
+/// `ConsensusModule.CLUSTER_ACTION_FLAGS_STANDBY_SNAPSHOT` (`:137`): the flag a
+/// standby member's snapshot request carries.
+pub const CLUSTER_ACTION_FLAGS_STANDBY_SNAPSHOT: i32 = 1;
 
 /// One log message, decoded.
 #[derive(Clone, Debug, PartialEq, Eq)]
