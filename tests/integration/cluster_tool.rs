@@ -185,6 +185,13 @@ fn the_tool_operates_a_three_node_cluster() {
             == Some(i64::from(ModuleState::Suspended.code()))
     });
 
+    // The reference's `shouldCheckForLeaderInAnyStateAfterElectionWasClosed`:
+    // a suspended leader is still the leader.
+    let mut out = Vec::new();
+    assert_eq!(0, tool.is_leader(nodes[leader].cluster_dir(), &mut out));
+    let mut out = Vec::new();
+    assert_eq!(1, tool.is_leader(nodes[follower].cluster_dir(), &mut out));
+
     let mut out = Vec::new();
     assert_eq!(
         FAILURE,
@@ -265,6 +272,17 @@ fn the_tool_operates_a_three_node_cluster() {
         .expect("writable counters")
         .set_value(counter.counter_id(), 1_700_000_000_000)
         .unwrap();
+
+    // `listMembersShouldReturnFalseIfQueryTimesOut`: the BACKUP mark file
+    // names a live driver, but no consensus module answers on its control
+    // channel.
+    let mut out = Vec::new();
+    assert_eq!(FAILURE, tool.list_members(&backup_dir, &mut out));
+    assert_eq!(
+        "timeout waiting for response from node\n",
+        text(&out),
+        "the query times out"
+    );
 
     let mut out = Vec::new();
     assert_eq!(0, tool.backup_query(&backup_dir, &mut out, None));

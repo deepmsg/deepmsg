@@ -168,7 +168,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
             ClusterComponentType::CONTAINER,
             usize::try_from(config.error_buffer_length)
                 .map_err(|_| ContainerError::Cluster("error buffer length".to_owned()))?,
-            deepmsg_cnc::create::FILE_PAGE_SIZE_DEFAULT,
+            mark::driver_file_page_size(&config.aeron_dir),
             now_ms,
             i64::from(std::process::id()),
         )?;

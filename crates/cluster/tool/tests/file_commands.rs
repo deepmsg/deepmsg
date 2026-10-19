@@ -316,3 +316,39 @@ fn describe_latest_cm_snapshot_without_a_recording_log_says_snapshot_not_found()
     );
     assert_eq!(String::from_utf8(out).unwrap(), "Snapshot not found\n");
 }
+
+#[test]
+fn a_switch_without_a_mark_file_says_so() {
+    let dir = scratch("toggle-empty");
+    let mut out = Vec::new();
+    assert_eq!(
+        ClusterTool::default().toggle(&dir, &mut out, "snapshot"),
+        FAILURE
+    );
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "cluster-mark.dat does not exist.\n"
+    );
+}
+
+#[test]
+fn list_members_without_a_mark_file_fails() {
+    let dir = scratch("members-empty");
+    let mut out = Vec::new();
+    assert_eq!(ClusterTool::default().list_members(&dir, &mut out), FAILURE);
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "cluster-mark.dat does not exist.\n"
+    );
+}
+
+#[test]
+fn is_leader_without_a_mark_file_fails() {
+    let dir = scratch("is-leader-empty");
+    let mut out = Vec::new();
+    assert_eq!(ClusterTool::default().is_leader(&dir, &mut out), FAILURE);
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "cluster-mark.dat does not exist.\n"
+    );
+}

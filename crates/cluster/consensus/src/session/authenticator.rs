@@ -312,6 +312,40 @@ mod tests {
     }
 
     #[test]
+    fn the_deny_all_supplier_denies_and_the_default_allows_the_backup_query() {
+        // `ConsensusModuleConfigurationTest.shouldUseDenyAllAuthorisationSupplierWhenPropertySet`
+        // (`ConsensusModuleConfigurationTest.java:31`).
+        let schema = i32::from(SBE_SCHEMA_ID);
+        let deny_all = authorisation_service_for(Some(DENY_ALL_NAME)).unwrap();
+        let backup_query = i32::from(BACKUP_QUERY_TEMPLATE_ID);
+        let session_connect =
+            i32::from(deepmsg_codec_cluster::session_connect_request_codec::SBE_TEMPLATE_ID);
+        assert!(!deny_all.is_authorised(schema, backup_query, None, &[]));
+        assert!(!deny_all.is_authorised(schema, session_connect, None, &[]));
+
+        let default = authorisation_service_for(None).unwrap();
+        assert!(default.is_authorised(schema, backup_query, None, &[]));
+        assert!(!default.is_authorised(schema, session_connect, None, &[]));
+    }
+
+    #[test]
+    fn the_allow_all_supplier_allows_both_templates() {
+        // `ConsensusModuleConfigurationTest.shouldUseAllowAllAuthorisationSupplierWhenPropertySet`
+        // (`ConsensusModuleConfigurationTest.java:60`).
+        let schema = i32::from(SBE_SCHEMA_ID);
+        let allow_all = authorisation_service_for(Some(ALLOW_ALL_NAME)).unwrap();
+        let backup_query = i32::from(BACKUP_QUERY_TEMPLATE_ID);
+        let session_connect =
+            i32::from(deepmsg_codec_cluster::session_connect_request_codec::SBE_TEMPLATE_ID);
+        assert!(allow_all.is_authorised(schema, backup_query, None, &[]));
+        assert!(allow_all.is_authorised(schema, session_connect, None, &[]));
+
+        let default = authorisation_service_for(None).unwrap();
+        assert!(default.is_authorised(schema, backup_query, None, &[]));
+        assert!(!default.is_authorised(schema, session_connect, None, &[]));
+    }
+
+    #[test]
     fn the_default_authorisation_service_is_the_backup_and_standby_one() {
         let service = AllowBackupAndStandbyAuthorisationService;
         let schema = i32::from(SBE_SCHEMA_ID);

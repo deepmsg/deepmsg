@@ -411,6 +411,14 @@ pub struct ConsensusModuleConfig {
     pub idle_strategy: String,
     /// `aeron.cluster.timer.service.supplier` (`ConsensusModule.java:935`).
     pub timer_service_supplier: String,
+    /// Whether this configuration carries a consensus-module extension.
+    ///
+    /// The reference loads one by class name (`aeron.cluster.consensus.module
+    /// .extension`); this build has no class loader, so the property is refused
+    /// by name and the flag is the **programmatic** seam a test (or an
+    /// embedder) uses to say it supplied an extension. Zero services are only
+    /// allowed when it is set (`ConsensusModule.java:2158`).
+    pub consensus_module_extension: bool,
     /// `aeron.cluster.services.dir`; empty when unset.
     pub services_dir_property: Option<String>,
     /// Where the service containers' mark files are: the property, canonical
@@ -677,6 +685,7 @@ impl ConsensusModuleConfig {
             delete_dir_on_start: false,
             app_version: APP_VERSION_DEFAULT,
             idle_strategy: idle_strategy.to_owned(),
+            consensus_module_extension: false,
             services_dir_property: properties.get(SERVICES_DIR_PROP_NAME).map(str::to_owned),
             services_dir: PathBuf::new(),
             agent_role_name: properties
@@ -725,6 +734,28 @@ impl ConsensusModuleConfig {
     /// [`ConfigProblem::Directory`] when a path cannot be canonicalised or a
     /// directory cannot be created.
     pub fn conclude(&mut self) -> Result<(), ConfigProblem> {
+        // `validateLogChannel` (`ConsensusModule.java:4609-4624`): a log
+        // channel that names a starting position would fight the recording
+        // log, which owns it.
+        let log_channel = deepmsg_core::uri::ChannelUri::parse(&self.log_channel)
+            .map_err(|error| ConfigProblem::Invalid(format!("logChannel: {error}")))?;
+        // `Context.conclude` (`ConsensusModule.java:2156-2160`): zero services
+        // need an extension.
+        if self.service_count == 0 && !self.consensus_module_extension {
+            return Err(ConfigProblem::Invalid(
+                "zero services are only supported when ConsensusModuleExtension is enabled"
+                    .to_owned(),
+            ));
+        }
+
+        for parameter in ["initial-term-id", "term-id", "term-offset"] {
+            if log_channel.get(parameter).is_some() {
+                return Err(ConfigProblem::Invalid(format!(
+                    "logChannel must not contain: {parameter}"
+                )));
+            }
+        }
+
         // Rust's `canonicalize` requires the path to exist, where Java's
         // `getCanonicalFile` does not; creating first and deleting after is the
         // same result with the same rule (`IoUtil.delete` then
@@ -910,6 +941,109 @@ mod tests {
         config.conclude().unwrap();
         assert_eq!(config.services_dir, services_dir.canonicalize().unwrap());
         assert_ne!(config.services_dir, config.cluster_dir);
+    }
+
+    #[test]
+    fn a_log_channel_naming_a_starting_position_is_refused() {
+        // `ConsensusModuleContextTest.rejectInvalidLogChannelParameters`
+        // (`ConsensusModuleContextTest.java:244`).
+        for parameter in ["initial-term-id", "term-id", "term-offset"] {
+            let mut source = properties();
+            source
+                .apply_args([format!(
+                    "-Daeron.cluster.log.channel=aeron:ipc?{parameter}=0"
+                )])
+                .unwrap();
+            let mut config = ConsensusModuleConfig::from_properties(&source).unwrap();
+            let problem = config.conclude().unwrap_err();
+            assert!(
+                problem.to_string().contains(parameter),
+                "{parameter}: {problem}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_service_count_range_is_the_references() {
+        // `ConsensusModuleContextTest.shouldValidateServiceCount`
+        // (`ConsensusModuleContextTest.java:1032`).
+        for count in ["-1", "2147483647", "-2147483648", "11"] {
+            let mut source = properties();
+            source
+                .apply_args([format!("-Daeron.cluster.service.count={count}")])
+                .unwrap();
+            let problem = ConsensusModuleConfig::from_properties(&source).unwrap_err();
+            assert!(
+                problem
+                    .to_string()
+                    .contains("service count of range [0, 10]"),
+                "{count}: {problem}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_services_need_a_consensus_module_extension() {
+        // `ConsensusModuleContextTest.shouldRejectServiceCountZeroWithoutConsensusModuleExtension`
+        // (`ConsensusModuleContextTest.java:1042`).
+        let root = scratch("zero-services");
+        let mut source = properties();
+        source
+            .apply_args([
+                "-Daeron.cluster.service.count=0".to_owned(),
+                format!(
+                    "-Daeron.cluster.dir={}",
+                    root.join("cluster").to_string_lossy()
+                ),
+            ])
+            .unwrap();
+        let mut config = ConsensusModuleConfig::from_properties(&source).unwrap();
+        let problem = config.conclude().unwrap_err();
+        assert!(
+            problem.to_string().contains(
+                "zero services are only supported when ConsensusModuleExtension is enabled"
+            ),
+            "{problem}"
+        );
+
+        config.consensus_module_extension = true;
+        config
+            .conclude()
+            .expect("an extension admits zero services");
+    }
+
+    #[test]
+    fn the_startup_canvass_timeout_is_a_multiple_of_the_leader_heartbeat() {
+        // `startupCanvassTimeoutMustBeMultiplesOfTheLeaderHeartbeatTimeout`
+        // (`ConsensusModuleContextTest.java:467`).
+        for (canvass, heartbeat) in [
+            ("0ns", "1000ns"),
+            ("5000ns", "5000ns"),
+            ("2000000000ns", "1000000001ns"),
+        ] {
+            let mut source = properties();
+            source
+                .apply_args([
+                    format!("-Daeron.cluster.startup.canvass.timeout={canvass}"),
+                    format!("-Daeron.cluster.leader.heartbeat.timeout={heartbeat}"),
+                ])
+                .unwrap();
+            let problem = ConsensusModuleConfig::from_properties(&source).unwrap_err();
+            assert!(
+                problem.to_string().contains("must be a multiple of"),
+                "{canvass}/{heartbeat}: {problem}"
+            );
+        }
+
+        // `startupCanvassTimeoutMustCanBeSetToBeMultiplesOfTheLeaderHeartbeatTimeout`
+        let mut source = properties();
+        source
+            .apply_args([
+                "-Daeron.cluster.startup.canvass.timeout=30s".to_owned(),
+                "-Daeron.cluster.leader.heartbeat.timeout=5s".to_owned(),
+            ])
+            .unwrap();
+        ConsensusModuleConfig::from_properties(&source).expect("30 s is six heartbeats");
     }
 
     #[test]

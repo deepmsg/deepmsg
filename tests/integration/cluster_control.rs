@@ -212,9 +212,12 @@ fn open_session(
 }
 
 fn launch(driver: &OwnArchivingMediaDriver, cluster_dir: &TempDir) -> ConsensusModuleAgent {
-    let config =
+    let mut config =
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
             .expect("the configuration parses");
+    // This build has no class loader; the flag is the programmatic
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    config.consensus_module_extension = true;
     ConsensusModuleAgent::launch(config).expect("the module launches")
 }
 
@@ -548,7 +551,23 @@ fn an_admin_snapshot_request_switches_the_control_toggle() {
     };
     driver.await_ready(DEADLINE).expect("the driver is ready");
 
-    let mut agent = launch(&driver, &cluster_dir);
+    // The reference's own admin test runs with `AuthorisationService.ALLOW_ALL`
+    // (`ClusterTest.java:2093-2096`): the default service denies an
+    // `AdminRequest`, so an injection-configuring test has to say otherwise.
+    let mut config =
+        ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
+            .expect("the configuration parses");
+    config.consensus_module_extension = true;
+    let mut agent = ConsensusModuleAgent::launch_with_components(
+        config,
+        deepmsg_cluster::LaunchComponents {
+            authorisation_service: Some(Box::new(
+                deepmsg_cluster::session::authenticator::AllowAll,
+            )),
+            ..Default::default()
+        },
+    )
+    .expect("the module launches");
     drive_until(&mut agent, "the first steady state", at_steady_state);
 
     let mut client = Client::connect(driver.aeron_dir()).expect("the client connects");

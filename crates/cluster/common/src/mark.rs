@@ -51,6 +51,7 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
 use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
@@ -672,6 +673,23 @@ pub fn check_header_length(values: &[&str]) -> Result<(), ClusterMarkError> {
 /// The file name a service container uses.
 pub fn service_filename(service_id: i32) -> String {
     format!("{SERVICE_FILENAME_PREFIX}{service_id}{FILE_EXTENSION}")
+}
+
+/// `driverFilePageSize`: the page size the driver aligned its CnC file to,
+/// which is what a component sizes **its own** mark file against
+/// (`ConsensusModule.java:1847-1853`, `ClusteredServiceContainer.java:887-889`).
+///
+/// The driver may not have published one (a pre-1.48 writer leaves zero); the
+/// build's default is used then, which is also what a driver that cannot be
+/// opened falls back to. The reference answers with the client's file page size
+/// when an `Aeron` client was assigned; here the caller always owns one.
+#[must_use]
+pub fn driver_file_page_size(aeron_dir: &Path) -> usize {
+    deepmsg_cnc::file::CncFile::open(aeron_dir, Duration::from_secs(5))
+        .ok()
+        .and_then(|cnc| usize::try_from(cnc.metadata().file_page_size).ok())
+        .filter(|size| (PAGE_MIN_SIZE..=PAGE_MAX_SIZE).contains(size))
+        .unwrap_or(deepmsg_cnc::create::FILE_PAGE_SIZE_DEFAULT)
 }
 
 /// `MarkFile.ensureMarkFileLink`, for the cluster's `.lnk`.

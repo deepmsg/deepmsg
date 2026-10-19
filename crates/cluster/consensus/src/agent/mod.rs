@@ -409,7 +409,7 @@ impl ConsensusModuleAgent {
             &config.mark_file_dir.join(mark::FILENAME),
             ClusterComponentType::CONSENSUS_MODULE,
             config.error_buffer_length as usize,
-            deepmsg_cnc::create::FILE_PAGE_SIZE_DEFAULT,
+            mark::driver_file_page_size(&config.aeron_dir),
             now_ms,
             i64::from(std::process::id()),
         )

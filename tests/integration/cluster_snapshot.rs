@@ -208,9 +208,12 @@ fn open_session_and_send(
 }
 
 fn launch(driver: &OwnArchivingMediaDriver, cluster_dir: &TempDir) -> ConsensusModuleAgent {
-    let config =
+    let mut config =
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
             .expect("the configuration parses");
+    // This build has no class loader; the flag is the programmatic
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    config.consensus_module_extension = true;
     ConsensusModuleAgent::launch(config).expect("the module launches")
 }
 
