@@ -61,8 +61,10 @@ fn every_name_is_classified_or_pending() {
     // P3-4d the four snapshot/replay names plus the log fragment limit and
     // P3-4e the termination timeout, P3-6a the control endpoint on the log
     // publication, and P3-6b the follower catchup and leader archive-control
-    // channels, so 32 rows are still Pending and must be gone by P3-11.
-    assert_eq!(pending, 32, "the P3-4a..4e/6a/6b rows are classified");
+    // channels, and P3-3a the three the cluster client reads (its name, the
+    // ingress endpoints and the message timeout), so 29 rows are still Pending
+    // and must be gone by P3-11.
+    assert_eq!(pending, 29, "the P3-4a..4e/6a/6b/3a rows are classified");
 }
 
 #[test]

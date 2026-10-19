@@ -74,7 +74,7 @@ pub const NAMES: &[(&str, Disposition)] = &[
         Disposition::Pending,
     ),
     ("aeron.cluster.backup.source.type", Disposition::Pending),
-    ("aeron.cluster.client.name", Disposition::Pending),
+    ("aeron.cluster.client.name", Disposition::Honoured),
     (
         "aeron.cluster.clock",
         Disposition::Refused("only the millisecond clock is implemented"),
@@ -120,7 +120,7 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ("aeron.cluster.id", Disposition::Honoured),
     ("aeron.cluster.idle.strategy", Disposition::Honoured),
     ("aeron.cluster.ingress.channel", Disposition::Honoured),
-    ("aeron.cluster.ingress.endpoints", Disposition::Pending),
+    ("aeron.cluster.ingress.endpoints", Disposition::Honoured),
     (
         "aeron.cluster.ingress.fragment.limit",
         Disposition::Honoured,
@@ -148,7 +148,7 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ("aeron.cluster.member.endpoints", Disposition::Pending),
     ("aeron.cluster.member.id", Disposition::Honoured),
     ("aeron.cluster.members", Disposition::Honoured),
-    ("aeron.cluster.message.timeout", Disposition::Pending),
+    ("aeron.cluster.message.timeout", Disposition::Honoured),
     ("aeron.cluster.replay.channel", Disposition::Honoured),
     ("aeron.cluster.replay.stream.id", Disposition::Honoured),
     ("aeron.cluster.replication.channel", Disposition::Honoured),

@@ -677,6 +677,7 @@ mod tests {
                 position: 0,
                 frame_length: 0,
                 fragmented_frame_length: 0,
+                image_registration_id: 0,
             },
             payload: bytes,
         }

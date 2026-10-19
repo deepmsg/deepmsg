@@ -259,21 +259,21 @@ unit	StandbySnapshotReplicatorTest	shouldSwitchEndpointsOnArchivePollForSignalsE
 unit	StandbySnapshotReplicatorTest	shouldThrowExceptionIfUnableToReplicateAnySnapshotsDueToClusterExceptions	-	-	unit		n/a:premium	
 unit	StandbySnapshotReplicatorTest	shouldThrowExceptionIfUnableToReplicateAnySnapshotsDueToArchiveExceptions	-	-	unit		n/a:premium	
 unit	StandbySnapshotReplicatorTest	shouldNotRetrieveSnapshotsIfRecordingLogAlreadyHasUpToDateCopies	-	-	unit		n/a:premium	
-unit	AeronClusterAsyncConnectTest	initialState	B	P3-3a	unit			
-unit	AeronClusterAsyncConnectTest	shouldCloseAsyncSubscription	B	P3-3a	unit			
-unit	AeronClusterAsyncConnectTest	shouldCloseEgressSubscription	B	P3-3a	unit			
-unit	AeronClusterAsyncConnectTest	shouldCloseAsyncPublication	B	P3-3a	unit			
-unit	AeronClusterAsyncConnectTest	shouldCloseIngressPublication	B	P3-3a	unit			
-unit	AeronClusterAsyncConnectTest	shouldCloseIngressPublicationsOnMembers	B	P3-3a	unit			
-unit	AeronClusterAsyncConnectTest	shouldRetryMemberIngressPublicationWhenSendChannelEndpointIsClosing	B	P3-3a	unit			
-unit	AeronClusterAsyncConnectTest	shouldConnectViaIngressChannel	B	P3-3a	unit			
-unit	AeronClusterContextTest	concludeThrowsConfigurationExceptionIfIngressChannelIsNotSet	B	P3-3a	unit			
-unit	AeronClusterContextTest	concludeThrowsConfigurationExceptionIfIngressChannelIsSetToIpcAndIngressEndpointsSpecified	B	P3-3a	unit			
-unit	AeronClusterContextTest	concludeThrowsConfigurationExceptionIfEgressChannelIsNotSet	B	P3-3a	unit			
-unit	AeronClusterContextTest	clientNameShouldHandleEmptyValue	B	P3-3a	unit			
-unit	AeronClusterContextTest	clientNameShouldReturnAssignedValue	B	P3-3a	unit			
-unit	AeronClusterContextTest	clientNameCanBeSetViaSystemProperty	B	P3-3a	unit			
-unit	AeronClusterContextTest	clientNameMustNotExceedMaxLength	B	P3-3a	unit			
+unit	AeronClusterAsyncConnectTest	initialState	B	P3-3a	unit			async_connect::tests::an_async_connect_starts_at_create_egress_subscription
+unit	AeronClusterAsyncConnectTest	shouldCloseAsyncSubscription	B	P3-3a	unit			async_connect::tests::closing_before_the_egress_subscription_lands_removes_the_pending_add
+unit	AeronClusterAsyncConnectTest	shouldCloseEgressSubscription	B	P3-3a	unit			async_connect::tests::closing_after_the_egress_subscription_lands_removes_the_subscription
+unit	AeronClusterAsyncConnectTest	shouldCloseAsyncPublication	B	P3-3a	unit			async_connect::tests::closing_before_the_ingress_publication_lands_removes_the_pending_add
+unit	AeronClusterAsyncConnectTest	shouldCloseIngressPublication	B	P3-3a	unit			async_connect::tests::closing_after_the_ingress_publication_lands_removes_the_publication
+unit	AeronClusterAsyncConnectTest	shouldCloseIngressPublicationsOnMembers	B	P3-3a	unit			async_connect::tests::member_publications_are_added_once_each_and_the_first_connected_one_wins
+unit	AeronClusterAsyncConnectTest	shouldRetryMemberIngressPublicationWhenSendChannelEndpointIsClosing	B	P3-3a	unit			async_connect::tests::a_temporarily_unavailable_member_add_is_retried
+unit	AeronClusterAsyncConnectTest	shouldConnectViaIngressChannel	B	P3-3a	unit			async_connect::tests::the_connect_request_carries_the_references_fields, ::an_ok_session_event_completes_the_connect
+unit	AeronClusterContextTest	concludeThrowsConfigurationExceptionIfIngressChannelIsNotSet	B	P3-3a	unit			context::tests::conclude_refuses_a_missing_ingress_channel
+unit	AeronClusterContextTest	concludeThrowsConfigurationExceptionIfIngressChannelIsSetToIpcAndIngressEndpointsSpecified	B	P3-3a	unit			context::tests::conclude_refuses_ipc_ingress_with_endpoints
+unit	AeronClusterContextTest	concludeThrowsConfigurationExceptionIfEgressChannelIsNotSet	B	P3-3a	unit			context::tests::conclude_refuses_a_missing_egress_channel
+unit	AeronClusterContextTest	clientNameShouldHandleEmptyValue	B	P3-3a	unit			context::tests::client_name_handles_an_empty_value
+unit	AeronClusterContextTest	clientNameShouldReturnAssignedValue	B	P3-3a	unit			context::tests::client_name_is_the_assigned_value
+unit	AeronClusterContextTest	clientNameCanBeSetViaSystemProperty	B	P3-3a	unit			context::tests::the_client_name_is_read_from_the_properties (a Properties map, not the process)
+unit	AeronClusterContextTest	clientNameMustNotExceedMaxLength	B	P3-3a	unit			context::tests::a_client_name_longer_than_the_driver_allows_is_refused
 unit	AeronClusterTest	shouldStayConnectedAfterSuccessfulFailover	B	P3-3b	unit			
 unit	AeronClusterTest	shouldRetryNewLeaderIngressPublicationWhenSendChannelEndpointIsClosing	B	P3-3b	unit			
 unit	AeronClusterTest	shouldCloseItselfWhenDisconnectedForLongerThanNewLeaderTimeout	B	P3-3b	unit			
@@ -290,8 +290,8 @@ unit	EgressAdapterTest	onFragmentShouldInvokeOnNewLeaderCallbackIfSessionIdMatch
 unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnNewLeader	B	P3-3b	unit			
 unit	EgressAdapterTest	onFragmentShouldInvokeOnAdminResponseCallbackIfSessionIdMatches	B	P3-3b	unit			
 unit	EgressAdapterTest	onFragmentIsANoOpIfSessionIdDoesNotMatchOnAdminResponse	B	P3-3b	unit			
-unit	EgressPollerTest	shouldIgnoreUnknownMessageSchema	B	P3-3a	unit			
-unit	EgressPollerTest	shouldHandleSessionMessage	B	P3-3a	unit			
+unit	EgressPollerTest	shouldIgnoreUnknownMessageSchema	B	P3-3a	unit			egress_poller::tests::an_unknown_schema_is_stepped_over
+unit	EgressPollerTest	shouldHandleSessionMessage	B	P3-3a	unit			egress_poller::tests::a_session_message_fills_the_slot_and_a_full_slot_aborts
 unit	CborClusterEventCodecTest	encodeDecodeLogElectionStateChange	-	-	unit		n/a:logging	
 unit	CborClusterEventCodecTest	encodeDecodeLogElectionStateChangeWithBoundaryLongValues	-	-	unit		n/a:logging	
 unit	CborClusterEventCodecTest	encodeDecodeLogElectionStateChangeWithBoundaryIntValues	-	-	unit		n/a:logging	

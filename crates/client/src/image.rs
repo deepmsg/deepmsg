@@ -50,6 +50,16 @@ use crate::log_buffer::LogBuffer;
 pub struct Fragment<'a> {
     frame: Frame<'a, ReadOnly>,
     position: i64,
+    /// The publication registration id of the image this fragment came from.
+    ///
+    /// The reference hands a fragment handler the image its poll was reading
+    /// through (`Header.context()` — the `Image` object — in
+    /// `Subscription.java` and `aeron_image.c`), and a cluster client uses it
+    /// as the identity of the connection its egress answers arrived on
+    /// (`AeronCluster.java:283`, `:298`). A reader that polls several images
+    /// cannot recover it afterwards: by the time a handler has the message,
+    /// the image it came from is no longer anywhere in the call.
+    image_registration_id: i64,
 }
 
 /// One run of frames, handed to a [`Image::block_poll`] handler.
@@ -100,13 +110,26 @@ impl<'a> Fragment<'a> {
     /// frames of their own — the assembler's tests write them into a term the
     /// test owns.
     #[cfg(test)]
-    pub(crate) const fn new(frame: Frame<'a, ReadOnly>, position: i64) -> Self {
-        Self { frame, position }
+    pub(crate) const fn new(
+        frame: Frame<'a, ReadOnly>,
+        position: i64,
+        image_registration_id: i64,
+    ) -> Self {
+        Self {
+            frame,
+            position,
+            image_registration_id,
+        }
     }
 
     /// Where this fragment begins in the stream.
     pub const fn position(&self) -> i64 {
         self.position
+    }
+
+    /// The publication registration id of the image it came from.
+    pub const fn image_registration_id(&self) -> i64 {
+        self.image_registration_id
     }
 
     /// How many payload bytes it carries.
@@ -705,6 +728,7 @@ impl Image {
                     handler(&Fragment {
                         frame: Frame::new(&term, offset),
                         position: next.raw(),
+                        image_registration_id: self.registration_id(),
                     });
                     fragments += 1;
 
@@ -923,6 +947,7 @@ impl Image {
                     let action = handler.on_fragment(&Fragment {
                         frame: Frame::new(&term, offset),
                         position: ledger.next.raw(),
+                        image_registration_id: self.registration_id(),
                     });
 
                     if !action.consumes() {

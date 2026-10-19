@@ -27,6 +27,7 @@ deepmsg-codec-cluster-mark = { path = "../crates/codec/cluster-mark" }
 deepmsg-archive = { path = "../crates/archive" }
 deepmsg-cluster = { path = "../crates/cluster/consensus" }
 deepmsg-cluster-common = { path = "../crates/cluster/common" }
+deepmsg-cluster-client = { path = "../crates/cluster/client" }
 deepmsg-cluster-service = { path = "../crates/cluster/service" }
 
 [[test]]
@@ -668,6 +669,13 @@ path = "integration/udp_receive_mtu.rs"
 [[test]]
 name = "cluster_lc4b"
 path = "interop/cluster_lc4b.rs"
+required-features = ["interop"]
+
+# P3-3a's LC-1 first step: our cluster client connecting to the reference's
+# single Java node over IPC.
+[[test]]
+name = "cluster_lc1_connect"
+path = "interop/cluster_lc1_connect.rs"
 required-features = ["interop"]
 
 # P3-2a's LC-4a smoke: the reference's driver, archive and consensus module in
