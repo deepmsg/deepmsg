@@ -44,7 +44,7 @@ impl Disposition {
 pub const NAMES: &[(&str, Disposition)] = &[
     (
         "aeron.cluster.accept.standby.snapshots",
-        Disposition::Pending,
+        Disposition::Refused("standby is a premium feature"),
     ),
     ("aeron.cluster.appointed.leader.id", Disposition::Honoured),
     (
@@ -55,25 +55,34 @@ pub const NAMES: &[(&str, Disposition)] = &[
         "aeron.cluster.authorisation.service.supplier",
         Disposition::Honoured,
     ),
-    ("aeron.cluster.backup.catchup.channel", Disposition::Pending),
+    (
+        "aeron.cluster.backup.catchup.channel",
+        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
+    ),
     (
         "aeron.cluster.backup.catchup.endpoint",
-        Disposition::Pending,
+        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
     ),
     (
         "aeron.cluster.backup.cool.down.interval",
-        Disposition::Pending,
+        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
     ),
-    ("aeron.cluster.backup.interval", Disposition::Pending),
+    (
+        "aeron.cluster.backup.interval",
+        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
+    ),
     (
         "aeron.cluster.backup.progress.timeout",
-        Disposition::Pending,
+        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
     ),
     (
         "aeron.cluster.backup.response.timeout",
-        Disposition::Pending,
+        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
     ),
-    ("aeron.cluster.backup.source.type", Disposition::Pending),
+    (
+        "aeron.cluster.backup.source.type",
+        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
+    ),
     ("aeron.cluster.client.name", Disposition::Honoured),
     (
         "aeron.cluster.clock",
@@ -82,16 +91,21 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ("aeron.cluster.consensus.channel", Disposition::Honoured),
     (
         "aeron.cluster.consensus.control.enable",
-        Disposition::Pending,
+        Disposition::AcceptedNotHonoured(
+            "consensus publications bind no control endpoint in this build",
+        ),
     ),
-    ("aeron.cluster.consensus.endpoints", Disposition::Pending),
+    (
+        "aeron.cluster.consensus.endpoints",
+        Disposition::AcceptedNotHonoured("consumed only by ClusterBackup/standby (P3-9)"),
+    ),
     (
         "aeron.cluster.consensus.module.agent.role.name",
-        Disposition::Pending,
+        Disposition::Honoured,
     ),
     (
         "aeron.cluster.consensus.module.extension",
-        Disposition::Pending,
+        Disposition::Refused("this build has no class loader"),
     ),
     (
         "aeron.cluster.consensus.module.stream.id",
@@ -109,10 +123,7 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ),
     ("aeron.cluster.election.timeout", Disposition::Honoured),
     ("aeron.cluster.error.buffer.length", Disposition::Honoured),
-    (
-        "aeron.cluster.file.sync.level",
-        Disposition::AcceptedNotHonoured("read and kept; the force() call sites are P3-4d"),
-    ),
+    ("aeron.cluster.file.sync.level", Disposition::Honoured),
     (
         "aeron.cluster.follower.catchup.channel",
         Disposition::Honoured,
@@ -145,7 +156,12 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ("aeron.cluster.log.stream.id", Disposition::Honoured),
     ("aeron.cluster.mark.file.dir", Disposition::Honoured),
     ("aeron.cluster.max.sessions", Disposition::Honoured),
-    ("aeron.cluster.member.endpoints", Disposition::Pending),
+    (
+        "aeron.cluster.member.endpoints",
+        Disposition::AcceptedNotHonoured(
+            "this member's endpoints come from aeron.cluster.members; the override is not applied",
+        ),
+    ),
     ("aeron.cluster.member.id", Disposition::Honoured),
     ("aeron.cluster.members", Disposition::Honoured),
     ("aeron.cluster.message.timeout", Disposition::Honoured),
@@ -154,41 +170,44 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ("aeron.cluster.replication.channel", Disposition::Honoured),
     (
         "aeron.cluster.replication.progress.interval",
-        Disposition::Pending,
+        Disposition::AcceptedNotHonoured("consumed only by ClusterBackup/standby (P3-9)"),
     ),
     (
         "aeron.cluster.replication.progress.timeout",
-        Disposition::Pending,
+        Disposition::AcceptedNotHonoured("consumed only by ClusterBackup/standby (P3-9)"),
     ),
-    ("aeron.cluster.service.class.name", Disposition::Pending),
+    (
+        "aeron.cluster.service.class.name",
+        Disposition::Refused("this build has no class loader"),
+    ),
     ("aeron.cluster.service.count", Disposition::Honoured),
     (
         "aeron.cluster.service.cycle.threshold",
-        Disposition::Pending,
+        Disposition::Honoured,
     ),
     (
         "aeron.cluster.service.delegating.error.handler",
-        Disposition::Pending,
+        Disposition::Refused("this build has no class loader"),
     ),
     (
         "aeron.cluster.service.error.buffer.length",
-        Disposition::Pending,
+        Disposition::Honoured,
     ),
-    ("aeron.cluster.service.id", Disposition::Pending),
-    ("aeron.cluster.service.name", Disposition::Pending),
-    ("aeron.cluster.service.responder", Disposition::Pending),
+    ("aeron.cluster.service.id", Disposition::Honoured),
+    ("aeron.cluster.service.name", Disposition::Honoured),
+    ("aeron.cluster.service.responder", Disposition::Honoured),
     (
         "aeron.cluster.service.snapshot.threshold",
-        Disposition::Pending,
+        Disposition::Honoured,
     ),
     ("aeron.cluster.service.stream.id", Disposition::Honoured),
-    ("aeron.cluster.services.dir", Disposition::Pending),
+    ("aeron.cluster.services.dir", Disposition::Honoured),
     ("aeron.cluster.session.timeout", Disposition::Honoured),
     ("aeron.cluster.snapshot.channel", Disposition::Honoured),
     ("aeron.cluster.snapshot.stream.id", Disposition::Honoured),
     (
         "aeron.cluster.standby.snapshot.notification.processing.delay",
-        Disposition::Pending,
+        Disposition::Refused("standby is a premium feature"),
     ),
     (
         "aeron.cluster.startup.canvass.timeout",
@@ -200,10 +219,10 @@ pub const NAMES: &[(&str, Disposition)] = &[
         "aeron.cluster.timer.service.supplier",
         Disposition::Honoured,
     ),
-    ("aeron.cluster.tool.delay", Disposition::Pending),
-    ("aeron.cluster.tool.replay.channel", Disposition::Pending),
-    ("aeron.cluster.tool.replay.stream.id", Disposition::Pending),
-    ("aeron.cluster.tool.timeout", Disposition::Pending),
+    ("aeron.cluster.tool.delay", Disposition::Honoured),
+    ("aeron.cluster.tool.replay.channel", Disposition::Honoured),
+    ("aeron.cluster.tool.replay.stream.id", Disposition::Honoured),
+    ("aeron.cluster.tool.timeout", Disposition::Honoured),
     (
         "aeron.cluster.total.snapshot.threshold",
         Disposition::Honoured,
