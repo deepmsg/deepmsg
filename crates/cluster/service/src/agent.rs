@@ -45,7 +45,7 @@ use deepmsg_driver::idle::Strategy;
 use crate::adapter::{JoinLogEvent, ServiceAdapter, ServiceEvents};
 use crate::cluster::{AgentContext, Cluster, ClusterTime, CommitPosition, LifecycleCallback};
 use crate::config::ServiceContainerConfig;
-use crate::counters::{COMMAND_TIMEOUT, ErrorReporter, SnapshotDuration};
+use crate::counters::{COMMAND_TIMEOUT, DutyCycle, ErrorReporter, SnapshotDuration};
 use crate::error::ContainerError;
 use crate::log_adapter::{
     BoundedLogAdapter, CLUSTER_ACTION_FLAGS_DEFAULT, CLUSTER_ACTION_FLAGS_STANDBY_SNAPSHOT,
@@ -122,6 +122,8 @@ pub struct ClusteredServiceAgent<S: ClusteredService> {
     is_service_active: bool,
     /// `snapshotDurationTracker` (`CSA:168`), counters 236/237.
     snapshot_duration: SnapshotDuration,
+    /// `dutyCycleTracker` (`CSA:167`), counters 218/219.
+    duty_cycle: DutyCycle,
     /// `standbySnapshotFlags` (`CSA:166`): which flag a snapshot request must
     /// carry for this container to take one.
     standby_snapshot_flags: i32,
@@ -138,6 +140,13 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
     /// file cannot be created, a counter cannot be allocated, or the recovery
     /// state names a snapshot that cannot be loaded.
     pub fn launch(config: ServiceContainerConfig, service: S) -> Result<Self, ContainerError> {
+        // The thread the agent runs on carries the service name
+        // (`ClusteredServiceContainer.java:929-930`); the binary set it too,
+        // and an in-process container gets the same name from here.
+        deepmsg_driver::sys::set_current_thread_name(&config.service_name).map_err(|error| {
+            ContainerError::Cluster(format!("could not name the container's thread: {error}"))
+        })?;
+
         let mut client = Client::connect(&config.aeron_dir)?;
 
         let shutdown = ShutdownHandle {
@@ -183,6 +192,16 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
             config.service_id,
             config.snapshot_duration_threshold_ns,
         )?;
+        let mut duty_cycle = DutyCycle::allocate(
+            &mut client,
+            config.cluster_id,
+            config.service_id,
+            config.cycle_threshold_ns,
+        )?;
+        // `onStart`'s `dutyCycleTracker.update(nanoClock.nanoTime())`
+        // (`ClusteredServiceAgent.java:205`): the first cycle measures from
+        // here, not from zero.
+        duty_cycle.start(deepmsg_core::clock::monotonic_nano_time());
 
         let idle = Strategy::by_agrona_name(&config.idle_strategy).ok_or_else(|| {
             ContainerError::Cluster(format!(
@@ -236,6 +255,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
             member_id: -1,
             is_service_active: false,
             snapshot_duration,
+            duty_cycle,
             standby_snapshot_flags: CLUSTER_ACTION_FLAGS_DEFAULT,
             shutdown,
         };
@@ -668,6 +688,9 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
     /// caller closes it. Any other error also ends the duty cycle.
     pub fn do_work(&mut self) -> Result<usize, ContainerError> {
         let now_ns = deepmsg_core::clock::monotonic_nano_time();
+        // `doWork`'s first line (`CSA:247-249`): the cycle that just ended is
+        // measured before any work is counted.
+        self.duty_cycle.measure(&self.client, now_ns);
         let mut work = 0;
 
         if self

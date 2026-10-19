@@ -114,6 +114,10 @@ pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_PROP_NAME: &str =
     "aeron.archive.control.response.stream.id";
 /// `CONTROL_RESPONSE_STREAM_ID_DEFAULT` (`AeronArchive.java:2764`).
 pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_DEFAULT: i32 = 20;
+/// `CYCLE_THRESHOLD_PROP_NAME` (`ClusteredServiceContainer.java:413`).
+pub const CYCLE_THRESHOLD_PROP_NAME: &str = "aeron.cluster.service.cycle.threshold";
+/// `CYCLE_THRESHOLD_DEFAULT_NS` (`:422`) — 100 ms.
+pub const CYCLE_THRESHOLD_DEFAULT_NS: i64 = 100_000_000;
 /// `SNAPSHOT_DURATION_THRESHOLD_PROP_NAME` (`ClusteredServiceContainer.java:430`).
 pub const SNAPSHOT_DURATION_THRESHOLD_PROP_NAME: &str = "aeron.cluster.service.snapshot.threshold";
 /// `SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS` (`:438`) — 1 s.
@@ -216,6 +220,9 @@ pub struct ServiceContainerConfig {
     /// `aeron.cluster.service.snapshot.threshold`: how long a snapshot may take
     /// before it is counted in counter 237.
     pub snapshot_duration_threshold_ns: i64,
+    /// `aeron.cluster.service.cycle.threshold`: when a duty cycle counts as
+    /// over its budget (`:413-422`), for counters 218/219.
+    pub cycle_threshold_ns: i64,
 }
 
 impl ServiceContainerConfig {
@@ -348,6 +355,8 @@ impl ServiceContainerConfig {
                 SNAPSHOT_DURATION_THRESHOLD_PROP_NAME,
                 SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS,
             )?,
+            cycle_threshold_ns: properties
+                .duration_ns(CYCLE_THRESHOLD_PROP_NAME, CYCLE_THRESHOLD_DEFAULT_NS)?,
         })
     }
 
@@ -450,6 +459,17 @@ mod tests {
         // clusterId 0, serviceId 0, control response stream 20 ⇒ 121.
         assert_eq!(config.archive_control_response_stream_id, 121);
         assert_eq!(config.snapshot_duration_threshold_ns, 1_000_000_000);
+        assert_eq!(config.cycle_threshold_ns, 100_000_000);
+    }
+
+    #[test]
+    fn the_cycle_threshold_is_the_property_or_its_default() {
+        let mut properties = Properties::new();
+        properties
+            .apply_args(["-Daeron.cluster.service.cycle.threshold=25ms".to_owned()])
+            .expect("a -D argument");
+        let config = ServiceContainerConfig::from_properties(&properties).expect("parses");
+        assert_eq!(config.cycle_threshold_ns, 25_000_000);
     }
 
     #[test]

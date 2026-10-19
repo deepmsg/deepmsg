@@ -932,6 +932,7 @@ impl TestCluster {
                 + 20
                 + (slot.spec.service_id + 1),
             snapshot_duration_threshold_ns: 1_000_000_000,
+            cycle_threshold_ns: 100_000_000,
         }
     }
 

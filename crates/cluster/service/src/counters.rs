@@ -18,7 +18,9 @@ use std::time::Duration;
 use deepmsg_client::client::Client;
 use deepmsg_client::counter::Counter;
 use deepmsg_cluster_common::counters::{
-    self, CLUSTER_CLUSTERED_SERVICE_ERROR_COUNT_TYPE_ID,
+    self, CLUSTER_CLUSTERED_SERVICE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID,
+    CLUSTER_CLUSTERED_SERVICE_ERROR_COUNT_TYPE_ID,
+    CLUSTER_CLUSTERED_SERVICE_MAX_CYCLE_TIME_TYPE_ID,
     CLUSTERED_SERVICE_MAX_SNAPSHOT_DURATION_TYPE_ID,
     CLUSTERED_SERVICE_SNAPSHOT_DURATION_THRESHOLD_EXCEEDED_TYPE_ID,
 };
@@ -40,6 +42,91 @@ pub const COMMIT_HASH: &str = "deepmsg";
 pub struct ErrorReporter {
     log: DistinctErrorLog,
     counter: Counter,
+}
+
+/// `DutyCycleStallTracker` (`DutyCycleStallTracker.java:84-94`): counters
+/// 218/219, the container's own duty cycle. The reference's agent calls
+/// `update(nanoClock)` in `onStart` and `measureAndUpdate(now)` as the first
+/// thing in `doWork` (`ClusteredServiceAgent.java:205`, `:247-249`).
+pub struct DutyCycle {
+    max_cycle_time: Counter,
+    threshold_exceeded: Counter,
+    threshold_ns: i64,
+    /// The stamp the previous cycle began at (`lastUpdate`).
+    last_ns: i64,
+}
+
+impl DutyCycle {
+    /// Allocate `Cluster container max cycle time in ns` (218) and its
+    /// threshold-exceeded count (219) (`ClusteredServiceContainer.java:969-984`).
+    ///
+    /// # Errors
+    ///
+    /// [`ContainerError`] when a label does not fit or the driver refuses a
+    /// counter.
+    pub fn allocate(
+        client: &mut Client,
+        cluster_id: i32,
+        service_id: i32,
+        threshold_ns: i64,
+    ) -> Result<Self, ContainerError> {
+        let max_spec = counters::service_counter(
+            "Cluster container max cycle time in ns",
+            cluster_id,
+            service_id,
+        )?;
+        let max_cycle_time = client.add_counter(
+            CLUSTER_CLUSTERED_SERVICE_MAX_CYCLE_TIME_TYPE_ID,
+            max_spec.key(),
+            max_spec.label(),
+            COMMAND_TIMEOUT,
+        )?;
+
+        let name = format!(
+            "Cluster container work cycle time exceeded count: threshold={}",
+            format_duration_ns(threshold_ns)
+        );
+        let exceeded_spec = counters::service_counter(&name, cluster_id, service_id)?;
+        let threshold_exceeded = client.add_counter(
+            CLUSTER_CLUSTERED_SERVICE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID,
+            exceeded_spec.key(),
+            exceeded_spec.label(),
+            COMMAND_TIMEOUT,
+        )?;
+
+        Ok(Self {
+            max_cycle_time,
+            threshold_exceeded,
+            threshold_ns,
+            last_ns: 0,
+        })
+    }
+
+    /// `DutyCycleTracker.update(now)` (`:53-56`): the start of a cycle.
+    pub const fn start(&mut self, now_ns: i64) {
+        self.last_ns = now_ns;
+    }
+
+    /// `DutyCycleTracker.measureAndUpdate(now)` (`:63-69`): measure the cycle
+    /// that just ended, then start the next one.
+    pub fn measure(&mut self, client: &Client, now_ns: i64) {
+        let duration_ns = now_ns.saturating_sub(self.last_ns);
+        self.last_ns = now_ns;
+
+        let Some(counters) = client.counters_writable() else {
+            return;
+        };
+        if let Some(max) = counters.value(self.max_cycle_time.counter_id())
+            && duration_ns > max
+        {
+            let _ = counters.set_value(self.max_cycle_time.counter_id(), duration_ns);
+        }
+        if duration_ns > self.threshold_ns {
+            if let Some(value) = counters.value(self.threshold_exceeded.counter_id()) {
+                let _ = counters.set_value(self.threshold_exceeded.counter_id(), value + 1);
+            }
+        }
+    }
 }
 
 /// `SnapshotDurationTracker` (`SnapshotDurationTracker.java:31-105`): the two
