@@ -473,6 +473,58 @@ impl RecordingLog {
             .find(|entry| entry.is_term() && entry.leadership_term_id == leadership_term_id)
     }
 
+    /// The complete snapshot set at or before `log_position`, else the lowest
+    /// complete set (`findSnapshotAtOrBeforeOrLowest`, `:1197-1240`).
+    ///
+    /// A **set** is the consensus module's snapshot plus one per service, all at
+    /// the same term and log position — the shape a backup needs, because it
+    /// replays them together. `service_count` is how many services the cluster
+    /// runs, so a set is `service_count + 1` adjacent entries in the sorted view.
+    ///
+    /// The two passes are the reference's: first the latest set at or before the
+    /// asked position (a backup that wants "the newest you can give me at this
+    /// point"), then the lowest set there is, for a caller whose position is
+    /// older than every snapshot.
+    ///
+    /// Answers the entries in sorted order — service id ascending, the
+    /// consensus module's last — which is the order the reference's
+    /// `subList(i - serviceCount, i + 1)` produces.
+    #[must_use]
+    pub fn find_snapshot_at_or_before_or_lowest(
+        &self,
+        log_position: i64,
+        service_count: i32,
+    ) -> Option<Vec<Snapshot>> {
+        for index in (0..self.entries.len()).rev() {
+            let entry = &self.entries[index];
+            if !is_valid_snapshot(entry) || entry.service_id != CONSENSUS_MODULE_SERVICE_ID {
+                continue;
+            }
+            if entry.log_position > log_position {
+                continue;
+            }
+            if let Some(snapshots) =
+                validate_snapshot_entries(&self.entries, service_count, index, entry)
+            {
+                return Some(snapshots);
+            }
+        }
+
+        for index in 0..self.entries.len() {
+            let entry = &self.entries[index];
+            if !is_valid_snapshot(entry) || entry.service_id != CONSENSUS_MODULE_SERVICE_ID {
+                continue;
+            }
+            if let Some(snapshots) =
+                validate_snapshot_entries(&self.entries, service_count, index, entry)
+            {
+                return Some(snapshots);
+            }
+        }
+
+        None
+    }
+
     /// `ensureCoherent` (`:1369-1444`): make the log describe `leadership_term_id`
     /// before the term is used.
     ///
@@ -778,6 +830,51 @@ fn encode_entry(entry: &Entry) -> Result<Vec<u8>, RecordingLogError> {
         bytes[52..52 + endpoint.len()].copy_from_slice(endpoint.as_bytes());
     }
     Ok(bytes)
+}
+
+/// `isValidSnapshot` (`RecordingLog.java:1354-1357`).
+fn is_valid_snapshot(entry: &Entry) -> bool {
+    entry.is_valid && entry.entry_type == ENTRY_TYPE_SNAPSHOT
+}
+
+/// `validateSnapshotEntries` (`:1252-1271`): the `service_count` entries before
+/// the consensus module's are a snapshot set at the same term and position.
+///
+/// The type test is the reference's — `entry.type != ENTRY_TYPE_SNAPSHOT`, on
+/// the type alone rather than through `isValidSnapshot`. Kept as it is rather
+/// than tightened: a set that contains an invalidated service snapshot is the
+/// reference's own answer, and a backup that refused it would differ.
+fn validate_snapshot_entries(
+    entries: &[Entry],
+    service_count: i32,
+    snapshot_index: usize,
+    consensus_module_entry: &Entry,
+) -> Option<Vec<Snapshot>> {
+    let count = usize::try_from(service_count).ok()?;
+    let first = snapshot_index.checked_sub(count)?;
+
+    for entry in &entries[first..snapshot_index] {
+        if entry.entry_type != ENTRY_TYPE_SNAPSHOT
+            || entry.leadership_term_id != consensus_module_entry.leadership_term_id
+            || entry.log_position != consensus_module_entry.log_position
+        {
+            return None;
+        }
+    }
+
+    Some(
+        entries[first..=snapshot_index]
+            .iter()
+            .map(|entry| Snapshot {
+                recording_id: entry.recording_id,
+                leadership_term_id: entry.leadership_term_id,
+                term_base_log_position: entry.term_base_log_position,
+                log_position: entry.log_position,
+                timestamp: entry.timestamp,
+                service_id: entry.service_id,
+            })
+            .collect(),
+    )
 }
 
 fn compare_entries(a: &Entry, b: &Entry) -> std::cmp::Ordering {
@@ -1132,6 +1229,112 @@ mod tests {
         };
         assert_eq!(entry.length(), 48);
         assert_eq!(entry.aligned_length(), 64);
+    }
+
+    /// A log over a scratch file, with `sets` of `(log_position, service_count)`
+    /// snapshots appended: for each set, one snapshot per service and then the
+    /// consensus module's, all at the same term and position — the shape
+    /// `validateSnapshotEntries` accepts.
+    fn log_with_snapshot_sets(
+        name: &str,
+        sets: &[(i64, i32)],
+    ) -> (RecordingLog, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "deepmsg-recording-log-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("recording.log");
+        let mut log = RecordingLog::open(&path).expect("a recording log");
+
+        for (index, (log_position, service_count)) in sets.iter().enumerate() {
+            let recording_id = 100 + index as i64;
+            for service_id in 0..*service_count {
+                log.append_snapshot(1, 0, *log_position, 1000, recording_id, service_id)
+                    .expect("a service snapshot");
+            }
+            log.append_snapshot(
+                1,
+                0,
+                *log_position,
+                1000,
+                recording_id,
+                CONSENSUS_MODULE_SERVICE_ID,
+            )
+            .expect("the consensus module's snapshot");
+        }
+
+        (log, directory)
+    }
+
+    #[test]
+    fn the_newest_complete_set_at_or_before_the_position_is_the_answer() {
+        // Two sets: positions 1000 and 2000, one service each.
+        let (log, directory) = log_with_snapshot_sets("at-or-before", &[(1000, 1), (2000, 1)]);
+
+        let snapshots = log
+            .find_snapshot_at_or_before_or_lowest(1500, 1)
+            .expect("the 1000 set is at or before 1500");
+        assert_eq!(2, snapshots.len());
+        assert_eq!(1000, snapshots[0].log_position);
+        assert_eq!(0, snapshots[0].service_id);
+        assert_eq!(
+            CONSENSUS_MODULE_SERVICE_ID, snapshots[1].service_id,
+            "the consensus module's is last"
+        );
+
+        let latest = log
+            .find_snapshot_at_or_before_or_lowest(i64::MAX, 1)
+            .expect("the newest");
+        assert_eq!(2000, latest[0].log_position);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_position_older_than_every_set_answers_the_lowest() {
+        let (log, directory) = log_with_snapshot_sets("lowest", &[(1000, 1), (2000, 1)]);
+
+        let snapshots = log
+            .find_snapshot_at_or_before_or_lowest(0, 1)
+            .expect("the lowest set is the fallback");
+        assert_eq!(1000, snapshots[0].log_position);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn an_incomplete_set_is_not_an_answer() {
+        // Two sets at the same term, but the first has only a service snapshot.
+        let directory = std::env::temp_dir().join(format!(
+            "deepmsg-recording-log-incomplete-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("recording.log");
+        let mut log = RecordingLog::open(&path).unwrap();
+
+        log.append_snapshot(1, 0, 1000, 1000, 100, 0).unwrap();
+        log.append_snapshot(2, 0, 2000, 1000, 101, 0).unwrap();
+        log.append_snapshot(2, 0, 2000, 1000, 101, CONSENSUS_MODULE_SERVICE_ID)
+            .unwrap();
+
+        let snapshots = log
+            .find_snapshot_at_or_before_or_lowest(i64::MAX, 1)
+            .expect("the complete set at 2000");
+        assert_eq!(2000, snapshots[0].log_position);
+        assert_eq!(2, snapshots.len());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn no_set_at_all_is_none() {
+        let (log, directory) = log_with_snapshot_sets("none", &[]);
+        assert_eq!(None, log.find_snapshot_at_or_before_or_lowest(i64::MAX, 1));
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
