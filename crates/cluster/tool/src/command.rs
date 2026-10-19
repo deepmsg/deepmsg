@@ -116,11 +116,12 @@ pub fn usage() -> String {
         .unwrap_or(0);
     let mut text = format!("{HELP_PREFIX}\n");
     for command in COMMANDS {
-        let mut name = command.name.to_owned();
-        while name.len() < width {
-            name.push(' ');
-        }
-        text.push_str(&format!("{name}: {}\n", command.description));
+        // The reference right-aligns the names (`ClusterToolCommand.java:70-78`).
+        let padding = " ".repeat(width - command.name.len());
+        text.push_str(&format!(
+            "{padding}{}: {}\n",
+            command.name, command.description
+        ));
     }
     text
 }

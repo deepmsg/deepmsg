@@ -382,7 +382,7 @@ fn the_mark_file_is_aligned_to_the_drivers_file_page_size() {
     // This build has no class loader; the flag is the programmatic
     // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
     config.consensus_module_extension = true;
-    let mut agent = ConsensusModuleAgent::launch(config).expect("the module launches");
+    let agent = ConsensusModuleAgent::launch(config).expect("the module launches");
 
     let mark_file = cluster_dir
         .path()

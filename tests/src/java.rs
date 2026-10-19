@@ -116,3 +116,13 @@ pub fn archive_tool(jar: &Path, directory: &Path, command: &[&str]) -> String {
 
     run(jar, "io.aeron.archive.ArchiveTool", &args)
 }
+
+/// The reference's own `ClusterTool` against a directory: the command name
+/// comes second, as in `archive_tool`'s counterpart (`ClusterTool.java:239-270`).
+pub fn cluster_tool(jar: &Path, directory: &Path, command: &[&str]) -> String {
+    let mut args = vec![directory.to_str().expect("a path")];
+
+    args.extend_from_slice(command);
+
+    run(jar, "io.aeron.cluster.ClusterTool", &args)
+}

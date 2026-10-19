@@ -757,3 +757,10 @@ required-features = ["interop"]
 name = "cluster_lc4a_snapshot"
 path = "interop/cluster_lc4a_snapshot.rs"
 required-features = ["interop"]
+
+# The reference's own ClusterTool against the directories our nodes write: the
+# other half of LC-5, and the card's "use the reference's tool" arm.
+[[test]]
+name = "cluster_tool_reference"
+path = "interop/cluster_tool_reference.rs"
+required-features = ["interop"]
