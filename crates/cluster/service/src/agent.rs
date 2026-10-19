@@ -35,12 +35,12 @@ use deepmsg_archive::server::recording_pos::{find_counter_id_by_session, parse_k
 use deepmsg_client::client::Client;
 use deepmsg_client::image::Image;
 use deepmsg_client::publication::ExclusivePublication;
-use deepmsg_core::uri::ChannelUri;
 use deepmsg_cluster_common::counters;
 use deepmsg_cluster_common::counters::recovery::RecoveryStateKey;
 use deepmsg_cluster_common::mark::{self, ClusterMarkFile};
 use deepmsg_codec_cluster::cluster_action::ClusterAction;
 use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
+use deepmsg_core::uri::ChannelUri;
 use deepmsg_driver::idle::Strategy;
 
 use crate::adapter::{JoinLogEvent, ServiceAdapter, ServiceEvents};
@@ -330,7 +330,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
                 Err(error) => snapshot_error = Some(ContainerError::Cluster(error.to_string())),
             }
         }
-        if let Some((_, unit)) = &snapshot {
+        if let Some((_, unit, _)) = &snapshot {
             self.time_unit = *unit;
         }
 
@@ -368,12 +368,18 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
                 None => {
                     let mut reader = snapshot
                         .as_mut()
-                        .map(|(image, _)| SnapshotReader::new(image));
+                        .map(|(image, _, _)| SnapshotReader::new(image));
                     service.on_start(&mut cluster, reader.as_mut())
                 }
             };
         }
         self.context.set_lifecycle(LifecycleCallback::None);
+
+        // The business has read the image; the replay subscription can go.
+        if let Some((_, _, subscription_id)) = snapshot {
+            self.client
+                .remove_subscription(subscription_id, COMMAND_TIMEOUT)?;
+        }
 
         let ack_id = self.ack_id;
         self.ack_id += 1;
@@ -414,7 +420,10 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
     ///
     /// The image is left positioned just after END, which is where the
     /// reference leaves it: the business's own records are what it reads.
-    fn load_snapshot(&mut self, recording_id: i64) -> Result<(Image, TimeUnit), ContainerError> {
+    fn load_snapshot(
+        &mut self,
+        recording_id: i64,
+    ) -> Result<(Image, TimeUnit, i64), ContainerError> {
         let Self {
             client,
             archive,
@@ -425,17 +434,36 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
         } = self;
 
         let archive = ensure_archive(archive, client, config)?;
-        let subscription_id = archive
-            .replay(
+
+        // ★ The subscription is added **before** the replay is started, and its
+        // registration id travels in the request. That is the C client's shape
+        // (`aeron_archive_replay`, `:1512-1528`), not `AeronArchive.startReplay`
+        // + `addSubscription`: the archive answers a start only once its replay
+        // publication is **connected** (`ReplaySession.java:68`), so a
+        // subscription added afterwards can join a publication that is already
+        // publishing and start at its current position — which loses the
+        // beginning of a small snapshot (measured: a 352-byte recording arrived
+        // as its last 32-byte record).
+        let subscription_id = client.add_subscription(
+            &config.replay_channel,
+            config.replay_stream_id,
+            COMMAND_TIMEOUT,
+        )?;
+        let replay_session_id = archive
+            .start_replay(
                 client,
                 recording_id,
                 &config.replay_channel,
                 config.replay_stream_id,
-                // `startReplay(recordingId, 0, NULL_VALUE, …)` (`CSA:941`): the
-                // default length, which is the NULL value — not the `-2` the
-                // consensus module uses, which asks for an end-of-stream
-                // marker this side does not wait for.
-                &ReplayParams::default(),
+                // `startReplay(recordingId, 0, NULL_VALUE, …)` (`CSA:941`): from
+                // the recording's **first byte**. A NULL position would mean
+                // "join at the current append position".
+                &ReplayParams {
+                    position: 0,
+                    length: -1,
+                    subscription_registration_id: subscription_id,
+                    ..ReplayParams::default()
+                },
             )
             .map_err(|error| {
                 ContainerError::Cluster(format!(
@@ -443,10 +471,15 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
                 ))
             })?;
 
+        #[allow(clippy::cast_possible_truncation)]
+        // the low 32 bits are the replay publication's session
+        let replay_publication_session_id = replay_session_id as i32;
         let image_registration_id = loop {
             let image = client
                 .subscription(subscription_id)
-                .and_then(|subscription| subscription.images().first())
+                .and_then(|subscription| {
+                    subscription.image_by_session_id(replay_publication_session_id)
+                })
                 .map(Image::registration_id);
             if let Some(registration_id) = image {
                 break registration_id;
@@ -495,9 +528,11 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
             .ok_or_else(|| {
                 ContainerError::Cluster("the snapshot image ended with the snapshot".to_owned())
             })?;
-        client.remove_subscription(subscription_id, COMMAND_TIMEOUT)?;
 
-        Ok((image, loader.time_unit()))
+        // The subscription is the image's owner; it stays until the business
+        // has read the image (`CSA:946-951`'s try-with-resources). Removing it
+        // here closes the image and the records after END become unreadable.
+        Ok((image, loader.time_unit(), subscription_id))
     }
 
     /// `executeAction` (`CSA:1057-1092`): take the snapshot, then ack with its
@@ -588,9 +623,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
                 true,
             )
             .map_err(|error| {
-                ContainerError::Cluster(format!(
-                    "the snapshot recording could not start: {error}"
-                ))
+                ContainerError::Cluster(format!("the snapshot recording could not start: {error}"))
             })?;
 
         let counter_id =

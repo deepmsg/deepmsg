@@ -371,14 +371,18 @@ impl ServiceSnapshotLoader {
             error: None,
         };
 
-        let result = client.poll_image(
-            subscription_id,
-            image_registration_id,
-            FRAGMENT_LIMIT,
-            |fragment| {
-                let _ = assembler.push_controlled(fragment, &mut dispatch);
-            },
-        );
+        // ★ **One fragment per poll**, where the reference reads a batch of
+        // `FRAGMENT_LIMIT`. `Image.controlledPoll` stops on `Action.BREAK`
+        // **without** consuming the record after END; this build's
+        // `Client::poll_image` hands a whole batch to the closure, and the
+        // assembler's answer cannot stop it. A batch therefore walks the image
+        // past END — measured: the image stood at 352 (the business's record
+        // included) by the time `on_start` was given it, and the state was
+        // unreachable. One at a time costs a few extra calls and leaves the
+        // image where the reference leaves it.
+        let result = client.poll_image(subscription_id, image_registration_id, 1, |fragment| {
+            let _ = assembler.push_controlled(fragment, &mut dispatch);
+        });
 
         self.assembler = assembler;
         self.in_snapshot = dispatch.in_snapshot;
@@ -416,6 +420,14 @@ impl ControlledHandler for Dispatch<'_> {
 
 impl Dispatch<'_> {
     fn dispatch(&mut self, message: Message<'_>) -> Result<Action, ContainerError> {
+        // Everything after END is the business's (`on_start` reads it), and the
+        // reference's poll stops at END (`Action.BREAK`). The client's poll
+        // here keeps handing fragments to the assembler after a `Break`, so the
+        // stop is enforced where the records are decoded.
+        if self.done {
+            return Ok(Action::Break);
+        }
+
         let payload = message.payload;
         if payload.len() < MESSAGE_HEADER_LENGTH {
             return Err(ContainerError::Cluster(format!(
@@ -428,7 +440,9 @@ impl Dispatch<'_> {
         let schema_id = header.schema_id();
         if schema_id != SBE_SCHEMA_ID {
             return Err(ContainerError::Cluster(format!(
-                "expected schemaId={SBE_SCHEMA_ID}, actual={schema_id}"
+                "expected schemaId={SBE_SCHEMA_ID}, actual={schema_id} (length={}, head={:?})",
+                payload.len(),
+                &payload[..payload.len().min(24)]
             )));
         }
 
@@ -449,8 +463,7 @@ impl Dispatch<'_> {
                         }
                         self.in_snapshot = true;
                         self.app_version = marker.app_version().unwrap_or(0);
-                        self.time_unit =
-                            TimeUnit::from_cluster_time_unit(marker.time_unit());
+                        self.time_unit = TimeUnit::from_cluster_time_unit(marker.time_unit());
                         self.handler
                             .on_load_begin_snapshot(self.app_version, self.time_unit)?;
                         Ok(Action::Continue)
@@ -582,7 +595,9 @@ mod tests {
         {
             let mut taker = ServiceSnapshotTaker::new(&mut sink, TimeUnit::Milliseconds, 7);
             taker.mark_begin(1_024, 5).expect("BEGIN");
-            taker.snapshot_session(&session(channel, &[1, 2, 3])).expect("session");
+            taker
+                .snapshot_session(&session(channel, &[1, 2, 3]))
+                .expect("session");
             taker.mark_end(1_024, 5).expect("END");
         }
 

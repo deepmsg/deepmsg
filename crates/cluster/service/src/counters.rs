@@ -134,11 +134,7 @@ impl SnapshotDuration {
 /// `SystemUtil.formatDuration` (`SystemUtil.java`): the exact-division ladder,
 /// in this order, with the reference's suffixes.
 fn format_duration_ns(duration_ns: i64) -> String {
-    for (unit, scale) in [
-        ("s", 1_000_000_000_i64),
-        ("ms", 1_000_000),
-        ("us", 1_000),
-    ] {
+    for (unit, scale) in [("s", 1_000_000_000_i64), ("ms", 1_000_000), ("us", 1_000)] {
         if duration_ns >= scale && duration_ns % scale == 0 {
             return format!("{}{unit}", duration_ns / scale);
         }

@@ -95,7 +95,8 @@ pub const ARCHIVE_LOCAL_CONTROL_STREAM_ID_PROP_NAME: &str = "aeron.archive.local
 /// `LOCAL_CONTROL_STREAM_ID_DEFAULT` (`AeronArchive.java:2735`).
 pub const ARCHIVE_LOCAL_CONTROL_STREAM_ID_DEFAULT: i32 = 10;
 /// `CONTROL_RESPONSE_STREAM_ID_PROP_NAME` (`AeronArchive.java:2758`).
-pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_PROP_NAME: &str = "aeron.archive.control.response.stream.id";
+pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_PROP_NAME: &str =
+    "aeron.archive.control.response.stream.id";
 /// `CONTROL_RESPONSE_STREAM_ID_DEFAULT` (`AeronArchive.java:2764`).
 pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_DEFAULT: i32 = 20;
 /// `SNAPSHOT_DURATION_THRESHOLD_PROP_NAME` (`ClusteredServiceContainer.java:430`).
@@ -384,7 +385,10 @@ mod tests {
         );
         assert_eq!(config.replay_stream_id, 103);
         assert_eq!(config.snapshot_stream_id, 106);
-        assert_eq!(config.archive_local_control_channel, "aeron:ipc?term-length=64k");
+        assert_eq!(
+            config.archive_local_control_channel,
+            "aeron:ipc?term-length=64k"
+        );
         assert_eq!(config.archive_local_control_stream_id, 10);
         // clusterId 0, serviceId 0, control response stream 20 ⇒ 121.
         assert_eq!(config.archive_control_response_stream_id, 121);

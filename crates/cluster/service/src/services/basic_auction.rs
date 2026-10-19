@@ -254,9 +254,21 @@ impl ClusteredService for BasicAuction {
             return Ok(());
         }
 
-        let correlation_id = i64::from_le_bytes(payload[CORRELATION_ID_OFFSET..CUSTOMER_ID_OFFSET].try_into().expect("eight bytes"));
-        let customer_id = i64::from_le_bytes(payload[CUSTOMER_ID_OFFSET..PRICE_OFFSET].try_into().expect("eight bytes"));
-        let price = i64::from_le_bytes(payload[PRICE_OFFSET..BID_MESSAGE_LENGTH].try_into().expect("eight bytes"));
+        let correlation_id = i64::from_le_bytes(
+            payload[CORRELATION_ID_OFFSET..CUSTOMER_ID_OFFSET]
+                .try_into()
+                .expect("eight bytes"),
+        );
+        let customer_id = i64::from_le_bytes(
+            payload[CUSTOMER_ID_OFFSET..PRICE_OFFSET]
+                .try_into()
+                .expect("eight bytes"),
+        );
+        let price = i64::from_le_bytes(
+            payload[PRICE_OFFSET..BID_MESSAGE_LENGTH]
+                .try_into()
+                .expect("eight bytes"),
+        );
 
         let bid_succeeded = self.auction.attempt_bid(price, customer_id);
 
@@ -325,7 +337,10 @@ mod tests {
         let egress = BasicAuction::egress_message(7, 3, 1_000, true);
         assert_eq!(i64::from_le_bytes(egress[0..8].try_into().unwrap()), 7);
         assert_eq!(i64::from_le_bytes(egress[8..16].try_into().unwrap()), 3);
-        assert_eq!(i64::from_le_bytes(egress[16..24].try_into().unwrap()), 1_000);
+        assert_eq!(
+            i64::from_le_bytes(egress[16..24].try_into().unwrap()),
+            1_000
+        );
         assert_eq!(egress[24], 1);
 
         let mut auction = BasicAuction::new();

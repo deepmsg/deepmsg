@@ -156,6 +156,11 @@ impl Lc4a {
             replay_stream_id: 103,
             snapshot_channel: "aeron:ipc?alias=snapshot".to_owned(),
             snapshot_stream_id: 106,
+            archive_local_control_channel: "aeron:ipc?term-length=64k".to_owned(),
+            archive_local_control_stream_id: 10,
+            // `clusterId * 100 + 100 + controlResponseStreamId + (serviceId + 1)`.
+            archive_control_response_stream_id: CLUSTER_ID * 100 + 100 + 20 + 1,
+            snapshot_duration_threshold_ns: 1_000_000_000,
         }
     }
 
