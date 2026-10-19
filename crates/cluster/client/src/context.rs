@@ -164,6 +164,12 @@ pub struct AeronClusterContext {
     pub credentials: Box<dyn CredentialsSupplier>,
     /// What the session's deadlines read.
     pub nano_clock: Box<dyn NanoClock>,
+    /// The session's listener, if it was given one. A session that polls egress
+    /// with no listener has nowhere to put a message, and says so when one
+    /// arrives.
+    pub egress_listener: Option<Box<dyn crate::egress::EgressListener>>,
+    /// The controlled listener, for `controlled_poll_egress`.
+    pub controlled_egress_listener: Option<Box<dyn crate::egress::ControlledEgressListener>>,
     /// `conclude` has run, once.
     is_concluded: bool,
 }
@@ -182,6 +188,8 @@ impl Default for AeronClusterContext {
             is_ingress_exclusive: true,
             credentials: Box::new(NullCredentialsSupplier),
             nano_clock: Box::new(SystemNanoClock),
+            egress_listener: None,
+            controlled_egress_listener: None,
             is_concluded: false,
         }
     }
@@ -199,6 +207,11 @@ impl fmt::Debug for AeronClusterContext {
             .field("egress_stream_id", &self.egress_stream_id)
             .field("client_name", &self.client_name)
             .field("is_ingress_exclusive", &self.is_ingress_exclusive)
+            .field("egress_listener", &self.egress_listener.is_some())
+            .field(
+                "controlled_egress_listener",
+                &self.controlled_egress_listener.is_some(),
+            )
             .field("is_concluded", &self.is_concluded)
             .finish()
     }
@@ -324,6 +337,23 @@ impl AeronClusterContext {
     #[must_use]
     pub fn nano_clock(mut self, clock: Box<dyn NanoClock>) -> Self {
         self.nano_clock = clock;
+        self
+    }
+
+    /// The listener a session's `poll_egress` delivers to.
+    #[must_use]
+    pub fn egress_listener(mut self, listener: Box<dyn crate::egress::EgressListener>) -> Self {
+        self.egress_listener = Some(listener);
+        self
+    }
+
+    /// The listener a session's `controlled_poll_egress` delivers to.
+    #[must_use]
+    pub fn controlled_egress_listener(
+        mut self,
+        listener: Box<dyn crate::egress::ControlledEgressListener>,
+    ) -> Self {
+        self.controlled_egress_listener = Some(listener);
         self
     }
 
