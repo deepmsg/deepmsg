@@ -29,6 +29,7 @@
 #![deny(clippy::disallowed_types)]
 
 pub mod context;
+pub mod egress_poller;
 pub mod error;
 
 pub use context::{
@@ -38,4 +39,5 @@ pub use context::{
     MAX_CLIENT_NAME_LENGTH, MESSAGE_TIMEOUT_DEFAULT_NS, MESSAGE_TIMEOUT_PROP_NAME,
     NullCredentialsSupplier, PROTOCOL_SEMANTIC_VERSION,
 };
+pub use egress_poller::EgressPoller;
 pub use error::ClusterClientError;
