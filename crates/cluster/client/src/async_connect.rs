@@ -1626,6 +1626,10 @@ mod tests {
     }
 
     fn session_event(correlation_id: i64) -> Vec<u8> {
+        session_event_with(correlation_id, EventCode::OK, b"you are now connected")
+    }
+
+    fn session_event_with(correlation_id: i64, code: EventCode, detail: &[u8]) -> Vec<u8> {
         let mut buffer = vec![0u8; 256];
         let length = {
             let encoder = SessionEventEncoder::default().wrap(
@@ -1640,16 +1644,41 @@ mod tests {
                 .correlation_id(correlation_id)
                 .leadership_term_id(5)
                 .leader_member_id(2)
-                .code(EventCode::OK)
+                .code(code)
                 .version(PROTOCOL_SEMANTIC_VERSION)
                 .leader_heartbeat_timeout_ns_opt(None)
-                .detail(b"you are now connected");
+                .detail(detail);
 
             message_header_codec::ENCODED_LENGTH + encoder.encoded_length()
         };
 
         buffer.truncate(length);
         buffer
+    }
+
+    /// A connect that has offered its request and is waiting for the answer.
+    fn driven_to_poll_response() -> (AsyncConnect, RecordingClient) {
+        let mut client = RecordingClient::new();
+        let mut connect = connect().context_is_concurrent();
+
+        land_egress(&mut connect, &mut client);
+        connect.poll_with(&mut client).expect("the ingress add");
+        let publication = client.last_registration_id();
+        client.answer(publication, AddAnswer::Ready);
+        connect
+            .poll_with(&mut client)
+            .expect("the ingress publication lands");
+        client.connect(publication);
+        connect
+            .poll_with(&mut client)
+            .expect("the state moves to await");
+        connect
+            .poll_with(&mut client)
+            .expect("the request is prepared");
+        connect.poll_with(&mut client).expect("the request is sent");
+
+        assert_eq!(ConnectState::PollResponse, connect.state());
+        (connect, client)
     }
 
     /// The request's bytes are the contract (`AC:2452-2471`).
@@ -1711,27 +1740,11 @@ mod tests {
     /// connect, and the session carries the reference's five values.
     #[test]
     fn an_ok_session_event_completes_the_connect() {
-        let mut client = RecordingClient::new();
-        let mut connect = connect().context_is_concurrent();
-
-        land_egress(&mut connect, &mut client);
-        connect.poll_with(&mut client).expect("the ingress add");
-        let publication = client.last_registration_id();
-        client.answer(publication, AddAnswer::Ready);
-        connect
-            .poll_with(&mut client)
-            .expect("the ingress publication lands");
-        client.connect(publication);
-        connect
-            .poll_with(&mut client)
-            .expect("the state moves to await");
-        connect
-            .poll_with(&mut client)
-            .expect("the request is prepared");
-        assert_eq!(ConnectState::SendMessage, connect.state());
-
-        connect.poll_with(&mut client).expect("the request is sent");
-        assert_eq!(ConnectState::PollResponse, connect.state());
+        let (mut connect, mut client) = driven_to_poll_response();
+        let publication = connect
+            .ingress_publication
+            .expect("the connect chose a publication")
+            .registration_id();
         let correlation_id = connect.correlation_id().expect("a request");
 
         client.push_egress(session_event(correlation_id));
@@ -1752,6 +1765,41 @@ mod tests {
             session.new_leader_timeout_ns(),
             "no heartbeat in the answer, so the reference's ten-second default"
         );
+    }
+
+    /// The correlation id is the whole of "this answer is mine"
+    /// (`AC:2488-2490`): an answer to another request does not complete the
+    /// connect.
+    #[test]
+    fn an_answer_to_another_request_does_not_complete_the_connect() {
+        let (mut connect, mut client) = driven_to_poll_response();
+        let correlation_id = connect.correlation_id().expect("a request");
+
+        client.push_egress(session_event(correlation_id + 1));
+        connect
+            .poll_with(&mut client)
+            .expect("someone else's answer");
+
+        assert_eq!(ConnectState::PollResponse, connect.state());
+    }
+
+    /// An `ERROR` event is the cluster refusing the connect, in its own words
+    /// (`AC:2511-2512`).
+    #[test]
+    fn an_error_event_fails_the_connect_with_the_clusters_words() {
+        let (mut connect, mut client) = driven_to_poll_response();
+        let correlation_id = connect.correlation_id().expect("a request");
+
+        client.push_egress(session_event_with(
+            correlation_id,
+            EventCode::ERROR,
+            b"session limit reached",
+        ));
+        let error = connect
+            .poll_with(&mut client)
+            .expect_err("the cluster refused it");
+
+        assert_eq!("ERROR - session limit reached", error.to_string());
     }
 
     impl AsyncConnect {
