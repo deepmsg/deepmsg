@@ -73,6 +73,19 @@ pub const PROTOCOL_VERSION: i32 = 3 << 8;
 /// How long an exchange may take before the test is a failure.
 pub const DEADLINE: Duration = Duration::from_secs(90);
 
+/// The budget for a wait whose work is a **catch-up**: a follower joining a
+/// log it is behind on.
+///
+/// The election's own attempt budget is `aeron.cluster.leader.heartbeat.timeout`
+/// (ten seconds, the reference's default, set to thirty in [`Node::start`]
+/// because this harness runs three consensus modules, three archiving media
+/// drivers and a client driver on one machine), and an attempt that misses its
+/// budget is retried from `INIT` — which restarts the replay, the log
+/// subscription and the recording. Several such attempts are ordinary on a
+/// loaded runner, and the reference's own cluster tests give their scenarios
+/// minutes rather than ninety seconds.
+pub const CATCHUP_DEADLINE: Duration = Duration::from_secs(180);
+
 /// Member roles, as counter 201 carries them (`Cluster.Role`).
 pub const ROLE_FOLLOWER: i64 = 0;
 /// The leader's role code.
@@ -125,12 +138,31 @@ impl Default for ChannelShape {
     }
 }
 
+/// The variable that names the port block a run takes, for a machine with more
+/// than one of these test binaries running at once.
+pub const PORT_BASE_ENV: &str = "CLUSTER_HARNESS_PORT_BASE";
+
 impl Ports {
     pub fn new() -> Self {
-        // 21000..24990, in tens; the highest offset used is +35 (a second
-        // client's egress port is +30 plus its offset).
+        // A block of fifty per run, because the highest offset used is +35 (a
+        // second client's egress port is +30 plus its offset). Eighty blocks,
+        // 21000..25200 — below the kernel's ephemeral range, which is where a
+        // random `pid %` would otherwise land.
+        //
+        // ★ **The block is per *process*, and two processes can land on the
+        // same one**: `pid %` is not a reservation, and this repository is
+        // developed in several worktrees at once. A run that has to coexist
+        // names its block ([`PORT_BASE_ENV`]); the earlier scheme used ten-port
+        // spacing against forty ports of use, so *any* two concurrent processes
+        // overlapped and the second one met `Address already in use` from a
+        // socket the first was still holding.
+        let base = std::env::var(PORT_BASE_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or_else(|| 21_000 + (u16::try_from(std::process::id() % 80).unwrap()) * 50);
+
         Self {
-            base: 21_000 + (u16::try_from(std::process::id() % 400).unwrap()) * 10,
+            base,
             egress_offset: 0,
             shape: ChannelShape::default(),
         }
@@ -395,6 +427,16 @@ impl Node {
             "-Daeron.cluster.control.channel=aeron:ipc?term-length=128k".to_owned(),
             "-Daeron.cluster.replication.channel=aeron:udp?endpoint=localhost:0".to_owned(),
             "-Daeron.cluster.service.count=0".to_owned(),
+            // The election's attempt budget, raised from the reference's
+            // ten-second default: this harness runs three consensus modules,
+            // three archiving media drivers (each a process) and a client
+            // driver over one machine, and a CI runner has four virtual cores.
+            // A catch-up attempt that misses the budget is **retried from
+            // `INIT`**, which throws away the replay, the log subscription and
+            // the recording start — so a budget that is too short turns one
+            // slow step into a loop. The reference's own `TestCluster` exposes
+            // this as `withLeaderHeartbeatTimeoutNs`.
+            "-Daeron.cluster.leader.heartbeat.timeout=30s".to_owned(),
         ];
 
         let mut node = Self {
