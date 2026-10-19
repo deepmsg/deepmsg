@@ -1170,3 +1170,103 @@ mod tests {
         })
     }
 }
+
+#[cfg(test)]
+mod compatibility_tests {
+    use deepmsg_codec::cluster::ReadBuf;
+    use deepmsg_codec::cluster::message_header_codec::MessageHeaderDecoder;
+    use deepmsg_codec::cluster::session_event_codec::SessionEventDecoder;
+
+    use super::*;
+
+    /// `readingVersion12UsingVersion5Codec`: a message written for an older
+    /// schema is read by the current decoder.
+    ///
+    /// The reference compares two generated codecs (v12 writes, v5 reads). This
+    /// build generates only the current schema, so the property is stated on
+    /// the one decoder it has: a `SessionEvent` whose header says **acting
+    /// block length 32 and acting version 5** — the shape a v5 writer
+    /// produced — reads its required fields, and answers `None` for the two
+    /// optional fields that version did not have. That is exactly what the
+    /// generated decoder switches on (`version()` below acting version 6,
+    /// `leader_heartbeat_timeout_ns()` below 13).
+    #[test]
+    fn an_older_acting_version_reads_the_required_fields_and_skips_the_optional_ones() {
+        const V5_BLOCK_LENGTH: u16 = 32;
+        const V5_ACTING_VERSION: u16 = 5;
+        const CLUSTER_SESSION_ID: i64 = -4_623_823;
+        const CORRELATION_ID: i64 = 3_583_456_348_756_843;
+        const LEADERSHIP_TERM_ID: i64 = 10_000_000_000;
+        const LEADER_MEMBER_ID: i32 = 2;
+        let detail = b"some very detailed message";
+
+        let mut bytes = vec![0u8; 8 + V5_BLOCK_LENGTH as usize + 4 + detail.len()];
+        // The SBE header: the acting block length and version are the old
+        // writer's, and they are what the decoder acts on.
+        bytes[0..2].copy_from_slice(&V5_BLOCK_LENGTH.to_le_bytes());
+        bytes[2..4].copy_from_slice(&SESSION_EVENT_TEMPLATE_ID.to_le_bytes());
+        bytes[4..6].copy_from_slice(&SBE_SCHEMA_ID.to_le_bytes());
+        bytes[6..8].copy_from_slice(&V5_ACTING_VERSION.to_le_bytes());
+
+        // The v5 block: through `code`, and no further.
+        bytes[8..16].copy_from_slice(&CLUSTER_SESSION_ID.to_le_bytes());
+        bytes[16..24].copy_from_slice(&CORRELATION_ID.to_le_bytes());
+        bytes[24..32].copy_from_slice(&LEADERSHIP_TERM_ID.to_le_bytes());
+        bytes[32..36].copy_from_slice(&LEADER_MEMBER_ID.to_le_bytes());
+        bytes[36..40].copy_from_slice(&i32::from(EventCode::REDIRECT).to_le_bytes());
+        // The variable field starts where the **acting** block ends.
+        let at = 8 + V5_BLOCK_LENGTH as usize;
+        bytes[at..at + 4].copy_from_slice(&(detail.len() as u32).to_le_bytes());
+        bytes[at + 4..].copy_from_slice(detail);
+
+        let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(&bytes), 0);
+        let mut decoder = SessionEventDecoder::default().header(header, 0);
+
+        assert_eq!(CLUSTER_SESSION_ID, decoder.cluster_session_id());
+        assert_eq!(CORRELATION_ID, decoder.correlation_id());
+        assert_eq!(LEADERSHIP_TERM_ID, decoder.leadership_term_id());
+        assert_eq!(LEADER_MEMBER_ID, decoder.leader_member_id());
+        assert_eq!(EventCode::REDIRECT, decoder.code());
+        assert_eq!(None, decoder.version(), "a v5 writer had no version field");
+        assert_eq!(
+            None,
+            decoder.leader_heartbeat_timeout_ns(),
+            "a v5 writer had no heartbeat field"
+        );
+
+        let coordinates = decoder.detail_decoder();
+        assert_eq!(Some(detail.as_slice()), var_slice(&bytes, coordinates));
+
+        // And the client's own decode reads the same message.
+        match decode(&Message {
+            header: deepmsg_client::fragment_assembler::MessageHeader {
+                session_id: 0,
+                stream_id: 102,
+                term_offset: 0,
+                flags: 0,
+                position: 0,
+                frame_length: 0,
+                fragmented_frame_length: 0,
+                image_registration_id: 0,
+            },
+            payload: &bytes,
+        }) {
+            Some(Egress::SessionEvent {
+                cluster_session_id,
+                correlation_id,
+                leadership_term_id,
+                leader_member_id,
+                code,
+                detail: decoded_detail,
+            }) => {
+                assert_eq!(CLUSTER_SESSION_ID, cluster_session_id);
+                assert_eq!(CORRELATION_ID, correlation_id);
+                assert_eq!(LEADERSHIP_TERM_ID, leadership_term_id);
+                assert_eq!(LEADER_MEMBER_ID, leader_member_id);
+                assert_eq!(EventCode::REDIRECT, code);
+                assert_eq!(detail.as_slice(), decoded_detail);
+            }
+            other => panic!("the older message decoded as {other:?}"),
+        }
+    }
+}

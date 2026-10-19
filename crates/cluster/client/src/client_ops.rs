@@ -110,6 +110,30 @@ pub(crate) trait ClientOps {
         payload: &[u8],
     ) -> Option<Appended>;
 
+    /// Offer a message made of two parts — the cluster session header and the
+    /// caller's payload — as one message (`Publication.offer(bufferOne, …,
+    /// bufferTwo, …)`).
+    fn offer_two_slices(
+        &self,
+        kind: PublicationKind,
+        registration_id: i64,
+        first: &[u8],
+        second: &[u8],
+    ) -> Option<Appended>;
+
+    /// Drive the client one turn: read what the driver has said and answer
+    /// nothing. The session's own loops call it where the reference calls
+    /// `runAgentInvokers` — adding a publication blocks until the driver makes
+    /// it, and only a turn of the client lets the driver say so.
+    fn poll(&mut self);
+
+    /// Whether the image a session is connected through has closed.
+    ///
+    /// An image the subscription no longer holds is counted as closed: the
+    /// connection it stood for is gone either way, and the session's reaction
+    /// to both is the same.
+    fn image_is_closed(&self, subscription_id: i64, image_registration_id: i64) -> bool;
+
     /// Read whole messages from the subscription under a controlled handler
     /// (`Subscription.controlledPoll`).
     fn poll_egress(
@@ -216,6 +240,33 @@ impl ClientOps for Client {
             PublicationKind::Concurrent => Client::offer(self, registration_id, payload),
             PublicationKind::Exclusive => Client::offer_exclusive(self, registration_id, payload),
         }
+    }
+
+    fn offer_two_slices(
+        &self,
+        kind: PublicationKind,
+        registration_id: i64,
+        first: &[u8],
+        second: &[u8],
+    ) -> Option<Appended> {
+        match kind {
+            PublicationKind::Concurrent => {
+                Client::offer_two_slices(self, registration_id, first, second)
+            }
+            PublicationKind::Exclusive => {
+                Client::offer_two_slices_exclusive(self, registration_id, first, second)
+            }
+        }
+    }
+
+    fn poll(&mut self) {
+        let _ = Client::poll(self);
+    }
+
+    fn image_is_closed(&self, subscription_id: i64, image_registration_id: i64) -> bool {
+        Client::subscription(self, subscription_id)
+            .and_then(|subscription| subscription.image(image_registration_id))
+            .is_none_or(deepmsg_client::image::Image::is_closed)
     }
 
     fn poll_egress(
