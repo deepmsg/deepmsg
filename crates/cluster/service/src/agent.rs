@@ -95,6 +95,15 @@ impl ShutdownHandle {
 pub struct ClusteredServiceAgent<S: ClusteredService> {
     config: ServiceContainerConfig,
     client: Client,
+    /// Whether [`Self::close`] tells the driver this client is done.
+    ///
+    /// `true` for every caller that lets the agent connect its own client —
+    /// the binary and the tests. `false` is the reference's in-process shape
+    /// (`ClusteredServiceContainer.Context.ownsAeronClient(false)`): the
+    /// caller's client is not closed, so the counters the driver keyed to it
+    /// survive the container and a consensus module watching them does not
+    /// see a service leave.
+    owns_client: bool,
     /// The local archive, connected the first time a snapshot is taken or
     /// loaded. **A deviation from the reference**, which connects and closes one
     /// per operation (`CSA:938`, `:990`): this build's `Archive` has no
@@ -140,6 +149,19 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
     /// file cannot be created, a counter cannot be allocated, or the recovery
     /// state names a snapshot that cannot be loaded.
     pub fn launch(config: ServiceContainerConfig, service: S) -> Result<Self, ContainerError> {
+        Self::launch_with_client_ownership(config, service, true)
+    }
+
+    /// The same, with the caller owning the client (see [`Self::owns_client`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::launch`].
+    pub fn launch_with_client_ownership(
+        config: ServiceContainerConfig,
+        service: S,
+        owns_client: bool,
+    ) -> Result<Self, ContainerError> {
         // The thread the agent runs on carries the service name
         // (`ClusteredServiceContainer.java:929-930`); the binary set it too,
         // and an in-process container gets the same name from here.
@@ -236,6 +258,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
             log_adapter: BoundedLogAdapter::new(config.log_fragment_limit),
             config,
             client,
+            owns_client,
             archive: None,
             service,
             context,
@@ -1180,7 +1203,11 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
         if let Err(error) = self.context.mark_file().signal_terminated() {
             eprintln!("failed to signal the mark file terminated: {error}");
         }
-        self.client.close();
+        if self.owns_client {
+            self.client.close();
+        } else {
+            self.client.detach();
+        }
         Ok(())
     }
 }

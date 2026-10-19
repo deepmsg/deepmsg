@@ -1161,7 +1161,15 @@ impl TestCluster {
         let (started_tx, started_rx) = mpsc::channel();
 
         let thread = std::thread::spawn(move || -> Result<(), String> {
-            let mut agent = match ClusteredServiceAgent::launch(config, observed) {
+            // The reference's in-process container is given an Aeron client it
+            // does not own (`ownsAeronClient=false`): when this agent ends, the
+            // client's counters stay in the driver and the consensus module
+            // does not see a service leave. Closing it here would take the
+            // node's driver side down with the failed service, which is the
+            // bug `cluster_lc4a_snapshot_failure` caught.
+            let mut agent = match ClusteredServiceAgent::launch_with_client_ownership(
+                config, observed, false,
+            ) {
                 Ok(agent) => agent,
                 Err(error) => {
                     let message = error.to_string();
