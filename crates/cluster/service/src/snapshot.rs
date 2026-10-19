@@ -28,14 +28,19 @@
 //! (`ConsensusModuleSnapshotTaker`), so the retry loop and its answers are the
 //! same in both places.
 
-use deepmsg_codec_cluster::WriteBuf;
-use deepmsg_codec_cluster::client_session_codec::{
-    ClientSessionEncoder, SBE_BLOCK_LENGTH as CLIENT_SESSION_BLOCK_LENGTH,
-};
-use deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH as MESSAGE_HEADER_LENGTH;
-use deepmsg_codec_cluster::snapshot_mark::SnapshotMark;
-use deepmsg_codec_cluster::snapshot_marker_codec::{
-    SBE_BLOCK_LENGTH as SNAPSHOT_MARKER_BLOCK_LENGTH, SnapshotMarkerEncoder,
+use deepmsg_client::client::Client;
+use deepmsg_client::fragment_assembler::{Action, ControlledHandler, FragmentAssembler, Message};
+use deepmsg_codec_cluster::client_session_codec::ClientSessionDecoder;
+use deepmsg_codec_cluster::message_header_codec::MessageHeaderDecoder;
+use deepmsg_codec_cluster::snapshot_marker_codec::SnapshotMarkerDecoder;
+use deepmsg_codec_cluster::{
+    ReadBuf, SBE_SCHEMA_ID, WriteBuf,
+    client_session_codec::{ClientSessionEncoder, SBE_BLOCK_LENGTH as CLIENT_SESSION_BLOCK_LENGTH},
+    message_header_codec::ENCODED_LENGTH as MESSAGE_HEADER_LENGTH,
+    snapshot_mark::SnapshotMark,
+    snapshot_marker_codec::{
+        SBE_BLOCK_LENGTH as SNAPSHOT_MARKER_BLOCK_LENGTH, SnapshotMarkerEncoder,
+    },
 };
 
 use crate::error::ContainerError;
@@ -239,6 +244,251 @@ impl<'a> ServiceSnapshotTaker<'a> {
     }
 }
 
+/// One `ClientSession` record, as the loader decoded it
+/// (`ServiceSnapshotLoader.java:118-136`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotSession<'a> {
+    /// `clusterSessionId`.
+    pub cluster_session_id: i64,
+    /// `responseStreamId`.
+    pub response_stream_id: i32,
+    /// `responseChannel`.
+    pub response_channel: &'a str,
+    /// `encodedPrincipal`.
+    pub encoded_principal: &'a [u8],
+}
+
+/// What the loader does with each record (`ClusteredServiceAgent.onLoad*`).
+pub trait SnapshotLoadHandler {
+    /// `SnapshotMarker(BEGIN)`: the snapshot's app version and time unit.
+    ///
+    /// # Errors
+    ///
+    /// Any error the caller wants to end the load with.
+    fn on_load_begin_snapshot(
+        &mut self,
+        app_version: i32,
+        time_unit: TimeUnit,
+    ) -> Result<(), ContainerError>;
+
+    /// One `ClientSession` record.
+    ///
+    /// # Errors
+    ///
+    /// Any error the caller wants to end the load with.
+    fn on_load_cluster_session(
+        &mut self,
+        session: SnapshotSession<'_>,
+    ) -> Result<(), ContainerError>;
+
+    /// `SnapshotMarker(END)`. The business's records follow this one; they are
+    /// not the loader's to read.
+    ///
+    /// # Errors
+    ///
+    /// Any error the caller wants to end the load with.
+    fn on_load_end_snapshot(&mut self) -> Result<(), ContainerError>;
+}
+
+/// `ServiceSnapshotLoader` (`ServiceSnapshotLoader.java:29-140`).
+///
+/// Two templates only: `SnapshotMarker(100)` and `ClientSession(102)`.
+/// Anything else is ignored, as the reference's dispatch is — a snapshot is
+/// allowed to carry records this build does not know, but not to be a
+/// different snapshot.
+pub struct ServiceSnapshotLoader {
+    assembler: FragmentAssembler,
+    in_snapshot: bool,
+    done: bool,
+    app_version: i32,
+    time_unit: TimeUnit,
+}
+
+impl Default for ServiceSnapshotLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ServiceSnapshotLoader {
+    /// A loader at the start of a snapshot.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            assembler: FragmentAssembler::new(),
+            in_snapshot: false,
+            done: false,
+            app_version: 0,
+            time_unit: TimeUnit::Milliseconds,
+        }
+    }
+
+    /// Whether the END marker has been read.
+    #[must_use]
+    pub const fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// The app version the snapshot's BEGIN carried.
+    #[must_use]
+    pub const fn app_version(&self) -> i32 {
+        self.app_version
+    }
+
+    /// The time unit the snapshot's BEGIN carried.
+    #[must_use]
+    pub const fn time_unit(&self) -> TimeUnit {
+        self.time_unit
+    }
+
+    /// Poll the replay image once (`ServiceSnapshotLoader.poll`,
+    /// `ServiceSnapshotLoader.java:67-70`).
+    ///
+    /// # Errors
+    ///
+    /// [`ContainerError::Cluster`] for a malformed record, a schema other than
+    /// this one, a snapshot type other than the container's, or a BEGIN/END
+    /// mismatch.
+    pub fn poll(
+        &mut self,
+        client: &mut Client,
+        subscription_id: i64,
+        image_registration_id: i64,
+        handler: &mut dyn SnapshotLoadHandler,
+    ) -> Result<Option<usize>, ContainerError> {
+        let mut assembler = core::mem::replace(&mut self.assembler, FragmentAssembler::new());
+        let mut dispatch = Dispatch {
+            handler,
+            in_snapshot: self.in_snapshot,
+            done: self.done,
+            app_version: self.app_version,
+            time_unit: self.time_unit,
+            error: None,
+        };
+
+        let result = client.poll_image(
+            subscription_id,
+            image_registration_id,
+            FRAGMENT_LIMIT,
+            |fragment| {
+                let _ = assembler.push_controlled(fragment, &mut dispatch);
+            },
+        );
+
+        self.assembler = assembler;
+        self.in_snapshot = dispatch.in_snapshot;
+        self.done = dispatch.done;
+        self.app_version = dispatch.app_version;
+        self.time_unit = dispatch.time_unit;
+        if let Some(error) = dispatch.error {
+            return Err(error);
+        }
+        Ok(result)
+    }
+}
+
+/// The loader as the assembler's listener.
+struct Dispatch<'a> {
+    handler: &'a mut dyn SnapshotLoadHandler,
+    in_snapshot: bool,
+    done: bool,
+    app_version: i32,
+    time_unit: TimeUnit,
+    error: Option<ContainerError>,
+}
+
+impl ControlledHandler for Dispatch<'_> {
+    fn on_message(&mut self, message: Message<'_>) -> Action {
+        match self.dispatch(message) {
+            Ok(action) => action,
+            Err(error) => {
+                self.error = Some(error);
+                Action::Abort
+            }
+        }
+    }
+}
+
+impl Dispatch<'_> {
+    fn dispatch(&mut self, message: Message<'_>) -> Result<Action, ContainerError> {
+        let payload = message.payload;
+        if payload.len() < MESSAGE_HEADER_LENGTH {
+            return Err(ContainerError::Cluster(format!(
+                "snapshot record of {} bytes is shorter than the message header",
+                payload.len()
+            )));
+        }
+
+        let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
+        let schema_id = header.schema_id();
+        if schema_id != SBE_SCHEMA_ID {
+            return Err(ContainerError::Cluster(format!(
+                "expected schemaId={SBE_SCHEMA_ID}, actual={schema_id}"
+            )));
+        }
+
+        match header.template_id() {
+            100 => {
+                let marker = SnapshotMarkerDecoder::default().header(header, 0);
+                if marker.type_id() != SNAPSHOT_TYPE_ID {
+                    return Err(ContainerError::Cluster(format!(
+                        "unexpected snapshot type: {}",
+                        marker.type_id()
+                    )));
+                }
+
+                match marker.mark() {
+                    SnapshotMark::BEGIN => {
+                        if self.in_snapshot {
+                            return Err(ContainerError::Cluster("already in snapshot".to_owned()));
+                        }
+                        self.in_snapshot = true;
+                        self.app_version = marker.app_version().unwrap_or(0);
+                        self.time_unit =
+                            TimeUnit::from_cluster_time_unit(marker.time_unit());
+                        self.handler
+                            .on_load_begin_snapshot(self.app_version, self.time_unit)?;
+                        Ok(Action::Continue)
+                    }
+                    SnapshotMark::END => {
+                        if !self.in_snapshot {
+                            return Err(ContainerError::Cluster(
+                                "missing begin snapshot".to_owned(),
+                            ));
+                        }
+                        self.done = true;
+                        self.handler.on_load_end_snapshot()?;
+                        Ok(Action::Break)
+                    }
+                    SnapshotMark::SECTION | SnapshotMark::NullVal => Ok(Action::Continue),
+                }
+            }
+            102 => {
+                let mut record = ClientSessionDecoder::default().header(header, 0);
+                let channel_coordinates = record.response_channel_decoder();
+                let principal_coordinates = record.encoded_principal_decoder();
+                let response_channel =
+                    core::str::from_utf8(record.response_channel_slice(channel_coordinates))
+                        .map_err(|error| {
+                            ContainerError::Cluster(format!(
+                                "the snapshot's response channel is not UTF-8: {error}"
+                            ))
+                        })?;
+                let encoded_principal = record.encoded_principal_slice(principal_coordinates);
+
+                self.handler.on_load_cluster_session(SnapshotSession {
+                    cluster_session_id: record.cluster_session_id(),
+                    response_stream_id: record.response_stream_id(),
+                    response_channel,
+                    encoded_principal,
+                })?;
+                Ok(Action::Continue)
+            }
+            _ => Ok(Action::Continue),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +605,160 @@ mod tests {
         let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(&claims[2]), 0);
         let marker = SnapshotMarkerDecoder::default().header(header, 0);
         assert_eq!(marker.mark(), SnapshotMark::END);
+    }
+
+    // -- the loader --------------------------------------------------------
+
+    #[derive(Default)]
+    struct RecordingHandler {
+        begins: Vec<(i32, TimeUnit)>,
+        sessions: Vec<(i64, i32, String, Vec<u8>)>,
+        ends: usize,
+    }
+
+    impl SnapshotLoadHandler for RecordingHandler {
+        fn on_load_begin_snapshot(
+            &mut self,
+            app_version: i32,
+            time_unit: TimeUnit,
+        ) -> Result<(), ContainerError> {
+            self.begins.push((app_version, time_unit));
+            Ok(())
+        }
+
+        fn on_load_cluster_session(
+            &mut self,
+            session: SnapshotSession<'_>,
+        ) -> Result<(), ContainerError> {
+            self.sessions.push((
+                session.cluster_session_id,
+                session.response_stream_id,
+                session.response_channel.to_owned(),
+                session.encoded_principal.to_vec(),
+            ));
+            Ok(())
+        }
+
+        fn on_load_end_snapshot(&mut self) -> Result<(), ContainerError> {
+            self.ends += 1;
+            Ok(())
+        }
+    }
+
+    fn message(bytes: &[u8]) -> Message<'_> {
+        Message {
+            header: deepmsg_client::fragment_assembler::MessageHeader {
+                session_id: 0,
+                stream_id: 0,
+                term_offset: 0,
+                flags: 0,
+                position: 0,
+                frame_length: 0,
+                fragmented_frame_length: 0,
+            },
+            payload: bytes,
+        }
+    }
+
+    /// The three records a container snapshot of one session is made of.
+    fn records() -> Vec<Vec<u8>> {
+        let mut sink = RecordingSink::new(1024);
+        {
+            let mut taker = ServiceSnapshotTaker::new(&mut sink, TimeUnit::Milliseconds, 7);
+            taker.mark_begin(1_024, 5).expect("BEGIN");
+            taker
+                .snapshot_session(&session("aeron:udp?endpoint=localhost:0", &[1, 2, 3]))
+                .expect("session");
+            taker.mark_end(1_024, 5).expect("END");
+        }
+        core::mem::take(&mut *sink.claims.borrow_mut())
+    }
+
+    fn drive(
+        loader: &mut ServiceSnapshotLoader,
+        bytes: &[u8],
+        handler: &mut dyn SnapshotLoadHandler,
+    ) -> Result<Action, ContainerError> {
+        let mut dispatch = Dispatch {
+            handler,
+            in_snapshot: loader.in_snapshot,
+            done: loader.done,
+            app_version: loader.app_version,
+            time_unit: loader.time_unit,
+            error: None,
+        };
+        let action = dispatch.dispatch(message(bytes));
+        loader.in_snapshot = dispatch.in_snapshot;
+        loader.done = dispatch.done;
+        loader.app_version = dispatch.app_version;
+        loader.time_unit = dispatch.time_unit;
+        action
+    }
+
+    #[test]
+    fn the_loader_reads_begin_sessions_and_end() {
+        let records = records();
+        let mut handler = RecordingHandler::default();
+        let mut loader = ServiceSnapshotLoader::new();
+
+        assert_eq!(
+            drive(&mut loader, &records[0], &mut handler).expect("BEGIN"),
+            Action::Continue
+        );
+        assert_eq!(
+            drive(&mut loader, &records[1], &mut handler).expect("session"),
+            Action::Continue
+        );
+        assert!(!loader.is_done());
+        assert_eq!(
+            drive(&mut loader, &records[2], &mut handler).expect("END"),
+            Action::Break
+        );
+
+        assert!(loader.is_done());
+        assert_eq!(loader.app_version(), 7);
+        assert_eq!(loader.time_unit(), TimeUnit::Milliseconds);
+        assert_eq!(handler.begins, vec![(7, TimeUnit::Milliseconds)]);
+        assert_eq!(handler.ends, 1);
+        assert_eq!(handler.sessions.len(), 1);
+        assert_eq!(handler.sessions[0].0, 1);
+        assert_eq!(handler.sessions[0].1, 42);
+        assert_eq!(handler.sessions[0].2, "aeron:udp?endpoint=localhost:0");
+        assert_eq!(handler.sessions[0].3, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn an_end_without_begin_is_refused() {
+        let records = records();
+        let mut handler = RecordingHandler::default();
+        let mut loader = ServiceSnapshotLoader::new();
+
+        let error = drive(&mut loader, &records[2], &mut handler).expect_err("no BEGIN");
+        assert!(error.to_string().contains("missing begin snapshot"));
+    }
+
+    #[test]
+    fn a_second_begin_is_refused() {
+        let records = records();
+        let mut handler = RecordingHandler::default();
+        let mut loader = ServiceSnapshotLoader::new();
+
+        drive(&mut loader, &records[0], &mut handler).expect("BEGIN");
+        let error = drive(&mut loader, &records[0], &mut handler).expect_err("second BEGIN");
+        assert!(error.to_string().contains("already in snapshot"));
+    }
+
+    #[test]
+    fn a_snapshot_of_another_type_is_refused() {
+        let mut records = records();
+        // `typeId` is the marker block's first field, right after the header.
+        records[0][MESSAGE_HEADER_LENGTH..MESSAGE_HEADER_LENGTH + 8]
+            .copy_from_slice(&1_i64.to_le_bytes());
+
+        let mut handler = RecordingHandler::default();
+        let mut loader = ServiceSnapshotLoader::new();
+
+        let error = drive(&mut loader, &records[0], &mut handler).expect_err("type 1");
+        assert!(error.to_string().contains("unexpected snapshot type: 1"));
     }
 }
