@@ -1299,7 +1299,7 @@ starting size, and it is now the capacity's own.
 
 ## A cluster session's messages (P3-4b)
 
-The four contracts a client meets on its first exchange with a cluster. Each is
+The contracts a client meets on its first exchange with a cluster. Each is
 pinned by a test in this repository; the reference's own cluster suites are the
 next witnesses (LC-1/LC-2, P3-3c/P3-4f), and these rows say what is already
 fixed before them.
@@ -1311,7 +1311,16 @@ fixed before them.
 | Session counter | type **241**; key = `clusterId` (4, LE) + `sessionId` (8, LE); label `cluster-session: <sessionInfo> - clusterId=<n>`; value = the session id, reference id = the response publication's registration id | `ClusterSession.java:502-524` | `cluster_session.rs::a_session_id_is_a_plain_long_and_the_counter_key_is_cluster_then_id`; the label text is in the same test |
 | Ingress channel URI | the configured channel, `endpoint=<member ingress endpoint>` when it names none, `rejoin=false`, `reliable-stream=true`; a follower never subscribes to a multicast ingress; an IPC subscription exists only for a **leader** with `aeron.cluster.ingress.ipc.allowed=true` | `ConsensusModuleAgent.java:3387-3415` | `agent::tests::ingress_endpoints_are_id_equals_endpoint_separated_by_commas`, `::an_ipc_response_channel_becomes_the_egress_channel_unless_ipc_ingress_is_allowed`; the end-to-end path is the session integration test |
 | Response channel refinement | `aeron.cluster.egress.channel`'s parameters are put onto a client's response channel; an `aeron:ipc` response channel is replaced **whole** by the egress channel unless IPC ingress is allowed | `ConsensusModuleAgent.java:3459-3475` | `agent::tests::the_egress_channels_parameters_are_put_onto_a_udp_response_channel` and the two tests beside it |
+| Connect request (client) | SBE header (8) + `SessionConnectRequest` (template **3**, block **16**): `correlationId`, `responseStreamId` = the egress stream id (**102** by default), `version` = the client-to-module protocol semantic version **0.3.0**, `responseChannel` = the egress channel with its endpoint resolved, `encodedCredentials`, `clientInfo` = `name=<clientName> version=<compat version> commit=<build token>` | `AeronCluster.java:2452-2471`, `:1209-1229`; `AeronCounters.java:1633-1636` | `async_connect::tests::the_connect_request_carries_the_references_fields` |
+| Client egress channel | a **UDP** egress channel gains `rejoin=false` at `conclude`; an IPC one is unchanged | `AeronCluster.java:1498-1502` | `context::tests::a_udp_egress_channel_gets_rejoin_false`, `context::tests::an_ipc_egress_channel_is_left_alone` |
 | Egress message path | a `SessionEvent` that fits the publication's maximum payload is **claimed**; a larger one is encoded into a reusable buffer and **offered**; three attempts each way, and a refusal is retried next slow tick | `EgressPublisher.java:54-109`, `:316-330` | `tests/egress_publisher.rs` (the eight `EgressPublisherTest` cases, one test each) |
+
+The `commit=` half of `clientInfo` is **this build's** token (`deepmsg-<crate
+version>`), not the reference's git sha — the same substitution its counter
+labels already record, made where a string a cluster stores is the whole point
+rather than something it acts on. The format around it is the reference's
+(`AeronCounters.formatVersionInfo`), so a reader that parses the field still
+finds `version=` and `commit=` where they were.
 
 A claim publishes the **unaligned** frame length
 (`deepmsg-core::logbuffer::frame::Frame::publish`): the SBE message plus the
