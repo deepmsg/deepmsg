@@ -20,30 +20,22 @@
 //! holds them apart and each takes a block of ports nobody else uses
 //! ([`ClusterPorts`]).
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
-use deepmsg_client::client::Client;
-use deepmsg_client::fragment_assembler::MessageHeader;
-use deepmsg_cluster_client::{AeronCluster, AeronClusterContext, EgressListener};
 use deepmsg_cluster_common::counters::{
     CLUSTER_NODE_ROLE_TYPE_ID, CLUSTER_SNAPSHOT_COUNTER_TYPE_ID,
 };
 use deepmsg_codec_cluster::event_code::EventCode;
-use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::cluster::{ClusterPorts, MemberSpec, Options, TestCluster};
-use deepmsg_tests::driver::OwnDriver;
+use deepmsg_tests::cluster_client::{Session, base_context, send_and_await_echo};
 
 /// The tests in this binary each start a whole cluster.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 const MEMBERS: i32 = 3;
 const CLUSTER_ID: i32 = 21;
-const INGRESS_STREAM_ID: i32 = 101;
-const EGRESS_STREAM_ID: i32 = 102;
 const ROLE_LEADER: i64 = 2;
 const DEADLINE: Duration = Duration::from_secs(30);
 
@@ -118,208 +110,6 @@ fn await_all_joined(cluster: &TestCluster, members: i32) -> i32 {
     );
 }
 
-/// The member whose role counter says LEADER, other than `excluded`.
-///
-/// The connect timeout is short on purpose: a member that has been stopped
-/// leaves a directory whose heartbeat ages out, and `Client::connect` spends
-/// its whole timeout discovering that — long enough that a caller waiting on it
-/// stops polling the session, which is the client liveness window itself.
-fn leader_other_than(cluster: &TestCluster, members: i32, excluded: i32) -> Option<i32> {
-    (0..members)
-        .filter(|member| *member != excluded)
-        .find(|member| {
-            Client::connect_with_timeout(cluster.aeron_dir(*member), Duration::from_millis(100))
-                .ok()
-                .and_then(|client| {
-                    let counters = client.counters_reader()?;
-                    let id = deepmsg_cluster_common::counters::find_cluster_counter(
-                        &counters,
-                        CLUSTER_NODE_ROLE_TYPE_ID,
-                        CLUSTER_ID,
-                    )?;
-                    counters.value(id)
-                })
-                == Some(ROLE_LEADER)
-        })
-}
-
-/// What the egress delivered, as the test reads it.
-#[derive(Default)]
-struct Received {
-    messages: Vec<Vec<u8>>,
-    events: Vec<(EventCode, String)>,
-    admin_responses: Vec<AdminResponse>,
-    new_leaders: Vec<i32>,
-}
-
-struct SharedListener(Rc<RefCell<Received>>);
-
-/// An admin response, as the client saw it.
-#[derive(Clone, Debug)]
-struct AdminResponse {
-    request_type: deepmsg_codec_cluster::admin_request_type::AdminRequestType,
-    response_code: deepmsg_codec_cluster::admin_response_code::AdminResponseCode,
-    message: String,
-}
-
-impl EgressListener for SharedListener {
-    fn on_message(
-        &mut self,
-        _cluster_session_id: i64,
-        _timestamp: i64,
-        payload: &[u8],
-        _header: &MessageHeader,
-    ) {
-        self.0.borrow_mut().messages.push(payload.to_vec());
-    }
-
-    fn on_session_event(
-        &mut self,
-        _correlation_id: i64,
-        _cluster_session_id: i64,
-        _leadership_term_id: i64,
-        _leader_member_id: i32,
-        code: EventCode,
-        detail: &str,
-    ) {
-        self.0.borrow_mut().events.push((code, detail.to_owned()));
-    }
-
-    fn on_new_leader(
-        &mut self,
-        _cluster_session_id: i64,
-        _leadership_term_id: i64,
-        leader_member_id: i32,
-        _ingress_endpoints: &str,
-    ) {
-        self.0.borrow_mut().new_leaders.push(leader_member_id);
-    }
-
-    fn on_admin_response(
-        &mut self,
-        _cluster_session_id: i64,
-        _correlation_id: i64,
-        request_type: deepmsg_codec_cluster::admin_request_type::AdminRequestType,
-        response_code: deepmsg_codec_cluster::admin_response_code::AdminResponseCode,
-        message: &str,
-        _payload: &[u8],
-    ) {
-        self.0.borrow_mut().admin_responses.push(AdminResponse {
-            request_type,
-            response_code,
-            message: message.to_owned(),
-        });
-    }
-}
-
-/// A connected session, its client, and the driver the two of them own.
-struct Session {
-    driver: OwnDriver,
-    client: Client,
-    session: AeronCluster,
-    received: Rc<RefCell<Received>>,
-}
-
-impl Session {
-    /// Connect on our own driver, with `context` naming the ingress and the
-    /// listener supplied here.
-    ///
-    /// `None` when our driver binary is not built, which is the suite's skip.
-    /// A connect that fails is a failure: the node logs go into the message,
-    /// because the reason is usually on the cluster's side.
-    fn connect(
-        label: &str,
-        cluster: &TestCluster,
-        members: i32,
-        mut context: AeronClusterContext,
-    ) -> Option<Self> {
-        let received = Rc::new(RefCell::new(Received::default()));
-        context.egress_listener = Some(Box::new(SharedListener(Rc::clone(&received))));
-
-        let driver = OwnDriver::start(label)?;
-        let mut client = Client::connect(driver.aeron_dir()).unwrap_or_else(|error| {
-            panic!("{label}: the client did not connect to our driver: {error}")
-        });
-
-        let session = AeronCluster::connect(context, &mut client).unwrap_or_else(|error| {
-            panic!(
-                "{label}: our client did not connect to the cluster: {error}\n{}",
-                node_logs(cluster, members)
-            )
-        });
-
-        Some(Self {
-            driver,
-            client,
-            session,
-            received,
-        })
-    }
-
-    /// One poll of the client and the session, which any wait must repeat.
-    fn drive(&mut self) {
-        let _ = self.client.poll();
-        self.session
-            .poll_egress(&mut self.client)
-            .unwrap_or_else(|error| panic!("the session failed to poll egress: {error}"));
-    }
-
-    /// Offer `payload` until the session takes it, or `false` at the deadline.
-    fn offer(&mut self, payload: &[u8], deadline: Instant) -> bool {
-        while Instant::now() < deadline {
-            if matches!(
-                self.session.offer(&mut self.client, payload),
-                Some(Appended::Ok { .. })
-            ) {
-                return true;
-            }
-
-            self.drive();
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        false
-    }
-
-    /// Drive until `condition` holds or the deadline passes.
-    fn poll_until(&mut self, deadline: Instant, mut condition: impl FnMut(&Self) -> bool) -> bool {
-        while Instant::now() < deadline {
-            self.drive();
-
-            if condition(self) {
-                return true;
-            }
-
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        self.drive();
-        condition(self)
-    }
-
-    fn messages(&self) -> Vec<Vec<u8>> {
-        self.received.borrow().messages.clone()
-    }
-
-    /// The last lines our own driver wrote, for a failure's message.
-    fn driver_log(&self) -> String {
-        self.driver.log_tail(40)
-    }
-}
-
-/// The client-side settings every scenario shares: the stream ids, a generous
-/// message timeout, and a UDP egress channel with a port the driver picks.
-fn base_context() -> AeronClusterContext {
-    let mut context = AeronClusterContext::default();
-    context.message_timeout_ns =
-        i64::try_from(DEADLINE.as_nanos()).expect("a timeout that fits an i64");
-    context.ingress_stream_id = INGRESS_STREAM_ID;
-    context.egress_stream_id = EGRESS_STREAM_ID;
-    context.client_name = "deepmsg-lc1-scenarios".to_owned();
-    context.egress_channel = Some("aeron:udp?term-length=128k|endpoint=localhost:0".to_owned());
-    context
-}
-
 fn skip() {
     eprintln!("SKIPPED: the reference jar, java, the fork's Java probes, or our driver is missing");
 }
@@ -330,22 +120,6 @@ fn node_logs(cluster: &TestCluster, members: i32) -> String {
         .map(|member| format!("member {member}:\n{}", cluster.node_log(member)))
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Offer `sequence` as eight little-endian bytes and wait for the echo.
-fn send_and_await_echo(session: &mut Session, sequence: u64, deadline: Instant) {
-    let payload = sequence.to_le_bytes();
-    let before = session.messages().len();
-
-    assert!(
-        session.offer(&payload, deadline),
-        "the session never accepted sequence {sequence}"
-    );
-
-    assert!(
-        session.poll_until(deadline, |session| session.messages().len() > before),
-        "the echo of sequence {sequence} never arrived"
-    );
 }
 
 /// The client connects on one ingress channel, names the leader, and an echo
@@ -366,13 +140,15 @@ fn a_client_connects_on_one_ingress_channel_and_echoes() {
     let leader = await_all_joined(&cluster, MEMBERS);
     let ports = ClusterPorts::new(base);
 
-    let mut context = base_context();
+    let mut context = base_context("deepmsg-lc1-scenarios", DEADLINE);
     context.ingress_channel = Some(format!(
         "aeron:udp?term-length=128k|endpoint={}",
         ports.ingress_endpoint(leader)
     ));
 
-    let Some(mut session) = Session::connect("lc1-one-channel", &cluster, MEMBERS, context) else {
+    let Some(mut session) = Session::connect("lc1-one-channel", context, &[], || {
+        node_logs(&cluster, MEMBERS)
+    }) else {
         skip();
         return;
     };
@@ -405,11 +181,13 @@ fn a_client_connects_with_an_ingress_endpoint_list() {
     let leader = await_all_joined(&cluster, MEMBERS);
     let ports = ClusterPorts::new(base);
 
-    let mut context = base_context();
+    let mut context = base_context("deepmsg-lc1-scenarios", DEADLINE);
     context.ingress_channel = Some("aeron:udp?term-length=128k".to_owned());
     context.ingress_endpoints = Some(ports.ingress_endpoints(MEMBERS));
 
-    let Some(mut session) = Session::connect("lc1-endpoints", &cluster, MEMBERS, context) else {
+    let Some(mut session) = Session::connect("lc1-endpoints", context, &[], || {
+        node_logs(&cluster, MEMBERS)
+    }) else {
         skip();
         return;
     };
@@ -440,13 +218,15 @@ fn a_client_pointed_at_a_follower_is_redirected_to_the_leader() {
         .expect("a three-node cluster has a follower");
     let ports = ClusterPorts::new(base);
 
-    let mut context = base_context();
+    let mut context = base_context("deepmsg-lc1-scenarios", DEADLINE);
     context.ingress_channel = Some(format!(
         "aeron:udp?term-length=128k|endpoint={}",
         ports.ingress_endpoint(follower)
     ));
 
-    let Some(mut session) = Session::connect("lc1-redirect", &cluster, MEMBERS, context) else {
+    let Some(mut session) = Session::connect("lc1-redirect", context, &[], || {
+        node_logs(&cluster, MEMBERS)
+    }) else {
         skip();
         return;
     };
@@ -479,14 +259,16 @@ fn a_client_follows_the_new_leader_without_losing_or_repeating_a_message() {
     let leader = await_all_joined(&cluster, MEMBERS);
     let ports = ClusterPorts::new(base);
 
-    let mut context = base_context();
+    let mut context = base_context("deepmsg-lc1-scenarios", DEADLINE);
     context.ingress_channel = Some("aeron:udp?term-length=128k".to_owned());
     context.ingress_endpoints = Some(ports.ingress_endpoints(MEMBERS));
     // An election on this machine takes well under a second, but the client's
     // own deadline is not what a scenario should be measuring.
     context.new_leader_timeout_ns = Some(i64::try_from(DEADLINE.as_nanos()).expect("a timeout"));
 
-    let Some(mut session) = Session::connect("lc1-failover", &cluster, MEMBERS, context) else {
+    let Some(mut session) = Session::connect("lc1-failover", context, &[], || {
+        node_logs(&cluster, MEMBERS)
+    }) else {
         skip();
         return;
     };
@@ -511,7 +293,7 @@ fn a_client_follows_the_new_leader_without_losing_or_repeating_a_message() {
         session.drive();
 
         if new_leader.is_none() {
-            new_leader = leader_other_than(&cluster, MEMBERS, leader);
+            new_leader = cluster.leader_other_than(leader);
         }
 
         if new_leader == Some(session.session.leader_member_id()) {
@@ -604,12 +386,13 @@ fn a_client_whose_session_times_out_is_closed() {
     let leader = await_all_joined(&cluster, MEMBERS);
     let ports = ClusterPorts::new(base);
 
-    let mut context = base_context();
+    let mut context = base_context("deepmsg-lc1-scenarios", DEADLINE);
     context.ingress_channel = Some("aeron:udp?term-length=128k".to_owned());
     context.ingress_endpoints = Some(ports.ingress_endpoints(MEMBERS));
 
-    let Some(mut session) = Session::connect("lc1-session-timeout", &cluster, MEMBERS, context)
-    else {
+    let Some(mut session) = Session::connect("lc1-session-timeout", context, &[], || {
+        node_logs(&cluster, MEMBERS)
+    }) else {
         skip();
         return;
     };
@@ -692,11 +475,13 @@ fn a_client_asks_for_a_snapshot() {
     let leader = await_all_joined(&cluster, MEMBERS);
     let ports = ClusterPorts::new(base);
 
-    let mut context = base_context();
+    let mut context = base_context("deepmsg-lc1-scenarios", DEADLINE);
     context.ingress_channel = Some("aeron:udp?term-length=128k".to_owned());
     context.ingress_endpoints = Some(ports.ingress_endpoints(MEMBERS));
 
-    let Some(mut session) = Session::connect("lc1-snapshot", &cluster, MEMBERS, context) else {
+    let Some(mut session) = Session::connect("lc1-snapshot", context, &[], || {
+        node_logs(&cluster, MEMBERS)
+    }) else {
         skip();
         return;
     };
@@ -781,14 +566,16 @@ fn a_client_answers_a_challenge_before_the_session_opens() {
     let leader = await_all_joined(&cluster, 1);
     let ports = ClusterPorts::new(base);
 
-    let mut context = base_context();
+    let mut context = base_context("deepmsg-lc1-scenarios", DEADLINE);
     context.ingress_channel = Some(format!(
         "aeron:udp?term-length=128k|endpoint={}",
         ports.ingress_endpoint(leader)
     ));
     context.credentials = Box::new(ChallengeAnswer);
 
-    let Some(mut session) = Session::connect("lc1-challenge", &cluster, 1, context) else {
+    let Some(mut session) =
+        Session::connect("lc1-challenge", context, &[], || node_logs(&cluster, 1))
+    else {
         skip();
         return;
     };

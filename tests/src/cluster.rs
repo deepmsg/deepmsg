@@ -69,7 +69,7 @@ use deepmsg_cluster_service::service::{LogHeader, SnapshotReader, SnapshotWriter
 use deepmsg_cluster_service::services;
 use deepmsg_cluster_service::{
     ClusteredService, ClusteredServiceAgent, ContainerError, Role, ServiceContainerConfig,
-    SessionId, ShutdownHandle,
+    SessionId, ShutdownHandle, TimeUnit,
 };
 use deepmsg_codec_cluster::close_reason::CloseReason;
 use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
@@ -600,6 +600,35 @@ impl TestCluster {
         counter_value(&client, type_id, self.options.cluster_id)
     }
 
+    /// The member whose role counter says LEADER, other than `excluded`.
+    ///
+    /// The connect timeout is short on purpose: a member that has been stopped
+    /// leaves a directory whose heartbeat ages out, and `Client::connect` would
+    /// spend its whole timeout discovering that — long enough that a caller
+    /// waiting here stops polling its own client, which is that client's
+    /// liveness window on another driver.
+    #[must_use]
+    pub fn leader_other_than(&self, excluded: i32) -> Option<i32> {
+        self.nodes
+            .iter()
+            .map(|node| node.id)
+            .filter(|member| *member != excluded)
+            .find(|member| {
+                Client::connect_with_timeout(self.aeron_dir(*member), Duration::from_millis(100))
+                    .ok()
+                    .and_then(|client| {
+                        let counters = client.counters_reader()?;
+                        let id = counters::find_cluster_counter(
+                            &counters,
+                            CLUSTER_NODE_ROLE_TYPE_ID,
+                            self.options.cluster_id,
+                        )?;
+                        counters.value(id)
+                    })
+                    == Some(ROLE_LEADER)
+            })
+    }
+
     /// The member whose role counter says LEADER, once one does.
     pub fn await_leader(&self) -> i32 {
         let deadline = Instant::now() + DEADLINE;
@@ -1087,15 +1116,22 @@ impl TestCluster {
             }
             ServiceImpl::Test(name) => {
                 assert!(
-                    name == "test-service" || name == "sequence-service",
-                    "no test business called `{name}`; the fixture has `test-service` and \
-                     `sequence-service`"
+                    matches!(
+                        name,
+                        "test-service" | "sequence-service" | "sequenced-egress"
+                    ),
+                    "no test business called `{name}`; the fixture has `test-service`, \
+                     `sequence-service` and `sequenced-egress`"
                 );
                 let state = Arc::new(TestServiceState::default());
-                let service = Box::new(TestService::new(
-                    Arc::clone(&state),
-                    name == "sequence-service",
-                ));
+                let service: Box<dyn ClusteredService + Send> = if name == "sequenced-egress" {
+                    Box::new(SequencedEgressService::new(Arc::clone(&state)))
+                } else {
+                    Box::new(TestService::new(
+                        Arc::clone(&state),
+                        name == "sequence-service",
+                    ))
+                };
                 let container = self.spawn_in_process(index, service);
                 (container, Some(state))
             }
@@ -1350,6 +1386,8 @@ pub struct TestServiceState {
     out_of_sequence: AtomicUsize,
     /// The next sequence number the business expects from each session.
     next_sequence: Mutex<HashMap<SessionId, u64>>,
+    /// Messages a timer-driven business offered, which no client action drove.
+    offered: AtomicUsize,
 }
 
 impl TestServiceState {
@@ -1363,6 +1401,12 @@ impl TestServiceState {
     #[must_use]
     pub fn out_of_sequence(&self) -> usize {
         self.out_of_sequence.load(Ordering::Acquire)
+    }
+
+    /// Messages a timer-driven business offered (`sequenced-egress`).
+    #[must_use]
+    pub fn offered(&self) -> usize {
+        self.offered.load(Ordering::Acquire)
     }
 
     /// `on_session_open` calls.
@@ -1547,6 +1591,175 @@ impl ClusteredService for TestService {
     ) -> Result<(), ContainerError> {
         self.state.terminated.store(true, Ordering::Release);
         self.inner.on_terminate(cluster)
+    }
+}
+
+/// The reference's `SequencedEgressService`
+/// (`ClusterSessionReliabilityTest.java:311-380`): a ten-millisecond timer
+/// offers every open session's next sequence number.
+///
+/// What it is for is egress traffic that **no client action drives**. The case
+/// that drops the client's egress and then lets it through again needs the
+/// stream to have moved on while the client was not reading: an echo service
+/// stops producing the moment the client stops offering, so a client that
+/// rejoined the image would be shown nothing and the case could not tell a
+/// rejoin from a correct absence.
+struct SequencedEgressService {
+    state: Arc<TestServiceState>,
+    next_sequence: HashMap<SessionId, u64>,
+}
+
+/// The reference's `TIMER_CORRELATION_ID`.
+const SEQUENCED_TIMER_ID: i64 = 1;
+
+impl SequencedEgressService {
+    fn new(state: Arc<TestServiceState>) -> Self {
+        Self {
+            state,
+            next_sequence: HashMap::new(),
+        }
+    }
+
+    /// Schedule the next tick, retrying while the cluster refuses.
+    ///
+    /// A timer's deadline is in the **cluster clock's unit**, not nanoseconds:
+    /// the reference converts ten milliseconds into it
+    /// (`cluster.timeUnit().convert(10, MILLISECONDS)`,
+    /// `ClusterSessionReliabilityTest.java:346`), and a deadline a million
+    /// times too large is a timer that never fires.
+    fn schedule(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+    ) -> Result<(), ContainerError> {
+        let interval = match cluster.time_unit() {
+            TimeUnit::Milliseconds => 10,
+            TimeUnit::Microseconds => 10_000,
+            TimeUnit::Nanoseconds => 10_000_000,
+        };
+        let deadline = cluster.time().saturating_add(interval);
+
+        while !cluster.schedule_timer(SEQUENCED_TIMER_ID, deadline)? {
+            cluster.idle(0)?;
+        }
+
+        Ok(())
+    }
+
+    fn cancel(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+    ) -> Result<(), ContainerError> {
+        while !cluster.cancel_timer(SEQUENCED_TIMER_ID)? {
+            cluster.idle(0)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl ClusteredService for SequencedEgressService {
+    fn on_start(
+        &mut self,
+        _cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        _snapshot: Option<&mut SnapshotReader<'_>>,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    fn on_session_open(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        session: SessionId,
+        _timestamp: i64,
+    ) -> Result<(), ContainerError> {
+        self.state.session_opens.fetch_add(1, Ordering::AcqRel);
+        self.next_sequence.insert(session, 0);
+        if self.next_sequence.len() == 1 {
+            self.schedule(cluster)?;
+        }
+
+        Ok(())
+    }
+
+    fn on_session_close(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        session: SessionId,
+        _timestamp: i64,
+        reason: CloseReason,
+    ) -> Result<(), ContainerError> {
+        self.state.session_closes.fetch_add(1, Ordering::AcqRel);
+        self.state
+            .close_reasons
+            .lock()
+            .expect("the reasons lock")
+            .push(reason);
+        self.next_sequence.remove(&session);
+
+        if self.next_sequence.is_empty() {
+            self.cancel(cluster)?;
+        }
+
+        Ok(())
+    }
+
+    fn on_session_message(
+        &mut self,
+        _cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        _session: Option<SessionId>,
+        _timestamp: i64,
+        _payload: &[u8],
+        _header: &LogHeader,
+    ) -> Result<(), ContainerError> {
+        self.state.messages.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn on_timer_event(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        correlation_id: i64,
+        _timestamp: i64,
+    ) -> Result<(), ContainerError> {
+        if correlation_id != SEQUENCED_TIMER_ID {
+            return Ok(());
+        }
+
+        self.schedule(cluster)?;
+
+        let sessions: Vec<SessionId> = self.next_sequence.keys().copied().collect();
+
+        for session in sessions {
+            let Some(sequence) = self.next_sequence.get(&session).copied() else {
+                continue;
+            };
+            let Some(mut client_session) = cluster.session(session) else {
+                continue;
+            };
+
+            if client_session.offer(&sequence.to_le_bytes())? > 0 {
+                self.next_sequence.insert(session, sequence.wrapping_add(1));
+                self.state.offered.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn on_take_snapshot(&mut self, _writer: &mut SnapshotWriter<'_>) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    fn on_role_change(&mut self, _new_role: Role) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    fn on_terminate(
+        &mut self,
+        _cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+    ) -> Result<(), ContainerError> {
+        self.state.terminated.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
