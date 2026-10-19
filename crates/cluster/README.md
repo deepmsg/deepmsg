@@ -1,7 +1,8 @@
 # deepmsg cluster (P3)
 
-Four crates, one per seam the reference draws. The design is
-`analysis/cluster/README.md`; this file is the map of the code.
+Five crates: one per seam the reference draws, plus the operator's tool
+across them. The design is `analysis/cluster/README.md`; this file is the
+map of the code.
 
 | Crate | Reference counterpart | What it is |
 |---|---|---|
@@ -9,6 +10,7 @@ Four crates, one per seam the reference draws. The design is
 | `consensus/` → `deepmsg-cluster` | `io.aeron.cluster` | the consensus module, the election state machine, `recording.log`, `node-state.dat`, `ClusterBackup`, `ClusterTool` |
 | `service/` → `deepmsg-cluster-service` | `io.aeron.cluster.service` | the service container and the `ClusteredService` API — the S2 seam's container side |
 | `client/` → `deepmsg-cluster-client` | `io.aeron.cluster.client` | `AsyncConnect`, the egress poller, leader change — the S1 seam's client side |
+| `tool/` → `deepmsg-cluster-tool` | `io.aeron.cluster.ClusterTool`, `ClusterToolOperator` | the operator's tool: the reference's eighteen commands, over a cluster's mark files, recording log, counters and archive |
 
 Dependency direction, and the rules it encodes:
 
@@ -16,6 +18,7 @@ Dependency direction, and the rules it encodes:
 consensus ─┐
 service ───┼─▶ common
 client ────┘
+tool ──▶ consensus, service, client, archive
     service ──▶ deepmsg-client      (the container is a client of the driver)
     service ──▶ deepmsg-driver      (idle strategies only — the reference's
                                      `aeron-cluster` depends on `aeron-driver`
