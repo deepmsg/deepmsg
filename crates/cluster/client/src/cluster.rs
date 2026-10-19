@@ -735,19 +735,19 @@ impl AeronCluster {
                                 self.state_deadline_ns = 0;
                             }
 
-                            match self.context.egress_listener.as_mut() {
-                                Some(listener) => listener.on_session_event(
+                            // The reference's default listener implements
+                            // only `onMessage` (`AC:1529-1552`); the other
+                            // three callbacks are default no-ops, so an event
+                            // with no listener is consumed and nothing more.
+                            if let Some(listener) = self.context.egress_listener.as_mut() {
+                                listener.on_session_event(
                                     correlation_id,
                                     cluster_session_id,
                                     leadership_term_id,
                                     leader_member_id,
                                     code,
                                     &String::from_utf8_lossy(detail),
-                                ),
-                                None => {
-                                    error = Some(missing_egress_listener());
-                                    return Action::Break;
-                                }
+                                );
                             }
                         }
                         Action::Continue
@@ -779,19 +779,15 @@ impl AeronCluster {
                         payload,
                     }) => {
                         if cluster_session_id == session_id {
-                            match self.context.egress_listener.as_mut() {
-                                Some(listener) => listener.on_admin_response(
+                            if let Some(listener) = self.context.egress_listener.as_mut() {
+                                listener.on_admin_response(
                                     cluster_session_id,
                                     correlation_id,
                                     request_type,
                                     response_code,
                                     &String::from_utf8_lossy(admin_message),
                                     payload,
-                                ),
-                                None => {
-                                    error = Some(missing_egress_listener());
-                                    return Action::Break;
-                                }
+                                );
                             }
                         }
                         Action::Continue
@@ -1857,5 +1853,13 @@ mod tests {
             "ERROR - egressListener must be specified on AeronCluster.Context",
             error.to_string()
         );
+
+        // A session event is not: the reference's default listener inherits
+        // no-op callbacks for everything but `onMessage`.
+        h.client
+            .push_egress(session_event(CLUSTER_SESSION_ID, EventCode::OK));
+        session
+            .poll_egress_with(&mut h.client)
+            .expect("an event with no listener is consumed");
     }
 }
