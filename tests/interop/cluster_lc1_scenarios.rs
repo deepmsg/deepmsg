@@ -462,7 +462,7 @@ fn a_client_asks_for_a_snapshot() {
         "test-service",
         // The reference's default authorisation service allows the backup and
         // standby commands and nothing else, so a SNAPSHOT request is refused
-        // with UNAUTHORISED_ACCESS (`ConsensusModule.java:813-1352`, and
+        // with UNAUTHORISED_ACCESS (`ConsensusModule.java:813`, `:1352`, and
         // `ClusterTest.shouldRejectTakeSnapshotRequestWithAnAuthorisationError`);
         // the case that takes one says `ALLOW_ALL`
         // (`ClusterTest.shouldTakeASnapshotAfterReceivingAdminRequestOfTypeSnapshot`).
