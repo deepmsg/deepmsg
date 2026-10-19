@@ -10,13 +10,15 @@
 //! container must be able to run against a *Java* consensus module (LC-4a),
 //! and the dependency direction is what keeps that true by construction.
 //!
-//! # What P3-2a is, and is not
+//! # What this is
 //!
-//! P3-2a is the container **without snapshots**: lifecycle, the service stream,
-//! the log, sessions and egress, timers and service messages, role changes and
-//! termination. A recovery that finds a snapshot recording id, and a
-//! `ClusterActionRequest(SNAPSHOT)`, end the container with an error naming
-//! `P3-2b` rather than pretending the service has no state to save.
+//! P3-2a built the container: lifecycle, the service stream, the log, sessions
+//! and egress, timers and service messages, role changes and termination.
+//! P3-2b gave it the two halves of a snapshot — taking one through a recording
+//! of its own publication (`snapshot`), and loading one back into the session
+//! table and `on_start` — plus the business twin the Java comparison is made
+//! with (`services::BasicAuction`). The container still refuses nothing by
+//! naming a future slice.
 //!
 //! # The frozen field table (public DoD 13, plan §3.1)
 //!
@@ -71,7 +73,9 @@ pub mod log_adapter;
 pub mod proxy;
 pub mod role;
 pub mod service;
+pub mod services;
 pub mod session;
+pub mod snapshot;
 
 pub use agent::{ClusteredServiceAgent, ShutdownHandle};
 pub use cluster::{ClientSession, Cluster, SessionInfo};
@@ -79,3 +83,4 @@ pub use config::ServiceContainerConfig;
 pub use error::ContainerError;
 pub use role::{Role, TimeUnit};
 pub use service::{ClusteredService, LogHeader, SessionId};
+pub use services::BasicAuction;

@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 
+use deepmsg_archive::client::ArchiveContext;
 use deepmsg_cluster_common::config::{ConfigError, Properties};
 
 /// `aeron.cluster.id` (`ConsensusModule.java`).
@@ -43,19 +44,19 @@ pub const SERVICE_STREAM_ID_DEFAULT: i32 = 104;
 pub const CONSENSUS_MODULE_STREAM_ID_PROP_NAME: &str = "aeron.cluster.consensus.module.stream.id";
 /// `CONSENSUS_MODULE_STREAM_ID_DEFAULT` (`:313`) — the container writes 105.
 pub const CONSENSUS_MODULE_STREAM_ID_DEFAULT: i32 = 105;
-/// `aeron.cluster.replay.channel` (`:264`); P3-2b.
+/// `aeron.cluster.replay.channel` (`:264`).
 pub const REPLAY_CHANNEL_PROP_NAME: &str = "aeron.cluster.replay.channel";
 /// `REPLAY_CHANNEL_DEFAULT` (`:270`).
 pub const REPLAY_CHANNEL_DEFAULT: &str = "aeron:ipc";
-/// `aeron.cluster.replay.stream.id` (`:275`); P3-2b.
+/// `aeron.cluster.replay.stream.id` (`:275`).
 pub const REPLAY_STREAM_ID_PROP_NAME: &str = "aeron.cluster.replay.stream.id";
 /// `REPLAY_STREAM_ID_DEFAULT` (`:282`).
 pub const REPLAY_STREAM_ID_DEFAULT: i32 = 103;
-/// `aeron.cluster.snapshot.channel` (`:318`); P3-2b.
+/// `aeron.cluster.snapshot.channel` (`:318`).
 pub const SNAPSHOT_CHANNEL_PROP_NAME: &str = "aeron.cluster.snapshot.channel";
 /// `SNAPSHOT_CHANNEL_DEFAULT` (`:324`).
 pub const SNAPSHOT_CHANNEL_DEFAULT: &str = "aeron:ipc?alias=snapshot";
-/// `aeron.cluster.snapshot.stream.id` (`:330`); P3-2b.
+/// `aeron.cluster.snapshot.stream.id` (`:330`).
 pub const SNAPSHOT_STREAM_ID_PROP_NAME: &str = "aeron.cluster.snapshot.stream.id";
 /// `SNAPSHOT_STREAM_ID_DEFAULT` (`:337`).
 pub const SNAPSHOT_STREAM_ID_DEFAULT: i32 = 106;
@@ -83,6 +84,25 @@ pub const IDLE_STRATEGY_PROP_NAME: &str = "aeron.cluster.idle.strategy";
 pub const IDLE_STRATEGY_DEFAULT: &str = "org.agrona.concurrent.BackoffIdleStrategy";
 /// `aeron.dir`, the driver's directory (`CommonContext`).
 pub const AERON_DIR_PROP_NAME: &str = "aeron.dir";
+/// `AeronArchive.Configuration.LOCAL_CONTROL_CHANNEL_PROP_NAME`
+/// (`AeronArchive.java:2716`); the container's archive is local, so this is
+/// the channel it sends on.
+pub const ARCHIVE_LOCAL_CONTROL_CHANNEL_PROP_NAME: &str = "aeron.archive.local.control.channel";
+/// `LOCAL_CONTROL_CHANNEL_DEFAULT` (`AeronArchive.java:2722`).
+pub const ARCHIVE_LOCAL_CONTROL_CHANNEL_DEFAULT: &str = "aeron:ipc?term-length=64k";
+/// `LOCAL_CONTROL_STREAM_ID_PROP_NAME` (`AeronArchive.java:2728`).
+pub const ARCHIVE_LOCAL_CONTROL_STREAM_ID_PROP_NAME: &str = "aeron.archive.local.control.stream.id";
+/// `LOCAL_CONTROL_STREAM_ID_DEFAULT` (`AeronArchive.java:2735`).
+pub const ARCHIVE_LOCAL_CONTROL_STREAM_ID_DEFAULT: i32 = 10;
+/// `CONTROL_RESPONSE_STREAM_ID_PROP_NAME` (`AeronArchive.java:2758`).
+pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_PROP_NAME: &str =
+    "aeron.archive.control.response.stream.id";
+/// `CONTROL_RESPONSE_STREAM_ID_DEFAULT` (`AeronArchive.java:2764`).
+pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_DEFAULT: i32 = 20;
+/// `SNAPSHOT_DURATION_THRESHOLD_PROP_NAME` (`ClusteredServiceContainer.java:430`).
+pub const SNAPSHOT_DURATION_THRESHOLD_PROP_NAME: &str = "aeron.cluster.service.snapshot.threshold";
+/// `SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS` (`:438`) — 1 s.
+pub const SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS: i64 = 1_000_000_000;
 /// The application version stamped into `NewLeadershipTermEvent.appVersion`.
 pub const APP_VERSION_DEFAULT: i32 = 1;
 
@@ -153,14 +173,26 @@ pub struct ServiceContainerConfig {
     pub idle_strategy: String,
     /// The application version this container is (`NewLeadershipTermEvent`).
     pub app_version: i32,
-    /// `aeron.cluster.replay.channel` — read now, used by P3-2b.
+    /// `aeron.cluster.replay.channel`.
     pub replay_channel: String,
-    /// `aeron.cluster.replay.stream.id` — P3-2b.
+    /// `aeron.cluster.replay.stream.id`.
     pub replay_stream_id: i32,
-    /// `aeron.cluster.snapshot.channel` — P3-2b.
+    /// `aeron.cluster.snapshot.channel`.
     pub snapshot_channel: String,
-    /// `aeron.cluster.snapshot.stream.id` — P3-2b.
+    /// `aeron.cluster.snapshot.stream.id`.
     pub snapshot_stream_id: i32,
+    /// `aeron.archive.local.control.channel`: the archive this container uses
+    /// is local to the same driver (`AeronArchive.java:2722`).
+    pub archive_local_control_channel: String,
+    /// `aeron.archive.local.control.stream.id`.
+    pub archive_local_control_stream_id: i32,
+    /// `aeron.archive.control.response.stream.id`, as the container computes it:
+    /// `clusterId * 100 + 100 + controlResponseStreamId + (serviceId + 1)`
+    /// (`ClusteredServiceContainer.java:1015-1020`).
+    pub archive_control_response_stream_id: i32,
+    /// `aeron.cluster.service.snapshot.threshold`: how long a snapshot may take
+    /// before it is counted in counter 237.
+    pub snapshot_duration_threshold_ns: i64,
 }
 
 impl ServiceContainerConfig {
@@ -204,6 +236,12 @@ impl ServiceContainerConfig {
         }
 
         let cluster_id = int(CLUSTER_ID_PROP_NAME, CLUSTER_ID_DEFAULT)?;
+        let archive_control_response_stream_id = int(
+            ARCHIVE_CONTROL_RESPONSE_STREAM_ID_PROP_NAME,
+            ARCHIVE_CONTROL_RESPONSE_STREAM_ID_DEFAULT,
+        )?;
+        let archive_control_response_stream_id =
+            cluster_id * 100 + 100 + archive_control_response_stream_id + (service_id + 1);
         let log_fragment_limit = int(LOG_FRAGMENT_LIMIT_PROP_NAME, LOG_FRAGMENT_LIMIT_DEFAULT)?;
         let log_fragment_limit =
             usize::try_from(log_fragment_limit).map_err(|_| ConfigProblem::Value {
@@ -260,7 +298,34 @@ impl ServiceContainerConfig {
                 .unwrap_or(SNAPSHOT_CHANNEL_DEFAULT)
                 .to_owned(),
             snapshot_stream_id: int(SNAPSHOT_STREAM_ID_PROP_NAME, SNAPSHOT_STREAM_ID_DEFAULT)?,
+            archive_local_control_channel: properties
+                .get(ARCHIVE_LOCAL_CONTROL_CHANNEL_PROP_NAME)
+                .unwrap_or(ARCHIVE_LOCAL_CONTROL_CHANNEL_DEFAULT)
+                .to_owned(),
+            archive_local_control_stream_id: int(
+                ARCHIVE_LOCAL_CONTROL_STREAM_ID_PROP_NAME,
+                ARCHIVE_LOCAL_CONTROL_STREAM_ID_DEFAULT,
+            )?,
+            archive_control_response_stream_id,
+            snapshot_duration_threshold_ns: properties.duration_ns(
+                SNAPSHOT_DURATION_THRESHOLD_PROP_NAME,
+                SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS,
+            )?,
         })
+    }
+
+    /// The archive this container records and replays with
+    /// (`ClusteredServiceContainer.java:1011-1045`): a **local** archive, on
+    /// IPC, with a response stream of its own so two services of one cluster do
+    /// not share a control session.
+    #[must_use]
+    pub fn archive_context(&self) -> ArchiveContext {
+        let mut context = ArchiveContext::new();
+        context.control_request_channel = Some(self.archive_local_control_channel.clone());
+        context.control_response_channel = Some(self.archive_local_control_channel.clone());
+        context.control_request_stream_id = self.archive_local_control_stream_id;
+        context.control_response_stream_id = self.archive_control_response_stream_id;
+        context
     }
 
     /// Where this container's own mark file lives
@@ -320,6 +385,14 @@ mod tests {
         );
         assert_eq!(config.replay_stream_id, 103);
         assert_eq!(config.snapshot_stream_id, 106);
+        assert_eq!(
+            config.archive_local_control_channel,
+            "aeron:ipc?term-length=64k"
+        );
+        assert_eq!(config.archive_local_control_stream_id, 10);
+        // clusterId 0, serviceId 0, control response stream 20 ⇒ 121.
+        assert_eq!(config.archive_control_response_stream_id, 121);
+        assert_eq!(config.snapshot_duration_threshold_ns, 1_000_000_000);
     }
 
     #[test]

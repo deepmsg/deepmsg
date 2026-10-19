@@ -68,6 +68,15 @@ impl TimeUnit {
         }
     }
 
+    /// The wire code for the snapshot marker: `ClusterClock.map`'s inverse.
+    pub const fn to_cluster_time_unit(self) -> ClusterTimeUnit {
+        match self {
+            Self::Milliseconds => ClusterTimeUnit::MILLIS,
+            Self::Microseconds => ClusterTimeUnit::MICROS,
+            Self::Nanoseconds => ClusterTimeUnit::NANOS,
+        }
+    }
+
     /// `TimeUnit.toMicros`.
     pub const fn to_micros(self, time: i64) -> i64 {
         match self {

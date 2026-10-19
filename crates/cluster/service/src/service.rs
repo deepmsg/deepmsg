@@ -16,8 +16,9 @@
 //! here returns [`ContainerError`] and the container propagates it with `?` —
 //! the same control flow, in the language's own spelling (plan rule 5).
 
+use deepmsg_client::client::Client;
 use deepmsg_client::image::Image;
-use deepmsg_client::publication::ExclusivePublication;
+use deepmsg_client::publication::{Claim, ExclusivePublication};
 use deepmsg_codec_cluster::close_reason::CloseReason;
 
 use crate::cluster::Cluster;
@@ -79,28 +80,56 @@ pub struct NewLeadershipTermEvent {
     pub app_version: i32,
 }
 
+/// The driver's position-limit counter for a publication
+/// (`Publication.positionLimitCounterId`): the limit every claim and offer is
+/// clamped to, read where it lives rather than carried by a caller.
+pub(crate) fn position_limit(client: &Client, publication: &ExclusivePublication) -> i64 {
+    client.counters_reader().map_or(0, |counters| {
+        counters
+            .value(publication.position_limit_counter_id())
+            .unwrap_or(0)
+    })
+}
+
 /// What the business writes its state into (`ServiceSnapshotTaker`'s
 /// publication, `onTakeSnapshot(ExclusivePublication)`).
 ///
-/// P3-2a defines it so the trait is complete; the container does not call
-/// `on_take_snapshot` until P3-2b.
+/// The reference hands the business the publication itself. This is a view over
+/// it plus the client, because the position limit `try_claim`/`offer` need lives
+/// in a driver counter rather than in the publication
+/// (`ExclusivePublicationSink`'s reason for carrying both).
+///
+/// Both methods answer the reference's negative `Publication` codes, so a
+/// business that back-pressures writes the same retry loop in either language.
 pub struct SnapshotWriter<'a> {
+    client: &'a mut Client,
     publication: &'a ExclusivePublication,
-    position_limit: i64,
 }
 
 impl<'a> SnapshotWriter<'a> {
     /// A writer over one snapshot recording's publication.
-    pub const fn new(publication: &'a ExclusivePublication, position_limit: i64) -> Self {
+    pub const fn new(client: &'a mut Client, publication: &'a ExclusivePublication) -> Self {
         Self {
+            client,
             publication,
-            position_limit,
         }
+    }
+
+    /// `IdleStrategy.idle` plus the agent invoker's poll (`SnapshotTaker`'s
+    /// retry loop): a back-pressured offer is cleared by the driver and the
+    /// archive, and this is the turn in which the client sees that happen.
+    pub fn idle(&mut self) {
+        let _ = self.client.poll();
     }
 
     /// The snapshot publication.
     pub const fn publication(&self) -> &'a ExclusivePublication {
         self.publication
+    }
+
+    /// The limit a claim or an offer is clamped to.
+    fn position_limit(&self) -> i64 {
+        position_limit(self.client, self.publication)
     }
 
     /// How far the recording has been written.
@@ -115,7 +144,7 @@ impl<'a> SnapshotWriter<'a> {
 
     /// Offer one record.
     pub fn offer(&self, payload: &[u8]) -> i64 {
-        match self.publication.offer(self.position_limit, payload) {
+        match self.publication.offer(self.position_limit(), payload) {
             deepmsg_core::logbuffer::append::Appended::Ok { position, .. } => position.raw(),
             deepmsg_core::logbuffer::append::Appended::BackPressured => {
                 crate::proxy::OFFER_BACK_PRESSURED
@@ -134,11 +163,41 @@ impl<'a> SnapshotWriter<'a> {
             }
         }
     }
+
+    /// Claim a record of `length` bytes (`ExclusivePublication.tryClaim`).
+    ///
+    /// The business writes the payload into [`Claim::frame`] and publishes it;
+    /// the negative answers are the same ones [`Self::offer`] gives.
+    ///
+    /// # Errors
+    ///
+    /// A negative `Publication` code when the claim could not be made.
+    pub fn try_claim(&self, length: usize) -> Result<Claim<'_>, i64> {
+        match self.publication.try_claim(self.position_limit(), length) {
+            Ok(claim) => Ok(claim),
+            Err(
+                deepmsg_core::logbuffer::append::Appended::BackPressured
+                | deepmsg_core::logbuffer::append::Appended::EndOfLog
+                | deepmsg_core::logbuffer::append::Appended::MidRotation,
+            ) => Err(crate::proxy::OFFER_BACK_PRESSURED),
+            Err(deepmsg_core::logbuffer::append::Appended::NotConnected) => {
+                Err(crate::proxy::OFFER_NOT_CONNECTED)
+            }
+            Err(
+                deepmsg_core::logbuffer::append::Appended::MaxPositionExceeded
+                | deepmsg_core::logbuffer::append::Appended::MessageTooLarge
+                | deepmsg_core::logbuffer::append::Appended::Malformed,
+            ) => Err(crate::proxy::OFFER_MAX_POSITION_EXCEEDED),
+            Err(_) => Err(crate::proxy::OFFER_ADMIN_ACTION),
+        }
+    }
 }
 
 /// What the business reads its state out of (`onStart`'s snapshot image).
 ///
-/// P3-2a always passes `None`; P3-2b fills the reader in.
+/// `None` on a start with nothing to recover; otherwise the image positioned
+/// just after the container's `SnapshotMarker(END)`, which is the first byte of
+/// whatever the business wrote in `on_take_snapshot`.
 pub struct SnapshotReader<'a> {
     image: &'a mut Image,
 }
@@ -238,8 +297,8 @@ pub trait ClusteredService {
         timestamp: i64,
     ) -> Result<(), ContainerError>;
 
-    /// Take a snapshot (`:108-113`). P3-2b's container calls it; P3-2a's never
-    /// does.
+    /// Take a snapshot (`:108-113`): write the business's state into the
+    /// recording, after the container's own records.
     ///
     /// # Errors
     ///

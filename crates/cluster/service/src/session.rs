@@ -3,8 +3,8 @@
 //! The reference keeps two structures over the same sessions: an `ArrayList`
 //! whose order is the snapshot's order, and a `Long2ObjectHashMap` for lookup
 //! (`CSA:1.5`). The list is kept **sorted by session id on insertion**
-//! (`CSA:628-652`), which is the order `P3-2b`'s snapshot will carry; it is
-//! fixed here rather than when the snapshot lands.
+//! (`CSA:628-652`), which is the order the snapshot carries — fixed here at
+//! P3-2a, before there was a snapshot to carry it.
 //!
 //! The Rust table keeps one `Vec` and a `Long2LongHashMap` from session id to
 //! index, which is the same pair of facts with one allocation strategy: the vec
