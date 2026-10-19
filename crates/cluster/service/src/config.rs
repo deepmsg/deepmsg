@@ -44,19 +44,19 @@ pub const SERVICE_STREAM_ID_DEFAULT: i32 = 104;
 pub const CONSENSUS_MODULE_STREAM_ID_PROP_NAME: &str = "aeron.cluster.consensus.module.stream.id";
 /// `CONSENSUS_MODULE_STREAM_ID_DEFAULT` (`:313`) — the container writes 105.
 pub const CONSENSUS_MODULE_STREAM_ID_DEFAULT: i32 = 105;
-/// `aeron.cluster.replay.channel` (`:264`); P3-2b.
+/// `aeron.cluster.replay.channel` (`:264`).
 pub const REPLAY_CHANNEL_PROP_NAME: &str = "aeron.cluster.replay.channel";
 /// `REPLAY_CHANNEL_DEFAULT` (`:270`).
 pub const REPLAY_CHANNEL_DEFAULT: &str = "aeron:ipc";
-/// `aeron.cluster.replay.stream.id` (`:275`); P3-2b.
+/// `aeron.cluster.replay.stream.id` (`:275`).
 pub const REPLAY_STREAM_ID_PROP_NAME: &str = "aeron.cluster.replay.stream.id";
 /// `REPLAY_STREAM_ID_DEFAULT` (`:282`).
 pub const REPLAY_STREAM_ID_DEFAULT: i32 = 103;
-/// `aeron.cluster.snapshot.channel` (`:318`); P3-2b.
+/// `aeron.cluster.snapshot.channel` (`:318`).
 pub const SNAPSHOT_CHANNEL_PROP_NAME: &str = "aeron.cluster.snapshot.channel";
 /// `SNAPSHOT_CHANNEL_DEFAULT` (`:324`).
 pub const SNAPSHOT_CHANNEL_DEFAULT: &str = "aeron:ipc?alias=snapshot";
-/// `aeron.cluster.snapshot.stream.id` (`:330`); P3-2b.
+/// `aeron.cluster.snapshot.stream.id` (`:330`).
 pub const SNAPSHOT_STREAM_ID_PROP_NAME: &str = "aeron.cluster.snapshot.stream.id";
 /// `SNAPSHOT_STREAM_ID_DEFAULT` (`:337`).
 pub const SNAPSHOT_STREAM_ID_DEFAULT: i32 = 106;
@@ -173,13 +173,13 @@ pub struct ServiceContainerConfig {
     pub idle_strategy: String,
     /// The application version this container is (`NewLeadershipTermEvent`).
     pub app_version: i32,
-    /// `aeron.cluster.replay.channel` — read now, used by P3-2b.
+    /// `aeron.cluster.replay.channel`.
     pub replay_channel: String,
-    /// `aeron.cluster.replay.stream.id` — P3-2b.
+    /// `aeron.cluster.replay.stream.id`.
     pub replay_stream_id: i32,
-    /// `aeron.cluster.snapshot.channel` — P3-2b.
+    /// `aeron.cluster.snapshot.channel`.
     pub snapshot_channel: String,
-    /// `aeron.cluster.snapshot.stream.id` — P3-2b.
+    /// `aeron.cluster.snapshot.stream.id`.
     pub snapshot_stream_id: i32,
     /// `aeron.archive.local.control.channel`: the archive this container uses
     /// is local to the same driver (`AeronArchive.java:2722`).

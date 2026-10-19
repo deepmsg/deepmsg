@@ -195,7 +195,9 @@ impl<'a> SnapshotWriter<'a> {
 
 /// What the business reads its state out of (`onStart`'s snapshot image).
 ///
-/// P3-2a always passes `None`; P3-2b fills the reader in.
+/// `None` on a start with nothing to recover; otherwise the image positioned
+/// just after the container's `SnapshotMarker(END)`, which is the first byte of
+/// whatever the business wrote in `on_take_snapshot`.
 pub struct SnapshotReader<'a> {
     image: &'a mut Image,
 }
@@ -295,8 +297,8 @@ pub trait ClusteredService {
         timestamp: i64,
     ) -> Result<(), ContainerError>;
 
-    /// Take a snapshot (`:108-113`). P3-2b's container calls it; P3-2a's never
-    /// does.
+    /// Take a snapshot (`:108-113`): write the business's state into the
+    /// recording, after the container's own records.
     ///
     /// # Errors
     ///

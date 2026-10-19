@@ -2,10 +2,9 @@
 //! dispatch.
 //!
 //! Counterpart of `ClusteredServiceAgent` (`ClusteredServiceAgent.java`,
-//! `CSA`). P3-2a is the container **without snapshots**: the recovery read that
-//! finds a snapshot recording id, and a `ClusterActionRequest(SNAPSHOT)`, both
-//! end the container with an error naming `P3-2b`, rather than pretending the
-//! service has no state to save.
+//! `CSA`). Both halves of a snapshot live here: a recovery that finds a
+//! recording id replays it and hands the image to `on_start`, and a
+//! `ClusterAction(SNAPSHOT)` takes one and answers it with the recording id.
 //!
 //! # The duty cycle (`CSA:247-281`)
 //!
@@ -137,7 +136,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
     ///
     /// [`ContainerError`] when the client cannot reach the driver, the mark
     /// file cannot be created, a counter cannot be allocated, or the recovery
-    /// state names a snapshot (P3-2b).
+    /// state names a snapshot that cannot be loaded.
     pub fn launch(config: ServiceContainerConfig, service: S) -> Result<Self, ContainerError> {
         let mut client = Client::connect(&config.aeron_dir)?;
 
@@ -435,15 +434,18 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
 
         let archive = ensure_archive(archive, client, config)?;
 
-        // ★ The subscription is added **before** the replay is started, and its
-        // registration id travels in the request. That is the C client's shape
-        // (`aeron_archive_replay`, `:1512-1528`), not `AeronArchive.startReplay`
-        // + `addSubscription`: the archive answers a start only once its replay
-        // publication is **connected** (`ReplaySession.java:68`), so a
-        // subscription added afterwards can join a publication that is already
-        // publishing and start at its current position — which loses the
-        // beginning of a small snapshot (measured: a 352-byte recording arrived
-        // as its last 32-byte record).
+        // ★ The subscription is added **before** the replay is started. That is
+        // the C client's shape (`aeron_archive_replay`, `:1512-1528`), not
+        // `AeronArchive.startReplay` + `addSubscription`: the archive answers a
+        // start only once its replay publication is **connected**
+        // (`ReplaySession.java:68`), so a subscription added afterwards can
+        // join a publication that is already publishing and start at its
+        // current position — which loses the beginning of a small snapshot
+        // (measured: a 352-byte recording arrived as its last 32-byte record).
+        // The replay request on the wire has no subscription-id field; what
+        // makes this work is the subscription existing before the request, and
+        // `ReplayParams::subscription_registration_id` is filled for the shape
+        // a caller reading the C API expects.
         let subscription_id = client.add_subscription(
             &config.replay_channel,
             config.replay_stream_id,
