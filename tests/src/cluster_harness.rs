@@ -845,6 +845,23 @@ impl Node {
         }
     }
 
+    /// The last term in this member's `recording.log` — the entry a
+    /// `BackupResponse` reports (`ConsensusPublisher.java:495-500` fills its
+    /// five log fields from `RecordingLog.findLastTerm`).
+    ///
+    /// `None` when the log has no term, or cannot be opened.
+    pub fn last_term(&self) -> Option<LastTerm> {
+        use deepmsg_cluster::persist::recording_log::{self, RecordingLog};
+
+        let path = self.cluster_dir.path().join(recording_log::FILENAME);
+        let log = RecordingLog::open(&path).ok()?;
+        log.find_last_term().map(|entry| LastTerm {
+            recording_id: entry.recording_id,
+            leadership_term_id: entry.leadership_term_id,
+            term_base_log_position: entry.term_base_log_position,
+        })
+    }
+
     /// The term buffer length and MTU the archive recorded the **current log
     /// recording** with.
     ///
@@ -903,6 +920,17 @@ impl Node {
     }
 }
 
+/// What [`Node::last_term`] read: the member's own last recording-log entry.
+#[derive(Clone, Copy, Debug)]
+pub struct LastTerm {
+    /// The recording the term lives in.
+    pub recording_id: i64,
+    /// The term itself.
+    pub leadership_term_id: i64,
+    /// Where the term starts in the log.
+    pub term_base_log_position: i64,
+}
+
 /// What [`Node::log_recording_shape`] read: the term the recording holds, and
 /// the shape it was made with.
 #[derive(Clone, Copy, Debug)]
@@ -944,6 +972,13 @@ impl NodeCounters {
         let counters = self.cnc.counters()?;
         let id = find_cluster_counter(&counters, type_id, CLUSTER_ID)?;
         counters.value(id)
+    }
+
+    /// The value at a counter **id** the cluster named — a `BackupResponse`
+    /// carries the commit-position counter's id, not its value, and this is how
+    /// a test reads what the id points at.
+    pub fn counter_value(&self, counter_id: i32) -> Option<i64> {
+        self.cnc.counters()?.value(counter_id)
     }
 
     /// Write one of the module's counters — how an operator drives the cluster

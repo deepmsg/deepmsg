@@ -72,6 +72,10 @@ name = "cluster_follower_path"
 path = "integration/cluster_follower_path.rs"
 
 [[test]]
+name = "cluster_backup_query"
+path = "integration/cluster_backup_query.rs"
+
+[[test]]
 name = "forwarding_poll"
 path = "integration/forwarding_poll.rs"
 
