@@ -473,6 +473,53 @@ impl RecordingLog {
             .find(|entry| entry.is_term() && entry.leadership_term_id == leadership_term_id)
     }
 
+    /// `isUnknown(leadershipTermId)` (`:937-940`): the log has no TERM entry
+    /// for this term yet.
+    ///
+    /// A backup asks this before appending a term it heard about, because the
+    /// term it heard about may already be in its own log.
+    #[must_use]
+    pub fn is_unknown(&self, leadership_term_id: i64) -> bool {
+        self.find_term_entry(leadership_term_id).is_none()
+    }
+
+    /// `getLatestSnapshot(serviceId)` (`:772-797`): the newest valid snapshot
+    /// for one service.
+    ///
+    /// The scan is over the **consensus module's** snapshots, because a
+    /// service's snapshot is only known through the set it belongs to: the
+    /// service's entry sits `serviceId + 1` records **before** the module's
+    /// (`:784-792`), which is the same layout
+    /// [`Self::find_snapshot_at_or_before_or_lowest`] reads as a slice.
+    #[must_use]
+    pub fn get_latest_snapshot(&self, service_id: i32) -> Option<&Entry> {
+        for index in (0..self.entries.len()).rev() {
+            let entry = &self.entries[index];
+            if !is_valid_snapshot(entry) || entry.service_id != CONSENSUS_MODULE_SERVICE_ID {
+                continue;
+            }
+
+            if service_id == CONSENSUS_MODULE_SERVICE_ID {
+                return Some(entry);
+            }
+
+            let Ok(service_offset) = usize::try_from(service_id) else {
+                continue;
+            };
+            let Some(snapshot) = index
+                .checked_sub(service_offset + 1)
+                .and_then(|index| self.entries.get(index))
+            else {
+                continue;
+            };
+            if is_valid_snapshot(snapshot) && snapshot.service_id == service_id {
+                return Some(snapshot);
+            }
+        }
+
+        None
+    }
+
     /// The complete snapshot set at or before `log_position`, else the lowest
     /// complete set (`findSnapshotAtOrBeforeOrLowest`, `:1197-1240`).
     ///
@@ -610,7 +657,7 @@ impl RecordingLog {
     /// The four-argument `appendTerm` (`:950-988`): the committed position is
     /// the next term's base when there is a next term, otherwise uncommitted;
     /// the term before this one is committed at this term's base.
-    fn append_term_entry(
+    pub fn append_term_entry(
         &mut self,
         recording_id: i64,
         leadership_term_id: i64,
@@ -1334,6 +1381,49 @@ mod tests {
     fn no_set_at_all_is_none() {
         let (log, directory) = log_with_snapshot_sets("none", &[]);
         assert_eq!(None, log.find_snapshot_at_or_before_or_lowest(i64::MAX, 1));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn a_term_the_log_has_not_recorded_is_unknown() {
+        let directory = std::env::temp_dir().join(format!(
+            "deepmsg-recording-log-unknown-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut log = RecordingLog::open(&directory.join("recording.log")).unwrap();
+
+        assert!(log.is_unknown(0), "an empty log knows no term");
+        log.append_term(0, 0, NULL_POSITION, 1000, 100, CONSENSUS_MODULE_SERVICE_ID)
+            .unwrap();
+
+        assert!(!log.is_unknown(0));
+        assert!(log.is_unknown(1));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn the_latest_snapshot_of_a_service_is_found_through_its_set() {
+        // Two sets at 1000 and 2000, two services each.
+        let (log, directory) = log_with_snapshot_sets("latest-snapshot", &[(1000, 2), (2000, 2)]);
+
+        let module = log
+            .get_latest_snapshot(CONSENSUS_MODULE_SERVICE_ID)
+            .expect("the newest module snapshot");
+        assert_eq!(2000, module.log_position);
+
+        for service_id in 0..2 {
+            let snapshot = log
+                .get_latest_snapshot(service_id)
+                .unwrap_or_else(|| panic!("service {service_id}'s newest snapshot"));
+            assert_eq!(2000, snapshot.log_position);
+            assert_eq!(service_id, snapshot.service_id);
+        }
+
+        assert_eq!(None, log.get_latest_snapshot(2), "a service with none");
+
         let _ = std::fs::remove_dir_all(directory);
     }
 
