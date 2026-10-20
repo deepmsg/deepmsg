@@ -864,7 +864,6 @@ impl ConsensusModuleAgent {
             let leader_member_id = self.leader_member_id();
             let ingress_endpoints = self.ingress_endpoints.as_str();
             let clock = self.clock;
-            let cluster_members = member::encode_as_string(&self.members);
             let service_count = self.config.service_count;
             let commit_position_counter_id = self.counters.commit_position.counter_id();
 
@@ -875,6 +874,7 @@ impl ConsensusModuleAgent {
                 log_publisher,
                 counters,
                 recording_log,
+                members,
                 ..
             } = self;
             let mut ctx = SessionContext {
@@ -892,7 +892,7 @@ impl ConsensusModuleAgent {
                 recording_log,
                 service_count,
                 commit_position_counter_id,
-                cluster_members: &cluster_members,
+                cluster_members: members.as_slice(),
             };
 
             work += sessions.send_redirects(&mut ctx)?;
@@ -981,7 +981,6 @@ impl ConsensusModuleAgent {
         let leader_member_id = self.leader_member_id();
         let ingress_endpoints = self.ingress_endpoints.as_str();
         let clock = self.clock;
-        let cluster_members = member::encode_as_string(&self.members);
         let service_count = self.config.service_count;
         let commit_position_counter_id = self.counters.commit_position.counter_id();
 
@@ -992,6 +991,7 @@ impl ConsensusModuleAgent {
             log_publisher,
             counters,
             recording_log,
+            members,
             ..
         } = self;
         let mut ctx = SessionContext {
@@ -1009,7 +1009,7 @@ impl ConsensusModuleAgent {
             recording_log,
             service_count,
             commit_position_counter_id,
-            cluster_members: &cluster_members,
+            cluster_members: members.as_slice(),
         };
 
         sessions.process_pending_backup_sessions(&mut ctx)
@@ -1026,7 +1026,6 @@ impl ConsensusModuleAgent {
         let leader_member_id = self.leader_member_id();
         let ingress_endpoints = self.ingress_endpoints.as_str();
         let clock = self.clock;
-        let cluster_members = member::encode_as_string(&self.members);
         let service_count = self.config.service_count;
         let commit_position_counter_id = self.counters.commit_position.counter_id();
 
@@ -1037,6 +1036,7 @@ impl ConsensusModuleAgent {
             log_publisher,
             counters,
             recording_log,
+            members,
             ..
         } = self;
         let mut ctx = SessionContext {
@@ -1054,7 +1054,7 @@ impl ConsensusModuleAgent {
             recording_log,
             service_count,
             commit_position_counter_id,
-            cluster_members: &cluster_members,
+            cluster_members: members.as_slice(),
         };
 
         let mut work = sessions.process_all_pending_sessions(&mut ctx)?;
@@ -4812,7 +4812,6 @@ impl ConsensusModuleAgent {
             // names where the leader is (`sendRedirects`).
             let leader_member_id = self.leader_member_id();
             let clock = self.clock;
-            let cluster_members = member::encode_as_string(&self.members);
             let service_count = self.config.service_count;
             let commit_position_counter_id = self.counters.commit_position.counter_id();
             let Self {
@@ -4822,6 +4821,7 @@ impl ConsensusModuleAgent {
                 log_publisher,
                 counters,
                 recording_log,
+                members,
                 ..
             } = self;
             let mut ctx = SessionContext {
@@ -4839,7 +4839,7 @@ impl ConsensusModuleAgent {
                 recording_log,
                 service_count,
                 commit_position_counter_id,
-                cluster_members: &cluster_members,
+                cluster_members: members.as_slice(),
             };
             for (term, cluster_session_id) in deferred_closes {
                 sessions.on_session_close(term, cluster_session_id, &mut ctx)?;
@@ -5367,7 +5367,6 @@ impl ConsensusModuleAgent {
         let now_ns = self.clock.time_nanos();
         let clock = self.clock;
         let ingress_endpoints = self.ingress_endpoints.as_str();
-        let self_cluster_members = member::encode_as_string(&self.members);
         let self_service_count = self.config.service_count;
         let self_commit_position_counter_id = self.counters.commit_position.counter_id();
 
@@ -5432,7 +5431,7 @@ impl ConsensusModuleAgent {
                     recording_log,
                     service_count: self_service_count,
                     commit_position_counter_id: self_commit_position_counter_id,
-                    cluster_members: &self_cluster_members,
+                    cluster_members: members.as_slice(),
                 };
                 for cluster_session_id in deferred_closes {
                     sessions.on_session_close(leadership_term_id, cluster_session_id, &mut ctx)?;

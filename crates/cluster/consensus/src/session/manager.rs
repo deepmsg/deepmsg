@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 
 use deepmsg_client::client::Client;
 use deepmsg_client::counter::Counter;
+use deepmsg_cluster_common::member::{self, ClusterMember};
 use deepmsg_codec_cluster::close_reason::CloseReason;
 use deepmsg_codec_cluster::event_code::EventCode;
 
@@ -90,9 +91,14 @@ pub struct SessionContext<'a> {
     /// The commit-position counter's id, carried in the answer so the backup can
     /// bound its replay by it (`ConsensusPublisher.java:498`).
     pub commit_position_counter_id: i32,
-    /// `ClusterMember.encodeAsString(activeMembers)` — the member list the
-    /// answer carries (`SessionManager.java:683`).
-    pub cluster_members: &'a str,
+    /// The active members: the backup answer encodes them
+    /// (`ClusterMember.encodeAsString(activeMembers)`,
+    /// `SessionManager.java:683`) **only when a query is answered**.
+    ///
+    /// The list, not its encoding: a `String` built here would be built on
+    /// every duty cycle, and a backup query is rare (`zero_alloc.rs` caught
+    /// exactly that).
+    pub cluster_members: &'a [ClusterMember],
 }
 
 /// Which of the two pending lists a pass is over (`SessionManager.java:75-76`).
@@ -629,13 +635,17 @@ impl SessionManager {
                                     client: &*ctx.client,
                                     session: &session,
                                 };
+                                // Encoded here, for this answer, where the
+                                // reference encodes it (`:683`) — not once per
+                                // duty cycle.
+                                let cluster_members = member::encode_as_string(ctx.cluster_members);
                                 if ctx.egress.send_backup_response(
                                     &egress_session,
                                     ctx.commit_position_counter_id,
                                     ctx.leader_member_id,
                                     ctx.member_id,
                                     &entry,
-                                    ctx.cluster_members,
+                                    &cluster_members,
                                     snapshots.as_deref(),
                                 )? {
                                     session.close(ctx.client, "done");
