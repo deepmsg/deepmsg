@@ -104,6 +104,11 @@ pub enum ConsensusMessage {
         response_stream_id: i32,
         version: i32,
         log_position: i64,
+        /// Where the answer goes — the backup's own consensus subscription
+        /// (`ClusterBackupAgent.java:698`).
+        response_channel: String,
+        /// What the backup offers to prove itself with; opaque here.
+        encoded_credentials: Vec<u8>,
     },
     ChallengeResponse {
         correlation_id: i64,
@@ -251,12 +256,19 @@ pub fn decode_consensus_message(payload: &[u8]) -> Result<Option<ConsensusMessag
             })
         }
         deepmsg_codec_cluster::backup_query_codec::SBE_TEMPLATE_ID => {
-            let decoder = BackupQueryDecoder::default().header(header, 0);
+            let mut decoder = BackupQueryDecoder::default().header(header, 0);
+            let coordinates = decoder.response_channel_decoder();
+            let response_channel =
+                String::from_utf8_lossy(decoder.response_channel_slice(coordinates)).into_owned();
+            let coordinates = decoder.encoded_credentials_decoder();
+            let encoded_credentials = decoder.encoded_credentials_slice(coordinates).to_vec();
             Some(ConsensusMessage::BackupQuery {
                 correlation_id: decoder.correlation_id(),
                 response_stream_id: decoder.response_stream_id(),
                 version: decoder.version().unwrap_or(0),
                 log_position: decoder.log_position().unwrap_or(-1),
+                response_channel,
+                encoded_credentials,
             })
         }
         deepmsg_codec_cluster::challenge_response_codec::SBE_TEMPLATE_ID => {

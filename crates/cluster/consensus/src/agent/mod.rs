@@ -864,6 +864,8 @@ impl ConsensusModuleAgent {
             let leader_member_id = self.leader_member_id();
             let ingress_endpoints = self.ingress_endpoints.as_str();
             let clock = self.clock;
+            let service_count = self.config.service_count;
+            let commit_position_counter_id = self.counters.commit_position.counter_id();
 
             let Self {
                 client,
@@ -871,6 +873,8 @@ impl ConsensusModuleAgent {
                 egress,
                 log_publisher,
                 counters,
+                recording_log,
+                members,
                 ..
             } = self;
             let mut ctx = SessionContext {
@@ -885,6 +889,10 @@ impl ConsensusModuleAgent {
                 leader_member_id,
                 ingress_endpoints,
                 now_ns,
+                recording_log,
+                service_count,
+                commit_position_counter_id,
+                cluster_members: members.as_slice(),
             };
 
             work += sessions.send_redirects(&mut ctx)?;
@@ -932,7 +940,14 @@ impl ConsensusModuleAgent {
                     }
                 }
             } else {
-                // `:2438-2452`: a follower whose leader has gone quiet — and
+                // `:2437-2443`: a follower answers the backup queries it heard.
+                // The leader does the same through `processAllPendingSessions`
+                // (`:2417`), which is why this is only the follower's call.
+                if self.role == Role::Follower && self.state == ModuleState::Active {
+                    work += self.process_pending_backup_sessions(now_ns)?;
+                }
+
+                // `:2444-2452`: a follower whose leader has gone quiet — and
                 // which is not already terminating — starts an election.
                 if (self.state == ModuleState::Active || self.state == ModuleState::Suspended)
                     && now_ns
@@ -954,17 +969,20 @@ impl ConsensusModuleAgent {
         Ok(work)
     }
 
-    /// The leader's session work (`:2415-2418`), split out because the control
-    /// toggle has to be read before it.
-    fn process_open_sessions(&mut self, now_ns: i64) -> Result<usize, ClusterError> {
+    /// `processPendingBackupSessions` (`:2437-2443`): the follower's half of a
+    /// backup query.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] from authentication, the log append or an egress send.
+    fn process_pending_backup_sessions(&mut self, now_ns: i64) -> Result<usize, ClusterError> {
         let leadership_term_id = self.leadership_term_id;
         let member_id = self.config.member_id;
-        // `onClusterMembersQuery` answers with `leaderMember.id()`
-        // (`ConsensusModuleAgent.java:1271-1279`) — the member the election
-        // said leads, which every member records in `updateMemberDetails`.
         let leader_member_id = self.leader_member_id();
         let ingress_endpoints = self.ingress_endpoints.as_str();
         let clock = self.clock;
+        let service_count = self.config.service_count;
+        let commit_position_counter_id = self.counters.commit_position.counter_id();
 
         let Self {
             client,
@@ -972,6 +990,8 @@ impl ConsensusModuleAgent {
             egress,
             log_publisher,
             counters,
+            recording_log,
+            members,
             ..
         } = self;
         let mut ctx = SessionContext {
@@ -986,6 +1006,55 @@ impl ConsensusModuleAgent {
             leader_member_id,
             ingress_endpoints,
             now_ns,
+            recording_log,
+            service_count,
+            commit_position_counter_id,
+            cluster_members: members.as_slice(),
+        };
+
+        sessions.process_pending_backup_sessions(&mut ctx)
+    }
+
+    /// The leader's session work (`:2415-2418`), split out because the control
+    /// toggle has to be read before it.
+    fn process_open_sessions(&mut self, now_ns: i64) -> Result<usize, ClusterError> {
+        let leadership_term_id = self.leadership_term_id;
+        let member_id = self.config.member_id;
+        // `onClusterMembersQuery` answers with `leaderMember.id()`
+        // (`ConsensusModuleAgent.java:1271-1279`) — the member the election
+        // said leads, which every member records in `updateMemberDetails`.
+        let leader_member_id = self.leader_member_id();
+        let ingress_endpoints = self.ingress_endpoints.as_str();
+        let clock = self.clock;
+        let service_count = self.config.service_count;
+        let commit_position_counter_id = self.counters.commit_position.counter_id();
+
+        let Self {
+            client,
+            sessions,
+            egress,
+            log_publisher,
+            counters,
+            recording_log,
+            members,
+            ..
+        } = self;
+        let mut ctx = SessionContext {
+            client,
+            log_publisher,
+            egress,
+            clock: &clock,
+            timed_out_counter: counters.timed_out_client,
+            control_toggle: counters.control_toggle,
+            leadership_term_id,
+            member_id,
+            leader_member_id,
+            ingress_endpoints,
+            now_ns,
+            recording_log,
+            service_count,
+            commit_position_counter_id,
+            cluster_members: members.as_slice(),
         };
 
         let mut work = sessions.process_all_pending_sessions(&mut ctx)?;
@@ -2186,12 +2255,30 @@ impl ConsensusModuleAgent {
                 );
                 Ok(0)
             }
-            ConsensusMessage::BackupQuery { .. }
-            | ConsensusMessage::HeartbeatRequest { .. }
+            ConsensusMessage::BackupQuery {
+                correlation_id,
+                response_stream_id,
+                version,
+                log_position,
+                response_channel,
+                encoded_credentials,
+            } => {
+                self.on_backup_query(
+                    correlation_id,
+                    response_stream_id,
+                    version,
+                    log_position,
+                    &response_channel,
+                    &encoded_credentials,
+                    now_ns,
+                );
+                Ok(0)
+            }
+            ConsensusMessage::HeartbeatRequest { .. }
             | ConsensusMessage::StandbySnapshot { .. } => {
-                // Backup queries, the challenge response and the standby
-                // snapshot are ClusterBackup's (P3-9) and premium's; a member
-                // that hears one is heard, counted and not answered.
+                // Heartbeat requests and the standby snapshot belong to the
+                // standby protocol, which is premium (plan §1.2); a member that
+                // hears one is heard, counted and not answered.
                 self.report_counted_error(None);
                 Ok(0)
             }
@@ -2403,7 +2490,87 @@ impl ConsensusModuleAgent {
         cluster_session_id: i64,
         encoded_credentials: &[u8],
     ) {
-        let _ = (correlation_id, cluster_session_id, encoded_credentials);
+        self.sessions.on_challenge_response_for_backup_session(
+            correlation_id,
+            cluster_session_id,
+            encoded_credentials,
+            self.clock.time_nanos(),
+        );
+    }
+
+    /// `onBackupQuery` (`ConsensusModuleAgent.java:1217-1240`): a backup asking
+    /// this member where the cluster's log is.
+    ///
+    /// Three gates, all the reference's: **no election in progress**, a state
+    /// that can answer (`ACTIVE`, `SUSPENDED`, `SNAPSHOT`), and the response
+    /// channel refined over the egress template (`refineResponseChannel`,
+    /// `:3459-3475`). A backup query that arrives mid-election is dropped —
+    /// the backup retries on its own interval.
+    #[allow(clippy::too_many_arguments)] // one per field the query carries
+    fn on_backup_query(
+        &mut self,
+        correlation_id: i64,
+        response_stream_id: i32,
+        version: i32,
+        log_position: i64,
+        response_channel: &str,
+        encoded_credentials: &[u8],
+        now_ns: i64,
+    ) {
+        if self.election.is_some() {
+            return;
+        }
+
+        if !matches!(
+            self.state,
+            ModuleState::Active | ModuleState::Suspended | ModuleState::Snapshot
+        ) {
+            return;
+        }
+
+        let response_channel = self.refine_response_channel(response_channel);
+        self.sessions.on_backup_query(
+            correlation_id,
+            response_stream_id,
+            version,
+            (NULL_VALUE != log_position).then_some(log_position),
+            &response_channel,
+            encoded_credentials,
+            now_ns,
+        );
+    }
+
+    /// `refineResponseChannel` (`:3459-3475`): an egress channel template, when
+    /// the deployment set one (`aeron.cluster.egress.channel`).
+    ///
+    /// Two shapes carry over from the reference: an `aeron:ipc` response
+    /// channel is replaced by the egress channel unless IPC ingress is allowed,
+    /// and any other channel has the template's parameters laid over it.
+    fn refine_response_channel(&self, response_channel: &str) -> String {
+        let Some(template) = &self.config.egress_channel else {
+            return response_channel.to_owned();
+        };
+
+        if response_channel.starts_with("aeron:ipc") {
+            return if self.config.ingress_ipc_allowed {
+                response_channel.to_owned()
+            } else {
+                template.clone()
+            };
+        }
+
+        let Ok(template_uri) = deepmsg_core::uri::ChannelUri::parse(template) else {
+            return response_channel.to_owned();
+        };
+        let Ok(mut channel_uri) = deepmsg_core::uri::ChannelUri::parse(response_channel) else {
+            return response_channel.to_owned();
+        };
+
+        for (key, value) in template_uri.params() {
+            channel_uri.put(key, value.clone());
+        }
+
+        channel_uri.build()
     }
 
     /// `onVote` (`:982-997`).
@@ -4645,12 +4812,16 @@ impl ConsensusModuleAgent {
             // names where the leader is (`sendRedirects`).
             let leader_member_id = self.leader_member_id();
             let clock = self.clock;
+            let service_count = self.config.service_count;
+            let commit_position_counter_id = self.counters.commit_position.counter_id();
             let Self {
                 client,
                 sessions,
                 egress,
                 log_publisher,
                 counters,
+                recording_log,
+                members,
                 ..
             } = self;
             let mut ctx = SessionContext {
@@ -4665,6 +4836,10 @@ impl ConsensusModuleAgent {
                 leader_member_id,
                 ingress_endpoints,
                 now_ns,
+                recording_log,
+                service_count,
+                commit_position_counter_id,
+                cluster_members: members.as_slice(),
             };
             for (term, cluster_session_id) in deferred_closes {
                 sessions.on_session_close(term, cluster_session_id, &mut ctx)?;
@@ -5192,6 +5367,8 @@ impl ConsensusModuleAgent {
         let now_ns = self.clock.time_nanos();
         let clock = self.clock;
         let ingress_endpoints = self.ingress_endpoints.as_str();
+        let self_service_count = self.config.service_count;
+        let self_commit_position_counter_id = self.counters.commit_position.counter_id();
 
         let (work, deferred_snapshot, deferred_termination, deferred_close) = {
             let Self {
@@ -5210,6 +5387,7 @@ impl ConsensusModuleAgent {
                 service_proxy,
                 service_publication_id,
                 members,
+                recording_log,
                 ..
             } = self;
 
@@ -5250,6 +5428,10 @@ impl ConsensusModuleAgent {
                     leader_member_id,
                     ingress_endpoints,
                     now_ns,
+                    recording_log,
+                    service_count: self_service_count,
+                    commit_position_counter_id: self_commit_position_counter_id,
+                    cluster_members: members.as_slice(),
                 };
                 for cluster_session_id in deferred_closes {
                     sessions.on_session_close(leadership_term_id, cluster_session_id, &mut ctx)?;

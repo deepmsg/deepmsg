@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 
 use deepmsg_client::client::Client;
 use deepmsg_client::counter::Counter;
+use deepmsg_cluster_common::member::{self, ClusterMember};
 use deepmsg_codec_cluster::close_reason::CloseReason;
 use deepmsg_codec_cluster::event_code::EventCode;
 
@@ -23,10 +24,11 @@ use crate::config::{
 };
 use crate::error::ClusterError;
 use crate::log_publisher::LogPublisher;
+use crate::persist::recording_log::RecordingLog;
 use crate::session::authenticator::{Authenticator, AuthorisationService};
 use crate::session::cluster_session::{
-    ClusterSession, ClusterSessionProxy, ClusterSessionState, NULL_VALUE, SessionEgress,
-    session_info,
+    ClusterSession, ClusterSessionAction, ClusterSessionProxy, ClusterSessionState, NULL_VALUE,
+    SessionEgress, is_authorised, session_info,
 };
 use crate::session::egress::EgressPublisher;
 use crate::state::Role;
@@ -80,6 +82,32 @@ pub struct SessionContext<'a> {
     pub ingress_endpoints: &'a str,
     /// The cycle's nanosecond time.
     pub now_ns: i64,
+    /// This member's recording log: what a backup query is answered from
+    /// (`SessionManager.java:673-681`).
+    pub recording_log: &'a RecordingLog,
+    /// How many services the cluster runs: a snapshot answer is a set of
+    /// `service_count + 1` entries.
+    pub service_count: i32,
+    /// The commit-position counter's id, carried in the answer so the backup can
+    /// bound its replay by it (`ConsensusPublisher.java:498`).
+    pub commit_position_counter_id: i32,
+    /// The active members: the backup answer encodes them
+    /// (`ClusterMember.encodeAsString(activeMembers)`,
+    /// `SessionManager.java:683`) **only when a query is answered**.
+    ///
+    /// The list, not its encoding: a `String` built here would be built on
+    /// every duty cycle, and a backup query is rare (`zero_alloc.rs` caught
+    /// exactly that).
+    pub cluster_members: &'a [ClusterMember],
+}
+
+/// Which of the two pending lists a pass is over (`SessionManager.java:75-76`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingKind {
+    /// Ordinary clients.
+    User,
+    /// Backup queries: `BACKUP` sessions, which are never committed to the log.
+    Backup,
 }
 
 /// The session table (`SessionManager.java:68-191`).
@@ -96,6 +124,10 @@ pub struct SessionManager {
     rejected_user_sessions: Vec<ClusterSession>,
     /// Sessions that have to hear who the leader is (`:73`).
     redirect_user_sessions: Vec<ClusterSession>,
+    /// Backup queries that are authenticating (`pendingBackupSessions`, `:75`).
+    pending_backup_sessions: Vec<ClusterSession>,
+    /// Backup sessions that have to hear they were rejected (`:76`).
+    rejected_backup_sessions: Vec<ClusterSession>,
     /// Sessions whose close event is not committed yet (`:78`).
     uncommitted_closed_sessions: VecDeque<ClusterSession>,
     /// `(logPosition, nextSessionId)` pairs (`:82`).
@@ -125,6 +157,8 @@ impl SessionManager {
             pending_user_sessions: Vec::new(),
             rejected_user_sessions: Vec::new(),
             redirect_user_sessions: Vec::new(),
+            pending_backup_sessions: Vec::new(),
+            rejected_backup_sessions: Vec::new(),
             uncommitted_closed_sessions: VecDeque::new(),
             uncommitted_next_committed_session_ids: VecDeque::new(),
             next_session_id: 1,
@@ -273,6 +307,8 @@ impl SessionManager {
             .iter_mut()
             .chain(self.rejected_user_sessions.iter_mut())
             .chain(self.redirect_user_sessions.iter_mut())
+            .chain(self.pending_backup_sessions.iter_mut())
+            .chain(self.rejected_backup_sessions.iter_mut())
         {
             if session.response_publication_id() == NULL_VALUE {
                 session.async_connect(client, self.cluster_id)?;
@@ -344,7 +380,7 @@ impl SessionManager {
     }
 
     /// `processAllPendingSessions` (`SessionManager.java:517-538`): user
-    /// sessions, then backup sessions (which this slice never creates).
+    /// sessions, then backup sessions.
     ///
     /// # Errors
     ///
@@ -353,10 +389,114 @@ impl SessionManager {
         &mut self,
         ctx: &mut SessionContext<'_>,
     ) -> Result<usize, ClusterError> {
-        self.process_pending_sessions(ctx)
+        let mut work_count = self.process_pending_list(PendingKind::User, ctx)?;
+        work_count += self.process_pending_list(PendingKind::Backup, ctx)?;
+        Ok(work_count)
     }
 
-    /// `processPendingSessions` (`SessionManager.java:583-761`).
+    /// `onBackupQuery` (`SessionManager.java:331-350`), through the reference's
+    /// `onBackupAction` (`:370-406`).
+    ///
+    /// A backup query is **not** a client session: it has no cluster session id
+    /// (`NULL_VALUE`), it is never appended to the log, and it lives for one
+    /// round trip. What it does have is an authentication step, because a
+    /// cluster may refuse to serve a backup that cannot prove itself — which is
+    /// exactly what `ClusterBackupTest#9` and `#10` check.
+    ///
+    /// `log_position` is what the query asked about; `None` is the reference's
+    /// `null`, which its answer turns into `Long.MAX_VALUE` ("the latest you
+    /// have").
+    #[allow(clippy::too_many_arguments)] // one per field the query carries
+    pub fn on_backup_query(
+        &mut self,
+        correlation_id: i64,
+        response_stream_id: i32,
+        version: i32,
+        log_position: Option<i64>,
+        response_channel: &str,
+        encoded_credentials: &[u8],
+        now_ns: i64,
+    ) {
+        let mut session = ClusterSession::new(
+            self.cluster_member_id,
+            NULL_VALUE,
+            response_stream_id,
+            response_channel,
+            session_info(ClusterSessionAction::Backup.name(), "", NULL_VALUE as i32),
+        );
+
+        session.set_action(ClusterSessionAction::Backup);
+        session.last_activity_ns(now_ns, correlation_id);
+        session.set_request_input(log_position);
+
+        // The reference checks the major version before authenticating, and
+        // rejects a session whose query came from an incompatible client.
+        if PROTOCOL_MAJOR_VERSION != semantic_version_major(version) {
+            let detail = format!(
+                "{SESSION_INVALID_VERSION_MSG} {}, cluster is {}",
+                semantic_version_string(version),
+                semantic_version_string(PROTOCOL_SEMANTIC_VERSION)
+            );
+            session.reject(EventCode::ERROR, &detail);
+            self.rejected_backup_sessions.push(session);
+        } else {
+            self.authenticator.on_connect_request(
+                session.id(),
+                encoded_credentials,
+                now_ns / 1_000_000,
+            );
+            self.pending_backup_sessions.push(session);
+        }
+    }
+
+    /// `onChallengeResponseForBackupSession` (`SessionManager.java:408-413`):
+    /// a backup's answer to the cluster's challenge.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] from the authenticator.
+    pub fn on_challenge_response_for_backup_session(
+        &mut self,
+        correlation_id: i64,
+        cluster_session_id: i64,
+        encoded_credentials: &[u8],
+        now_ns: i64,
+    ) {
+        let now_ms = now_ns / 1_000_000;
+        if let Some(session) = self
+            .pending_backup_sessions
+            .iter_mut()
+            .rev()
+            .find(|session| {
+                session.id() == cluster_session_id
+                    && session.state() == ClusterSessionState::Challenged
+            })
+        {
+            session.last_activity_ns(now_ns, correlation_id);
+            self.authenticator.on_challenge_response(
+                cluster_session_id,
+                encoded_credentials,
+                now_ms,
+            );
+        }
+    }
+
+    /// `processPendingBackupSessions` (`SessionManager.java:569-580`): the
+    /// follower's half of a backup query, which the leader does through
+    /// [`Self::process_all_pending_sessions`] (`ConsensusModuleAgent.java:2437-2443`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::process_pending_sessions`].
+    pub fn process_pending_backup_sessions(
+        &mut self,
+        ctx: &mut SessionContext<'_>,
+    ) -> Result<usize, ClusterError> {
+        self.process_pending_list(PendingKind::Backup, ctx)
+    }
+
+    /// `processPendingSessions` (`SessionManager.java:583-761`) over the user
+    /// sessions.
     ///
     /// # Errors
     ///
@@ -367,11 +507,43 @@ impl SessionManager {
         &mut self,
         ctx: &mut SessionContext<'_>,
     ) -> Result<usize, ClusterError> {
+        self.process_pending_list(PendingKind::User, ctx)
+    }
+
+    /// One pass over one of the two pending lists — the reference's
+    /// `processPendingSessions(ArrayList pendingSessions, ArrayList
+    /// rejectedSessions, ...)` (`:583`), which both callers use.
+    fn process_pending_list(
+        &mut self,
+        kind: PendingKind,
+        ctx: &mut SessionContext<'_>,
+    ) -> Result<usize, ClusterError> {
+        let mut pending_sessions = match kind {
+            PendingKind::User => std::mem::take(&mut self.pending_user_sessions),
+            PendingKind::Backup => std::mem::take(&mut self.pending_backup_sessions),
+        };
+
+        let result = self.process_pending_body(&mut pending_sessions, kind, ctx);
+
+        match kind {
+            PendingKind::User => self.pending_user_sessions = pending_sessions,
+            PendingKind::Backup => self.pending_backup_sessions = pending_sessions,
+        }
+
+        result
+    }
+
+    fn process_pending_body(
+        &mut self,
+        pending_sessions: &mut Vec<ClusterSession>,
+        kind: PendingKind,
+        ctx: &mut SessionContext<'_>,
+    ) -> Result<usize, ClusterError> {
         let mut work_count = 0;
-        let mut index = self.pending_user_sessions.len();
+        let mut index = pending_sessions.len();
         while index > 0 {
             index -= 1;
-            let mut session = self.pending_user_sessions.swap_remove(index);
+            let mut session = pending_sessions.swap_remove(index);
 
             if session.state() == ClusterSessionState::Invalid {
                 session.close(ctx.client, "invalid session");
@@ -411,7 +583,7 @@ impl SessionManager {
 
             if session.state() == ClusterSessionState::Authenticated {
                 match session.action() {
-                    crate::session::cluster_session::ClusterSessionAction::Client => {
+                    ClusterSessionAction::Client => {
                         let timestamp = ctx.clock.time();
                         if session.append_session_to_log_and_send_open(
                             ctx.client,
@@ -427,20 +599,84 @@ impl SessionManager {
                             self.add_session(session);
                             work_count += 1;
                         } else {
-                            self.pending_user_sessions.push(session);
+                            pending_sessions.push(session);
+                        }
+                    }
+                    ClusterSessionAction::Backup => {
+                        // `SessionManager.java:654-690`: authorise the query,
+                        // answer it from **this member's** recording log, and
+                        // close the session — a backup query is one round trip,
+                        // not a session that lives.
+                        if !is_authorised(
+                            self.authorisation_service.as_ref(),
+                            i32::from(deepmsg_codec_cluster::SBE_SCHEMA_ID),
+                            i32::from(deepmsg_codec_cluster::backup_query_codec::SBE_TEMPLATE_ID),
+                            None,
+                            session.encoded_principal(),
+                        ) {
+                            session.reject(
+                                EventCode::AUTHENTICATION_REJECTED,
+                                "Not authorised for BackupQuery",
+                            );
+                            self.rejected_backup_sessions.push(session);
+                            continue;
+                        }
+
+                        let log_position = session.request_input().unwrap_or(i64::MAX);
+                        match ctx.recording_log.find_last_term() {
+                            Some(entry) => {
+                                let snapshots =
+                                    ctx.recording_log.find_snapshot_at_or_before_or_lowest(
+                                        log_position,
+                                        ctx.service_count,
+                                    );
+                                let entry = entry.clone();
+                                let egress_session = SessionEgress {
+                                    client: &*ctx.client,
+                                    session: &session,
+                                };
+                                // Encoded here, for this answer, where the
+                                // reference encodes it (`:683`) — not once per
+                                // duty cycle.
+                                let cluster_members = member::encode_as_string(ctx.cluster_members);
+                                if ctx.egress.send_backup_response(
+                                    &egress_session,
+                                    ctx.commit_position_counter_id,
+                                    ctx.leader_member_id,
+                                    ctx.member_id,
+                                    &entry,
+                                    &cluster_members,
+                                    snapshots.as_deref(),
+                                )? {
+                                    session.close(ctx.client, "done");
+                                    work_count += 1;
+                                } else {
+                                    pending_sessions.push(session);
+                                }
+                            }
+                            None => {
+                                // No term at all: the reference sends nothing
+                                // and leaves the session pending (`:672-690`).
+                                pending_sessions.push(session);
+                            }
                         }
                     }
                     other => {
+                        // `HEARTBEAT` and `STANDBY_SNAPSHOT` belong to the
+                        // standby protocol, which is premium (plan §1.2).
                         return Err(ClusterError::Cluster(format!(
-                            "a {} session needs the backup path (P3-9)",
+                            "a {} session needs the standby path, which is premium",
                             other.name()
                         )));
                     }
                 }
             } else if session.state() == ClusterSessionState::Rejected {
-                self.rejected_user_sessions.push(session);
+                match kind {
+                    PendingKind::User => self.rejected_user_sessions.push(session),
+                    PendingKind::Backup => self.rejected_backup_sessions.push(session),
+                }
             } else {
-                self.pending_user_sessions.push(session);
+                pending_sessions.push(session);
             }
         }
         Ok(work_count)
@@ -556,6 +792,10 @@ impl SessionManager {
         let mut rejected = std::mem::take(&mut self.rejected_user_sessions);
         let work = self.send_for_all(&mut rejected, ctx)?;
         self.rejected_user_sessions = rejected;
+
+        let mut rejected = std::mem::take(&mut self.rejected_backup_sessions);
+        let work = work + self.send_for_all(&mut rejected, ctx)?;
+        self.rejected_backup_sessions = rejected;
         Ok(work)
     }
 

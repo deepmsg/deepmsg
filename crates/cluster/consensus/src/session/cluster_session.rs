@@ -142,6 +142,11 @@ pub struct ClusterSession {
     event_code: Option<EventCode>,
     close_reason: CloseReason,
     encoded_principal: Vec<u8>,
+    /// What the session's own request carried besides its identity
+    /// (`ClusterSession.requestInput`): for a `BACKUP` session, the log position
+    /// the query asked about (`SessionManager.java:666-668`). `None` is the
+    /// reference's `null`.
+    request_input: Option<i64>,
 }
 
 impl ClusterSession {
@@ -175,12 +180,23 @@ impl ClusterSession {
             event_code: None,
             close_reason: CloseReason::NullVal,
             encoded_principal: Vec::new(),
+            request_input: None,
         }
     }
 
     /// The session's id, as the log and the client know it.
     pub const fn id(&self) -> i64 {
         self.id
+    }
+
+    /// `requestInput()` (`ClusterSession.java:329-332`).
+    pub const fn request_input(&self) -> Option<i64> {
+        self.request_input
+    }
+
+    /// `requestInput(Object)` (`:325-328`).
+    pub fn set_request_input(&mut self, request_input: Option<i64>) {
+        self.request_input = request_input;
     }
 
     /// The member this session is being served by.

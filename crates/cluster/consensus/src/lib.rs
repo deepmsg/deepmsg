@@ -37,6 +37,7 @@
 #![deny(clippy::disallowed_types)]
 
 pub mod agent;
+pub mod backup;
 pub mod clock;
 pub mod config;
 pub mod consensus;
@@ -54,6 +55,9 @@ pub mod state;
 pub mod timer;
 
 pub use agent::{ConsensusModuleAgent, LaunchComponents};
+pub use backup::agent::{ClusterBackupAgent, ClusterBackupComponents, ClusterBackupEventsListener};
+pub use backup::context::{ClusterBackupConfig, ClusterBackupContext};
+pub use backup::{ClusterBackup, ReplayStart, SourceType, State as BackupState};
 pub use clock::{ClusterClock, MillisecondClusterClock};
 pub use config::ConsensusModuleConfig;
 pub use error::ClusterError;
