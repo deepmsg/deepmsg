@@ -710,6 +710,18 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
     /// [`ContainerError::AgentTermination`] when the agent must stop; the
     /// caller closes it. Any other error also ends the duty cycle.
     pub fn do_work(&mut self) -> Result<usize, ContainerError> {
+        // A caller that asked this agent to stop is the reference's
+        // `AgentRunner.close` (`org.agrona.concurrent.AgentRunner`): the loop
+        // ends with an `AgentTerminationException`, which is what the agent's
+        // own termination path sees too. Without it the flag `ShutdownHandle
+        // ::stop` sets is written and read by nobody, and a fixture that stops
+        // an in-process container waits on a thread that will never end.
+        if self.shutdown.is_stopped() {
+            return Err(ContainerError::AgentTermination(
+                "shutdown requested".to_owned(),
+            ));
+        }
+
         let now_ns = deepmsg_core::clock::monotonic_nano_time();
         // `doWork`'s first line (`CSA:247-249`): the cycle that just ended is
         // measured before any work is counted.
@@ -898,10 +910,23 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
             CLUSTER_ACTION_FLAGS_DEFAULT
         };
 
-        let channel = format!(
-            "{}|alias=log-sc-{}",
-            event.log_channel, self.config.service_id
-        );
+        // `new ChannelUriStringBuilder(activeLog.channel).alias(subscriptionAlias)
+        // .build()` (`CSA:855-857`): the alias is **put**, not appended. The
+        // leader's own `JoinLog` names `…|alias=log` (`CM:1692-1693`), so
+        // appending here builds a channel with two `alias` parameters — and a
+        // subscription on it never forms an image with the leader's log
+        // publication, which leaves the leader in `LeaderInit` waiting for a
+        // service ack that cannot come.
+        let channel = match deepmsg_core::uri::ChannelUri::parse(&event.log_channel) {
+            Ok(mut uri) => {
+                uri.put("alias", format!("log-sc-{}", self.config.service_id));
+                uri.build()
+            }
+            Err(_) => format!(
+                "{}|alias=log-sc-{}",
+                event.log_channel, self.config.service_id
+            ),
+        };
         let subscription_id =
             self.client
                 .add_subscription(&channel, event.log_stream_id, COMMAND_TIMEOUT)?;

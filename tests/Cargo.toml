@@ -772,3 +772,11 @@ required-features = ["interop"]
 name = "cluster_tool_reference"
 path = "interop/cluster_tool_reference.rs"
 required-features = ["interop"]
+
+[[test]]
+name = "cluster_backup_cases"
+path = "integration/cluster_backup_cases.rs"
+
+[[test]]
+name = "cluster_backup_binary"
+path = "integration/cluster_backup_binary.rs"

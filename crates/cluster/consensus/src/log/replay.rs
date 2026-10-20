@@ -17,6 +17,10 @@ use crate::log::adapter::LogAdapter;
 pub struct AgentLogReplay {
     /// The subscription the replay is read from.
     pub subscription_id: i64,
+    /// The channel that subscription named — what a `JoinLog` to the services
+    /// hands them, so they read the same replay
+    /// (`LogReplay.doWork`'s `logSubscription.channel()`, `LogReplay.java:96`).
+    pub channel: String,
     /// The archive's replay session id, for `stop_replay`.
     pub replay_session_id: i64,
     /// The replay publication's session id (low 32 bits of the above).

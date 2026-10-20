@@ -88,6 +88,16 @@ pub fn install_stop_handler() -> Result<(), io::Error> {
     Ok(())
 }
 
+/// Ask this process's own loops to stop, without a signal.
+///
+/// A program that embeds the driver — or several agents that each poll
+/// [`stop_signal`] — needs one part to be able to stop the others when it
+/// fails. `SIGTERM` is recorded because that is the request a stop makes; no
+/// signal handler ran, and nothing is delivered to the process.
+pub fn raise_stop_signal() {
+    STOP_SIGNAL.store(libc::SIGTERM, Ordering::SeqCst);
+}
+
 /// The signal that has asked this process to stop, if any.
 pub fn stop_signal() -> Option<i32> {
     match STOP_SIGNAL.load(Ordering::SeqCst) {

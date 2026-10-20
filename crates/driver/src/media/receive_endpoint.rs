@@ -1027,23 +1027,45 @@ impl ReceiveChannelEndpoint {
     /// A subscription went away. Returns whether the endpoint is now reading
     /// nothing at all, which is when the conductor may release it.
     pub fn remove_subscription(&mut self, stream_id: i32) -> bool {
-        self.dispatcher.remove_subscription(stream_id);
-        self.decrement(&stream_id, None);
+        // The dispatcher hears it only when the endpoint's **last** holder of
+        // the stream lets go
+        // (`aeron_receive_channel_endpoint_decref_to_stream`,
+        // `media/aeron_receive_channel_endpoint.c:720-748`): two subscriptions
+        // on one stream share one dispatcher entry, and the first to leave
+        // must not stop the packets the other is still reading.
+        if self.decrement(&stream_id, None).0 {
+            self.dispatcher.remove_subscription(stream_id);
+        }
 
         self.stream_refcounts.is_empty() && self.session_refcounts.is_empty()
     }
 
     /// A subscription for one session went away.
     pub fn remove_subscription_by_session(&mut self, stream_id: i32, session_id: i32) -> bool {
-        self.dispatcher
-            .remove_subscription_by_session(stream_id, session_id);
-        self.decrement(&stream_id, Some(session_id));
+        // The same rule per session
+        // (`aeron_receive_channel_endpoint_decref_to_stream_and_session`,
+        // `:807-837`): the dispatcher's per-session entry goes when the last
+        // subscription that named that session does. A backup depends on it —
+        // it resolves its wildcard catchup port with a session-named
+        // subscription and then closes it, while the archive's own recording
+        // subscription names the same session and has to keep reading.
+        let (_, session_was_last) = self.decrement(&stream_id, Some(session_id));
+        if session_was_last {
+            self.dispatcher
+                .remove_subscription_by_session(stream_id, session_id);
+        }
 
         self.stream_refcounts.is_empty() && self.session_refcounts.is_empty()
     }
 
     /// Take one reference off a stream, and off a session when one was named.
-    fn decrement(&mut self, stream_id: &i32, session_id: Option<i32>) {
+    ///
+    /// Answers whether the stream's count reached zero, and whether the
+    /// session's did — the two the dispatcher is told about, each on its own
+    /// count (`aeron_receive_channel_endpoint.c:720-837`).
+    fn decrement(&mut self, stream_id: &i32, session_id: Option<i32>) -> (bool, bool) {
+        let mut stream_was_last = false;
+        let mut session_was_last = false;
         if let Some(index) = self
             .stream_refcounts
             .iter()
@@ -1052,21 +1074,31 @@ impl ReceiveChannelEndpoint {
             self.stream_refcounts[index].1 -= 1;
             if self.stream_refcounts[index].1 <= 0 {
                 self.stream_refcounts.swap_remove(index);
+                stream_was_last = true;
             }
         }
 
         if let Some(session_id) = session_id {
-            if let Some(index) = self
+            match self
                 .session_refcounts
                 .iter()
                 .position(|((stream, session), _)| *stream == *stream_id && *session == session_id)
             {
-                self.session_refcounts[index].1 -= 1;
-                if self.session_refcounts[index].1 <= 0 {
-                    self.session_refcounts.swap_remove(index);
+                Some(index) => {
+                    self.session_refcounts[index].1 -= 1;
+                    if self.session_refcounts[index].1 <= 0 {
+                        self.session_refcounts.swap_remove(index);
+                        session_was_last = true;
+                    }
                 }
+                // A session this endpoint has no count for is one it has
+                // already let go: the reference returns from the decref
+                // without telling the receiver anything (`:814-817`).
+                None => session_was_last = false,
             }
         }
+
+        (stream_was_last, session_was_last)
     }
 
     /// How many subscriptions read through this endpoint.
@@ -2162,6 +2194,64 @@ mod tests {
             SetupInterest::CreateImage,
             endpoint.dispatcher_mut().on_setup(1003, 9)
         );
+    }
+
+    /// The dispatcher hears that a subscription went away only when the
+    /// endpoint's **last** holder of that stream and session lets go
+    /// (`aeron_receive_channel_endpoint_decref_to_stream_and_session`,
+    /// `media/aeron_receive_channel_endpoint.c:807-837`; the stream's own
+    /// count is `:720-748`).
+    ///
+    /// The case that needs it: a backup resolves its wildcard catchup port
+    /// with a session-named subscription and then closes it, and the archive's
+    /// own recording subscription, which named the same session, has to keep
+    /// reading the replay the cluster archive sends. Told too early, the
+    /// stream's interest is gone before the replay publication's `SETUP`
+    /// arrives, and the archive answers it with "no connection established".
+    #[test]
+    fn the_last_holder_of_a_session_decides_when_the_dispatcher_hears_it() {
+        let mut fixture = Fixture::new();
+        let (mut counters, regions) = fixture.open();
+
+        let mut endpoint = ReceiveChannelEndpoint::with_transport(
+            channel("aeron:udp?endpoint=127.0.0.1:40224|control-mode=manual"),
+            None,
+            &crate::media::TransportBindings::Default,
+            stub(40224),
+            1,
+            16,
+            &mut counters,
+            &regions,
+            7,
+            1_000,
+            1_000_000,
+            &[],
+        )
+        .expect("an endpoint");
+
+        endpoint.add_subscription_by_session(1001, 7);
+        endpoint.add_subscription_by_session(1001, 7);
+        assert!(endpoint.dispatcher().has_stream(1001));
+
+        endpoint.remove_subscription_by_session(1001, 7);
+        assert!(
+            endpoint.dispatcher().has_stream(1001),
+            "the second subscription that named the session is still reading"
+        );
+
+        endpoint.remove_subscription_by_session(1001, 7);
+        assert!(
+            !endpoint.dispatcher().has_stream(1001),
+            "the last reader takes the stream with it"
+        );
+
+        // The whole-stream count has the same shape.
+        endpoint.add_subscription(1002);
+        endpoint.add_subscription(1002);
+        endpoint.remove_subscription(1002);
+        assert!(endpoint.dispatcher().has_stream(1002));
+        endpoint.remove_subscription(1002);
+        assert!(!endpoint.dispatcher().has_stream(1002));
     }
 
     /// An endpoint holds what it is given and reads from all of them: one on

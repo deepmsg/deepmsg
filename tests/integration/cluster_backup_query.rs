@@ -27,6 +27,8 @@
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::Client;
+use deepmsg_cluster::control::cluster_control::ToggleState;
+use deepmsg_cluster_common::counters::CLUSTER_CONTROL_TOGGLE_TYPE_ID;
 use deepmsg_codec_cluster::backup_query_codec::BackupQueryEncoder;
 use deepmsg_codec_cluster::backup_response_codec::{BackupResponseDecoder, SBE_TEMPLATE_ID};
 use deepmsg_codec_cluster::message_header_codec::{
@@ -35,8 +37,8 @@ use deepmsg_codec_cluster::message_header_codec::{
 use deepmsg_codec_cluster::{ReadBuf, WriteBuf};
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::cluster_harness::{
-    DEADLINE, ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters, PROTOCOL_VERSION, Ports,
-    ROLE_LEADER, announce_skip, await_launched, members, wait_until,
+    ClientSide, DEADLINE, ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters,
+    PROTOCOL_VERSION, Ports, ROLE_LEADER, announce_skip, await_launched, members, wait_until,
 };
 use deepmsg_tests::driver::OwnDriver;
 
@@ -253,7 +255,14 @@ impl BackupSide {
     /// the reference retries a backup query on its interval, this retries until
     /// the test's deadline.
     fn send_query(&mut self, publication: i64, correlation_id: i64) {
-        let message = backup_query(correlation_id, &self.response_channel);
+        self.send_query_at(publication, correlation_id, i64::MAX);
+    }
+
+    /// The same, naming the log position the answer's snapshot set is chosen
+    /// against (`ClusterBackupAgent.backupQuery`'s `logPosition` argument,
+    /// `:690-700`).
+    fn send_query_at(&mut self, publication: i64, correlation_id: i64, log_position: i64) {
+        let message = backup_query_at(correlation_id, &self.response_channel, log_position);
         let deadline = Instant::now() + DEADLINE;
         loop {
             let outcome = self.client.offer(publication, &message);
@@ -296,11 +305,9 @@ impl BackupSide {
     }
 }
 
-/// `ConsensusPublisher.backupQuery` (`:452-480`) with the fields the reference's
-/// `ClusterBackupAgent` fills in (`:690-700`): correlation id, response stream
-/// id, protocol version, "the latest you have" (`Long.MAX_VALUE`) as the log
-/// position, the response channel and the credentials (none here).
-fn backup_query(correlation_id: i64, response_channel: &str) -> Vec<u8> {
+/// `ConsensusPublisher.backupQuery`'s message, with the log position the
+/// snapshot set is chosen against.
+fn backup_query_at(correlation_id: i64, response_channel: &str, log_position: i64) -> Vec<u8> {
     let mut buffer = vec![0_u8; 256 + response_channel.len()];
     let encoder =
         BackupQueryEncoder::default().wrap(WriteBuf::new(&mut buffer), MESSAGE_HEADER_LENGTH);
@@ -310,7 +317,7 @@ fn backup_query(correlation_id: i64, response_channel: &str) -> Vec<u8> {
         .correlation_id(correlation_id)
         .response_stream_id(CONSENSUS_STREAM_ID)
         .version(PROTOCOL_VERSION)
-        .log_position(i64::MAX)
+        .log_position(log_position)
         .response_channel(response_channel.as_bytes())
         .encoded_credentials(b"");
     let length = MESSAGE_HEADER_LENGTH + message.encoded_length();
@@ -386,4 +393,147 @@ fn decode_backup_response(payload: &[u8]) -> Option<BackupResponse> {
         snapshots,
         cluster_members,
     })
+}
+
+/// `ClusterBackupTest.shouldQueryForSnapshotsWithLogPosition`
+/// (`ClusterBackupTest.java:667-716`): a query that names a log position is
+/// answered with the snapshot **at or before** it, or the lowest one when the
+/// position precedes them all (`RecordingLog.findSnapshotAtOrBeforeOrLowest`).
+///
+/// Four snapshots, twenty messages apart, and a query per boundary. The answer
+/// is the member's own recording log's snapshot — the group in
+/// `BackupResponse`, not a counter's value.
+#[test]
+fn a_backup_query_finds_the_snapshot_at_or_before_its_log_position() {
+    // The binary's other case takes `Ports::new()`'s block; this one takes the
+    // next, because `cargo test` runs the two on threads of one process.
+    static BASE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(|| Ports::new().base());
+    let ports = Ports::with_base(base + 50);
+    let member_string = members(&ports);
+    let faults = Faults::default();
+    let (launched_tx, launched_rx) = std::sync::mpsc::channel();
+
+    let mut nodes = Vec::new();
+    for id in 0..MEMBER_COUNT {
+        let Some(node) = Node::start(id, &ports, &member_string, &faults, &launched_tx) else {
+            announce_skip();
+            return;
+        };
+        nodes.push(node);
+    }
+    await_launched(&faults, &launched_rx, MEMBER_COUNT);
+
+    let counters: Vec<NodeCounters> = nodes
+        .iter()
+        .map(|node| NodeCounters::open(node.aeron_dir()))
+        .collect();
+    wait_until("every member's election to close", &faults, || {
+        counters
+            .iter()
+            .all(|node| node.election_state() == Some(ELECTION_CLOSED))
+    });
+
+    let leader_id = counters
+        .iter()
+        .position(|node| node.role() == Some(ROLE_LEADER))
+        .expect("a leader") as i32;
+    let leader = &nodes[leader_id as usize];
+
+    // Four rounds of twenty messages and one snapshot each
+    // (`ClusterBackupTest.java:676-692`).
+    let Some(mut client) = ClientSide::start(&ports, leader_id) else {
+        announce_skip();
+        return;
+    };
+    let session = client.connect_session(&faults);
+    for round in 1..=4 {
+        // Twenty messages per round, and no replies to wait for: this cluster
+        // has no service (the query path does not need one), so what the round
+        // needs is the **log** to move before the snapshot is taken.
+        let before = counters[leader_id as usize].commit_position().unwrap_or(0);
+        for _ in 0..20 {
+            client.send(&session, b"x", &faults);
+        }
+        wait_until("the round's messages on the log", &faults, || {
+            counters[leader_id as usize]
+                .commit_position()
+                .is_some_and(|position| position > before)
+        });
+
+        counters[leader_id as usize].set(
+            CLUSTER_CONTROL_TOGGLE_TYPE_ID,
+            i64::from(ToggleState::Snapshot.code()),
+        );
+        wait_until("the leader's snapshot count", &faults, || {
+            counters[leader_id as usize].snapshot_count() == Some(round)
+        });
+    }
+
+    // The snapshots the member holds, oldest first — each round's entry in its
+    // own `recording.log`.
+    let snapshots = {
+        use deepmsg_cluster::persist::recording_log::{
+            self, CONSENSUS_MODULE_SERVICE_ID, ENTRY_TYPE_SNAPSHOT, RecordingLog,
+        };
+        let log = RecordingLog::open(&leader.cluster_dir().join(recording_log::FILENAME))
+            .expect("the leader's recording log");
+        log.entries()
+            .iter()
+            .filter(|entry| {
+                entry.is_valid
+                    && entry.entry_type == ENTRY_TYPE_SNAPSHOT
+                    && entry.service_id == CONSENSUS_MODULE_SERVICE_ID
+            })
+            .map(|entry| (entry.recording_id, entry.log_position))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(4, snapshots.len(), "four consensus-module snapshots");
+
+    let Some(mut backup) = BackupSide::start(&ports) else {
+        announce_skip();
+        return;
+    };
+    let publication = backup.add_query_publication(&ports.consensus_channel(leader_id));
+
+    // position → the snapshot the answer must name.
+    let mut cases: Vec<(i64, usize)> = vec![(0, 0)];
+    for (index, (_, position)) in snapshots.iter().enumerate() {
+        cases.push((position - 1, index.saturating_sub(1)));
+        cases.push((*position, index));
+        cases.push((position + 1, index));
+    }
+    cases.push((snapshots[3].1 + 1_000_000, 3));
+    cases.push((i64::MAX, 3));
+
+    for (offset, (position, expected)) in cases.into_iter().enumerate() {
+        let correlation_id = CORRELATION_ID + 100 + offset as i64;
+        backup.send_query_at(publication, correlation_id, position);
+        let response = backup.await_response(correlation_id);
+
+        assert_eq!(
+            1,
+            response.snapshots.len(),
+            "position {position} is answered with one snapshot: {:?}",
+            response.snapshots
+        );
+        let (recording_id, log_position, service_id) = response.snapshots[0];
+        assert_eq!(
+            snapshots[expected].0, recording_id,
+            "position {position} names snapshot {expected}'s recording"
+        );
+        assert_eq!(
+            snapshots[expected].1, log_position,
+            "position {position} names snapshot {expected}'s log position"
+        );
+        assert_eq!(
+            deepmsg_cluster::persist::recording_log::CONSENSUS_MODULE_SERVICE_ID,
+            service_id,
+            "the snapshot is the consensus module's own"
+        );
+    }
+
+    for node in &mut nodes {
+        node.stop();
+    }
 }

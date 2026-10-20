@@ -5,12 +5,14 @@
 //! `consensus-module-0-0`; the kernel keeps **15 bytes**, so this test asserts
 //! the name reaches the operating system and the configuration test in
 //! `deepmsg_cluster::config` asserts the full spelling for both naming modes.
-//! The backup arm (`cluster-backup` / `aeron-cl-bu`) is P3-9's.
+//! The backup arm (`cluster-backup` / `aeron-cl-bu`) is the same rule: its
+//! name is the configuration's for the full spelling (`ClusterBackupConfig
+//! ::role_name`'s unit test) and the kernel's 14 bytes here.
 
 use std::sync::mpsc;
 
 use deepmsg_tests::cluster_harness::{
-    ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters, Ports, announce_skip,
+    BackupNode, ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters, Ports, announce_skip,
     await_launched, members, wait_until,
 };
 
@@ -63,6 +65,21 @@ fn every_node_thread_carries_the_consensus_module_name() {
         named >= MEMBER_COUNT as usize,
         "each node's thread is named: {names:?}"
     );
+
+    // And the backup's, which the reference's test names in the same place
+    // (`ClusterThreadNamingTest.java:92-123`). `cluster-backup` is fourteen
+    // bytes, so the kernel keeps it whole.
+    let Some(backup) = BackupNode::start(&ports, &member_string, &faults) else {
+        announce_skip();
+        return;
+    };
+    assert_eq!("cluster-backup", backup.role_name(), "the configured name");
+    let names = task_names();
+    assert!(
+        names.iter().any(|name| name == "cluster-backup"),
+        "the backup's thread carries its name: {names:?}"
+    );
+    drop(backup);
 
     for mut node in nodes {
         node.stop();

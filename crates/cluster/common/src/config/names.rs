@@ -57,32 +57,26 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ),
     (
         "aeron.cluster.backup.catchup.channel",
-        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
+        Disposition::Honoured,
     ),
     (
         "aeron.cluster.backup.catchup.endpoint",
-        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
+        Disposition::Honoured,
     ),
     (
         "aeron.cluster.backup.cool.down.interval",
-        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
+        Disposition::Honoured,
     ),
-    (
-        "aeron.cluster.backup.interval",
-        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
-    ),
+    ("aeron.cluster.backup.interval", Disposition::Honoured),
     (
         "aeron.cluster.backup.progress.timeout",
-        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
+        Disposition::Honoured,
     ),
     (
         "aeron.cluster.backup.response.timeout",
-        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
+        Disposition::Honoured,
     ),
-    (
-        "aeron.cluster.backup.source.type",
-        Disposition::AcceptedNotHonoured("ClusterBackup is P3-9"),
-    ),
+    ("aeron.cluster.backup.source.type", Disposition::Honoured),
     ("aeron.cluster.client.name", Disposition::Honoured),
     (
         "aeron.cluster.clock",
@@ -95,10 +89,7 @@ pub const NAMES: &[(&str, Disposition)] = &[
             "consensus publications bind no control endpoint in this build",
         ),
     ),
-    (
-        "aeron.cluster.consensus.endpoints",
-        Disposition::AcceptedNotHonoured("consumed only by ClusterBackup/standby (P3-9)"),
-    ),
+    ("aeron.cluster.consensus.endpoints", Disposition::Honoured),
     (
         "aeron.cluster.consensus.module.agent.role.name",
         Disposition::Honoured,
@@ -170,11 +161,11 @@ pub const NAMES: &[(&str, Disposition)] = &[
     ("aeron.cluster.replication.channel", Disposition::Honoured),
     (
         "aeron.cluster.replication.progress.interval",
-        Disposition::AcceptedNotHonoured("consumed only by ClusterBackup/standby (P3-9)"),
+        Disposition::Honoured,
     ),
     (
         "aeron.cluster.replication.progress.timeout",
-        Disposition::AcceptedNotHonoured("consumed only by ClusterBackup/standby (P3-9)"),
+        Disposition::Honoured,
     ),
     (
         "aeron.cluster.service.class.name",

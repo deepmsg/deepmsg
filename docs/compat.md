@@ -1419,8 +1419,55 @@ The thread names, and where they are set:
 
 The kernel keeps 15 bytes of a thread name, so the system tests assert the
 truncated name and the configuration tests assert the full one
-(`ClusterThreadNamingTest.java:62-123`). The backup's name
-(`cluster-backup` / `aeron-cl-bu`) is P3-9's.
+(`ClusterThreadNamingTest.java:62-123`). The backup's name is
+`cluster-backup` / `aeron-cl-bu`, set by `ClusterBackupConfig::role_name` from
+`aeron.thread.naming` and carried by `deepmsg-cluster-backup` and by the
+harness's in-process backup (P3-9).
 
 LC-6's table is `crates/cluster/common/src/config/names.rs`: all 80 names
 have a disposition, and `property_names.rs` fails if any is `Pending`.
+
+## The cluster backup node (P3-9)
+
+`ClusterBackup` is the reference's OSS backup node: a process that asks a
+cluster where it is (`BackupQuery`), copies the leader's log and snapshots
+into an archive of its own, and writes a `recording.log` a consensus module can
+be started from. `deepmsg-cluster-backup` is the reference's
+`ClusterBackupMediaDriver` — a media driver, an archive and a backup in one
+process (`ClusterBackupMediaDriver.java:32-161`), with the reference's
+three-thread shape (the driver's slot 0, the archive's conductor, the backup's
+agent).
+
+| Contract | Value | Reference source | Pinned by |
+|---|---|---|---|
+| Property names | the seven `aeron.cluster.backup.*` names are `Honoured`, as are `aeron.cluster.consensus.endpoints` and the two `aeron.cluster.replication.progress.*` names (the backup is their only consumer) | `ClusterBackup.java:326-590`; `ConsensusModule.java:969-986` | `names.rs`; `property_names.rs` |
+| `cluster.backup.initial.replay.start` | `BEGINNING` (the default) or `LATEST_SNAPSHOT`. **Not** in the eighty-name table: the reference spells it without the `aeron.cluster.` prefix (`ClusterBackup.java:561-566`), so it is named here instead | `ClusterBackup.java:555-578` | `backup::context`'s `ReplayStart` tests; `cluster_backup_cases::should_backup_cluster_with_from_latest_snapshot_log_position` |
+| Defaults | catchup channel's six parameters, interval 1 h, response timeout 5 s, progress timeout 10 s, cool-down 30 s, source type `ANY` | `ClusterBackup.java:344-408` | `backup::context` |
+| Mark file | `ClusterComponentType.BACKUP`, the `.lnk` beside its parent directory, the active error buffer, `signalReady` last | `ClusterBackup.java:679-917` | `backup::context`'s conclude tests |
+| Counters | **208** state, **209** live log position, **210** next query deadline, **211** errors (versioned), **240** snapshots retrieved — the reference's type ids and labels | `ClusterBackup.java:78-97`, `:778-819` | `common::counters`; `cluster_backup_cases` reads all five |
+| Thread names | `cluster-backup` (classic) / `aeron-cl-bu` (new); no cluster or member id | `ClusterBackup.java:225-226` | `backup::context::tests::the_configured_thread_name_follows_the_naming_mode`; `cluster_thread_naming` |
+| What starts from it | a member over the backup's archive and cluster directories replays the recording into its **services**: the CM tells them to join the log replay at its start position before the new term begins (`LogReplay.doWork` → `awaitServicesReady`, `LogReplay.java:77-101`) | `LogReplay.java:77-101`; `ClusterBackupAgent.java:916-996` | `cluster_backup_cases` (every case asserts the restarted business's message count and snapshot load) |
+
+Deviations in the backup agent, each a deliberate one:
+
+* **The cluster archive's connect and its replays are blocking calls.** The
+  reference polls an `AsyncConnect` and a `ControlResponsePoller` from a duty
+  cycle with no spare time (`ClusterBackupAgent.java:713-719`, `:818-900`);
+  this build's `Archive::start_replay` is "ask, wait, answer", which is the
+  same shape as the reference's *own* synchronous archive calls and costs at
+  worst one command timeout per turn.
+* **The cluster archive's control channel defaults to `aeron:udp`**, a shape
+  with no destination; the reference's two channel fields default to `null`
+  and every deployment names them. The endpoint is filled from the member that
+  answered, so a caller that sets nothing still works.
+* **`Context.close` closes every counter.** The reference's non-owning path
+  leaks the snapshot and query-deadline counters (`ClusterBackup.java:2012-2016`)
+  and its owning path NPEs when the client was supplied; neither is copied.
+* **Errors are counted and logged where they occur.** A thrown error goes to
+  counter 211 and to the mark file's distinct error log before the reset
+  (`ClusterBackup.java:804`) — the two the authentication cases read.
+* **`awaitLocalSocketsClosed` has a deadline.** The reference waits for the
+  driver to free every local socket without one (`CMA:2988-3000`); this build's
+  driver does not release receive endpoints, so a member whose log endpoint is
+  shared with its own container would wait forever on close. Ten seconds is
+  long past any driver turn; the deviation is in `agent/mod.rs`.

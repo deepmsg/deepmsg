@@ -318,9 +318,9 @@ unit	EgressPublisherTest	shouldSendNewLeaderEventUsingOfferIfTooBig	A	P3-4b	unit
 unit	EgressPublisherTest	shouldSendAdminResponseUsingTryClaimIfSmall	A	P3-4b	unit			should_send_admin_response_using_try_claim_if_small
 unit	EgressPublisherTest	shouldSendAdminResponseUsingOfferIfTooBig	A	P3-4b	unit			should_send_admin_response_using_offer_if_too_big
 unit	IngressAdapterTest	shouldDelegateToConsensusModuleAgent	A	P3-4b	unit			should_delegate_unknown_schema_to_the_extension_hook,should_delegate_session_message_header_to_on_ingress_message,should_delegate_session_connect_request_to_on_session_connect,should_delegate_session_close_request_to_on_session_close,should_delegate_session_keep_alive_to_on_session_keep_alive,should_delegate_challenge_response_to_on_ingress_challenge_response,should_delegate_admin_request_to_on_admin_request (seven parameterised cases, one test each)
-unit	LogSourceValidatorTest	leaderLogSourceTypeShouldOnlyAcceptLeader	A	P3-9	unit			
-unit	LogSourceValidatorTest	followerLogSourceTypeShouldOnlyAcceptFollowerAndUnknown	A	P3-9	unit			
-unit	LogSourceValidatorTest	anyLogSourceTypeShouldAny	A	P3-9	unit			
+unit	LogSourceValidatorTest	leaderLogSourceTypeShouldOnlyAcceptLeader	A	P3-9	unit			backup::log_source_validator::tests::leader_log_source_type_should_only_accept_leader
+unit	LogSourceValidatorTest	followerLogSourceTypeShouldOnlyAcceptFollowerAndUnknown	A	P3-9	unit			backup::log_source_validator::tests::follower_log_source_type_should_only_accept_follower_and_unknown
+unit	LogSourceValidatorTest	anyLogSourceTypeShouldAny	A	P3-9	unit			backup::log_source_validator::tests::any_log_source_type_should_any
 unit	NameResolutionClusterNodeTest	shouldConnectAndSendKeepAliveWithBadName	A	P3-6c	unit			
 unit	NodeStateFileTest	shouldFailIfCreateNewFalseAndFileDoesNotExist	A	P3-1f	unit			
 unit	NodeStateFileTest	shouldCreateIfCreateNewTrueAndFileDoesNotExist	A	P3-1f	unit			
@@ -419,9 +419,9 @@ unit	ServiceProxyTest	shouldSendClusterMemberExtendedResponse	A	P3-4c	unit			sho
 unit	SessionManagerTest	shouldProcessPendingStandbySnapshotNotificationsAfterReachingCommitPosition	A	P3-4b	unit		n/a:premium	
 unit	SessionManagerTest	shouldRetryCreatingResponsePublicationWhenResourceTemporarilyUnavailable	A	P3-4b	unit			the_resource_temporarily_unavailable_answer_reissues_the_add (weakened: the decision over the driver's error, not a driver)
 unit	SessionManagerTest	shouldProcessPendingStandbySnapshotNotificationsAfterProcessingDelay	A	P3-4b	unit		n/a:premium	
-unit	SnapshotReplicationTest	shouldReplicateTwoSnapshots	A	P3-6b	unit			
-unit	SnapshotReplicationTest	shouldNotBeCompleteIfNotSynced	A	P3-6b	unit			
-unit	SnapshotReplicationTest	closeWillCloseUnderlyingSnapshotReplication	A	P3-6b	unit			
+unit	SnapshotReplicationTest	shouldReplicateTwoSnapshots	A	P3-6b	unit			backup::snapshot_replication::tests::should_replicate_two_snapshots
+unit	SnapshotReplicationTest	shouldNotBeCompleteIfNotSynced	A	P3-6b	unit			backup::snapshot_replication::tests::should_not_be_complete_if_not_synced
+unit	SnapshotReplicationTest	closeWillCloseUnderlyingSnapshotReplication	A	P3-6b	unit			backup::snapshot_replication::tests::close_will_close_underlying_snapshot_replication
 unit	ClusterMarkFileTest	throwsExceptionIfErrorBufferLengthIsInvalid	A	P3-1b	unit			
 unit	ClusterMarkFileTest	shouldCallForceIfMarkFileIsNotClosed	A	P3-1b	unit	disabled:jre-range		
 unit	ClusterMarkFileTest	shouldNotCallForceIfMarkFileIsClosed	A	P3-1b	unit	disabled:jre-range		

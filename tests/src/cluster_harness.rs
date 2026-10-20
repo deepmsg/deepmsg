@@ -38,15 +38,26 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use deepmsg_archive::client::Credentials;
 use deepmsg_client::client::Client;
-use deepmsg_cluster::{ConsensusModuleAgent, ConsensusModuleConfig};
+use deepmsg_cluster::session::authenticator::{Authenticator, SessionProxy};
+use deepmsg_cluster::{
+    ClusterBackup, ClusterBackupComponents, ClusterBackupConfig, ClusterBackupContext,
+    ConsensusModuleAgent, ConsensusModuleConfig, LaunchComponents, ReplayStart, SourceType,
+};
 use deepmsg_cluster_common::config::Properties;
 use deepmsg_cluster_common::counters::{
-    CLUSTER_COMMIT_POSITION_TYPE_ID, CLUSTER_ELECTION_STATE_TYPE_ID,
+    CLUSTER_BACKUP_ERROR_COUNT_TYPE_ID, CLUSTER_BACKUP_LIVE_LOG_POSITION_TYPE_ID,
+    CLUSTER_BACKUP_QUERY_DEADLINE_TYPE_ID, CLUSTER_BACKUP_SNAPSHOT_RETRIEVE_COUNT_TYPE_ID,
+    CLUSTER_BACKUP_STATE_TYPE_ID, CLUSTER_COMMIT_POSITION_TYPE_ID, CLUSTER_ELECTION_STATE_TYPE_ID,
     CLUSTER_LEADERSHIP_TERM_ID_TYPE_ID, CLUSTER_NODE_ROLE_TYPE_ID,
     CLUSTER_SNAPSHOT_COUNTER_TYPE_ID, find_cluster_counter,
 };
+use deepmsg_cluster_service::agent::ClusteredServiceAgent;
+use deepmsg_cluster_service::config::ServiceContainerConfig;
 use deepmsg_cnc::file::CncFile;
+use deepmsg_codec_cluster::challenge_codec::ChallengeDecoder;
+use deepmsg_codec_cluster::challenge_response_codec::ChallengeResponseEncoder;
 use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH as MESSAGE_HEADER_LENGTH;
 use deepmsg_codec_cluster::session_connect_request_codec::SessionConnectRequestEncoder;
@@ -57,6 +68,7 @@ use deepmsg_driver::idle::Strategy;
 
 use crate::archive;
 use crate::archiving_driver::{self, OwnArchivingMediaDriver};
+use crate::cluster::{TestServiceState, in_process_test_service};
 use crate::driver::OwnDriver;
 use crate::temp::TempDir;
 
@@ -96,6 +108,7 @@ pub const ELECTION_CLOSED: i64 = 17;
 /// The reference's port scheme (`TestCluster.java:1877-1905`) with a base that
 /// moves with the process id, so two concurrent `cargo test` runs do not meet
 /// on a fixed port.
+#[derive(Clone, Copy)]
 pub struct Ports {
     base: u16,
     /// Added to [`Self::client_egress`], so a second client can answer on a
@@ -168,6 +181,25 @@ impl Ports {
         }
     }
 
+    /// A block whose first port is `base`.
+    ///
+    /// For a binary whose cases run on threads of one process: each case takes
+    /// a block of its own past the one [`Self::new`] would pick, because the
+    /// blocks are per process and the cases are not.
+    #[must_use]
+    pub const fn with_base(base: u16) -> Self {
+        Self {
+            base,
+            egress_offset: 0,
+            shape: ChannelShape {
+                log_term_length: 512 * 1024,
+                ingress_term_length: 128 * 1024,
+                egress_term_length: 128 * 1024,
+                mtu: None,
+            },
+        }
+    }
+
     /// The first port of this run's block, for a test that needs a port of its
     /// own past every offset the cluster uses (the highest is `+35`; a backup
     /// takes `+43` and `+44`).
@@ -237,6 +269,19 @@ impl Ports {
     /// the catchup endpoint it cannot be a port the kernel picks.
     pub fn archive(&self, member_id: i32) -> u16 {
         self.base + 40 + u16::try_from(member_id).unwrap()
+    }
+
+    /// Where a backup's own consensus **subscription** listens
+    /// (`TestCluster.java:591-592`: the consensus channel with the backup's
+    /// endpoint on it).
+    pub fn backup_consensus(&self) -> u16 {
+        self.base + 43
+    }
+
+    /// Where a backup's archive receives the cluster's log and snapshots —
+    /// `aeron.cluster.backup.catchup.endpoint` (`TestCluster.java:599`).
+    pub fn backup_catchup(&self) -> u16 {
+        self.base + 44
     }
 
     pub fn ingress_channel(&self, member_id: i32) -> String {
@@ -317,22 +362,50 @@ pub fn members(ports: &Ports) -> String {
 /// Failures a node thread reports after it has launched, so the driving test
 /// fails with the node's own words rather than a timeout.
 #[derive(Clone, Default)]
-pub struct Faults(Arc<Mutex<Vec<String>>>);
+pub struct Faults {
+    recorded: Arc<Mutex<Vec<String>>>,
+    /// Failures a case has said it **expects** — an error path it is testing.
+    /// A recorded message containing one of these is kept in
+    /// [`Self::snapshot`] but does not fail [`Self::check`].
+    expected: Arc<Mutex<Vec<String>>>,
+}
 
 impl Faults {
+    /// Declare that `pattern` (a substring) is an expected failure.
+    ///
+    /// The reference's own refusal cases are about a member (or a backup)
+    /// failing on purpose — invalid credentials, say — and a harness that
+    /// panics on the very failure the case is asserting would make the case
+    /// unportable.
+    pub fn expect(&self, pattern: &str) {
+        self.expected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pattern.to_owned());
+    }
+
     pub fn record(&self, message: String) {
-        self.0
+        self.recorded
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(message);
     }
 
-    pub fn check(&self) {
-        let first = self
-            .0
+    fn is_expected(&self, message: &str) -> bool {
+        self.expected
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .first()
+            .iter()
+            .any(|pattern| message.contains(pattern))
+    }
+
+    pub fn check(&self) {
+        let first = self
+            .recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|message| !self.is_expected(message))
             .cloned();
         if let Some(first) = first {
             panic!("a consensus module failed: {first}");
@@ -341,7 +414,7 @@ impl Faults {
 
     /// The recorded failures, for an assertion's message.
     pub fn snapshot(&self) -> Vec<String> {
-        self.0
+        self.recorded
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -357,8 +430,23 @@ impl Faults {
 /// have run, or the driver refuses the same cluster id).
 pub struct Node {
     id: i32,
+    /// The driver's name, which with the process id is its aeron directory —
+    /// kept so [`Self::restart_whole`] recreates the same path.
+    name: String,
     cluster_dir: TempDir,
     archive_dir: TempDir,
+    /// The in-process test container, when this node runs one. `None` is the
+    /// zero-service arrangement `zero_alloc` and the three-node harness use.
+    service: Option<InProcessService>,
+    /// What the test business did, kept beside the container rather than in
+    /// it: a case reads it **after** the node has been stopped, which is when
+    /// a clean shutdown's snapshots are the thing being asserted.
+    service_state: Option<Arc<TestServiceState>>,
+    /// The test business's name, kept so a restart starts the same one.
+    service_name: Option<&'static str>,
+    /// The member's authenticator, when a case supplies one — the equivalent
+    /// of the reference's `authenticatorSupplier` (`ConsensusModule.java:807`).
+    authenticator: Option<TestAuthenticator>,
     /// `None` only while [`Self::restart_whole`] is between two drivers: the
     /// old one has to be **dropped** before the new one starts, because its
     /// `Drop` removes the aeron directory and the log — the same path the new
@@ -379,6 +467,13 @@ pub struct Node {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// One in-process test container: its stop handle, its thread, and what its
+/// business did.
+struct InProcessService {
+    shutdown: deepmsg_cluster_service::ShutdownHandle,
+    thread: std::thread::JoinHandle<Result<(), String>>,
+}
+
 impl Node {
     /// Start the driver and launch the module. `None` when the driver cannot
     /// start, which is how a test announces a skip.
@@ -389,9 +484,114 @@ impl Node {
         faults: &Faults,
         launched: &mpsc::Sender<(i32, Result<(), String>)>,
     ) -> Option<Self> {
-        let name = format!("cluster-node-{id}");
-        let archive_dir = TempDir::new(&format!("{name}-archive"));
-        let cluster_dir = TempDir::new(&format!("{name}-cluster"));
+        Self::start_inner(id, ports, member_string, faults, launched, None, None, None)
+    }
+
+    /// The same, with one in-process test container (`test-service` or
+    /// `sequence-service`) on this member.
+    ///
+    /// A member with a container is a different cluster configuration, not a
+    /// different parameter: `aeron.cluster.service.count` decides whether
+    /// `launch` waits for a `JoinLog` ack, so the two arrangements are started
+    /// by the two named constructors rather than by a boolean a reader would
+    /// have to chase.
+    pub fn start_with_service(
+        id: i32,
+        ports: &Ports,
+        member_string: &str,
+        faults: &Faults,
+        launched: &mpsc::Sender<(i32, Result<(), String>)>,
+        service: &'static str,
+    ) -> Option<Self> {
+        Self::start_inner(
+            id,
+            ports,
+            member_string,
+            faults,
+            launched,
+            Some(service),
+            None,
+            None,
+        )
+    }
+
+    /// The same, with an authenticator — a cluster that refuses a session whose
+    /// credentials it does not accept.
+    pub fn start_with_service_and_authenticator(
+        id: i32,
+        ports: &Ports,
+        member_string: &str,
+        faults: &Faults,
+        launched: &mpsc::Sender<(i32, Result<(), String>)>,
+        service: &'static str,
+        authenticator: TestAuthenticator,
+    ) -> Option<Self> {
+        Self::start_inner(
+            id,
+            ports,
+            member_string,
+            faults,
+            launched,
+            Some(service),
+            Some(authenticator),
+            None,
+        )
+    }
+
+    /// Start a member over directories that already exist — the reference's
+    /// `startStaticNodeFromBackup` (`TestCluster.java:623-687`): a cluster of
+    /// one over the backup's archive and cluster directories.
+    ///
+    /// The directories are passed in so ownership moves to this node: the
+    /// backup they came from must have been stopped first, and its `TempDir`s
+    /// are what is left when it is told to hand them over.
+    #[allow(clippy::too_many_arguments)] // one per thing a case varies
+    pub fn start_over_directories(
+        id: i32,
+        ports: &Ports,
+        member_string: &str,
+        faults: &Faults,
+        launched: &mpsc::Sender<(i32, Result<(), String>)>,
+        service: Option<&'static str>,
+        archive_dir: TempDir,
+        cluster_dir: TempDir,
+    ) -> Option<Self> {
+        Self::start_inner(
+            id,
+            ports,
+            member_string,
+            faults,
+            launched,
+            service,
+            None,
+            Some((archive_dir, cluster_dir)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // one per thing a case varies
+    fn start_inner(
+        id: i32,
+        ports: &Ports,
+        member_string: &str,
+        faults: &Faults,
+        launched: &mpsc::Sender<(i32, Result<(), String>)>,
+        service: Option<&'static str>,
+        authenticator: Option<TestAuthenticator>,
+        directories: Option<(TempDir, TempDir)>,
+    ) -> Option<Self> {
+        // The aeron directory is the process id **and** this name
+        // (`temp_aeron_dir`), and `cargo test` runs a binary's cases on
+        // threads of one process: a name without the port block gives two
+        // cases' member 0 one directory, and the second driver's
+        // `dir.delete.on.start` meets `ENOTEMPTY`. The block is unique per
+        // case, so it is the part of the name that keeps them apart.
+        let name = format!("cluster-node-{id}-{}", ports.base());
+        let (archive_dir, cluster_dir) = directories.unwrap_or_else(|| {
+            (
+                TempDir::new(&format!("{name}-archive")),
+                TempDir::new(&format!("{name}-cluster")),
+            )
+        });
 
         // The archive's control channel is given a fixed endpoint: a follower
         // replicating from this member's archive dials the endpoint in the
@@ -410,7 +610,7 @@ impl Node {
         let mut driver = OwnArchivingMediaDriver::start(&name, archive_dir.path(), &property_refs)?;
         driver.await_ready(DEADLINE).expect("the driver comes up");
 
-        let args = vec![
+        let mut args = vec![
             format!("-Daeron.dir={}", driver.aeron_dir().display()),
             format!("-Daeron.cluster.dir={}", cluster_dir.path().display()),
             format!("-Daeron.cluster.id={CLUSTER_ID}"),
@@ -434,7 +634,6 @@ impl Node {
             ),
             "-Daeron.cluster.control.channel=aeron:ipc?term-length=128k".to_owned(),
             "-Daeron.cluster.replication.channel=aeron:udp?endpoint=localhost:0".to_owned(),
-            "-Daeron.cluster.service.count=0".to_owned(),
             // The election's attempt budget, raised from the reference's
             // ten-second default: this harness runs three consensus modules,
             // three archiving media drivers (each a process) and a client
@@ -446,11 +645,40 @@ impl Node {
             // this as `withLeaderHeartbeatTimeoutNs`.
             "-Daeron.cluster.leader.heartbeat.timeout=30s".to_owned(),
         ];
+        match service {
+            None => args.push("-Daeron.cluster.service.count=0".to_owned()),
+            Some(name) => {
+                // One container, on the control channel this harness already
+                // gives the module. The stream ids and channels are the
+                // reference's defaults spelled out, so the container and the
+                // module cannot settle them from different tables.
+                args.extend([
+                    "-Daeron.cluster.service.count=1".to_owned(),
+                    "-Daeron.cluster.service.id=0".to_owned(),
+                    format!("-Ddeepmsg.cluster.service={name}"),
+                    "-Daeron.cluster.service.responder=true".to_owned(),
+                    "-Daeron.cluster.service.stream.id=104".to_owned(),
+                    "-Daeron.cluster.consensus.module.stream.id=105".to_owned(),
+                    "-Daeron.cluster.replay.channel=aeron:ipc".to_owned(),
+                    "-Daeron.cluster.replay.stream.id=103".to_owned(),
+                    "-Daeron.cluster.snapshot.channel=aeron:ipc?alias=snapshot".to_owned(),
+                    "-Daeron.cluster.snapshot.stream.id=106".to_owned(),
+                    "-Daeron.archive.local.control.channel=aeron:ipc?term-length=64k".to_owned(),
+                    "-Daeron.archive.local.control.stream.id=10".to_owned(),
+                    "-Daeron.archive.control.response.stream.id=20".to_owned(),
+                ]);
+            }
+        }
 
         let mut node = Self {
             id,
+            name: name.clone(),
             cluster_dir,
             archive_dir,
+            service: None,
+            service_state: None,
+            service_name: service,
+            authenticator,
             driver: Some(driver),
             driver_properties: properties,
             args,
@@ -473,7 +701,8 @@ impl Node {
             .expect("the module's configuration settles");
         // This build has no class loader; the flag is the programmatic
         // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
-        config.consensus_module_extension = true;
+        // A member with a container has no such gap.
+        config.consensus_module_extension = self.service_name.is_none();
         let idle_strategy = config.idle_strategy.clone();
 
         let id = self.id;
@@ -483,6 +712,7 @@ impl Node {
         self.finished = Arc::clone(&finished);
         let faults = self.faults.clone();
         let sender = launched.clone();
+        let authenticator = self.authenticator.clone();
 
         self.thread = Some(std::thread::spawn(move || {
             let Some(mut idle) = Strategy::by_agrona_name(&idle_strategy) else {
@@ -492,7 +722,14 @@ impl Node {
 
             // Blocks until the election has closed for this member: the
             // leader's log recording, or the follower's join of the log.
-            let mut agent = match ConsensusModuleAgent::launch(config) {
+            let mut agent = match ConsensusModuleAgent::launch_with_components(
+                config,
+                LaunchComponents {
+                    authenticator: authenticator
+                        .map(|authenticator| Box::new(authenticator) as Box<dyn Authenticator>),
+                    ..LaunchComponents::default()
+                },
+            ) {
                 Ok(agent) => agent,
                 Err(error) => {
                     let _ = sender.send((id, Err(error.to_string())));
@@ -521,6 +758,92 @@ impl Node {
 
             finished.store(true, Ordering::Relaxed);
         }));
+
+        self.launch_service();
+    }
+
+    /// Start the in-process container, when this node has one.
+    ///
+    /// After the module's thread, not before: the module's `launch` is what
+    /// waits for the container's `JoinLog` ack, and it blocks in the thread
+    /// above while this one starts the container that answers it — the same
+    /// arrangement `crate::cluster`'s in-process arm uses, with the roles of
+    /// the two threads swapped.
+    fn launch_service(&mut self) {
+        let Some(name) = self.service_name else {
+            return;
+        };
+
+        let mut properties = Properties::new();
+        properties
+            .apply_args(self.args.clone())
+            .expect("the container's properties parse");
+        let config = ServiceContainerConfig::from_properties(&properties)
+            .expect("the container's configuration settles");
+        let (service, state) = in_process_test_service(name);
+        let (started_tx, started_rx) =
+            mpsc::channel::<Result<deepmsg_cluster_service::ShutdownHandle, String>>();
+        let id = self.id;
+        let faults = self.faults.clone();
+        let running_faults = self.faults.clone();
+
+        let thread = std::thread::spawn(move || -> Result<(), String> {
+            // The reference's in-process container is given a client it does
+            // not own: ending the container must not take the driver's
+            // counters with it (`Client::detach`).
+            let mut agent =
+                match ClusteredServiceAgent::launch_with_client_ownership(config, service, false) {
+                    Ok(agent) => agent,
+                    Err(error) => {
+                        let message = error.to_string();
+                        let _ = started_tx.send(Err(message.clone()));
+                        return Err(message);
+                    }
+                };
+            let shutdown = agent.shutdown_handle();
+            let _ = started_tx.send(Ok(shutdown));
+
+            let mut idle = Strategy::by_agrona_name("backoff").expect("backoff");
+            loop {
+                match agent.do_work() {
+                    Ok(work) => idle.idle(work),
+                    Err(deepmsg_cluster_service::ContainerError::AgentTermination(_)) => break,
+                    Err(error) => {
+                        let _ = agent.close();
+                        running_faults.record(format!("node {id}: the container: {error}"));
+                        return Err(error.to_string());
+                    }
+                }
+            }
+            agent.close().map_err(|error| error.to_string())
+        });
+
+        // A container that never comes up leaves the module waiting for its
+        // ack; the wait has a budget of its own, but a fault here is the
+        // clearer report.
+        match started_rx.recv_timeout(DEADLINE) {
+            Ok(Ok(shutdown)) => {
+                self.service_state = Some(Arc::clone(&state));
+                self.service = Some(InProcessService { shutdown, thread });
+            }
+            Ok(Err(error)) => {
+                faults.record(format!("node {id}: the container did not start: {error}"));
+            }
+            Err(error) => {
+                faults.record(format!(
+                    "node {id}: the container never reported its start: {error}"
+                ));
+            }
+        }
+    }
+
+    /// The test business's observables, when this node runs one in process.
+    ///
+    /// Kept after [`Self::stop`] has ended the container: a case that asserts
+    /// on what a shutdown's snapshot left behind reads it then.
+    #[must_use]
+    pub fn service_state(&self) -> Option<Arc<TestServiceState>> {
+        self.service_state.clone()
     }
 
     /// The archive directory this node owns.
@@ -584,8 +907,8 @@ impl Node {
         if let Some(mut driver) = self.driver.take() {
             driver.stop().expect("the driver stops");
         }
-        let name = format!("cluster-node-{}", self.id);
         let refs: Vec<&str> = self.driver_properties.iter().map(String::as_str).collect();
+        let name = self.name.clone();
         let mut driver = OwnArchivingMediaDriver::start(&name, self.archive_dir.path(), &refs)
             .expect("the driver comes back up");
         driver.await_ready(DEADLINE).expect("the driver is ready");
@@ -628,10 +951,45 @@ impl Node {
 
     /// Stop the module — "the follower dies" — with the media left running so
     /// the restart path has something to come back to.
+    ///
+    /// The module first, with its container still running: a module stopped in
+    /// the middle of `awaitServicesReady` is waiting for an ack only a live
+    /// container can send, and joining it before the container goes is a
+    /// fixture that hangs on the last line of a passing case. The container is
+    /// stopped (not abandoned) right after: a client of the module that is
+    /// still polling when the module's counters go is the failure
+    /// `cluster_lc4a_snapshot_failure` caught.
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+
+        // A module that does not come back within the budget is a fault, not a
+        // join that never returns: a case that hangs teaches nothing, and the
+        // thread it would wait for is one this build's duty cycle is stuck
+        // inside (a blocking archive call, or an `awaitServicesReady` whose
+        // ack cannot arrive).
+        let deadline = Instant::now() + DEADLINE;
+        while !self.finished.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !self.finished.load(Ordering::Relaxed) {
+            self.faults
+                .record(format!("node {}: the module did not stop", self.id));
+            let _ = self.thread.take();
+            return;
+        }
+
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+
+        if let Some(service) = self.service.take() {
+            service.shutdown.stop();
+            match service.thread.join() {
+                Ok(Ok(())) | Err(_) => {}
+                Ok(Err(error)) => self
+                    .faults
+                    .record(format!("node {}: the container: {error}", self.id)),
+            }
         }
     }
 
@@ -1067,6 +1425,546 @@ impl NodeCounters {
     }
 }
 
+/// What a cluster member's authenticator does, for the authentication cases.
+///
+/// The reference supplies these as Java classes (`SampleAuthenticator` and its
+/// two test suppliers); this is the same decision as data. The shape is the
+/// sample's: a per-session **state** decided from the connect request, moved by
+/// a challenge response, and read by the two callbacks the session manager runs
+/// every pass while a session is pending (`SampleAuthenticator.java`). The
+/// callbacks are idempotent — `on_challenged_session` runs again and again
+/// while the session waits for its response, and must do nothing until one has
+/// arrived.
+#[derive(Clone)]
+pub struct TestAuthenticator {
+    kind: TestAuthenticatorKind,
+    sessions: std::collections::HashMap<i64, TestAuthenticationState>,
+}
+
+#[derive(Clone)]
+enum TestAuthenticatorKind {
+    /// The reference's `SimpleCredentialsSupplier`: the credentials are the
+    /// principal, and the cluster accepts exactly `expected_credentials`.
+    Simple {
+        expected_credentials: Vec<u8>,
+        principal: Vec<u8>,
+    },
+    /// The reference's `ChallengeResponseCredentialsSupplier`: a challenge is
+    /// sent at the connect request, and the answer must be `expected_response`.
+    ChallengeResponse {
+        challenge: Vec<u8>,
+        expected_response: Vec<u8>,
+        principal: Vec<u8>,
+    },
+}
+
+/// Where one session stands, as `SampleAuthenticator.SessionState` has it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestAuthenticationState {
+    /// A challenge has been sent and its response is awaited.
+    AwaitingResponse,
+    /// The credentials were accepted.
+    Authenticated,
+    /// The credentials were refused.
+    Rejected,
+}
+
+impl TestAuthenticator {
+    /// A cluster that accepts exactly `expected_credentials`.
+    #[must_use]
+    pub fn simple(expected_credentials: &[u8], principal: &[u8]) -> Self {
+        Self {
+            kind: TestAuthenticatorKind::Simple {
+                expected_credentials: expected_credentials.to_vec(),
+                principal: principal.to_vec(),
+            },
+            sessions: std::collections::HashMap::new(),
+        }
+    }
+
+    /// A cluster that challenges, and accepts exactly `expected_response`.
+    #[must_use]
+    pub fn challenge_response(
+        challenge: &[u8],
+        expected_response: &[u8],
+        principal: &[u8],
+    ) -> Self {
+        Self {
+            kind: TestAuthenticatorKind::ChallengeResponse {
+                challenge: challenge.to_vec(),
+                expected_response: expected_response.to_vec(),
+                principal: principal.to_vec(),
+            },
+            sessions: std::collections::HashMap::new(),
+        }
+    }
+
+    fn state(&self, session_id: i64) -> Option<TestAuthenticationState> {
+        self.sessions.get(&session_id).copied()
+    }
+}
+
+impl Authenticator for TestAuthenticator {
+    fn on_connect_request(&mut self, session_id: i64, encoded_credentials: &[u8], _now_ms: i64) {
+        let state = match &self.kind {
+            TestAuthenticatorKind::Simple {
+                expected_credentials,
+                ..
+            } => {
+                if encoded_credentials == expected_credentials.as_slice() {
+                    TestAuthenticationState::Authenticated
+                } else {
+                    TestAuthenticationState::Rejected
+                }
+            }
+            // The connect request names no acceptable principal in this shape:
+            // it asks for the challenge, and the answer is judged below.
+            TestAuthenticatorKind::ChallengeResponse { .. } => {
+                TestAuthenticationState::AwaitingResponse
+            }
+        };
+        self.sessions.insert(session_id, state);
+    }
+
+    fn on_challenge_response(&mut self, session_id: i64, encoded_credentials: &[u8], _now_ms: i64) {
+        // `SampleAuthenticator.onChallengeResponse`: a response moves
+        // `CHALLENGE` to `AUTHENTICATED` only for the expected answer, and
+        // anything else is a refusal — including a second answer.
+        let state = match &self.kind {
+            TestAuthenticatorKind::ChallengeResponse {
+                expected_response, ..
+            } => {
+                if self.state(session_id) == Some(TestAuthenticationState::AwaitingResponse)
+                    && encoded_credentials == expected_response.as_slice()
+                {
+                    TestAuthenticationState::Authenticated
+                } else {
+                    TestAuthenticationState::Rejected
+                }
+            }
+            TestAuthenticatorKind::Simple { .. } => TestAuthenticationState::Rejected,
+        };
+        self.sessions.insert(session_id, state);
+    }
+
+    fn on_connected_session(
+        &mut self,
+        session: &mut dyn SessionProxy,
+        _now_ms: i64,
+    ) -> Result<(), deepmsg_cluster::ClusterError> {
+        let session_id = session.session_id();
+        match (self.state(session_id), &self.kind) {
+            (Some(TestAuthenticationState::Authenticated), kind) => {
+                session.authenticate(principal(kind))?;
+                self.sessions.remove(&session_id);
+            }
+            (
+                Some(TestAuthenticationState::AwaitingResponse),
+                TestAuthenticatorKind::ChallengeResponse { challenge, .. },
+            ) => {
+                session.challenge(challenge)?;
+            }
+            _ => {
+                session.reject();
+                self.sessions.remove(&session_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn on_challenged_session(
+        &mut self,
+        session: &mut dyn SessionProxy,
+        _now_ms: i64,
+    ) -> Result<(), deepmsg_cluster::ClusterError> {
+        let session_id = session.session_id();
+        match self.state(session_id) {
+            Some(TestAuthenticationState::AwaitingResponse) => {}
+            Some(TestAuthenticationState::Authenticated) => {
+                let principal = principal(&self.kind).to_vec();
+                session.authenticate(&principal)?;
+                self.sessions.remove(&session_id);
+            }
+            _ => {
+                session.reject();
+                self.sessions.remove(&session_id);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn principal(kind: &TestAuthenticatorKind) -> &[u8] {
+    match kind {
+        TestAuthenticatorKind::Simple { principal, .. }
+        | TestAuthenticatorKind::ChallengeResponse { principal, .. } => principal,
+    }
+}
+
+/// A backup node: its own driver **and archive**, a `ClusterBackup` agent on a
+/// thread of this process, and the five probes the reference's `TestBackupNode`
+/// reads (`TestBackupNode.java:91-142`).
+///
+/// The backup is a fourth `OwnArchivingMediaDriver` rather than a member: it
+/// never joins the cluster, and the log it records is the local archive's copy
+/// of the cluster's replay (`ClusterBackup.java:887-893`).
+pub struct BackupNode {
+    aeron_dir: std::path::PathBuf,
+    /// `None` only after [`Self::into_directories`] has handed them to the
+    /// member started from this backup.
+    archive_dir: Option<TempDir>,
+    cluster_dir: Option<TempDir>,
+    driver: Option<OwnArchivingMediaDriver>,
+    counters: NodeCounters,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    faults: Faults,
+    role_name: String,
+}
+
+/// What a test varies about a backup node. The defaults are the reference
+/// fixture's (`TestCluster.java:594-616`): `FOLLOWER`, a kernel-chosen catchup
+/// port, replication from the beginning, and no credentials.
+pub struct BackupOptions {
+    /// `aeron.cluster.backup.source.type`.
+    pub source_type: SourceType,
+    /// `aeron.cluster.backup.catchup.endpoint`'s port; `0` asks the kernel.
+    pub catchup_port: u16,
+    /// `cluster.backup.initial.replay.start`.
+    pub initial_replay_start: ReplayStart,
+    /// What the backup offers the cluster and its archive. `None` is
+    /// [`deepmsg_archive::client::NoCredentials`].
+    pub credentials: Option<TestCredentials>,
+}
+
+/// What a case's backup offers the cluster and its archive.
+///
+/// The reference's three suppliers (`Null`, `Simple`, `ChallengeResponse`)
+/// differ in two answers — the encoded credentials, and the answer to a
+/// challenge — so this is those two byte strings. A case that must be refused
+/// sends the wrong ones; nothing here looks at their content.
+#[derive(Clone, Debug, Default)]
+pub struct TestCredentials {
+    /// What `encoded()` answers.
+    pub encoded: Vec<u8>,
+    /// What `on_challenge()` answers.
+    pub challenge_answer: Vec<u8>,
+}
+
+impl Credentials for TestCredentials {
+    fn encoded(&mut self) -> Vec<u8> {
+        self.encoded.clone()
+    }
+
+    fn on_challenge(&mut self, _challenge: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(self.challenge_answer.clone())
+    }
+}
+
+impl Default for BackupOptions {
+    fn default() -> Self {
+        Self {
+            source_type: SourceType::Follower,
+            catchup_port: 0,
+            initial_replay_start: ReplayStart::Beginning,
+            credentials: None,
+        }
+    }
+}
+
+impl BackupNode {
+    /// Start a backup for `member_string` with the fixture's defaults.
+    pub fn start(ports: &Ports, member_string: &str, faults: &Faults) -> Option<Self> {
+        Self::start_with(ports, member_string, faults, BackupOptions::default())
+    }
+
+    /// The same, with what a case varies.
+    pub fn start_with(
+        ports: &Ports,
+        member_string: &str,
+        faults: &Faults,
+        options: BackupOptions,
+    ) -> Option<Self> {
+        let archive_dir = TempDir::new("cluster-backup-archive");
+        let cluster_dir = TempDir::new("cluster-backup-cluster");
+        Self::start_over_directories(
+            ports,
+            member_string,
+            faults,
+            options,
+            archive_dir,
+            cluster_dir,
+        )
+    }
+
+    /// Start over directories that already exist — a backup resumed after a
+    /// stop (`TestCluster.java:652-665`: `cleanStart=false` keeps the
+    /// recording and the log).
+    pub fn start_over_directories(
+        ports: &Ports,
+        member_string: &str,
+        faults: &Faults,
+        options: BackupOptions,
+        archive_dir: TempDir,
+        cluster_dir: TempDir,
+    ) -> Option<Self> {
+        let properties: Vec<String> = archive::PROPERTIES
+            .iter()
+            .map(|property| (*property).to_owned())
+            .collect();
+        let property_refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+
+        let mut driver =
+            OwnArchivingMediaDriver::start(
+                &format!("cluster-backup-{}", ports.base()),
+                archive_dir.path(),
+                &property_refs,
+            )?;
+        driver
+            .await_ready(DEADLINE)
+            .expect("the backup's archive comes up");
+
+        let consensus_endpoints = (0..MEMBER_COUNT)
+            .map(|id| format!("localhost:{}", ports.consensus(id)))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut properties = Properties::new();
+        properties
+            .apply_args(vec![
+                format!("-Daeron.dir={}", driver.aeron_dir().display()),
+                format!("-Daeron.cluster.dir={}", cluster_dir.path().display()),
+                format!("-Daeron.cluster.id={CLUSTER_ID}"),
+                format!("-Daeron.cluster.members={member_string}"),
+                format!(
+                    "-Daeron.cluster.consensus.channel=aeron:udp?endpoint=localhost:{}",
+                    ports.backup_consensus()
+                ),
+                format!("-Daeron.cluster.consensus.endpoints={consensus_endpoints}"),
+                format!(
+                    "-Daeron.cluster.backup.catchup.endpoint=localhost:{}",
+                    options.catchup_port
+                ),
+                format!(
+                    "-Daeron.cluster.backup.source.type={}",
+                    options.source_type.name()
+                ),
+                format!(
+                    "-Dcluster.backup.initial.replay.start={}",
+                    options.initial_replay_start.name()
+                ),
+                // The reference's own fixture shortens this to a second so a
+                // failed attempt retries while the case is still watching
+                // (`TestCluster.java:598`).
+                "-Daeron.cluster.backup.cool.down.interval=1s".to_owned(),
+            ])
+            .expect("the backup's properties parse");
+        let config = ClusterBackupConfig::from_properties(&properties)
+            .expect("the backup's configuration settles");
+
+        let counters = NodeCounters::open(driver.aeron_dir());
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let recorded_faults = faults.clone();
+        let faults = faults.clone();
+        let (started_tx, started_rx) = mpsc::channel::<Result<String, String>>();
+
+        let credentials = options.credentials;
+        let thread = std::thread::spawn(move || {
+            // Built here rather than handed in: the components hold trait
+            // objects with no `Send` bound (the reference's context holds the
+            // same live objects), and the agent is what lives on this thread.
+            let components = ClusterBackupComponents {
+                credentials: match credentials {
+                    None => Box::new(deepmsg_archive::client::NoCredentials),
+                    Some(credentials) => Box::new(credentials),
+                },
+                ..ClusterBackupComponents::default()
+            };
+            let context = ClusterBackupContext::new(config);
+            let mut agent = match ClusterBackup::launch_with_components(context, components) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    let _ = started_tx.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let _ = started_tx.send(Ok(agent.role_name().to_owned()));
+
+            let mut idle = Strategy::by_agrona_name("backoff").expect("backoff");
+            while !flag.load(Ordering::Relaxed) {
+                match agent.do_work() {
+                    Ok(work) => idle.idle(work),
+                    Err(error) if error.is_termination() => break,
+                    Err(error) => {
+                        // `AgentRunner` counts the error and keeps running: the
+                        // agent has put itself in `RESET_BACKUP` and the next
+                        // turn cools down and re-queries. A fixture that broke
+                        // here would never observe a reset — and a case whose
+                        // point is the reset would wait for a state the thread
+                        // has already left.
+                        faults.record(format!("the backup: {error}"));
+                        idle.idle(0);
+                    }
+                }
+            }
+
+            if let Err(error) = agent.close() {
+                faults.record(format!("the backup's close: {error}"));
+            }
+        });
+
+        let role_name = match started_rx.recv_timeout(DEADLINE) {
+            Ok(Ok(role_name)) => role_name,
+            Ok(Err(error)) => panic!("the backup did not launch: {error}"),
+            Err(error) => panic!("the backup never reported its launch: {error}"),
+        };
+
+        Some(Self {
+            aeron_dir: driver.aeron_dir().to_path_buf(),
+            archive_dir: Some(archive_dir),
+            cluster_dir: Some(cluster_dir),
+            driver: Some(driver),
+            counters,
+            stop,
+            thread: Some(thread),
+            faults: recorded_faults,
+            role_name,
+        })
+    }
+
+    /// `ClusterBackup.State` (counter 208) as its code.
+    pub fn state(&self) -> Option<i64> {
+        self.counters.value(CLUSTER_BACKUP_STATE_TYPE_ID)
+    }
+
+    /// Counter 209, or `None` when the counter is gone.
+    pub fn live_log_position(&self) -> Option<i64> {
+        self.counters
+            .value(CLUSTER_BACKUP_LIVE_LOG_POSITION_TYPE_ID)
+    }
+
+    /// Counter 210 — the epoch-millisecond deadline of the next query.
+    pub fn next_query_deadline_ms(&self) -> Option<i64> {
+        self.counters.value(CLUSTER_BACKUP_QUERY_DEADLINE_TYPE_ID)
+    }
+
+    /// Counter 240.
+    pub fn snapshot_retrieve_count(&self) -> Option<i64> {
+        self.counters
+            .value(CLUSTER_BACKUP_SNAPSHOT_RETRIEVE_COUNT_TYPE_ID)
+    }
+
+    /// Counter 211: how many errors have been counted.
+    pub fn error_count(&self) -> Option<i64> {
+        self.counters.value(CLUSTER_BACKUP_ERROR_COUNT_TYPE_ID)
+    }
+
+    /// The backup's mark file error log, as text
+    /// (`TestBackupNode.clusterBackupErrorLog`).
+    pub fn error_log(&self) -> Vec<String> {
+        use deepmsg_cnc::error_log::ErrorLogReader;
+
+        let path = self
+            .cluster_dir()
+            .join(deepmsg_cluster_common::mark::FILENAME);
+        let Ok(mark) = deepmsg_cluster_common::mark::ClusterMarkFile::open(&path) else {
+            return Vec::new();
+        };
+        let Some(buffer) = mark.error_buffer_read_only() else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        let _ = ErrorLogReader::new(buffer).read(i64::MIN, &mut entries);
+        entries.into_iter().map(|entry| entry.text).collect()
+    }
+
+    /// The thread name the agent runs under (`ClusterBackupAgent.roleName`),
+    /// read from the agent itself rather than from the configuration.
+    #[must_use]
+    pub fn role_name(&self) -> &str {
+        &self.role_name
+    }
+
+    /// Where the backup's own recording of the cluster's log starts — the
+    /// reference's `TestBackupNode.recordingLogStartPosition`
+    /// (`TestBackupNode.java:149-166`): the last term's recording, then the
+    /// backup archive's start position for it.
+    pub fn recording_log_start_position(&self) -> Option<i64> {
+        use deepmsg_archive::client::{Archive, ArchiveContext, Handlers, NoCredentials};
+        use deepmsg_cluster::persist::recording_log::{self, RecordingLog};
+
+        let log_path = self.cluster_dir().join(recording_log::FILENAME);
+        let log = RecordingLog::open(&log_path).ok()?;
+        let recording_id = log.find_last_term()?.recording_id;
+        drop(log);
+
+        let mut client = Client::connect(&self.aeron_dir).ok()?;
+        let mut context = ArchiveContext::new();
+        context.aeron_dir = self.aeron_dir.to_string_lossy().into_owned();
+        context.control_request_channel = Some("aeron:ipc".to_owned());
+        context.control_response_channel = Some("aeron:ipc".to_owned());
+        let mut archive = Archive::connect(
+            &context,
+            &mut client,
+            &mut NoCredentials,
+            Handlers::default(),
+        )
+        .ok()?;
+
+        archive.get_start_position(&mut client, recording_id).ok()
+    }
+
+    /// The backup's own aeron directory.
+    pub fn aeron_dir(&self) -> &std::path::Path {
+        &self.aeron_dir
+    }
+
+    pub fn cluster_dir(&self) -> &std::path::Path {
+        self.cluster_dir
+            .as_ref()
+            .expect("the directories are still this node's")
+            .path()
+    }
+
+    /// Stop the agent and the driver, and hand the directories over — the
+    /// reference's `startStaticNodeFromBackup` needs both (`TestCluster
+    /// .java:623-687`).
+    pub fn into_directories(mut self) -> (TempDir, TempDir) {
+        self.stop_agent();
+        if let Some(mut driver) = self.driver.take() {
+            driver.stop().expect("the backup's driver stops");
+        }
+        (
+            self.archive_dir
+                .take()
+                .expect("the directories are still here"),
+            self.cluster_dir
+                .take()
+                .expect("the directories are still here"),
+        )
+    }
+
+    fn stop_agent(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for BackupNode {
+    fn drop(&mut self) {
+        self.stop_agent();
+        if let Some(mut driver) = self.driver.take() {
+            let _ = driver.stop();
+        }
+        // A recorded fault that the case never looked at is a case that ended
+        // without knowing: the harness's own rule for every node.
+        let _ = &self.faults;
+    }
+}
+
 /// The client side: one ingress publication and one egress subscription on a
 /// driver that is not any member's.
 pub struct ClientSide {
@@ -1087,7 +1985,7 @@ impl ClientSide {
     /// one the cluster may still hold open.
     pub fn start_at(ports: &Ports, leader_id: i32, egress_offset: u16) -> Option<Self> {
         let ports = &ports.with_egress_offset(egress_offset);
-        let driver = OwnDriver::start("cluster-harness-client")?;
+        let driver = OwnDriver::start(&format!("cluster-harness-client-{}", ports.base()))?;
         let mut client = Client::connect(driver.aeron_dir()).expect("the test client connects");
 
         let egress_channel = ports.client_egress_channel();
@@ -1155,6 +2053,142 @@ impl ClientSide {
         self.client.poll();
     }
 
+    /// One poll, and everything the egress subscription delivered: the
+    /// `SessionEvent`s, the `Challenge`s, and how many session messages (the
+    /// service's replies) arrived.
+    ///
+    /// They share the stream, so a case that wants the replies must consume
+    /// the events in the same pass — polling for one and then the other would
+    /// read the same fragment twice or miss it.
+    pub fn poll_egress(&mut self) -> (Vec<SessionEvent>, usize) {
+        let (events, _, messages) = self.poll_egress_all();
+        (events, messages)
+    }
+
+    /// [`Self::poll_egress`], keeping the challenges a cluster sends a client
+    /// that must answer one.
+    pub fn poll_egress_all(&mut self) -> (Vec<SessionEvent>, Vec<Challenge>, usize) {
+        self.client.poll();
+
+        let mut events = Vec::new();
+        let mut challenges = Vec::new();
+        let mut messages = 0;
+        self.client
+            .poll_subscription(self.egress_subscription_id, 10, |message| {
+                if let Some(event) = decode_session_event(message.payload) {
+                    events.push(event);
+                } else if let Some(challenge) = decode_challenge(message.payload) {
+                    challenges.push(challenge);
+                } else {
+                    messages += 1;
+                }
+            });
+
+        (events, challenges, messages)
+    }
+
+    /// Open a session and wait for the `OK` event — the reference's
+    /// `connectClient` followed by its `awaitReady` (`AeronCluster`).
+    pub fn connect_session(&mut self, faults: &Faults) -> SessionEvent {
+        self.connect_session_with(&[], &[], faults)
+    }
+
+    /// The same, with the credentials a cluster's authenticator will judge
+    /// (`SessionConnectRequest.encodedCredentials`) and, for a cluster that
+    /// challenges, the answer to send back.
+    pub fn connect_session_with(
+        &mut self,
+        credentials: &[u8],
+        challenge_answer: &[u8],
+        faults: &Faults,
+    ) -> SessionEvent {
+        const CORRELATION_ID: i64 = 1;
+        let request =
+            connect_request_with_credentials(CORRELATION_ID, &self.egress_channel, credentials);
+        offer_message(self, faults, &request);
+
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            faults.check();
+            let (events, challenges, _) = self.poll_egress_all();
+
+            for challenge in challenges {
+                self.answer_challenge(&challenge, challenge_answer, faults);
+            }
+
+            if let Some(event) = events
+                .into_iter()
+                .find(|event| event.correlation_id == CORRELATION_ID)
+            {
+                assert_eq!(
+                    EventCode::OK,
+                    event.code,
+                    "the session was refused: {:?} {}",
+                    event.code,
+                    event.detail
+                );
+                return event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the session open event never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Answer a `Challenge` on the ingress publication — what the reference's
+    /// `AeronCluster` does with its credentials supplier
+    /// (`AeronCluster.java:1235-1290`).
+    pub fn answer_challenge(&self, challenge: &Challenge, answer: &[u8], faults: &Faults) {
+        let message = challenge_response_message(
+            challenge.correlation_id,
+            challenge.cluster_session_id,
+            answer,
+        );
+        offer_message(self, faults, &message);
+    }
+
+    /// Offer one session message on the open session.
+    pub fn send(&self, session: &SessionEvent, payload: &[u8], faults: &Faults) {
+        let message = ingress_message(
+            session.leadership_term_id,
+            session.cluster_session_id,
+            payload,
+        );
+        offer_message(self, faults, &message);
+    }
+
+    /// Send `count` messages and wait until as many replies have arrived — the
+    /// reference's `sendAndAwaitMessages`.
+    pub fn send_and_await_messages(
+        &mut self,
+        session: &SessionEvent,
+        count: usize,
+        faults: &Faults,
+    ) {
+        for index in 0..count {
+            self.send(session, &[b'0' + u8::try_from(index % 10).unwrap()], faults);
+        }
+        self.await_responses(count, faults);
+    }
+
+    /// Poll until `count` replies have arrived on the current session.
+    pub fn await_responses(&mut self, count: usize, faults: &Faults) {
+        let deadline = Instant::now() + DEADLINE;
+        let mut seen = 0;
+        while seen < count {
+            faults.check();
+            let (_, messages) = self.poll_egress();
+            seen += messages;
+            assert!(
+                Instant::now() < deadline,
+                "only {seen} of {count} replies arrived"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// The last `lines` lines the client's own driver wrote.
     #[must_use]
     pub fn driver_log_tail(&self, lines: usize) -> String {
@@ -1169,6 +2203,60 @@ impl ClientSide {
             .subscription(self.egress_subscription_id)
             .map_or(0, |subscription| subscription.images().len())
     }
+}
+
+/// A `Challenge` (`Challenge.java`): what a cluster sends a session it wants
+/// credentials from before it may open.
+#[derive(Clone, Debug)]
+pub struct Challenge {
+    /// The correlation id of the connect request that is being challenged.
+    pub correlation_id: i64,
+    /// The session the cluster assigned.
+    pub cluster_session_id: i64,
+    /// The challenge to answer.
+    pub encoded_challenge: Vec<u8>,
+}
+
+/// Decode a `Challenge`, or `None` for a payload that is something else.
+pub fn decode_challenge(payload: &[u8]) -> Option<Challenge> {
+    if payload.len() < MESSAGE_HEADER_LENGTH {
+        return None;
+    }
+    let header = deepmsg_codec_cluster::message_header_codec::MessageHeaderDecoder::default()
+        .wrap(ReadBuf::new(payload), 0);
+    if header.schema_id() != deepmsg_codec_cluster::SBE_SCHEMA_ID
+        || header.template_id() != deepmsg_codec_cluster::challenge_codec::SBE_TEMPLATE_ID
+    {
+        return None;
+    }
+
+    let mut decoder = ChallengeDecoder::default().header(header, 0);
+    let (offset, length) = decoder.encoded_challenge_decoder();
+    Some(Challenge {
+        correlation_id: decoder.correlation_id(),
+        cluster_session_id: decoder.cluster_session_id(),
+        encoded_challenge: decoder.encoded_challenge_slice((offset, length)).to_vec(),
+    })
+}
+
+/// A `ChallengeResponse` on the ingress publication (`ChallengeResponse.java`).
+pub fn challenge_response_message(
+    correlation_id: i64,
+    cluster_session_id: i64,
+    encoded_credentials: &[u8],
+) -> Vec<u8> {
+    let mut buffer = vec![0_u8; MESSAGE_HEADER_LENGTH + 16 + 4 + encoded_credentials.len()];
+    let encoder =
+        ChallengeResponseEncoder::default().wrap(WriteBuf::new(&mut buffer), MESSAGE_HEADER_LENGTH);
+    let mut header = encoder.header(0);
+    let mut message = header.parent().expect("the encoder just wrapped");
+    message
+        .correlation_id(correlation_id)
+        .cluster_session_id(cluster_session_id)
+        .encoded_credentials(encoded_credentials);
+    let length = MESSAGE_HEADER_LENGTH + message.encoded_length();
+    buffer.truncate(length);
+    buffer
 }
 
 #[derive(Clone, Debug)]
@@ -1210,7 +2298,16 @@ pub fn decode_session_event(payload: &[u8]) -> Option<SessionEvent> {
 /// client writes it (`AeronCluster`): the response channel is the egress
 /// subscription's own endpoint.
 pub fn connect_request(correlation_id: i64, response_channel: &str) -> Vec<u8> {
-    let mut buffer = vec![0_u8; 256 + response_channel.len()];
+    connect_request_with_credentials(correlation_id, response_channel, &[])
+}
+
+/// [`connect_request`] with credentials a cluster's authenticator will see.
+pub fn connect_request_with_credentials(
+    correlation_id: i64,
+    response_channel: &str,
+    credentials: &[u8],
+) -> Vec<u8> {
+    let mut buffer = vec![0_u8; 256 + response_channel.len() + credentials.len()];
     let encoder = SessionConnectRequestEncoder::default()
         .wrap(WriteBuf::new(&mut buffer), MESSAGE_HEADER_LENGTH);
     let mut header = encoder.header(0);
@@ -1220,7 +2317,7 @@ pub fn connect_request(correlation_id: i64, response_channel: &str) -> Vec<u8> {
         .response_stream_id(EGRESS_STREAM_ID)
         .version(PROTOCOL_VERSION)
         .response_channel(response_channel.as_bytes())
-        .encoded_credentials(b"")
+        .encoded_credentials(credentials)
         .client_info(b"cluster-harness");
     let length = MESSAGE_HEADER_LENGTH + message.encoded_length();
     buffer.truncate(length);
@@ -1308,7 +2405,10 @@ pub fn await_launched(
         );
         match launched.recv_timeout(Duration::from_millis(100)) {
             Ok((_, Ok(()))) => done += 1,
-            Ok((id, Err(error))) => panic!("node {id} did not launch: {error}"),
+            Ok((id, Err(error))) => panic!(
+                "node {id} did not launch: {error}; faults: {:?}",
+                faults.snapshot()
+            ),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => panic!("every node died launching"),
         }
