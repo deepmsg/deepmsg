@@ -461,8 +461,11 @@ impl Node {
         properties
             .apply_args(self.args.clone())
             .expect("the properties parse");
-        let config = ConsensusModuleConfig::from_properties(&properties)
+        let mut config = ConsensusModuleConfig::from_properties(&properties)
             .expect("the module's configuration settles");
+        // This build has no class loader; the flag is the programmatic
+        // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+        config.consensus_module_extension = true;
         let idle_strategy = config.idle_strategy.clone();
 
         let id = self.id;

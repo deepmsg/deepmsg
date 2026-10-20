@@ -1052,6 +1052,20 @@ impl Client {
         let _ = self.write_command(CLIENT_CLOSE_TYPE_ID, &encode_client_close(self.client_id));
     }
 
+    /// Relinquish this client **without telling the driver**: the caller owns
+    /// it, and the reference's in-process container is given exactly that
+    /// (`ClusteredServiceContainer.Context.ownsAeronClient(false)`).
+    ///
+    /// The local state is marked closed so a later [`Drop`] sends nothing; the
+    /// driver keeps the session, and every counter it keyed to this client,
+    /// until its own liveness timeout reclaims them. The reference's node owns
+    /// the client and closes it when the **node** ends; a build that has no
+    /// node-level client uses this to keep the same observable behaviour for
+    /// the life of a container that ends early.
+    pub fn detach(mut self) {
+        self.closed = true;
+    }
+
     /// Register something to run when this client closes
     /// (`Aeron.addCloseHandler`, `Aeron.java:661-664`).
     ///

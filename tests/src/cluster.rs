@@ -630,10 +630,18 @@ impl TestCluster {
     }
 
     /// The member whose role counter says LEADER, once one does.
+    ///
+    /// A member whose node was stopped is skipped: its driver's CnC file can
+    /// still carry a heartbeat inside the client's ten-second liveness window,
+    /// so a connect would succeed and read the role it had before it died —
+    /// which is how a test that stopped the leader saw it "still leading".
     pub fn await_leader(&self) -> i32 {
         let deadline = Instant::now() + DEADLINE;
         while Instant::now() < deadline {
             for node in &self.nodes {
+                if node.process.is_none() {
+                    continue;
+                }
                 if self.counter_on(node.id, CLUSTER_NODE_ROLE_TYPE_ID) == Some(ROLE_LEADER) {
                     return node.id;
                 }
@@ -932,6 +940,7 @@ impl TestCluster {
                 + 20
                 + (slot.spec.service_id + 1),
             snapshot_duration_threshold_ns: 1_000_000_000,
+            cycle_threshold_ns: 100_000_000,
         }
     }
 
@@ -1160,7 +1169,15 @@ impl TestCluster {
         let (started_tx, started_rx) = mpsc::channel();
 
         let thread = std::thread::spawn(move || -> Result<(), String> {
-            let mut agent = match ClusteredServiceAgent::launch(config, observed) {
+            // The reference's in-process container is given an Aeron client it
+            // does not own (`ownsAeronClient=false`): when this agent ends, the
+            // client's counters stay in the driver and the consensus module
+            // does not see a service leave. Closing it here would take the
+            // node's driver side down with the failed service, which is the
+            // bug `cluster_lc4a_snapshot_failure` caught.
+            let mut agent = match ClusteredServiceAgent::launch_with_client_ownership(
+                config, observed, false,
+            ) {
                 Ok(agent) => agent,
                 Err(error) => {
                     let message = error.to_string();

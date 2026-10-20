@@ -161,3 +161,82 @@ fn the_reference_container_schedules_and_cancels_the_same_way() {
     let _serial = SERIAL.lock().expect("the serial lock");
     timers("lc4a-timers-java", arms()[2].1);
 }
+
+/// P3-8's container counters: `Cluster container max cycle time in ns` (218)
+/// and its threshold-exceeded count (219), allocated per `(clusterId,
+/// serviceId)` the way the reference's `Context.conclude` does
+/// (`ClusteredServiceContainer.java:969-984`).
+#[test]
+fn our_container_allocates_the_cycle_time_counters() {
+    use deepmsg_cluster_common::counters::{
+        CLUSTER_CLUSTERED_SERVICE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID,
+        CLUSTER_CLUSTERED_SERVICE_MAX_CYCLE_TIME_TYPE_ID,
+    };
+
+    let _serial = SERIAL.lock().expect("the serial lock");
+    for (arm, member) in [arms()[0], arms()[1]] {
+        let Some(mut cluster) = start("lc4a-cycle-counters", member) else {
+            eprintln!("SKIPPED: the reference jar, java, or the fork's Java probes");
+            return;
+        };
+        cluster.await_active();
+
+        let max = cluster
+            .counter_on(0, CLUSTER_CLUSTERED_SERVICE_MAX_CYCLE_TIME_TYPE_ID)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{arm}: 218 is allocated\ncontainer logs:\n{}",
+                    cluster.container_logs()
+                )
+            });
+        assert!(
+            max > 0,
+            "{arm}: the container ran at least one cycle: {max}"
+        );
+        assert!(
+            cluster
+                .counter_on(
+                    0,
+                    CLUSTER_CLUSTERED_SERVICE_CYCLE_TIME_THRESHOLD_EXCEEDED_TYPE_ID
+                )
+                .is_some(),
+            "{arm}: 219 is allocated"
+        );
+
+        cluster.shutdown();
+    }
+}
+
+/// `ClusterThreadNamingTest`'s second scenario (`:125-189`): the container's
+/// thread carries `clustered-service-<clusterId>-<serviceId>`, cut to the
+/// kernel's 15 bytes. In-process only: an external container's thread is not
+/// in this process, and its own binary is covered by its unit test.
+#[test]
+fn the_in_process_container_thread_is_named() {
+    let _serial = SERIAL.lock().expect("the serial lock");
+    let Some(mut cluster) = start("lc4a-container-name", arms()[0].1) else {
+        eprintln!("SKIPPED: the reference jar, java, or the fork's Java probes");
+        return;
+    };
+    cluster.await_active();
+
+    let names = task_names();
+    assert!(
+        names.iter().any(|name| name == "clustered-servi"),
+        "the container's thread is named: {names:?}"
+    );
+
+    cluster.shutdown();
+}
+
+/// Every live thread's kernel name (`/proc/self/task/<tid>/comm`).
+fn task_names() -> Vec<String> {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return Vec::new();
+    };
+    tasks
+        .filter_map(Result::ok)
+        .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+        .map(|name| name.trim_end_matches('\n').to_owned())
+        .collect()
+}

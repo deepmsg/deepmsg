@@ -19,6 +19,7 @@ members = [
     "crates/cluster/consensus",
     "crates/cluster/service",
     "crates/cluster/client",
+    "crates/cluster/tool",
     "crates/tools",
     "crates/bench",
     "examples",

@@ -12,8 +12,11 @@
 //!   stream has ended (`Image.sourceIdentity`, `Image.joinPosition`,
 //!   `Image.isEndOfStream`).
 //!
-//! Everything here is our own driver and our own client over `aeron:ipc`, so it
-//! needs no reference checkout and runs in CI.
+//! Everything here is our own driver and our own client, so it needs no
+//! reference checkout and runs in CI. All but one use `aeron:ipc`; where a
+//! second subscription joins a running image, the answer depends on what the
+//! image has received rather than on what a shared log buffer holds, and that
+//! case uses `aeron:udp`.
 
 use std::time::{Duration, Instant};
 
@@ -721,4 +724,120 @@ fn an_image_that_left_the_subscription_hears_that_it_is_over() {
         held.is_closed(),
         "a subscription that leaves the client ends the images it gave away"
     );
+}
+
+/// A subscription that joins an image already running starts where the
+/// **slowest reader** is, not where the image has got to
+/// (`aeron_publication_image_join_position`,
+/// `aeron-driver/src/main/c/aeron_publication_image.h:376-396`).
+///
+/// A lone subscriber cannot tell the difference; a second one can. Joining at
+/// the image's position would start it past the frames the first reader has
+/// not read yet, and those frames are never replayed — the late reader would
+/// call the stream continuous in the middle of a gap.
+///
+/// What made this a hang rather than a loss: a restarted cluster member's
+/// archive starts recording the catch-up replay a turn **after** the member's
+/// own log subscription has joined it, by which time the replay of the gap may
+/// be over. The recording subscription then joined past the gap, and the
+/// archive refused to extend the recording (`cannot extend recording …
+/// image.joinPosition … != rec.stopPosition`), so the member looped
+/// `FOLLOWER_CATCHUP_AWAIT` until the harness gave up.
+#[test]
+fn a_second_subscription_joins_where_the_slowest_reader_is() {
+    let Some((_own, mut client)) = own_driver_and_client("image-join-position") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let port = free_port();
+    let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}|term-length=64k");
+
+    let publication = client
+        .add_publication(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication on the channel");
+    let first = client
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("the first subscription");
+    await_image(&mut client, first);
+
+    // Frames reach the image but not the reader: polling the *client* drains
+    // driver events, and only `poll_subscription` moves a reader's position.
+    let deadline = Instant::now() + DEADLINE;
+    let mut offered = 0;
+    while offered < 20 {
+        assert!(
+            Instant::now() < deadline,
+            "{offered} messages were offered in {DEADLINE:?}"
+        );
+        if let Some(Appended::Ok { .. }) = client.offer(publication, &[0_u8; 512]) {
+            offered += 1;
+        } else {
+            client.poll();
+        }
+        client.poll();
+    }
+
+    // The image has to have received them, or the two answers agree for the
+    // wrong reason. `rcv-pos` is the number the broken answer used.
+    let received = await_received_position(&mut client);
+    assert!(
+        received > 0,
+        "the image never received a frame, so this test proves nothing"
+    );
+
+    let first_join = image_join_position(&client, first);
+    assert_eq!(0, first_join, "the first reader joined at the start");
+
+    let second = client
+        .add_subscription(&channel, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("the second subscription on the same stream");
+    await_image(&mut client, second);
+
+    assert_eq!(
+        first_join,
+        image_join_position(&client, second),
+        "a reader that joins later starts where the slowest reader is, not at rcv-pos={received}"
+    );
+}
+
+/// The position the driver's image has received to (`rcv-pos`), whichever
+/// image holds one.
+fn await_received_position(client: &mut Client) -> i64 {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        client.poll();
+        let received = client.counters_reader().map_or(0, |counters| {
+            let mut position = 0_i64;
+            counters.for_each(|descriptor| {
+                if descriptor.type_id == deepmsg_driver::position::type_id::RECEIVER_POSITION {
+                    position = position.max(descriptor.value);
+                }
+            });
+            position
+        });
+        if received > 0 || Instant::now() >= deadline {
+            return received;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Where the subscription's image says its reader started.
+fn image_join_position(client: &Client, subscription: i64) -> i64 {
+    client
+        .subscription(subscription)
+        .expect("the subscription")
+        .images()
+        .first()
+        .expect("the subscription holds an image")
+        .join_position()
+}
+
+/// A UDP port nothing else in this process's run of this binary uses.
+fn free_port() -> u16 {
+    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
+    let base = 40_000 + (std::process::id() as u16 % 20_000);
+
+    base
 }

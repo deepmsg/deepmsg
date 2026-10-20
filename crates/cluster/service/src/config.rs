@@ -114,6 +114,10 @@ pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_PROP_NAME: &str =
     "aeron.archive.control.response.stream.id";
 /// `CONTROL_RESPONSE_STREAM_ID_DEFAULT` (`AeronArchive.java:2764`).
 pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_DEFAULT: i32 = 20;
+/// `CYCLE_THRESHOLD_PROP_NAME` (`ClusteredServiceContainer.java:413`).
+pub const CYCLE_THRESHOLD_PROP_NAME: &str = "aeron.cluster.service.cycle.threshold";
+/// `CYCLE_THRESHOLD_DEFAULT_NS` (`:422`) — 100 ms.
+pub const CYCLE_THRESHOLD_DEFAULT_NS: i64 = 100_000_000;
 /// `SNAPSHOT_DURATION_THRESHOLD_PROP_NAME` (`ClusteredServiceContainer.java:430`).
 pub const SNAPSHOT_DURATION_THRESHOLD_PROP_NAME: &str = "aeron.cluster.service.snapshot.threshold";
 /// `SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS` (`:438`) — 1 s.
@@ -216,6 +220,9 @@ pub struct ServiceContainerConfig {
     /// `aeron.cluster.service.snapshot.threshold`: how long a snapshot may take
     /// before it is counted in counter 237.
     pub snapshot_duration_threshold_ns: i64,
+    /// `aeron.cluster.service.cycle.threshold`: when a duty cycle counts as
+    /// over its budget (`:413-422`), for counters 218/219.
+    pub cycle_threshold_ns: i64,
 }
 
 impl ServiceContainerConfig {
@@ -348,6 +355,8 @@ impl ServiceContainerConfig {
                 SNAPSHOT_DURATION_THRESHOLD_PROP_NAME,
                 SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS,
             )?,
+            cycle_threshold_ns: properties
+                .duration_ns(CYCLE_THRESHOLD_PROP_NAME, CYCLE_THRESHOLD_DEFAULT_NS)?,
         })
     }
 
@@ -357,9 +366,24 @@ impl ServiceContainerConfig {
     /// not share a control session.
     #[must_use]
     pub fn archive_context(&self) -> ArchiveContext {
+        // `concludeArchiveContext` (`ClusteredServiceContainer.java:1011-1045`):
+        // both control channels carry an alias naming this service and
+        // cluster, so two services of one cluster do not share an archive
+        // control session.
+        let aliased = |suffix: &str| {
+            deepmsg_core::uri::ChannelUri::parse(&self.archive_local_control_channel)
+                .map(|uri| {
+                    uri.with_alias_if_absent(&format!(
+                        "sc-{}-archive-ctrl-{suffix}-cluster-{}",
+                        self.service_id, self.cluster_id
+                    ))
+                    .build()
+                })
+                .unwrap_or_else(|_| self.archive_local_control_channel.clone())
+        };
         let mut context = ArchiveContext::new();
-        context.control_request_channel = Some(self.archive_local_control_channel.clone());
-        context.control_response_channel = Some(self.archive_local_control_channel.clone());
+        context.control_request_channel = Some(aliased("req"));
+        context.control_response_channel = Some(aliased("resp"));
         context.control_request_stream_id = self.archive_local_control_stream_id;
         context.control_response_stream_id = self.archive_control_response_stream_id;
         context
@@ -450,6 +474,45 @@ mod tests {
         // clusterId 0, serviceId 0, control response stream 20 ⇒ 121.
         assert_eq!(config.archive_control_response_stream_id, 121);
         assert_eq!(config.snapshot_duration_threshold_ns, 1_000_000_000);
+        assert_eq!(config.cycle_threshold_ns, 100_000_000);
+    }
+
+    #[test]
+    fn the_archive_control_channels_carry_service_aliases() {
+        // `shouldCreateAliasForControlStreams`
+        // (`ClusteredServiceContainerContextTest.java:326`).
+        let config =
+            ServiceContainerConfig::from_properties(&Properties::new()).expect("defaults parse");
+        let context = config.archive_context();
+        let request = context
+            .control_request_channel
+            .as_deref()
+            .expect("a request channel");
+        let response = context
+            .control_response_channel
+            .as_deref()
+            .expect("a response channel");
+        assert!(
+            request.contains("alias=sc-0-archive-ctrl-req-cluster-0"),
+            "{request}"
+        );
+        assert!(
+            response.contains("alias=sc-0-archive-ctrl-resp-cluster-0"),
+            "{response}"
+        );
+        assert_eq!(context.control_request_stream_id, 10);
+        // clusterId 0, serviceId 0, control response stream 20: 121.
+        assert_eq!(context.control_response_stream_id, 121);
+    }
+
+    #[test]
+    fn the_cycle_threshold_is_the_property_or_its_default() {
+        let mut properties = Properties::new();
+        properties
+            .apply_args(["-Daeron.cluster.service.cycle.threshold=25ms".to_owned()])
+            .expect("a -D argument");
+        let config = ServiceContainerConfig::from_properties(&properties).expect("parses");
+        assert_eq!(config.cycle_threshold_ns, 25_000_000);
     }
 
     #[test]

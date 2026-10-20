@@ -1870,15 +1870,40 @@ impl IpcSubscriptions {
             return Err(());
         };
 
-        let Some(link) = self.links.get_mut(link_index) else {
-            return Err(());
-        };
-
-        if link.reads_image(image_registration_id) {
+        if self
+            .links
+            .get(link_index)
+            .is_none_or(|link| link.reads_image(image_registration_id))
+        {
             return Err(());
         }
 
-        let joining_position = images.join_position(image_registration_id, counters, regions);
+        // `aeron_publication_image_join_position` (`aeron_publication_image.h:376-396`):
+        // `rcv-pos`, or the **slowest reader** when one is behind it. A reader
+        // links where the frames it must see still are, not where the image has
+        // got to; joining at `rcv-pos` would skip everything between.
+        //
+        // The cluster is where the two differ: a restarted follower's archive
+        // starts recording the catch-up replay after that follower's own log
+        // subscription has already joined it, and the replay of the gap can be
+        // over by then. Without the slow reader the recording subscription
+        // joins past the gap and the archive refuses to extend the recording
+        // (`cannot extend recording … image.joinPosition … != rec.stopPosition`).
+        let mut joining_position = images.join_position(image_registration_id, counters, regions);
+        for reader in &self.links {
+            for entry in &reader.subscribables {
+                if entry.target != SubscriptionTarget::Image(image_registration_id) {
+                    continue;
+                }
+                if let Some(position) = counters.value(regions, entry.counter_id) {
+                    joining_position = joining_position.min(position);
+                }
+            }
+        }
+
+        let Some(link) = self.links.get_mut(link_index) else {
+            return Err(());
+        };
 
         let Some(counter_id) = crate::position::allocate_subscription_position(
             counters,

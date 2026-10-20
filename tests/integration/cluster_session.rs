@@ -76,11 +76,14 @@ impl Harness {
             OwnArchivingMediaDriver::start(name, archive_dir.path(), &archive::PROPERTIES)?;
         driver.await_ready(DEADLINE).expect("the driver is ready");
 
-        let config = ConsensusModuleConfig::from_properties(&properties(
+        let mut config = ConsensusModuleConfig::from_properties(&properties(
             driver.aeron_dir(),
             cluster_dir.path(),
         ))
         .expect("the configuration parses");
+        // This build has no class loader; the flag is the programmatic
+        // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+        config.consensus_module_extension = true;
         let agent = ConsensusModuleAgent::launch_with_components(config, components)
             .expect("the module launches");
 

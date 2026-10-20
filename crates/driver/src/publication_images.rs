@@ -658,17 +658,16 @@ impl PublicationImages {
         }
     }
 
-    /// The join position a subscription starts reading at
-    /// (`aeron_publication_image_join_position`,
-    /// `aeron-driver/src/main/c/aeron_publication_image.h:376-396`): where the
-    /// image has been rebuilt to, and never before it.
+    /// Where the image has got to (`rcv-pos`): the *upper* bound of the join
+    /// position `aeron_publication_image_join_position`
+    /// (`aeron-driver/src/main/c/aeron_publication_image.h:376-396`) answers.
     ///
-    /// The reference takes the *slowest reader* when there are several, which
-    /// is a position the conductor can only get by asking the receiver. This
-    /// reads the counter instead: `rcv-pos` is by construction the position a
-    /// reader may start at without seeing a hole, and for the one-reader case —
-    /// which is every case until a second client subscribes to one stream —
-    /// the two are the same number.
+    /// The reference's answer is the **slowest reader** when one is behind
+    /// `rcv-pos`, because a reader that started at `rcv-pos` would miss every
+    /// frame the image received between the two. Reader positions belong to
+    /// the links, not to the image, so the minimum is applied by the caller
+    /// that holds both:
+    /// [`crate::ipc_subscriptions::IpcSubscriptions::link_image`].
     pub fn join_position(
         &self,
         registration_id: i64,

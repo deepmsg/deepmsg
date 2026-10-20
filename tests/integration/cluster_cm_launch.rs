@@ -74,9 +74,12 @@ fn a_single_member_module_starts_allocates_its_counters_and_reaches_steady_state
         .await_ready(DEADLINE)
         .expect("the archiving media driver comes up");
 
-    let config =
+    let mut config =
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
             .expect("the configuration settles");
+    // This build has no class loader; the flag is the programmatic
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    config.consensus_module_extension = true;
     let mut agent = ConsensusModuleAgent::launch(config).expect("the module launches");
 
     // ---- the counters, by type id, key and label --------------------------
@@ -188,9 +191,12 @@ fn a_single_member_module_starts_allocates_its_counters_and_reaches_steady_state
     // **not** reach steady state, and that is the honest answer for this slice:
     // the recovered commit position is behind the appended position, so
     // LEADER_REPLAY asks for a replay, which is `P3-4d`.
-    let config =
+    let mut config =
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
             .expect("the configuration settles again");
+    // This build has no class loader; the flag is the programmatic
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    config.consensus_module_extension = true;
     let mut agent = ConsensusModuleAgent::launch(config).expect("the module restarts");
 
     let plan = agent.recovery_plan();
@@ -247,9 +253,12 @@ fn a_closed_client_ends_the_duty_cycle() {
         .await_ready(DEADLINE)
         .expect("the archiving media driver comes up");
 
-    let config =
+    let mut config =
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
             .expect("the configuration settles");
+    // This build has no class loader; the flag is the programmatic
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    config.consensus_module_extension = true;
     let mut agent = ConsensusModuleAgent::launch(config).expect("the module launches");
 
     agent.client_mut().close();
@@ -341,4 +350,56 @@ fn expected_counters() -> Vec<(i32, CounterSpec)> {
             .unwrap(),
         ),
     ]
+}
+
+/// `shouldAlignMarkFileBasedOnTheMediaDriverFilePageSize`
+/// (`ConsensusModuleContextTest.java:996`): a mark file is sized against the
+/// **driver's** file page size, not this build's default. The driver is told
+/// to use 1 MiB here, so the 1 MiB error buffer plus the 8 KiB header align to
+/// 2 MiB instead of 1 MiB + 4 KiB.
+#[test]
+fn the_mark_file_is_aligned_to_the_drivers_file_page_size() {
+    const PAGE_SIZE: u64 = 1024 * 1024;
+
+    let archive_dir = TempDir::new("cluster-cm-page-archive");
+    let cluster_dir = TempDir::new("cluster-cm-page-cluster");
+    let mut driver_properties = archive::PROPERTIES.to_vec();
+    driver_properties.push("-Daeron.file.page.size=1m");
+
+    let Some(mut driver) =
+        OwnArchivingMediaDriver::start("cluster-cm-page", archive_dir.path(), &driver_properties)
+    else {
+        archiving_driver::announce_skip();
+        return;
+    };
+    driver
+        .await_ready(DEADLINE)
+        .expect("the archiving media driver comes up");
+
+    let mut config =
+        ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
+            .expect("the configuration settles");
+    // This build has no class loader; the flag is the programmatic
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    config.consensus_module_extension = true;
+    let agent = ConsensusModuleAgent::launch(config).expect("the module launches");
+
+    let mark_file = cluster_dir
+        .path()
+        .join(deepmsg_cluster_common::mark::FILENAME);
+    let length = std::fs::metadata(&mark_file)
+        .expect("the mark file exists")
+        .len();
+    let expected = {
+        let unaligned = deepmsg_cluster_common::mark::HEADER_LENGTH as u64
+            + deepmsg_cluster_common::mark::ERROR_BUFFER_MIN_LENGTH as u64;
+        (unaligned + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
+    };
+    assert_eq!(
+        expected, length,
+        "the mark file is aligned to the driver's 1 MiB page size"
+    );
+
+    agent.close().expect("the module closes");
+    driver.stop().expect("the driver stops");
 }

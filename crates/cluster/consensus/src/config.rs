@@ -21,6 +21,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use deepmsg_archive::client::context::ArchiveContext;
+use deepmsg_archive::server::config::ThreadNaming;
 use deepmsg_cluster_common::config::{ConfigError, Properties};
 use deepmsg_codec_cluster::cluster_time_unit::ClusterTimeUnit;
 
@@ -245,6 +246,22 @@ pub const fn semantic_version_major(version: i32) -> i32 {
     (version >> 16) & 0xFFFF
 }
 
+/// `CLUSTER_SERVICES_DIR_PROP_NAME` (`ClusteredServiceContainer.java:356`):
+/// where the containers' mark files are, when it is not the cluster dir.
+pub const SERVICES_DIR_PROP_NAME: &str = "aeron.cluster.services.dir";
+
+/// `THREAD_NAMING_PROP_NAME` (`CommonContext.java:534`).
+pub const THREAD_NAMING_PROP_NAME: &str = "aeron.thread.naming";
+
+/// `CLUSTER_CONSENSUS_MODULE_AGENT_ROLE_NAME_PROP_NAME`
+/// (`ConsensusModule.java:957-961`): the name of the agent's thread, empty for
+/// the computed one.
+pub const AGENT_ROLE_NAME_PROP_NAME: &str = "aeron.cluster.consensus.module.agent.role.name";
+
+/// `AERON_CLUSTER_CONSENSUS_THREAD_NAME` (`ConsensusModule.java:281`): the
+/// `new` naming's role name.
+pub const AGENT_ROLE_NAME_NEW: &str = "aeron-cl-cm";
+
 /// Why a configuration could not be settled.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigProblem {
@@ -394,6 +411,24 @@ pub struct ConsensusModuleConfig {
     pub idle_strategy: String,
     /// `aeron.cluster.timer.service.supplier` (`ConsensusModule.java:935`).
     pub timer_service_supplier: String,
+    /// Whether this configuration carries a consensus-module extension.
+    ///
+    /// The reference loads one by class name (`aeron.cluster.consensus.module
+    /// .extension`); this build has no class loader, so the property is refused
+    /// by name and the flag is the **programmatic** seam a test (or an
+    /// embedder) uses to say it supplied an extension. Zero services are only
+    /// allowed when it is set (`ConsensusModule.java:2158`).
+    pub consensus_module_extension: bool,
+    /// `aeron.cluster.services.dir`; empty when unset.
+    pub services_dir_property: Option<String>,
+    /// Where the service containers' mark files are: the property, canonical
+    /// (`ConsensusModule.java:1756-1762`), or the cluster directory.
+    pub services_dir: PathBuf,
+    /// `aeron.cluster.consensus.module.agent.role.name`; `None` when empty.
+    pub agent_role_name: Option<String>,
+    /// `aeron.thread.naming`: which spelling of the computed role name applies
+    /// (`ConsensusModule.java:1867-1871`).
+    pub thread_naming: ThreadNaming,
     /// `aeron.cluster.wheel.tick.resolution`, in nanoseconds
     /// (`ConsensusModule.java:892-898`, default 8 ms).
     pub wheel_tick_resolution_ns: i64,
@@ -402,6 +437,21 @@ pub struct ConsensusModuleConfig {
 }
 
 impl ConsensusModuleConfig {
+    /// The name of the thread the agent runs on: the property when it names
+    /// one, otherwise the computed role name (`ConsensusModule.java:1867-1871`).
+    #[must_use]
+    pub fn agent_role_name(&self) -> String {
+        if let Some(name) = &self.agent_role_name {
+            return name.clone();
+        }
+        match self.thread_naming {
+            ThreadNaming::New => AGENT_ROLE_NAME_NEW.to_owned(),
+            ThreadNaming::Classic => {
+                format!("consensus-module-{}-{}", self.cluster_id, self.member_id)
+            }
+        }
+    }
+
     /// Read the names `P3-4a` honours, with the reference's defaults.
     ///
     /// # Errors
@@ -478,10 +528,24 @@ impl ConsensusModuleConfig {
         }
 
         let cluster_id = int(CLUSTER_ID_PROP_NAME, CLUSTER_ID_DEFAULT)?;
+        let member_id = int(CLUSTER_MEMBER_ID_PROP_NAME, CLUSTER_MEMBER_ID_DEFAULT)?;
+        // `concludeArchiveContext` (`ConsensusModule.java:2077-2100`): the
+        // local archive's two channels carry an alias that names this member,
+        // so two members sharing a driver do not share a control session.
+        let request_uri = deepmsg_core::uri::ChannelUri::parse("aeron:ipc")
+            .expect("a built-in URI")
+            .with_alias_if_absent(&format!(
+                "cm-archive-ctrl-req-cluster-{cluster_id}-member-{member_id}"
+            ));
+        let response_uri = deepmsg_core::uri::ChannelUri::parse("aeron:ipc")
+            .expect("a built-in URI")
+            .with_alias_if_absent(&format!(
+                "cm-archive-ctrl-resp-cluster-{cluster_id}-member-{member_id}"
+            ));
         let mut archive = ArchiveContext::new();
         archive.aeron_dir = aeron_dir.to_string_lossy().into_owned();
-        archive.control_request_channel = Some("aeron:ipc".to_owned());
-        archive.control_response_channel = Some("aeron:ipc".to_owned());
+        archive.control_request_channel = Some(request_uri.build());
+        archive.control_response_channel = Some(response_uri.build());
         // `Context.conclude` (`ConsensusModule.java:2077-2084`): the response
         // stream is per-cluster so two clusters can share one archive.
         archive.control_response_stream_id += cluster_id * 100 + 100;
@@ -510,7 +574,7 @@ impl ConsensusModuleConfig {
             cluster_dir,
             mark_file_dir: mark_file_dir.unwrap_or_else(|| PathBuf::from(CLUSTER_DIR_DEFAULT)),
             aeron_dir,
-            member_id: int(CLUSTER_MEMBER_ID_PROP_NAME, CLUSTER_MEMBER_ID_DEFAULT)?,
+            member_id,
             cluster_id,
             cluster_members: required(CLUSTER_MEMBERS_PROP_NAME)?,
             ingress_channel: required(INGRESS_CHANNEL_PROP_NAME)?,
@@ -635,6 +699,20 @@ impl ConsensusModuleConfig {
             delete_dir_on_start: false,
             app_version: APP_VERSION_DEFAULT,
             idle_strategy: idle_strategy.to_owned(),
+            consensus_module_extension: false,
+            services_dir_property: properties.get(SERVICES_DIR_PROP_NAME).map(str::to_owned),
+            services_dir: PathBuf::new(),
+            agent_role_name: properties
+                .get(AGENT_ROLE_NAME_PROP_NAME)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            thread_naming: match properties.get(THREAD_NAMING_PROP_NAME) {
+                None => ThreadNaming::DEFAULT,
+                Some(value) => ThreadNaming::parse(value).ok_or_else(|| ConfigProblem::Value {
+                    name: THREAD_NAMING_PROP_NAME,
+                    value: value.to_owned(),
+                })?,
+            },
             timer_service_supplier: {
                 let name = properties
                     .get(crate::timer::TIMER_SERVICE_SUPPLIER_PROP_NAME)
@@ -670,6 +748,28 @@ impl ConsensusModuleConfig {
     /// [`ConfigProblem::Directory`] when a path cannot be canonicalised or a
     /// directory cannot be created.
     pub fn conclude(&mut self) -> Result<(), ConfigProblem> {
+        // `validateLogChannel` (`ConsensusModule.java:4609-4624`): a log
+        // channel that names a starting position would fight the recording
+        // log, which owns it.
+        let log_channel = deepmsg_core::uri::ChannelUri::parse(&self.log_channel)
+            .map_err(|error| ConfigProblem::Invalid(format!("logChannel: {error}")))?;
+        // `Context.conclude` (`ConsensusModule.java:2156-2160`): zero services
+        // need an extension.
+        if self.service_count == 0 && !self.consensus_module_extension {
+            return Err(ConfigProblem::Invalid(
+                "zero services are only supported when ConsensusModuleExtension is enabled"
+                    .to_owned(),
+            ));
+        }
+
+        for parameter in ["initial-term-id", "term-id", "term-offset"] {
+            if log_channel.get(parameter).is_some() {
+                return Err(ConfigProblem::Invalid(format!(
+                    "logChannel must not contain: {parameter}"
+                )));
+            }
+        }
+
         // Rust's `canonicalize` requires the path to exist, where Java's
         // `getCanonicalFile` does not; creating first and deleting after is the
         // same result with the same rule (`IoUtil.delete` then
@@ -691,6 +791,21 @@ impl ConsensusModuleConfig {
                 }
             }
         }
+
+        // `clusterServicesDirectoryName` (`ConsensusModule.java:1756-1762`):
+        // the property, canonical, or the cluster directory's own path. Rust's
+        // `canonicalize` needs the path to exist, so it is made first.
+        self.services_dir = match self.services_dir_property.as_deref() {
+            Some(name) if !name.is_empty() => {
+                std::fs::create_dir_all(name).map_err(|error| {
+                    ConfigProblem::Directory(format!(
+                        "could not create services directory: {error}"
+                    ))
+                })?;
+                canonical(Path::new(name))?
+            }
+            _ => self.cluster_dir.clone(),
+        };
 
         if let Some(name) = &self.mark_file_dir_property {
             std::fs::create_dir_all(name).map_err(|error| {
@@ -726,5 +841,268 @@ fn canonical(path: &Path) -> Result<PathBuf, ConfigProblem> {
 impl From<ConfigProblem> for ClusterError {
     fn from(problem: ConfigProblem) -> Self {
         Self::Cluster(problem.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three names `from_properties` requires; everything else defaults.
+    fn properties() -> Properties {
+        let mut properties = Properties::new();
+        properties
+            .apply_args([
+                "-Daeron.cluster.members=0,localhost:20111,localhost:20112,localhost:20113,localhost:20114,localhost:20115".to_owned(),
+                "-Daeron.cluster.ingress.channel=aeron:udp?endpoint=localhost:20111".to_owned(),
+                "-Daeron.cluster.replication.channel=aeron:udp?endpoint=localhost:20116".to_owned(),
+                "-Daeron.cluster.id=19".to_owned(),
+                "-Daeron.cluster.member.id=7".to_owned(),
+            ])
+            .expect("the properties parse");
+        properties
+    }
+
+    #[test]
+    fn the_default_agent_role_name_is_the_classic_one() {
+        let config = ConsensusModuleConfig::from_properties(&properties()).unwrap();
+        assert_eq!("consensus-module-19-7", config.agent_role_name());
+    }
+
+    #[test]
+    fn the_new_naming_gets_the_short_agent_role_name() {
+        let mut source = properties();
+        source
+            .apply_args(["-Daeron.thread.naming=new".to_owned()])
+            .unwrap();
+        let config = ConsensusModuleConfig::from_properties(&source).unwrap();
+        assert_eq!("aeron-cl-cm", config.agent_role_name());
+    }
+
+    #[test]
+    fn an_explicit_agent_role_name_wins_in_both_namings() {
+        for naming in ["classic", "new"] {
+            let mut source = properties();
+            source
+                .apply_args([
+                    format!("-Daeron.thread.naming={naming}"),
+                    "-Daeron.cluster.consensus.module.agent.role.name=consensus-override"
+                        .to_owned(),
+                ])
+                .unwrap();
+            let config = ConsensusModuleConfig::from_properties(&source).unwrap();
+            assert_eq!("consensus-override", config.agent_role_name(), "{naming}");
+        }
+    }
+
+    #[test]
+    fn an_empty_agent_role_name_is_the_computed_one() {
+        let mut source = properties();
+        source
+            .apply_args(["-Daeron.cluster.consensus.module.agent.role.name=".to_owned()])
+            .unwrap();
+        let config = ConsensusModuleConfig::from_properties(&source).unwrap();
+        assert_eq!(None, config.agent_role_name);
+        assert_eq!("consensus-module-19-7", config.agent_role_name());
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deepmsg-cm-config-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_services_directory_is_the_cluster_directory_when_unset() {
+        let root = scratch("services-default");
+        let cluster_dir = root.join("b/./42/../c");
+        let mut source = properties();
+        source
+            .apply_args([format!(
+                "-Daeron.cluster.dir={}",
+                cluster_dir.to_string_lossy()
+            )])
+            .unwrap();
+        let mut config = ConsensusModuleConfig::from_properties(&source).unwrap();
+        config.conclude().unwrap();
+        assert_eq!(config.services_dir, config.cluster_dir);
+        assert!(config.services_dir.is_absolute());
+    }
+
+    #[test]
+    fn the_services_directory_is_resolved_from_the_property() {
+        let root = scratch("services-set");
+        let services_dir = root.join("m/n/././././o");
+        let mut source = properties();
+        source
+            .apply_args([
+                format!(
+                    "-Daeron.cluster.dir={}",
+                    root.join("b/./42/../c").to_string_lossy()
+                ),
+                format!(
+                    "-Daeron.cluster.services.dir={}",
+                    services_dir.to_string_lossy()
+                ),
+            ])
+            .unwrap();
+        let mut config = ConsensusModuleConfig::from_properties(&source).unwrap();
+        config.conclude().unwrap();
+        assert_eq!(config.services_dir, services_dir.canonicalize().unwrap());
+        assert_ne!(config.services_dir, config.cluster_dir);
+    }
+
+    #[test]
+    fn a_log_channel_naming_a_starting_position_is_refused() {
+        // `ConsensusModuleContextTest.rejectInvalidLogChannelParameters`
+        // (`ConsensusModuleContextTest.java:244`).
+        for parameter in ["initial-term-id", "term-id", "term-offset"] {
+            let mut source = properties();
+            source
+                .apply_args([format!(
+                    "-Daeron.cluster.log.channel=aeron:ipc?{parameter}=0"
+                )])
+                .unwrap();
+            let mut config = ConsensusModuleConfig::from_properties(&source).unwrap();
+            let problem = config.conclude().unwrap_err();
+            assert!(
+                problem.to_string().contains(parameter),
+                "{parameter}: {problem}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_service_count_range_is_the_references() {
+        // `ConsensusModuleContextTest.shouldValidateServiceCount`
+        // (`ConsensusModuleContextTest.java:1032`).
+        for count in ["-1", "2147483647", "-2147483648", "11"] {
+            let mut source = properties();
+            source
+                .apply_args([format!("-Daeron.cluster.service.count={count}")])
+                .unwrap();
+            let problem = ConsensusModuleConfig::from_properties(&source).unwrap_err();
+            assert!(
+                problem
+                    .to_string()
+                    .contains("service count of range [0, 10]"),
+                "{count}: {problem}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_services_need_a_consensus_module_extension() {
+        // `ConsensusModuleContextTest.shouldRejectServiceCountZeroWithoutConsensusModuleExtension`
+        // (`ConsensusModuleContextTest.java:1042`).
+        let root = scratch("zero-services");
+        let mut source = properties();
+        source
+            .apply_args([
+                "-Daeron.cluster.service.count=0".to_owned(),
+                format!(
+                    "-Daeron.cluster.dir={}",
+                    root.join("cluster").to_string_lossy()
+                ),
+            ])
+            .unwrap();
+        let mut config = ConsensusModuleConfig::from_properties(&source).unwrap();
+        let problem = config.conclude().unwrap_err();
+        assert!(
+            problem.to_string().contains(
+                "zero services are only supported when ConsensusModuleExtension is enabled"
+            ),
+            "{problem}"
+        );
+
+        config.consensus_module_extension = true;
+        config
+            .conclude()
+            .expect("an extension admits zero services");
+    }
+
+    #[test]
+    fn the_startup_canvass_timeout_is_a_multiple_of_the_leader_heartbeat() {
+        // `startupCanvassTimeoutMustBeMultiplesOfTheLeaderHeartbeatTimeout`
+        // (`ConsensusModuleContextTest.java:467`).
+        for (canvass, heartbeat) in [
+            ("0ns", "1000ns"),
+            ("5000ns", "5000ns"),
+            ("2000000000ns", "1000000001ns"),
+        ] {
+            let mut source = properties();
+            source
+                .apply_args([
+                    format!("-Daeron.cluster.startup.canvass.timeout={canvass}"),
+                    format!("-Daeron.cluster.leader.heartbeat.timeout={heartbeat}"),
+                ])
+                .unwrap();
+            let problem = ConsensusModuleConfig::from_properties(&source).unwrap_err();
+            assert!(
+                problem.to_string().contains("must be a multiple of"),
+                "{canvass}/{heartbeat}: {problem}"
+            );
+        }
+
+        // `startupCanvassTimeoutMustCanBeSetToBeMultiplesOfTheLeaderHeartbeatTimeout`
+        let mut source = properties();
+        source
+            .apply_args([
+                "-Daeron.cluster.startup.canvass.timeout=30s".to_owned(),
+                "-Daeron.cluster.leader.heartbeat.timeout=5s".to_owned(),
+            ])
+            .unwrap();
+        ConsensusModuleConfig::from_properties(&source).expect("30 s is six heartbeats");
+    }
+
+    #[test]
+    fn the_archive_control_channels_carry_member_aliases() {
+        // `shouldCreateAliasForControlStreams`
+        // (`ConsensusModuleContextTest.java:897`).
+        let config = ConsensusModuleConfig::from_properties(&properties()).unwrap();
+        let request = config
+            .archive
+            .control_request_channel
+            .as_deref()
+            .expect("a request channel");
+        let response = config
+            .archive
+            .control_response_channel
+            .as_deref()
+            .expect("a response channel");
+        assert!(
+            request.contains("alias=cm-archive-ctrl-req-cluster-19-member-7"),
+            "{request}"
+        );
+        assert!(
+            response.contains("alias=cm-archive-ctrl-resp-cluster-19-member-7"),
+            "{response}"
+        );
+        assert_eq!(
+            19 * 100 + 100 + 20,
+            config.archive.control_response_stream_id,
+            "the response stream is per cluster"
+        );
+    }
+
+    #[test]
+    fn an_unknown_thread_naming_is_refused() {
+        let mut source = properties();
+        source
+            .apply_args(["-Daeron.thread.naming=loud".to_owned()])
+            .unwrap();
+        let problem = ConsensusModuleConfig::from_properties(&source).unwrap_err();
+        assert_eq!(
+            ConfigProblem::Value {
+                name: THREAD_NAMING_PROP_NAME,
+                value: "loud".to_owned()
+            },
+            problem
+        );
     }
 }

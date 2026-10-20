@@ -103,6 +103,12 @@ pub struct Entry {
     pub is_valid: bool,
     /// The archive endpoint a STANDBY_SNAPSHOT names.
     pub archive_endpoint: Option<String>,
+    /// Where the entry sits **on disk**, counted from zero in file order
+    /// (`Entry.entryIndex`). The sorted view loses that order, and
+    /// `ClusterTool sort-recording-log` is the command that needs it back: it
+    /// compares this with the position in the sorted view to decide whether the
+    /// file is already sorted (`ClusterToolOperator.java:1368-1379`).
+    pub entry_index: u32,
 }
 
 impl Entry {
@@ -296,6 +302,7 @@ impl RecordingLog {
                 entry_type: plain_type,
                 is_valid,
                 archive_endpoint,
+                entry_index: u32::try_from(self.entries.len()).unwrap_or(u32::MAX),
             };
             if entry.length() > MAX_ENTRY_LENGTH {
                 return Err(RecordingLogError::EntryTooLong {
@@ -316,6 +323,20 @@ impl RecordingLog {
     /// The sorted entries.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// Whether the file is in the same order as the sorted view — the question
+    /// `ClusterTool sort-recording-log` answers (`ClusterToolOperator.java:1368-1379`).
+    ///
+    /// Each entry remembers the index it had on disk, so this is a comparison of
+    /// that index with the position in the view; a file whose appends never
+    /// back-filled an older term is already sorted.
+    #[must_use]
+    pub fn is_sorted(&self) -> bool {
+        self.entries
+            .iter()
+            .enumerate()
+            .all(|(index, entry)| entry.entry_index as usize == index)
     }
 
     /// Append a TERM entry (`:950`).
@@ -343,6 +364,7 @@ impl RecordingLog {
             entry_type: ENTRY_TYPE_TERM,
             is_valid: true,
             archive_endpoint: None,
+            entry_index: 0,
         })
     }
 
@@ -371,6 +393,7 @@ impl RecordingLog {
             entry_type: ENTRY_TYPE_SNAPSHOT,
             is_valid: true,
             archive_endpoint: None,
+            entry_index: 0,
         })
     }
 
@@ -390,23 +413,10 @@ impl RecordingLog {
             }
         }
         entry.position = align(self.length as usize, RECORD_ALIGNMENT) as u64;
-        let mut bytes = vec![0_u8; entry.aligned_length()];
-        bytes[0..8].copy_from_slice(&entry.recording_id.to_le_bytes());
-        bytes[8..16].copy_from_slice(&entry.leadership_term_id.to_le_bytes());
-        bytes[16..24].copy_from_slice(&entry.term_base_log_position.to_le_bytes());
-        bytes[24..32].copy_from_slice(&entry.log_position.to_le_bytes());
-        bytes[32..40].copy_from_slice(&entry.timestamp.to_le_bytes());
-        bytes[40..44].copy_from_slice(&entry.service_id.to_le_bytes());
-        let type_field = if entry.is_valid {
-            entry.entry_type
-        } else {
-            entry.entry_type | ENTRY_TYPE_INVALID_FLAG
-        };
-        bytes[44..48].copy_from_slice(&type_field.to_le_bytes());
-        if let Some(endpoint) = &entry.archive_endpoint {
-            bytes[48..52].copy_from_slice(&(endpoint.len() as u32).to_le_bytes());
-            bytes[52..52 + endpoint.len()].copy_from_slice(endpoint.as_bytes());
-        }
+        // The disk index (`nextEntryIndex`, `RecordingLog.java:1530`): the new
+        // entry is the last one in the file however the sorted view falls out.
+        entry.entry_index = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
+        let bytes = encode_entry(&entry)?;
         write_all_at(&self.file, entry.position, &bytes)?;
         self.length = entry.position + bytes.len() as u64;
         self.entries.push(entry.clone());
@@ -592,11 +602,44 @@ impl RecordingLog {
     ///
     /// The file system.
     pub fn invalidate_latest_snapshot(&mut self) -> Result<Option<usize>, RecordingLogError> {
-        let Some(index) = self.entries.iter().rposition(|entry| entry.is_snapshot()) else {
+        // `invalidateLatestSnapshot` (`:804-845`): the scan is over the
+        // **consensus module's** valid snapshots and it takes every one at the
+        // highest log position, not simply the last snapshot in the view. A
+        // cluster that snapshots each service separately has one CM snapshot per
+        // position, and a tie is possible across terms.
+        let mut indices = Vec::new();
+        let mut highest = NULL_POSITION;
+        for index in (0..self.entries.len()).rev() {
+            let entry = &self.entries[index];
+            if !entry.is_snapshot() || entry.service_id != CONSENSUS_MODULE_SERVICE_ID {
+                continue;
+            }
+            if entry.log_position < highest {
+                break;
+            }
+            if !self
+                .entries
+                .iter()
+                .any(|term| term.is_term() && term.leadership_term_id == entry.leadership_term_id)
+            {
+                return Err(RecordingLogError::UnknownLeadershipTerm(
+                    entry.leadership_term_id,
+                ));
+            }
+            if entry.log_position > highest {
+                indices.clear();
+                highest = entry.log_position;
+            }
+            indices.push(index);
+        }
+
+        let Some(first) = indices.first().copied() else {
             return Ok(None);
         };
-        self.set_valid(index, false)?;
-        Ok(Some(index))
+        for index in indices {
+            self.set_valid(index, false)?;
+        }
+        Ok(Some(first))
     }
 
     /// Clear the invalid flag at the same offset the entry already occupies
@@ -650,6 +693,93 @@ impl RecordingLog {
 }
 
 /// The reference's `ENTRY_COMPARATOR` (`:504-545`).
+/// Rewrite the log in the given order — `ClusterToolOperator.updateRecordingLog`
+/// (`:1381-1425`): a `.tmp` file written first, then the original removed and
+/// the temporary renamed over it. An **empty** list deletes the file, which is
+/// what `seed-recording-log-from-snapshot` asks for when no valid snapshot is
+/// left.
+///
+/// # Errors
+///
+/// The file system, an endpoint that does not fit, or an entry too long to be
+/// a record.
+pub fn write_entries(path: &Path, entries: &[Entry]) -> Result<(), RecordingLogError> {
+    if entries.is_empty() {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        };
+    }
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("recording.log has no file name"))?
+        .to_string_lossy()
+        .into_owned();
+    let temporary = path.with_file_name(format!("{file_name}.tmp"));
+    match std::fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    let mut position = 0_u64;
+    for entry in entries {
+        let bytes = encode_entry(entry)?;
+        write_all_at(&file, position, &bytes)?;
+        position += bytes.len() as u64;
+    }
+
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+/// One entry's bytes, zero-padded to the record alignment (`writeEntryToBuffer`
+/// and `length()`, `RecordingLog.java:1339-1352`, `:235-241`).
+fn encode_entry(entry: &Entry) -> Result<Vec<u8>, RecordingLogError> {
+    if let Some(endpoint) = &entry.archive_endpoint {
+        if endpoint.len() > MAX_ENDPOINT_LENGTH {
+            return Err(RecordingLogError::EndpointTooLong {
+                length: endpoint.len(),
+            });
+        }
+    }
+    if entry.length() > MAX_ENTRY_LENGTH {
+        return Err(RecordingLogError::EntryTooLong {
+            length: entry.length(),
+        });
+    }
+
+    let mut bytes = vec![0_u8; entry.aligned_length()];
+    bytes[0..8].copy_from_slice(&entry.recording_id.to_le_bytes());
+    bytes[8..16].copy_from_slice(&entry.leadership_term_id.to_le_bytes());
+    bytes[16..24].copy_from_slice(&entry.term_base_log_position.to_le_bytes());
+    bytes[24..32].copy_from_slice(&entry.log_position.to_le_bytes());
+    bytes[32..40].copy_from_slice(&entry.timestamp.to_le_bytes());
+    bytes[40..44].copy_from_slice(&entry.service_id.to_le_bytes());
+    let type_field = if entry.is_valid {
+        entry.entry_type
+    } else {
+        entry.entry_type | ENTRY_TYPE_INVALID_FLAG
+    };
+    bytes[44..48].copy_from_slice(&type_field.to_le_bytes());
+    if let Some(endpoint) = &entry.archive_endpoint {
+        bytes[48..52].copy_from_slice(&(endpoint.len() as u32).to_le_bytes());
+        bytes[52..52 + endpoint.len()].copy_from_slice(endpoint.as_bytes());
+    }
+    Ok(bytes)
+}
+
 fn compare_entries(a: &Entry, b: &Entry) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match a.leadership_term_id.cmp(&b.leadership_term_id) {
@@ -998,6 +1128,7 @@ mod tests {
             entry_type: ENTRY_TYPE_TERM,
             is_valid: true,
             archive_endpoint: None,
+            entry_index: 0,
         };
         assert_eq!(entry.length(), 48);
         assert_eq!(entry.aligned_length(), 64);

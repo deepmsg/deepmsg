@@ -385,6 +385,12 @@ impl ConsensusModuleAgent {
     ) -> Result<Self, ClusterError> {
         config.conclude()?;
 
+        // `AgentRunner.startOnThread` names the thread before the first duty
+        // cycle (`ConsensusModule.java:343`); the kernel keeps 15 bytes of it.
+        deepmsg_driver::sys::set_current_thread_name(&config.agent_role_name()).map_err(
+            |error| ClusterError::Cluster(format!("could not name the agent's thread: {error}")),
+        )?;
+
         let authenticator = match components.authenticator {
             Some(authenticator) => authenticator,
             None => authenticator_for(&config.authenticator_supplier)
@@ -403,7 +409,7 @@ impl ConsensusModuleAgent {
             &config.mark_file_dir.join(mark::FILENAME),
             ClusterComponentType::CONSENSUS_MODULE,
             config.error_buffer_length as usize,
-            deepmsg_cnc::create::FILE_PAGE_SIZE_DEFAULT,
+            mark::driver_file_page_size(&config.aeron_dir),
             now_ms,
             i64::from(std::process::id()),
         )
@@ -430,7 +436,7 @@ impl ConsensusModuleAgent {
                 &config.ingress_channel,
                 "",
                 &config.authenticator_supplier,
-                config.cluster_dir.to_string_lossy().as_ref(),
+                config.services_dir.to_string_lossy().as_ref(),
             ])
             .map_err(cluster)?;
 
@@ -853,7 +859,9 @@ impl ConsensusModuleAgent {
         {
             let leadership_term_id = self.leadership_term_id;
             let member_id = self.config.member_id;
-            let leader_member_id = self.members[self.this_member_index].id;
+            // The leader the election recorded, not this member: a redirect
+            // names where the leader is (`sendRedirects`).
+            let leader_member_id = self.leader_member_id();
             let ingress_endpoints = self.ingress_endpoints.as_str();
             let clock = self.clock;
 
@@ -871,6 +879,7 @@ impl ConsensusModuleAgent {
                 egress,
                 clock: &clock,
                 timed_out_counter: counters.timed_out_client,
+                control_toggle: counters.control_toggle,
                 leadership_term_id,
                 member_id,
                 leader_member_id,
@@ -950,7 +959,10 @@ impl ConsensusModuleAgent {
     fn process_open_sessions(&mut self, now_ns: i64) -> Result<usize, ClusterError> {
         let leadership_term_id = self.leadership_term_id;
         let member_id = self.config.member_id;
-        let leader_member_id = self.members[self.this_member_index].id;
+        // `onClusterMembersQuery` answers with `leaderMember.id()`
+        // (`ConsensusModuleAgent.java:1271-1279`) — the member the election
+        // said leads, which every member records in `updateMemberDetails`.
+        let leader_member_id = self.leader_member_id();
         let ingress_endpoints = self.ingress_endpoints.as_str();
         let clock = self.clock;
 
@@ -968,6 +980,7 @@ impl ConsensusModuleAgent {
             egress,
             clock: &clock,
             timed_out_counter: counters.timed_out_client,
+            control_toggle: counters.control_toggle,
             leadership_term_id,
             member_id,
             leader_member_id,
@@ -1328,10 +1341,14 @@ impl ConsensusModuleAgent {
     /// follower learns the id from the log replication (`P3-6b`), so until
     /// then this answers the local id — the only member there is.
     fn leader_member_id(&self) -> i32 {
+        // `-1` before a term names one, like the reference's null
+        // `leaderMember`; answering with this member's own id would make a
+        // follower claim the leadership (`ClusterTool` reads exactly this
+        // from the members query).
         self.members
             .iter()
             .find(|member| member.is_leader)
-            .map_or(self.config.member_id, |member| member.id)
+            .map_or(-1, |member| member.id)
     }
 
     /// The reference's `ctx.countedErrorHandler().onError(...)`: one on counter
@@ -4624,7 +4641,9 @@ impl ConsensusModuleAgent {
         if !deferred_closes.is_empty() || !deferred_admins.is_empty() {
             let leadership_term_id = self.leadership_term_id;
             let member_id = self.config.member_id;
-            let leader_member_id = self.members[self.this_member_index].id;
+            // The leader the election recorded, not this member: a redirect
+            // names where the leader is (`sendRedirects`).
+            let leader_member_id = self.leader_member_id();
             let clock = self.clock;
             let Self {
                 client,
@@ -4640,6 +4659,7 @@ impl ConsensusModuleAgent {
                 egress,
                 clock: &clock,
                 timed_out_counter: counters.timed_out_client,
+                control_toggle: counters.control_toggle,
                 leadership_term_id,
                 member_id,
                 leader_member_id,
@@ -4693,16 +4713,27 @@ fn handle_admin_request(
     }
 
     if request.request_type == AdminRequestType::SNAPSHOT {
-        // The reference switches the control toggle (`:806-816`); the toggle
-        // is P3-4e, so this answers with the reference's own failure text
-        // instead of pretending the snapshot was scheduled.
+        // `:806-816`: the switch is a compare-and-set out of `NEUTRAL`, and
+        // the answer says whether it was taken. The cluster takes the snapshot
+        // when its slow tick reads the toggle (`checkClusterControlToggle`).
+        let applied = ctx.client.counters_writable().is_some_and(|counters| {
+            ClusterControlToggle::Snapshot.toggle(&counters, ctx.control_toggle.counter_id())
+        });
         return send_admin_response(
             ctx,
             session,
             request.correlation_id,
             request.request_type,
-            AdminResponseCode::ERROR,
-            "Failed to switch ClusterControl to the ToggleState.SNAPSHOT state",
+            if applied {
+                AdminResponseCode::OK
+            } else {
+                AdminResponseCode::ERROR
+            },
+            if applied {
+                ""
+            } else {
+                "Failed to switch ClusterControl to the ToggleState.SNAPSHOT state"
+            },
         );
     }
 
@@ -5156,7 +5187,7 @@ impl ConsensusModuleAgent {
 
         let leadership_term_id = self.leadership_term_id;
         let member_id = self.config.member_id;
-        let leader_member_id = self.members[self.this_member_index].id;
+        let leader_member_id = self.leader_member_id();
         let state = self.state;
         let now_ns = self.clock.time_nanos();
         let clock = self.clock;
@@ -5213,6 +5244,7 @@ impl ConsensusModuleAgent {
                     egress,
                     clock: &clock,
                     timed_out_counter: counters.timed_out_client,
+                    control_toggle: counters.control_toggle,
                     leadership_term_id,
                     member_id,
                     leader_member_id,

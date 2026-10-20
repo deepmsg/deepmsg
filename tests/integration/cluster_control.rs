@@ -19,6 +19,10 @@ use deepmsg_cluster::{
 };
 use deepmsg_cluster_common::config::Properties;
 use deepmsg_cluster_common::counters::{self, CLUSTER_CONTROL_TOGGLE_TYPE_ID};
+use deepmsg_codec_cluster::admin_request_codec::AdminRequestEncoder;
+use deepmsg_codec_cluster::admin_request_type::AdminRequestType;
+use deepmsg_codec_cluster::admin_response_code::AdminResponseCode;
+use deepmsg_codec_cluster::admin_response_codec::AdminResponseDecoder;
 use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH as MESSAGE_HEADER_LENGTH;
 use deepmsg_codec_cluster::session_connect_request_codec::SessionConnectRequestEncoder;
@@ -208,9 +212,12 @@ fn open_session(
 }
 
 fn launch(driver: &OwnArchivingMediaDriver, cluster_dir: &TempDir) -> ConsensusModuleAgent {
-    let config =
+    let mut config =
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
             .expect("the configuration parses");
+    // This build has no class loader; the flag is the programmatic
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    config.consensus_module_extension = true;
     ConsensusModuleAgent::launch(config).expect("the module launches")
 }
 
@@ -525,4 +532,126 @@ fn a_null_publication_answers_false() {
     let mut publisher = ConsensusPublisher::new();
     assert!(!publisher.termination_position(1, 0, 0));
     assert!(!publisher.termination_ack(0, 0, 0, 1));
+}
+
+/// `AdminRequest` (`ConsensusModuleAgent.onAdminRequest`, `:780-826`): a
+/// client's request is answered `OK` **and the toggle is switched**, which is
+/// what the snapshot that follows needs.
+#[test]
+fn an_admin_snapshot_request_switches_the_control_toggle() {
+    let archive_dir = TempDir::new("cluster-control-admin-archive");
+    let cluster_dir = TempDir::new("cluster-control-admin-cluster");
+    let Some(mut driver) = OwnArchivingMediaDriver::start(
+        "cluster-control-admin",
+        archive_dir.path(),
+        &archive::PROPERTIES,
+    ) else {
+        archiving_driver::announce_skip();
+        return;
+    };
+    driver.await_ready(DEADLINE).expect("the driver is ready");
+
+    // The reference's own admin test runs with `AuthorisationService.ALLOW_ALL`
+    // (`ClusterTest.java:2093-2096`): the default service denies an
+    // `AdminRequest`, so an injection-configuring test has to say otherwise.
+    let mut config =
+        ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
+            .expect("the configuration parses");
+    config.consensus_module_extension = true;
+    let mut agent = ConsensusModuleAgent::launch_with_components(
+        config,
+        deepmsg_cluster::LaunchComponents {
+            authorisation_service: Some(Box::new(
+                deepmsg_cluster::session::authenticator::AllowAll,
+            )),
+            ..Default::default()
+        },
+    )
+    .expect("the module launches");
+    drive_until(&mut agent, "the first steady state", at_steady_state);
+
+    let mut client = Client::connect(driver.aeron_dir()).expect("the client connects");
+    let ingress_publication = client
+        .add_publication("aeron:ipc", INGRESS_STREAM_ID, DEADLINE)
+        .expect("ingress publication");
+    let egress_subscription = client
+        .add_subscription("aeron:ipc", EGRESS_STREAM_ID, DEADLINE)
+        .expect("egress subscription");
+    let session_id = open_session(
+        &mut agent,
+        &mut client,
+        ingress_publication,
+        egress_subscription,
+    );
+    drive_until(&mut agent, "the open session", |agent| {
+        agent.session_count() == 1
+    });
+
+    let term = agent.leadership_term_id();
+    let correlation_id = 77;
+    let request = admin_request(term, session_id, correlation_id);
+
+    let deadline = Instant::now() + DEADLINE;
+    let mut sent = false;
+    let mut answered = false;
+    while Instant::now() < deadline && !answered {
+        agent.do_work().expect("the duty cycle is healthy");
+        client.poll();
+        if !sent && offer(&client, ingress_publication, &request) {
+            sent = true;
+        }
+        client.poll_subscription(egress_subscription, 10, |message| {
+            let payload = message.payload;
+            if payload.len() < MESSAGE_HEADER_LENGTH {
+                return;
+            }
+            let header =
+                deepmsg_codec_cluster::message_header_codec::MessageHeaderDecoder::default()
+                    .wrap(ReadBuf::new(payload), 0);
+            if header.schema_id() != deepmsg_codec_cluster::SBE_SCHEMA_ID
+                || header.template_id()
+                    != deepmsg_codec_cluster::admin_response_codec::SBE_TEMPLATE_ID
+            {
+                return;
+            }
+            let decoder = AdminResponseDecoder::default().header(header, 0);
+            if decoder.correlation_id() == correlation_id
+                && decoder.request_type() == AdminRequestType::SNAPSHOT
+            {
+                answered = decoder.response_code() == AdminResponseCode::OK;
+            }
+        });
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(answered, "the admin request is answered OK");
+    drive_until(&mut agent, "the snapshot the toggle asks for", |agent| {
+        counter_value(
+            agent,
+            deepmsg_cluster_common::counters::CLUSTER_SNAPSHOT_COUNTER_TYPE_ID,
+        ) >= 1
+    });
+
+    agent.close().expect("the module closes");
+    client.close();
+    driver.stop().expect("the driver stops");
+}
+
+/// The `AdminRequest` body (`AdminRequestEncoder`, template 26): no session
+/// header, because the block carries the term and the session id.
+fn admin_request(leadership_term_id: i64, cluster_session_id: i64, correlation_id: i64) -> Vec<u8> {
+    let mut buffer = vec![0_u8; 128];
+    let encoder =
+        AdminRequestEncoder::default().wrap(WriteBuf::new(&mut buffer), MESSAGE_HEADER_LENGTH);
+    let mut header = encoder.header(0);
+    let mut message = header.parent().expect("the encoder just wrapped");
+    message
+        .leadership_term_id(leadership_term_id)
+        .cluster_session_id(cluster_session_id)
+        .correlation_id(correlation_id)
+        .request_type(AdminRequestType::SNAPSHOT)
+        .payload(&[]);
+    let length = MESSAGE_HEADER_LENGTH + message.encoded_length();
+    buffer.truncate(length);
+    buffer
 }

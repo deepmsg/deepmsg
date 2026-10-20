@@ -44,8 +44,10 @@ fn no_name_appears_twice_and_the_table_is_sorted() {
 
 #[test]
 fn every_name_is_classified_or_pending() {
-    // Pending is allowed today and must be gone by P3-11; what is never allowed
-    // is a name with no row at all, which the test above already catches.
+    // LC-6: no row is left `Pending`. P3-8 classified the last 29 — the four
+    // `aeron.cluster.tool.*` names, the seven the container reads, the role
+    // name and services directory, and the backup/standby/class-loader rows
+    // that are answered with a reason (`ClusterBackup` is P3-9).
     let mut pending = 0;
     for (name, disposition) in NAMES {
         match disposition {
@@ -56,15 +58,7 @@ fn every_name_is_classified_or_pending() {
             }
         }
     }
-    // P3-4b honoured five more (the two supplier names, the ingress fragment
-    // limit and IPC switch, the session limit), P3-4c the three timer names,
-    // P3-4d the four snapshot/replay names plus the log fragment limit and
-    // P3-4e the termination timeout, P3-6a the control endpoint on the log
-    // publication, and P3-6b the follower catchup and leader archive-control
-    // channels, and P3-3a the three the cluster client reads (its name, the
-    // ingress endpoints and the message timeout), so 29 rows are still Pending
-    // and must be gone by P3-11.
-    assert_eq!(pending, 29, "the P3-4a..4e/6a/6b/3a rows are classified");
+    assert_eq!(pending, 0, "LC-6: every name has a disposition");
 }
 
 #[test]
