@@ -271,7 +271,6 @@ bench_fingerprint "$out/fingerprint.txt" >/dev/null
                   # The arm's own revision, out of the file `build-c-driver.sh`
                   # leaves beside it. The work area's HEAD is a different thing
                   # and would name the same revision for every arm.
-                  local rev named
                   rev=$(awk '/^revision /{print $2}' "$AERON_C_ARM_DIR/$arm/BUILD-INFO.txt" 2>/dev/null)
                   named=$(awk '/^revision-name /{print $2}' "$AERON_C_ARM_DIR/$arm/BUILD-INFO.txt" 2>/dev/null)
                   echo "              built from ${rev:-unknown} ${named:+($named)}" ;;
