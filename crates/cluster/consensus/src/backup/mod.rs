@@ -24,10 +24,23 @@
 //! the backup side. Neither half is useful without the other, which is why the
 //! card covers both.
 
+pub mod agent;
+pub mod consensus_publisher;
 pub mod context;
 pub mod log_source_validator;
+pub mod publication_group;
 pub mod snapshot_replication;
 
+use deepmsg_client::client::Client;
+use deepmsg_cluster_common::counters::{
+    self, CLUSTER_BACKUP_ERROR_COUNT_TYPE_ID, CLUSTER_BACKUP_LIVE_LOG_POSITION_TYPE_ID,
+    CLUSTER_BACKUP_QUERY_DEADLINE_TYPE_ID, CLUSTER_BACKUP_SNAPSHOT_RETRIEVE_COUNT_TYPE_ID,
+    CLUSTER_BACKUP_STATE_TYPE_ID,
+};
+
+use crate::backup::agent::{BackupCounters, ClusterBackupAgent, ClusterBackupComponents};
+use crate::backup::context::{ClusterBackupConfig, ClusterBackupContext};
+use crate::backup::publication_group::COMMAND_TIMEOUT;
 use crate::error::ClusterError;
 
 /// `Aeron.NULL_VALUE` (`Aeron.java:82`): -1, used by the reference for
@@ -183,6 +196,120 @@ impl ReplayStart {
             ))),
         }
     }
+}
+
+/// `ClusterBackup` (`ClusterBackup.java:208-322`): a concluded context with an
+/// agent on it.
+///
+/// The reference's class is a `Context` plus an `AgentRunner` — everything that
+/// happens is in the agent. The same shape here: [`Self::launch`] concludes the
+/// context, makes the Aeron client and the five counters, and starts the agent
+/// (its `onStart` opens the recording log and the local archive).
+pub struct ClusterBackup;
+
+impl ClusterBackup {
+    /// Launch with default components — no credentials, no listener, no hooks.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::launch_with_components`].
+    pub fn launch(context: ClusterBackupContext) -> Result<ClusterBackupAgent, ClusterError> {
+        Self::launch_with_components(context, ClusterBackupComponents::default())
+    }
+
+    /// The same, with the deployment's live objects supplied in process — the
+    /// equivalent of the reference's configurable `Context` fields.
+    ///
+    /// # Errors
+    ///
+    /// The context's `conclude`, the driver's client, a counter the driver
+    /// refuses, or the agent's `onStart`.
+    pub fn launch_with_components(
+        mut context: ClusterBackupContext,
+        components: ClusterBackupComponents,
+    ) -> Result<ClusterBackupAgent, ClusterError> {
+        context.conclude()?;
+
+        let config = context.config().clone();
+        deepmsg_driver::sys::set_current_thread_name(&config.role_name()).map_err(|error| {
+            ClusterError::Cluster(format!("could not name the agent's thread: {error}"))
+        })?;
+
+        let mut client = Client::connect(&config.aeron_dir).map_err(|error| {
+            ClusterError::Cluster(format!(
+                "the backup's Aeron client will not connect: {error}"
+            ))
+        })?;
+
+        let counters = allocate_counters(&mut client, &config)?;
+        let mut agent = ClusterBackupAgent::new(context, client, counters, components)?;
+        agent.on_start()?;
+
+        Ok(agent)
+    }
+}
+
+/// The five counters `ClusterBackup.Context.conclude` allocates
+/// (`ClusterBackup.java:778-819`).
+///
+/// # Errors
+///
+/// A label the counter's field will not hold, or a driver that refuses the add.
+fn allocate_counters(
+    client: &mut Client,
+    config: &ClusterBackupConfig,
+) -> Result<BackupCounters, ClusterError> {
+    let cluster_id = config.cluster_id;
+    let allocate = |client: &mut Client,
+                    type_id: i32,
+                    spec: counters::CounterSpec|
+     -> Result<deepmsg_client::counter::Counter, ClusterError> {
+        client
+            .add_counter(type_id, spec.key(), spec.label(), COMMAND_TIMEOUT)
+            .map_err(|error| ClusterError::Cluster(format!("the backup's counters: {error}")))
+    };
+
+    let errors = allocate(
+        client,
+        CLUSTER_BACKUP_ERROR_COUNT_TYPE_ID,
+        // The same two literals the consensus module's own versioned counter
+        // carries (`agent/mod.rs::allocate_counters`): the reference's
+        // `ClusterBackupVersion.VERSION` and `GIT_SHA`.
+        counters::versioned_cluster_counter(
+            "ClusterBackup Errors",
+            cluster_id,
+            "1.53.2",
+            "deepmsg",
+        )?,
+    )?;
+    let state = allocate(
+        client,
+        CLUSTER_BACKUP_STATE_TYPE_ID,
+        counters::cluster_counter("ClusterBackup State", cluster_id)?,
+    )?;
+    let live_log_position = allocate(
+        client,
+        CLUSTER_BACKUP_LIVE_LOG_POSITION_TYPE_ID,
+        counters::cluster_counter("ClusterBackup live log position", cluster_id)?,
+    )?;
+    let next_query_deadline_ms = allocate(
+        client,
+        CLUSTER_BACKUP_QUERY_DEADLINE_TYPE_ID,
+        counters::cluster_counter("ClusterBackup next query deadline in ms", cluster_id)?,
+    )?;
+    let snapshots_retrieved = allocate(
+        client,
+        CLUSTER_BACKUP_SNAPSHOT_RETRIEVE_COUNT_TYPE_ID,
+        counters::cluster_counter("ClusterBackup snapshots retrieved", cluster_id)?,
+    )?;
+
+    Ok(BackupCounters {
+        errors,
+        state,
+        live_log_position,
+        next_query_deadline_ms,
+        snapshots_retrieved,
+    })
 }
 
 #[cfg(test)]

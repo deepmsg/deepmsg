@@ -76,6 +76,10 @@ name = "cluster_backup_query"
 path = "integration/cluster_backup_query.rs"
 
 [[test]]
+name = "cluster_backup"
+path = "integration/cluster_backup.rs"
+
+[[test]]
 name = "forwarding_poll"
 path = "integration/forwarding_poll.rs"
 

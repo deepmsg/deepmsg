@@ -168,6 +168,14 @@ impl Ports {
         }
     }
 
+    /// The first port of this run's block, for a test that needs a port of its
+    /// own past every offset the cluster uses (the highest is `+35`; a backup
+    /// takes `+43` and `+44`).
+    #[must_use]
+    pub const fn base(&self) -> u16 {
+        self.base
+    }
+
     /// Sit the same ports on a new channel shape — H5's second arm, which
     /// restarts the cluster with the new one (`ClusterTest.java:1892-1895`).
     pub fn set_channel_shape(&mut self, shape: ChannelShape) {

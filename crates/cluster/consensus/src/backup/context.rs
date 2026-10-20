@@ -24,13 +24,26 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use deepmsg_archive::server::config::ThreadNaming;
 use deepmsg_cluster_common::config::Properties;
 use deepmsg_cluster_common::mark::{self, ClusterMarkFile};
+use deepmsg_cluster_common::member::{self, ClusterMember};
 use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
+use deepmsg_core::uri::ChannelUri;
 
 use super::{ReplayStart, SourceType};
+use crate::backup::agent::{
+    AERON_CLUSTER_BACKUP_THREAD_NAME, AERON_CLUSTER_BACKUP_THREAD_NAME_CLASSIC,
+};
 use crate::config::ConfigProblem;
 use crate::error::ClusterError;
+
+/// `aeron.thread.naming` (`CommonContext.java:534`) — the same name the
+/// consensus module reads (`config.rs:THREAD_NAMING_PROP_NAME`).
+pub const THREAD_NAMING_PROP_NAME: &str = "aeron.thread.naming";
+
+/// `CommonContext.ENDPOINT_PARAM_NAME`.
+const ENDPOINT_PARAM_NAME: &str = "endpoint";
 
 // ---------------------------------------------------------------------------
 // Property names — `ClusterBackup.java` unless another file is named.
@@ -173,6 +186,9 @@ pub struct ClusterBackupConfig {
     pub cluster_members: Option<String>,
     /// `aeron.cluster.member.id`.
     pub member_id: i32,
+    /// `aeron.thread.naming`: which spelling of the role name applies
+    /// (`CommonContext.threadName`).
+    pub thread_naming: ThreadNaming,
     /// Delete the cluster directory before concluding (programmatic).
     pub delete_dir_on_start: bool,
 }
@@ -262,6 +278,13 @@ impl ClusterBackupConfig {
                 .transpose()?,
             cluster_members: properties.get(MEMBERS_PROP_NAME).map(str::to_owned),
             member_id: int(MEMBER_ID_PROP_NAME, -1)?,
+            thread_naming: match properties.get(THREAD_NAMING_PROP_NAME) {
+                None => ThreadNaming::DEFAULT,
+                Some(value) => ThreadNaming::parse(value).ok_or_else(|| ConfigProblem::Value {
+                    name: THREAD_NAMING_PROP_NAME,
+                    value: value.to_owned(),
+                })?,
+            },
             delete_dir_on_start: false,
         })
     }
@@ -304,6 +327,53 @@ impl ClusterBackupConfig {
         let member = deepmsg_cluster_common::member::find_member(&members, self.member_id)?;
 
         Some(member.catchup_endpoint.clone())
+    }
+
+    /// The name of the agent's thread (`ClusterBackup.java:225-226`, chosen by
+    /// `CommonContext.threadName` from `aeron.thread.naming`).
+    ///
+    /// `classic` is the default and names the thread `cluster-backup`; `new`
+    /// names it `aeron-cl-bu`. Neither carries the cluster id: the reference's
+    /// backup thread does not, unlike the consensus module's.
+    #[must_use]
+    pub fn role_name(&self) -> String {
+        match self.thread_naming {
+            ThreadNaming::Classic => AERON_CLUSTER_BACKUP_THREAD_NAME_CLASSIC.to_owned(),
+            ThreadNaming::New => AERON_CLUSTER_BACKUP_THREAD_NAME.to_owned(),
+        }
+    }
+
+    /// The consensus channel the backup subscribes on, with its endpoint
+    /// filled in from the member string when the property does not name one
+    /// (`ClusterBackup.Configuration.consensusChannel()`, `:447-478`).
+    ///
+    /// The reference has a third source — `aeron.cluster.member.endpoints` —
+    /// which this build does not apply (`P3-0e`), so a deployment that names
+    /// neither the property nor the member string keeps the template as it is.
+    #[must_use]
+    pub fn resolved_consensus_channel(&self) -> String {
+        let Ok(mut uri) = ChannelUri::parse(&self.consensus_channel) else {
+            return self.consensus_channel.clone();
+        };
+
+        if uri.get(ENDPOINT_PARAM_NAME).is_some() {
+            return self.consensus_channel.clone();
+        }
+
+        let Some(member) = self
+            .cluster_members
+            .as_deref()
+            .and_then(|members| ClusterMember::parse_list(members).ok())
+            .and_then(|members| {
+                member::find_member(&members, self.member_id)
+                    .map(|member| member.consensus_endpoint.clone())
+            })
+        else {
+            return self.consensus_channel.clone();
+        };
+
+        uri.put(ENDPOINT_PARAM_NAME, member);
+        uri.build()
     }
 
     /// The replication's progress timeout, defaulted (`:647`, default at
@@ -571,6 +641,7 @@ mod tests {
             replication_progress_interval_ns: None,
             cluster_members: None,
             member_id: -1,
+            thread_naming: ThreadNaming::DEFAULT,
             delete_dir_on_start: false,
         }
     }
