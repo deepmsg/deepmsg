@@ -687,7 +687,7 @@ impl ConsensusModuleAgent {
             commit_position,
             appended_position,
             now_ns,
-            now_ns as u64,
+            election_rng_seed(now_ns, self.config.member_id),
         );
         self.election = Some(election);
         // `Election`'s constructor increments the election counter
@@ -2929,7 +2929,7 @@ impl ConsensusModuleAgent {
             commit_position,
             appended_position,
             now_ns,
-            now_ns as u64,
+            election_rng_seed(now_ns, self.config.member_id),
         );
         let _ = reason;
 
@@ -4115,6 +4115,25 @@ fn channel_uri_media_is_udp(channel: &str) -> bool {
 fn replace_port_with_wildcard(endpoint: &str) -> Option<String> {
     let index = endpoint.rfind(':')?;
     Some(format!("{}0", &endpoint[..=index]))
+}
+
+/// The seed of one election's canvass backoff: the clock **and the member**.
+///
+/// The member is in it because this build's cluster clock counts
+/// milliseconds (`MillisecondClusterClock`, `clock.rs:69`), so `time_nanos()`
+/// is a millisecond value scaled up and every member that enters an election
+/// inside the same millisecond — which is what a partition does — would hand
+/// its generator the identical seed. The streams then draw identical
+/// nomination delays, every member nominates in the same millisecond, every
+/// ballot splits, and the cluster cannot elect at all: measured on the
+/// partition scenario as six consecutive rounds with the three members'
+/// nomination deadlines equal to the millisecond (`records/P3-6c.md`).
+///
+/// The reference has no such coupling to have to avoid: its `Random`
+/// (`ConsensusModule.java:2131`) is seeded from `System.nanoTime`, which is
+/// nanoseconds and per-process.
+fn election_rng_seed(now_ns: i64, member_id: i32) -> u64 {
+    (now_ns as u64) ^ (member_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 fn storage_space_refusal(error: &ClusterError) -> bool {

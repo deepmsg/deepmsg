@@ -56,8 +56,25 @@ pub struct ElectionRng {
 impl ElectionRng {
     /// Seed the generator. Production passes the epoch clock; tests pass a
     /// constant.
+    ///
+    /// The seed is mixed first (SplitMix64's finalizer), and that is not
+    /// decoration. Three members of one cluster construct their elections
+    /// within a millisecond of each other, so a clock seed leaves their seeds
+    /// microscopically apart — and xorshift64's **first** draw from nearby
+    /// seeds is nearby too: seeds 1 ms apart drew nomination delays within
+    /// 0.5% of each other in this build's own partition scenario. Every member
+    /// then nominated in the same millisecond, every ballot split three ways,
+    /// and the election could not converge no matter how long it ran
+    /// (`records/P3-6c.md`). The reference does not have that coupling — its
+    /// `Random` is one per module (`ConsensusModule.java:2131`) and a 48-bit
+    /// LCG scrambles a nearby seed in its first step — so a stream per member
+    /// that starts a millisecond apart is what it has, and what this has to.
+    ///
+    /// Mixing also keeps the state non-zero, which xorshift64 needs.
     pub const fn new(seed: u64) -> Self {
-        Self { state: seed }
+        Self {
+            state: mix_seed(seed),
+        }
     }
 
     /// The next draw in `[0, 1)`, mirroring `java.util.Random.nextDouble()`'s
@@ -69,6 +86,15 @@ impl ElectionRng {
         self.state ^= self.state << 17;
         (self.state >> 11) as f64 / (1u64 << 53) as f64
     }
+}
+
+/// SplitMix64's finalizer: every input bit reaches every output bit, so seeds
+/// a nanosecond apart start streams that have nothing in common.
+const fn mix_seed(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// One election, between `enterElection` and `electionComplete`.
