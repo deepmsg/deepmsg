@@ -271,7 +271,7 @@ fn an_appointed_leader_is_the_one_that_serves() {
 /// blackout that also stops the log leaves the leader's log ahead of its
 /// commit position — uncommitted entries it appended while it could not reach
 /// a quorum — and the container's log reader is bounded by the commit position
-/// (`BoundedLogAdapter.poll(commitPosition)`, `BoundedLogAdapter.java:100-108`).
+/// (`BoundedLogAdapter.poll(limit)`, `BoundedLogAdapter.java:130-133`).
 /// Its old image therefore never drains, is never announced unavailable, and
 /// the new term's `JoinLog` is never taken: the consensus module waits in
 /// `awaitServicesReady` for an ack that cannot come. That is what the case

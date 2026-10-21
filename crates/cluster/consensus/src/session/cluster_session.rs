@@ -514,7 +514,7 @@ impl ClusterSession {
     /// Synchronous where [`Self::async_connect`] is not, because the reference's
     /// is, and because of what runs right after it: `prepareSessionsForNewTerm`
     /// calls this and then marks the new-leader event pending
-    /// (`SessionManager.java:939-964`), so the event that goes out on the next
+    /// (`SessionManager.java:932-967`), so the event that goes out on the next
     /// duty cycle has to have a publication to go out on. Without one the send
     /// reports success into nothing: the client never learns where the cluster
     /// moved to, keeps offering to the old leader, and gets `CLOSED` (-4) from
