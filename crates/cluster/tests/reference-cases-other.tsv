@@ -97,26 +97,26 @@
 # Lane B owns the harness, the container, the client and the tooling.
 #
 # kind	class	method	lane	card	assert_surface	ref_flags	disposition	ours
-system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndEmptyLog	B	P3-9	stub-service,counter			
-system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndNonEmptyLog	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndThenSendMessages	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldBackupClusterWithSnapshot	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldBackupClusterAfterCleanShutdown	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldBackupClusterWithSnapshotAndNonEmptyLog	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldBackupClusterWithSnapshotAndNonEmptyLogWithSimpleAuthentication	B	P3-9	java-injection,stub-service,counter,client		hook:service-supplier	
-system	ClusterBackupTest	shouldBackupClusterWithSnapshotAndNonEmptyLogWithChallengeResponseAuthentication	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldLogErrorWithInvalidCredentials	B	P3-9	counter			
-system	ClusterBackupTest	shouldLogErrorWithInvalidChallengeResponse	B	P3-9	counter			
-system	ClusterBackupTest	shouldBackupClusterWithSnapshotThenSend	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldBackupClusterWithFromLatestSnapshotLogPosition	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldBeAbleToGetTimeOfNextBackupQuery	B	P3-9	counter			
-system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndNonEmptyLogWithReQuery	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndNonEmptyLogAfterFailure	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndNonEmptyLogWithFailure	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldBackupClusterWithInvalidNameResolution	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldBackupClusterAndJoinLive	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldResumeBackupIfStopped	B	P3-9	stub-service,counter,client			
-system	ClusterBackupTest	shouldQueryForSnapshotsWithLogPosition	B	P3-9	counter,client			
+system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndEmptyLog	B	P3-9	stub-service,counter			cluster_backup_cases::should_backup_cluster_no_snapshots_and_empty_log
+system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndNonEmptyLog	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_backup_cluster_no_snapshots_and_non_empty_log_from_any (-from_leader, -from_follower: the three @EnumSource executions)
+system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndThenSendMessages	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_backup_cluster_no_snapshots_and_then_send_messages
+system	ClusterBackupTest	shouldBackupClusterWithSnapshot	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_backup_cluster_with_snapshot
+system	ClusterBackupTest	shouldBackupClusterAfterCleanShutdown	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_backup_cluster_after_clean_shutdown
+system	ClusterBackupTest	shouldBackupClusterWithSnapshotAndNonEmptyLog	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_backup_cluster_with_snapshot_and_non_empty_log
+system	ClusterBackupTest	shouldBackupClusterWithSnapshotAndNonEmptyLogWithSimpleAuthentication	B	P3-9	java-injection,stub-service,counter,client		hook:service-supplier	cluster_backup_cases::should_backup_cluster_with_snapshot_and_non_empty_log_with_simple_authentication
+system	ClusterBackupTest	shouldBackupClusterWithSnapshotAndNonEmptyLogWithChallengeResponseAuthentication	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_backup_cluster_with_snapshot_and_non_empty_log_with_challenge_response_authentication
+system	ClusterBackupTest	shouldLogErrorWithInvalidCredentials	B	P3-9	counter			cluster_backup_cases::should_log_error_with_invalid_credentials
+system	ClusterBackupTest	shouldLogErrorWithInvalidChallengeResponse	B	P3-9	counter			cluster_backup_cases::should_log_error_with_invalid_challenge_response
+system	ClusterBackupTest	shouldBackupClusterWithSnapshotThenSend	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_backup_cluster_with_snapshot_then_send
+system	ClusterBackupTest	shouldBackupClusterWithFromLatestSnapshotLogPosition	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_backup_cluster_with_from_latest_snapshot_log_position
+system	ClusterBackupTest	shouldBeAbleToGetTimeOfNextBackupQuery	B	P3-9	counter			cluster_backup_cases::should_be_able_to_get_time_of_next_backup_query
+system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndNonEmptyLogWithReQuery	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_backup_cluster_no_snapshots_and_non_empty_log_with_re_query
+system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndNonEmptyLogAfterFailure	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_backup_cluster_no_snapshots_and_non_empty_log_after_failure
+system	ClusterBackupTest	shouldBackupClusterNoSnapshotsAndNonEmptyLogWithFailure	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_backup_cluster_no_snapshots_and_non_empty_log_with_failure
+system	ClusterBackupTest	shouldBackupClusterWithInvalidNameResolution	B	P3-9	stub-service,counter,client			n/a:no-fixture-name-resolution (the reference injects a RedirectingNameResolver per member; this harness has no name-resolution layer)
+system	ClusterBackupTest	shouldBackupClusterAndJoinLive	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_backup_cluster_and_join_live
+system	ClusterBackupTest	shouldResumeBackupIfStopped	B	P3-9	stub-service,counter,client			cluster_backup_cases::should_resume_backup_if_stopped_with_a_wildcard_catchup_port (-_with_a_fixed_catchup_port: the two @ValueSource executions) (weakened: 100_000 messages -> 2_000; the resume path is what the case is about)
+system	ClusterBackupTest	shouldQueryForSnapshotsWithLogPosition	B	P3-9	counter,client			cluster_backup_query::a_backup_query_finds_the_snapshot_at_or_before_its_log_position
 system	ClusterSessionReliabilityTest	sessionShouldGetClosedWhenIngressImageGoesUnavailableToPreventSilentMessageLoss	B	P3-3c	client	cluster_lc1_reliability::session_should_get_closed_when_ingress_image_goes_unavailable_to_prevent_silent_message_loss (the passers-by are the same; the loss is the driver's `debug.send.data.loss` blackout, and the burst starts after the connect request and five messages rather than on the service's count)		
 system	ClusterSessionReliabilityTest	sessionShouldGetClosedWhenMulticastIngressImageGoesUnavailableToPreventSilentMessageLoss	B	P3-3c	client	cluster_lc1_reliability::session_should_get_closed_when_multicast_ingress_image_goes_unavailable_to_prevent_silent_message_loss (ingress on 239.192.11.87:20123 on loopback, as the reference's case)		
 system	ClusterSessionReliabilityTest	sessionShouldGetClosedWhenIngressImageGoesUnavailableAfterFailoverToPreventSilentMessageLoss	B	P3-3c	client	cluster_lc1_reliability::session_should_get_closed_when_ingress_image_goes_unavailable_after_failover_to_prevent_silent_message_loss (the leader is stopped before any message, so the blackout is anchored on the new leader's endpoint)		
@@ -150,19 +150,19 @@ system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicate
 system	ServiceIpcIngressMessageTest	shouldProcessServiceMessagesWithoutDuplicatesWhenClusterIsRestartedAfterTakingASnapshot	B	P3-2c	java-injection,stub-service,counter,client		n/a:java-injection	service_messages_survive_a_snapshot_and_a_restart_in_process, ..._external
 system	ServiceIpcIngressMessageTest	shouldHandleServiceMessagesMissedOnTheFollowerWhenSnapshot	B	P3-2c	stub-service,counter,client			(deferred: needs a follower to miss a service message, which needs an injected buggy business)
 system	TestClusterTest	testCustomAeronDirectory	B	P3-2c	counter,client		n/a:fixture-self-test	(n/a:fixture-self-test)
-unit	ClusterBackupAgentTest	shouldReturnReplayStartPositionIfAlreadyExisting	B	P3-9	unit			
-unit	ClusterBackupAgentTest	shouldReturnNullPositionIfLastTermIsNullAndSnapshotsIsEmpty	B	P3-9	unit			
-unit	ClusterBackupAgentTest	shouldLargestPositionLessThanOrEqualToInitialReplayPosition	B	P3-9	unit			
-unit	ClusterBackupAgentTest	shouldRunTerminationHooksOnTermination	B	P3-9	unit			
-unit	ClusterBackupContextTest	throwsIllegalStateExceptionIfThereIsAnActiveMarkFile	B	P3-9	unit			
-unit	ClusterBackupContextTest	clusterDirectoryNameShouldMatchClusterDirWhenClusterDirSet	B	P3-9	unit			
-unit	ClusterBackupContextTest	clusterDirectoryNameShouldMatchClusterDirWhenClusterDirectoryNameSet	B	P3-9	unit			
-unit	ClusterBackupContextTest	concludeShouldCreateMarkFileDirSetViaSystemProperty	B	P3-9	unit	disabled:no-reason		
-unit	ClusterBackupContextTest	concludeShouldCreateMarkFileDirSetDirectly	B	P3-9	unit			
-unit	ClusterBackupContextTest	shouldRemoveLinkIfMarkFileIsInClusterDir	B	P3-9	unit			
-unit	ClusterBackupContextTest	concludeShouldCreateLinkFilePointingToTheParentDirectoryOfTheMarkFile	B	P3-9	unit			
-unit	ClusterBackupContextTest	shouldAlignMarkFileBasedOnTheAeronClientFilePageSize	B	P3-9	unit			
-unit	ClusterBackupContextTest	shouldAlignMarkFileBasedOnTheMediaDriverFilePageSize	B	P3-9	unit			
+unit	ClusterBackupAgentTest	shouldReturnReplayStartPositionIfAlreadyExisting	B	P3-9	unit			backup::agent::tests::should_return_replay_start_position_if_already_existing
+unit	ClusterBackupAgentTest	shouldReturnNullPositionIfLastTermIsNullAndSnapshotsIsEmpty	B	P3-9	unit			backup::agent::tests::should_return_null_position_if_last_term_is_null_and_snapshots_is_empty
+unit	ClusterBackupAgentTest	shouldLargestPositionLessThanOrEqualToInitialReplayPosition	B	P3-9	unit			backup::agent::tests::should_take_the_largest_consensus_module_snapshot_position
+unit	ClusterBackupAgentTest	shouldRunTerminationHooksOnTermination	B	P3-9	unit			backup::agent::tests::should_run_termination_hooks_on_termination
+unit	ClusterBackupContextTest	throwsIllegalStateExceptionIfThereIsAnActiveMarkFile	B	P3-9	unit			backup::context::tests::a_second_context_over_an_active_mark_file_is_refused
+unit	ClusterBackupContextTest	clusterDirectoryNameShouldMatchClusterDirWhenClusterDirSet	B	P3-9	unit			backup::context::tests::the_cluster_directory_is_what_the_context_resolves_to
+unit	ClusterBackupContextTest	clusterDirectoryNameShouldMatchClusterDirWhenClusterDirectoryNameSet	B	P3-9	unit			backup::context::tests::the_cluster_directory_is_what_the_context_resolves_to (one test for both, as the record §3.1 says)
+unit	ClusterBackupContextTest	concludeShouldCreateMarkFileDirSetViaSystemProperty	B	P3-9	unit	disabled:no-reason		n/a:no-global-system-property (the reference sets it through System.setProperty; this build takes properties as arguments)
+unit	ClusterBackupContextTest	concludeShouldCreateMarkFileDirSetDirectly	B	P3-9	unit			backup::context::tests::a_mark_file_directory_elsewhere_is_created_and_linked
+unit	ClusterBackupContextTest	shouldRemoveLinkIfMarkFileIsInClusterDir	B	P3-9	unit			backup::context::tests::a_link_is_removed_when_the_mark_file_is_in_the_cluster_directory
+unit	ClusterBackupContextTest	concludeShouldCreateLinkFilePointingToTheParentDirectoryOfTheMarkFile	B	P3-9	unit			backup::context::tests::a_mark_file_directory_elsewhere_is_created_and_linked
+unit	ClusterBackupContextTest	shouldAlignMarkFileBasedOnTheAeronClientFilePageSize	B	P3-9	unit			backup::context::tests::the_mark_file_is_aligned_to_the_drivers_page_size (weakened: both page-size cases land on the driver's CnC page size; record §3.1)
+unit	ClusterBackupContextTest	shouldAlignMarkFileBasedOnTheMediaDriverFilePageSize	B	P3-9	unit			backup::context::tests::the_mark_file_is_aligned_to_the_drivers_page_size (weakened: same)
 unit	ClusterEventEnablementTest	shouldLogConfiguredEvents	-	-	unit		n/a:logging	
 unit	ClusterLoggingAgentTest	logAll	-	-	unit		n/a:logging	
 unit	ConsensusModuleConfigurationTest	shouldUseDenyAllAuthorisationSupplierWhenPropertySet	B	P3-8	unit			session::authenticator::tests::the_deny_all_supplier_denies_and_the_default_allows_the_backup_query

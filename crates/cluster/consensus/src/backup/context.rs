@@ -780,6 +780,21 @@ mod tests {
         );
     }
 
+    /// The two names the agent's thread may carry (`ClusterBackup.java:225-226`),
+    /// chosen by `aeron.thread.naming` and by nothing else — unlike the
+    /// consensus module's, which appends the cluster and member ids.
+    #[test]
+    fn the_configured_thread_name_follows_the_naming_mode() {
+        let dir = scratch("role-name");
+        let mut config = config(&dir, &dir);
+
+        config.thread_naming = ThreadNaming::Classic;
+        assert_eq!(AERON_CLUSTER_BACKUP_THREAD_NAME_CLASSIC, config.role_name());
+
+        config.thread_naming = ThreadNaming::New;
+        assert_eq!(AERON_CLUSTER_BACKUP_THREAD_NAME, config.role_name());
+    }
+
     /// A second `conclude` on the same context is refused (`:683-686`).
     #[test]
     fn a_context_concludes_once() {

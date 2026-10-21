@@ -51,9 +51,18 @@ const CLUSTER_PROPERTIES: &[(&str, &str)] = &[
     ("aeron.cluster.session.timeout", "4s"),
 ];
 
-/// The next cluster's port base; this binary owns the 43xxx block.
+/// The next cluster's port base; this binary owns the 9xxx block.
+///
+/// Below `net.ipv4.ip_local_port_range` (32768 here) on purpose: inside it any
+/// process may hold a port mid-run, and a member that cannot bind its own log
+/// endpoint fails its follower log handover, re-canvasses and terminates — a
+/// failure that reads as a cluster member dying for no reason
+/// (`Election.java:1362`; `records/P3-9.md` §9.2, where `avahi-daemon` held
+/// 46004). The 43xxx block this used to own was inside the range and overlapped
+/// `cluster_lc1_scenarios`' 41xxx, and `cargo test` runs the two binaries
+/// together.
 fn next_port_base() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(43_000);
+    static NEXT: AtomicU16 = AtomicU16::new(9_000);
     NEXT.fetch_add(1_000, Ordering::Relaxed)
 }
 

@@ -301,6 +301,12 @@ impl Options {
 /// binds its endpoints), and a client that names `ingressEndpoints` is told
 /// `id=endpoint` instead. Both spellings are produced here so a scenario
 /// cannot get one of them from a different base than the other.
+///
+/// **A base belongs below `net.ipv4.ip_local_port_range`** (32768 on this
+/// machine): inside it any process may take a port mid-run, and a cluster that
+/// loses one of its own endpoints to, say, `avahi-daemon` fails in a way that
+/// reads as a member dying for no reason (the member's follower log handover
+/// binds its own log endpoint, `Election.java:1362`).
 #[derive(Clone, Copy, Debug)]
 pub struct ClusterPorts {
     base: u16,
@@ -433,6 +439,35 @@ impl TestCluster {
     /// [`NodeImpl::Rust`], [`DriverImpl::Deepmsg`]) or when a node or container
     /// does not start.
     pub fn start(test_name: &str, members: &[MemberSpec], options: Options) -> Option<Self> {
+        Self::start_inner(test_name, members, options, Vec::new())
+    }
+
+    /// [`Self::start`], with some members' `cluster.dir` and `archive.dir`
+    /// supplied by the caller — `(member id, archive dir, cluster dir)`, the
+    /// order [`BackupNode::into_directories`] hands them over in.
+    ///
+    /// The reference's `startStaticNodeFromBackup` (`TestCluster.java:623-687`)
+    /// starts a member over the two directories a backup wrote: they are not
+    /// this fixture's to create, and `deleteDirOnStart` is `false` because what
+    /// is in them *is* the thing under test. The driver's own directory is
+    /// still new — the reference deletes and recreates that one.
+    ///
+    /// [`BackupNode::into_directories`]: crate::cluster_harness::BackupNode::into_directories
+    pub fn start_over_directories(
+        test_name: &str,
+        members: &[MemberSpec],
+        options: Options,
+        directories: Vec<(i32, TempDir, TempDir)>,
+    ) -> Option<Self> {
+        Self::start_inner(test_name, members, options, directories)
+    }
+
+    fn start_inner(
+        test_name: &str,
+        members: &[MemberSpec],
+        options: Options,
+        mut directories: Vec<(i32, TempDir, TempDir)>,
+    ) -> Option<Self> {
         assert!(!members.is_empty(), "a cluster needs at least one member");
         for member in members {
             assert!(
@@ -478,11 +513,22 @@ impl TestCluster {
             if nodes.iter().any(|node| node.id == member.id) {
                 continue;
             }
+            let supplied = directories
+                .iter()
+                .position(|(id, _, _)| *id == member.id)
+                .map(|index| directories.remove(index));
+            let (archive, cluster) = match supplied {
+                Some((_, archive, cluster)) => (archive, cluster),
+                None => (
+                    TempDir::new(&format!("{test_name}-{}-archive", member.id)),
+                    TempDir::new(&format!("{test_name}-{}-cluster", member.id)),
+                ),
+            };
             nodes.push(Node {
                 id: member.id,
                 aeron: TempDir::new(&format!("{test_name}-{}-aeron", member.id)),
-                cluster: TempDir::new(&format!("{test_name}-{}-cluster", member.id)),
-                archive: TempDir::new(&format!("{test_name}-{}-archive", member.id)),
+                cluster,
+                archive,
                 service_count: i32::try_from(
                     members.iter().filter(|other| other.id == member.id).count(),
                 )
@@ -490,6 +536,11 @@ impl TestCluster {
                 process: None,
             });
         }
+        assert!(
+            directories.is_empty(),
+            "directories were supplied for members that are not in the table: {:?}",
+            directories.iter().map(|(id, _, _)| *id).collect::<Vec<_>>()
+        );
 
         let containers = members
             .iter()
@@ -1038,6 +1089,25 @@ impl TestCluster {
         }
     }
 
+    /// Where a member's archive listens: the endpoint the member string
+    /// advertises for it, or a kernel-chosen port when the string names zero
+    /// (which is what [`Options::default`] builds).
+    fn archive_control_channel(&self, member: i32) -> String {
+        use deepmsg_cluster_common::member::{ClusterMember, find_member};
+
+        let endpoint = ClusterMember::parse_list(&self.options.members_string())
+            .ok()
+            .and_then(|members| {
+                find_member(&members, member).map(|found| found.archive_endpoint.clone())
+            })
+            .filter(|endpoint| !endpoint.ends_with(":0"));
+
+        endpoint.map_or_else(
+            || "aeron:udp?endpoint=localhost:0".to_owned(),
+            |endpoint| format!("aeron:udp?endpoint={endpoint}"),
+        )
+    }
+
     fn spawn_java_node(&self, index: usize) -> Process {
         let node = &self.nodes[index];
         let mut args: Vec<String> = AGRONA_JVM_ARGS
@@ -1053,7 +1123,17 @@ impl TestCluster {
             "-Daeron.archive.dir={}",
             node.archive.path().display()
         ));
-        args.push("-Daeron.archive.control.channel=aeron:udp?endpoint=localhost:0".to_owned());
+        // The member string says where a member's archive is reachable, and a
+        // backup dials that endpoint — it reads it out of the cluster's
+        // response and connects there (`ClusterBackupAgent.java:578-590`).
+        // The reference's fixture gives every archive the same fixed endpoint
+        // it puts in the member string (`TestCluster.java:275`,
+        // `:2189-2192`); a member string that names port zero keeps the
+        // kernel-chosen port.
+        args.push(format!(
+            "-Daeron.archive.control.channel={}",
+            self.archive_control_channel(node.id)
+        ));
         args.push("-Daeron.archive.replication.channel=aeron:udp?endpoint=localhost:0".to_owned());
         args.push(format!("-Daeron.cluster.id={}", self.options.cluster_id));
         args.push(format!("-Daeron.cluster.member.id={}", node.id));
@@ -1392,6 +1472,14 @@ pub struct TestServiceState {
     session_closes: AtomicUsize,
     close_reasons: Mutex<Vec<CloseReason>>,
     fail_next_snapshot: AtomicBool,
+    /// `TestNode.TestService.wasSnapshotTaken` (`TestNode.java`): a snapshot of
+    /// this business was written. The reference's backup cases read it after a
+    /// cluster shutdown, whose snapshots are what the backup has to carry.
+    snapshot_taken: AtomicBool,
+    /// The same business was handed a snapshot on `on_start` — which is the
+    /// assertion behind "a node started from a backup directory came up from
+    /// the snapshot", not merely "the backup counted one".
+    snapshot_loaded: AtomicBool,
     terminated: AtomicBool,
     /// The messages whose first eight bytes were not the session's next
     /// sequence number — a gap, a repeat, or a payload too short to hold one.
@@ -1443,6 +1531,20 @@ impl TestServiceState {
     #[must_use]
     pub fn close_reasons(&self) -> Vec<CloseReason> {
         self.close_reasons.lock().expect("the reasons lock").clone()
+    }
+
+    /// Whether a snapshot of this business was taken
+    /// (`TestService.wasSnapshotTaken`).
+    #[must_use]
+    pub fn was_snapshot_taken(&self) -> bool {
+        self.snapshot_taken.load(Ordering::Acquire)
+    }
+
+    /// Whether `on_start` was given a snapshot to recover from
+    /// (`TestService.wasSnapshotLoaded`).
+    #[must_use]
+    pub fn was_snapshot_loaded(&self) -> bool {
+        self.snapshot_loaded.load(Ordering::Acquire)
     }
 
     /// Make the next snapshot fail (`TestService.failNextSnapshot`).
@@ -1505,12 +1607,57 @@ impl TestService {
     }
 }
 
+/// Build the fixture's in-process test business by name, with its observables.
+///
+/// The names are the fixture's own — `test-service` (the reference's echo plus
+/// the observables) and `sequence-service` (the same, checking each session's
+/// sequence numbers). A product business comes from
+/// `deepmsg_cluster_service::services`, not from here; these two exist only in
+/// the test process, which is what makes their state readable by a test.
+pub fn in_process_test_service(
+    name: &str,
+) -> (Box<dyn ClusteredService + Send>, Arc<TestServiceState>) {
+    let state = Arc::new(TestServiceState::default());
+    let service = match name {
+        "test-service" => TestService::new(Arc::clone(&state), false),
+        "sequence-service" => TestService::new(Arc::clone(&state), true),
+        other => panic!("no test business named {other}"),
+    };
+    (Box::new(service), state)
+}
+
 impl ClusteredService for TestService {
     fn on_start(
         &mut self,
         cluster: &mut deepmsg_cluster_service::Cluster<'_>,
-        snapshot: Option<&mut SnapshotReader<'_>>,
+        mut snapshot: Option<&mut SnapshotReader<'_>>,
     ) -> Result<(), ContainerError> {
+        if let Some(reader) = snapshot.as_deref_mut() {
+            // `TestNode.TestService.onStart` (`TestNode.java:546-576`): the
+            // business restores its message count from its own snapshot image
+            // — one record, the count at the moment the snapshot was taken.
+            // Without it a business started from a backup directory counts only
+            // what the log replay delivers, which is how a snapshot-carrying
+            // case would read a plausible but wrong number.
+            self.state.snapshot_loaded.store(true, Ordering::Release);
+            let mut count = None;
+            loop {
+                reader.poll(10, |fragment| {
+                    if let Some(value) = fragment.payload_i64_at(0) {
+                        count = Some(value);
+                    }
+                });
+                if count.is_some() || reader.is_end_of_stream() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            if let Some(value) = count {
+                self.state
+                    .messages
+                    .store(usize::try_from(value).unwrap_or(0), Ordering::Release);
+            }
+        }
         self.inner.on_start(cluster, snapshot)
     }
 
@@ -1595,7 +1742,23 @@ impl ClusteredService for TestService {
                 "This is a simulated failure for this snapshot".to_owned(),
             ));
         }
-        self.inner.on_take_snapshot(writer)
+        self.inner.on_take_snapshot(writer)?;
+
+        // The reference's `TestService.onTakeSnapshot` writes the business's
+        // own message count into the snapshot (`TestNode.java:697-712`), then
+        // `wasSnapshotTaken`. The count is what a case reads back through
+        // `wasSnapshotLoaded` + `messageCount()` after a restart.
+        let record = i64::try_from(self.state.messages())
+            .unwrap_or(i64::MAX)
+            .to_le_bytes();
+        loop {
+            if writer.offer(&record) > 0 {
+                break;
+            }
+            writer.idle();
+        }
+        self.state.snapshot_taken.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn on_role_change(&mut self, new_role: Role) -> Result<(), ContainerError> {

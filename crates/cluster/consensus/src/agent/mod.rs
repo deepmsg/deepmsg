@@ -126,6 +126,11 @@ pub const MARK_FILE_UPDATE_INTERVAL_NS: i64 = 1_000_000_000;
 /// How long a synchronous startup call waits for the driver.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long [`ConsensusModuleAgent::await_local_sockets_closed`] waits for the
+/// driver — see its note on why this build needs a deadline and the reference
+/// does not.
+const LOCAL_SOCKETS_CLOSED_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// `ConsensusModule.Configuration.CLUSTER_INGRESS_FRAGMENT_LIMIT_DEFAULT` is 50;
 /// the consensus adapter polls with the same bound.
 const CONSENSUS_FRAGMENT_LIMIT: usize = 50;
@@ -3161,10 +3166,25 @@ impl ElectionHost for ConsensusModuleAgent {
             self.idle()?;
         }
 
+        // `localLogChannel = isIpc ? channel : SPY_PREFIX + channel`
+        // (`CMA:1703`): over UDP the log publication is **manual** and has
+        // destinations for the other members only, so this member's own
+        // service can only reach it through a spy link. Naming the raw
+        // channel here hands the service a subscription no publication ever
+        // matches, and the leader then waits in `LeaderInit` forever for an
+        // ack it cannot receive — with `ssc=true` (a one-member cluster) the
+        // publication counts its spies as connected, which is why the
+        // single-member case never met it.
+        let local_log_channel = if is_ipc {
+            channel
+        } else {
+            format!("{}{channel}", deepmsg_driver::udp_channel::SPY_PREFIX)
+        };
+
         // `awaitServicesReady` (`:1801-1838`): tell the services where the log
         // is and wait for every one of them to answer at that position.
         self.await_services_ready(
-            &channel,
+            &local_log_channel,
             self.config.log_stream_id,
             log_session_id,
             log_position,
@@ -3173,11 +3193,7 @@ impl ElectionHost for ConsensusModuleAgent {
             Role::Leader,
         )?;
 
-        self.live_log_destination = if is_ipc {
-            channel
-        } else {
-            format!("aeron-spy:{channel}")
-        };
+        self.live_log_destination = local_log_channel;
         self.last_append_position = log_position;
 
         Ok(())
@@ -3641,6 +3657,17 @@ impl ElectionHost for ConsensusModuleAgent {
         // the closed registration held. This is the wait that makes a rebound
         // port possible — `LocalSocketAddressStatus.findNumberOfAddressesByRegistrationId`
         // counts the `LOCAL_SOCKADDR` counters that still name the id.
+        //
+        // **Bounded here, and that is a deviation.** The reference waits
+        // without a deadline because its driver frees the endpoint — and every
+        // counter under it — when the last subscription leaves. This build's
+        // driver does not release receive endpoints yet (`receive_endpoints
+        // .rs::detach_subscription` is called from one place and the endpoint
+        // is kept), so a member whose log endpoint is shared with its own
+        // service container leaves the counter behind and the reference's wait
+        // never ends. Ten seconds is long past any driver turn; after it the
+        // close proceeds and a same-driver rebind is the caller's problem.
+        let deadline = std::time::Instant::now() + LOCAL_SOCKETS_CLOSED_TIMEOUT;
         loop {
             self.idle()?;
 
@@ -3656,7 +3683,7 @@ impl ElectionHost for ConsensusModuleAgent {
                 open
             });
 
-            if open == 0 {
+            if open == 0 || std::time::Instant::now() >= deadline {
                 return Ok(());
             }
         }
@@ -6089,16 +6116,21 @@ impl ConsensusModuleAgent {
     /// its snapshot ids through, alive only for the recovery.
     fn add_recovery_state_counter(&mut self) -> Option<Counter> {
         let snapshot = self.recovery_plan.snapshots.first();
-        let (term, log_position, timestamp) = snapshot.map_or(
-            (self.recovery_plan.last_leadership_term_id, 0, 0),
-            |snapshot| {
+        // The no-snapshot arm names the agent's **field**, which is the null
+        // value during recovery (`CMA:2874`) — not the term the recording log
+        // holds. The container reads this term as "is there a snapshot to
+        // load", and the key's service count is zero here, so a term from the
+        // log makes every service ask for a snapshot id that cannot exist:
+        // `invalid serviceId 0 for count of 0`, which is how a member started
+        // from a backup directory with no snapshot in it failed to come up.
+        let (term, log_position, timestamp) =
+            snapshot.map_or((self.leadership_term_id, 0, 0), |snapshot| {
                 (
                     snapshot.leadership_term_id,
                     snapshot.log_position,
                     snapshot.timestamp,
                 )
-            },
-        );
+            });
         let snapshot_recording_ids = self
             .recovery_plan
             .snapshots
@@ -6308,14 +6340,18 @@ impl ConsensusModuleAgent {
         let mut channel = ChannelUri::parse(&replay_channel)
             .map_err(|error| ClusterError::Cluster(error.to_string()))?;
         channel.put("session-id", log_session_id.to_string());
-        let subscription_id =
-            self.client
-                .add_subscription(&channel.build(), replay_stream_id, COMMAND_TIMEOUT)?;
+        let replay_subscription_channel = channel.build();
+        let subscription_id = self.client.add_subscription(
+            &replay_subscription_channel,
+            replay_stream_id,
+            COMMAND_TIMEOUT,
+        )?;
 
         let done = std::sync::Arc::new(AtomicBool::new(false));
         let position = std::sync::Arc::new(AtomicI64::new(log_position));
         self.log_replay = Some(AgentLogReplay {
             subscription_id,
+            channel: replay_subscription_channel,
             replay_session_id,
             log_session_id,
             start_position: log_position,
@@ -6342,26 +6378,24 @@ impl ConsensusModuleAgent {
         let snapshot_began;
         let work;
 
-        {
+        // `LogReplay.doWork`'s first branch (`LogReplay.java:77-101`): the
+        // replay's image has just joined, so the **services** are told to join
+        // it too — the same replay publication, by its session id, from the
+        // replay's own start position. That is how a member started from a
+        // backup rebuilds its services' state from the log: the log was never
+        // in the new term's publication, it is the recording being replayed.
+        let joined = {
             let Self {
-                client,
-                archive,
-                log_replay,
-                sessions,
-                timer,
-                trackers,
-                expired_timer_count,
-                leadership_term_id,
-                config,
-                counters,
-                ..
+                client, log_replay, ..
             } = self;
 
             let Some(replay) = log_replay.as_mut() else {
                 return Ok(0);
             };
 
-            if !replay.adapter.has_image() {
+            if replay.adapter.has_image() {
+                None
+            } else {
                 let Some(image) =
                     client
                         .subscription(replay.subscription_id)
@@ -6381,8 +6415,47 @@ impl ConsensusModuleAgent {
                 replay
                     .adapter
                     .set_image(image.registration_id(), join_position);
-                return Ok(1);
+                Some((
+                    replay.channel.clone(),
+                    replay.log_session_id,
+                    replay.start_position,
+                    replay.stop_position,
+                ))
             }
+        };
+
+        if let Some((channel, log_session_id, start_position, stop_position)) = joined {
+            let stream_id = self.config.replay_stream_id;
+            self.await_services_ready(
+                &channel,
+                stream_id,
+                log_session_id,
+                start_position,
+                stop_position,
+                true,
+                Role::Follower,
+            )?;
+            return Ok(1);
+        }
+
+        {
+            let Self {
+                client,
+                archive,
+                log_replay,
+                sessions,
+                timer,
+                trackers,
+                expired_timer_count,
+                leadership_term_id,
+                config,
+                counters,
+                ..
+            } = self;
+
+            let Some(replay) = log_replay.as_mut() else {
+                return Ok(0);
+            };
 
             let mut handler = AgentLogReplayHandler {
                 sessions,

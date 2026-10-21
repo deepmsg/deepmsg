@@ -710,6 +710,14 @@ name = "cluster_lc1_scenarios"
 path = "interop/cluster_lc1_scenarios.rs"
 required-features = ["interop"]
 
+# P3-9's second source: our backup beside a Java three-node cluster, and a Java
+# member started from the directories our backup wrote. The other half,
+# `cluster_backup_cases`, has both ends ours.
+[[test]]
+name = "cluster_backup_java"
+path = "interop/cluster_backup_java.rs"
+required-features = ["interop"]
+
 # P3-3c's LC-1 reliability cases: the reference's ClusterSessionReliabilityTest,
 # with the loss injected by our driver's own settings because it is a process.
 [[test]]
@@ -772,3 +780,11 @@ required-features = ["interop"]
 name = "cluster_tool_reference"
 path = "interop/cluster_tool_reference.rs"
 required-features = ["interop"]
+
+[[test]]
+name = "cluster_backup_cases"
+path = "integration/cluster_backup_cases.rs"
+
+[[test]]
+name = "cluster_backup_binary"
+path = "integration/cluster_backup_binary.rs"

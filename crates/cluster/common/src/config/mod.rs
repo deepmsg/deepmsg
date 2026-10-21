@@ -170,6 +170,18 @@ impl Properties {
         Ok(())
     }
 
+    /// Every name and value, in name order.
+    ///
+    /// A binary that settles several configurations from one property list
+    /// needs this: `deepmsg-cluster-backup` reads its driver's and its
+    /// archive's names through APIs that take `-D` arguments, and re-reading
+    /// the files there would let the two halves see different lists.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.values
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
     /// The raw value, if set.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.values.get(name).map(String::as_str)

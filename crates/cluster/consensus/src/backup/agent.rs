@@ -54,6 +54,7 @@ use deepmsg_client::client::Client;
 use deepmsg_client::counter::Counter;
 use deepmsg_client::counter::CounterEvent;
 use deepmsg_cluster_common::member::{self, ClusterMember};
+use deepmsg_cnc::error_log::{DistinctErrorLog, ErrorLogRegion};
 use deepmsg_codec_cluster::backup_response_codec::BackupResponseDecoder;
 use deepmsg_codec_cluster::challenge_codec::ChallengeDecoder;
 use deepmsg_codec_cluster::event_code::EventCode;
@@ -203,7 +204,6 @@ pub struct BackupCounters {
 /// the reference's `leaderLogEntry` / `leaderLastTermEntry`.
 #[derive(Clone, Copy, Debug)]
 struct LeaderEntry {
-    recording_id: i64,
     leadership_term_id: i64,
     term_base_log_position: i64,
 }
@@ -284,6 +284,9 @@ pub struct ClusterBackupAgent {
     live_log_recording_id: i64,
     live_log_recording_counter_id: i32,
 
+    /// The mark file's error log, remembered across sightings
+    /// (`CountedErrorHandler`'s `DistinctErrorLog`).
+    counted_error_log: DistinctErrorLog,
     slow_tick_deadline_ms: i64,
     mark_file_update_deadline_ms: i64,
     time_of_last_backup_query_ms: i64,
@@ -388,6 +391,7 @@ impl ClusterBackupAgent {
             live_log_replay_session_id: NULL_VALUE,
             live_log_recording_id: NULL_VALUE,
             live_log_recording_counter_id: NULL_COUNTER_ID,
+            counted_error_log: DistinctErrorLog::default(),
             slow_tick_deadline_ms: 0,
             mark_file_update_deadline_ms: 0,
             time_of_last_backup_query_ms: 0,
@@ -494,7 +498,12 @@ impl ClusterBackupAgent {
                 }
 
                 // `:275-285`: a possible failure is reported, the backup resets,
-                // and the error still leaves the cycle.
+                // and the error still leaves the cycle. The runner's counted
+                // error handler runs for every thrown error
+                // (`AgentRunner`'s handler, `ClusterBackupAgent.java:248-319`),
+                // which is what puts `AUTHENTICATION_REJECTED` in the mark
+                // file's error log where a case reads it.
+                self.count_error(&error);
                 self.possible_failure(&error);
                 self.set_state(State::ResetBackup);
                 Err(error)
@@ -773,7 +782,6 @@ impl ClusterBackupAgent {
         if !same_supplier {
             self.cluster_log_recording_id = response.log_recording_id;
             self.leader_log_entry = Some(LeaderEntry {
-                recording_id: response.log_recording_id,
                 leadership_term_id: response.log_leadership_term_id,
                 term_base_log_position: response.log_term_base_log_position,
             });
@@ -786,7 +794,6 @@ impl ClusterBackupAgent {
             .is_some_and(|entry| entry.leadership_term_id == response.last_leadership_term_id);
         if !last_term_is_recorded {
             self.leader_last_term_entry = Some(LeaderEntry {
-                recording_id: response.log_recording_id,
                 leadership_term_id: response.last_leadership_term_id,
                 term_base_log_position: response.last_term_base_log_position,
             });
@@ -1277,7 +1284,7 @@ impl ClusterBackupAgent {
 
     // -- LIVE_LOG_REPLAY -----------------------------------------------------
 
-    /// `liveLogReplay` (`:812-900`): replay the cluster's log into the local
+    /// `liveLogReplay` (`:818-900`): replay the cluster's log into the local
     /// archive's recording.
     fn live_log_replay(&mut self, now_ms: i64) -> Result<usize, ClusterError> {
         let mut work = 0;
@@ -1338,6 +1345,14 @@ impl ClusterBackupAgent {
                 self.ctx.config().log_stream_id,
                 &params,
             )?;
+            // `correlationId = replayId` (`ClusterBackupAgent.java:848`):
+            // a non-null correlation is what says "the replay has been asked
+            // for". This build's `start_replay` is blocking and burns its own
+            // correlation, so the session id is the marker; without it the
+            // next turn sees a null correlation and asks again, and the
+            // replay channel it no longer holds is the error that stops the
+            // duty cycle.
+            self.correlation_id = self.live_log_replay_session_id;
             self.replay_channel = None;
             self.time_of_last_progress_ms = now_ms;
             work += 1;
@@ -1404,6 +1419,12 @@ impl ClusterBackupAgent {
     /// local recording log, so a consensus module can start from this
     /// directory.
     fn update_recording_log(&mut self, now_ms: i64) -> Result<usize, ClusterError> {
+        // The id the entries carry is the **backup's own** recording of the
+        // replayed log (`liveLogRecordingId`, `ClusterBackupAgent.java:929`,
+        // `:959`), not the cluster's: this recording log is what a member
+        // started from the backup directory will replay, and a cluster
+        // recording id names nothing in this archive.
+        let recording_id = self.live_log_recording_id;
         let Some(recording_log) = self.recording_log.as_mut() else {
             return Err(ClusterError::Cluster(
                 "the backup's recording log is not open".to_owned(),
@@ -1422,7 +1443,7 @@ impl ClusterBackupAgent {
             {
                 recording_log
                     .append_term_entry(
-                        entry.recording_id,
+                        recording_id,
                         entry.leadership_term_id,
                         entry.term_base_log_position,
                         NULL_VALUE,
@@ -1457,7 +1478,7 @@ impl ClusterBackupAgent {
             if recording_log.is_unknown(entry.leadership_term_id) {
                 recording_log
                     .append_term_entry(
-                        entry.recording_id,
+                        recording_id,
                         entry.leadership_term_id,
                         entry.term_base_log_position,
                         NULL_VALUE,
@@ -1694,10 +1715,21 @@ impl ClusterBackupAgent {
         self.ctx.config().cool_down_interval_ns / 1_000_000
     }
 
-    /// `countedErrorHandler().onError` — counter 211, then the caller's handler.
+    /// `countedErrorHandler().onError` — counter 211, the mark file's distinct
+    /// error log, then the caller's handler (`ClusterBackup.java:804`).
     fn count_error(&mut self, error: &ClusterError) {
         let current = read_counter(&self.client, self.counters.errors).unwrap_or(0);
         write_counter(&self.client, self.counters.errors, current + 1);
+
+        if let Some(mark_file) = self.ctx.mark_file() {
+            if let Some(buffer) = mark_file.error_buffer() {
+                let region = ErrorLogRegion::new(buffer);
+                let now_ms = deepmsg_core::clock::epoch_millis();
+                let _ = self
+                    .counted_error_log
+                    .record(&region, now_ms, 0, &error.to_string());
+            }
+        }
 
         if let Some(handler) = self.error_handler.as_mut() {
             handler(error);
