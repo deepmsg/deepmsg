@@ -3812,18 +3812,25 @@ impl ElectionHost for ConsensusModuleAgent {
             .unwrap_or(self.this_member_index);
 
         // `electionComplete` (`ConsensusModuleAgent.java:1905-1944`):
-        // `prepareSessionsForNewTerm(isLeaderStartup)` and then `connectIngress`.
-        // There are no sessions to prepare before P3-4d loads a snapshot, but
-        // the order is kept so that slice has the call where the reference has
-        // it.
+        // `prepareSessionsForNewTerm(isLeaderStartup)` **only on the leader**
+        // (`:1911-1922` is inside its role check), and then `connectIngress`,
+        // which every role does.
+        //
+        // The role gate is load-bearing now that preparing a session means
+        // reconnecting its response publication: a follower that took the call
+        // would publish into a client's response channel for a session only the
+        // leader answers, and would keep a publication the next term's
+        // `prepareForNewLeadership` does not know to disconnect.
         let is_leader_startup = self.node_startup_election;
         self.node_startup_election = false;
-        self.sessions.prepare_sessions_for_new_term(
-            &mut self.client,
-            self.config.cluster_id,
-            is_leader_startup,
-            now_ns,
-        )?;
+        if self.role == Role::Leader {
+            self.sessions.prepare_sessions_for_new_term(
+                &mut self.client,
+                self.config.cluster_id,
+                is_leader_startup,
+                now_ns,
+            )?;
+        }
         self.connect_ingress()?;
 
         Ok(())
