@@ -336,6 +336,41 @@ impl Ports {
         }
     }
 
+    /// The **client's** ingress channel — the cluster's ingress shape with no
+    /// endpoint, which is how the reference's own client names it
+    /// (`TestCluster.java:148`) — and the members' `id=endpoint` list beside it
+    /// (`AeronCluster.parseIngressEndpoints`, `AC:735-756`).
+    ///
+    /// A client of a cluster whose members are other processes cannot use IPC:
+    /// it names the channel once and every member's endpoint, and the client
+    /// library builds one publication per endpoint.
+    pub fn client_ingress_channel(&self) -> String {
+        format!(
+            "aeron:udp?term-length={}|alias=ingress{}",
+            self.shape.ingress_term_length,
+            self.mtu_parameter()
+        )
+    }
+
+    /// `0=localhost:<port>,1=…` for every member (`AC:735-756`).
+    pub fn client_ingress_endpoints(&self) -> String {
+        (0..MEMBER_COUNT)
+            .map(|id| format!("{id}=localhost:{}", self.ingress(id)))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// The **client's** egress channel: the reference names a wildcard endpoint
+    /// and the client resolves it into the response channel it sends with its
+    /// connect (`TestCluster.java:147`).
+    pub fn client_egress_wildcard_channel(&self) -> String {
+        format!(
+            "aeron:udp?term-length={}|endpoint=localhost:0|alias=egress{}",
+            self.shape.egress_term_length,
+            self.mtu_parameter()
+        )
+    }
+
     pub fn client_egress_channel(&self) -> String {
         format!(
             "aeron:udp?term-length={}|endpoint=localhost:{}{}",
@@ -523,7 +558,51 @@ impl Node {
         faults: &Faults,
         launched: &mpsc::Sender<(i32, Result<(), String>)>,
     ) -> Option<Self> {
-        Self::start_inner(id, ports, member_string, faults, launched, None, None, None)
+        Self::start_inner(
+            id,
+            ports,
+            member_string,
+            faults,
+            launched,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+        )
+    }
+
+    /// [`Self::start`], with settings the case varies.
+    ///
+    /// `driver_properties` go to this member's **archiving media driver** —
+    /// where the network knob family lives (`debug.send.data.loss.*`,
+    /// `debug.receive.data.loss.*`, `crates/driver/src/config.rs`) — and
+    /// `module_arguments` to the consensus module's command line
+    /// (`aeron.cluster.appointed.leader.id` and the other per-member settings
+    /// a scenario picks).
+    #[allow(clippy::too_many_arguments)] // one per thing a case varies
+    pub fn start_with_properties(
+        id: i32,
+        ports: &Ports,
+        member_string: &str,
+        faults: &Faults,
+        launched: &mpsc::Sender<(i32, Result<(), String>)>,
+        service: Option<&'static str>,
+        driver_properties: &[&str],
+        module_arguments: &[&str],
+    ) -> Option<Self> {
+        Self::start_inner(
+            id,
+            ports,
+            member_string,
+            faults,
+            launched,
+            service,
+            None,
+            None,
+            driver_properties,
+            module_arguments,
+        )
     }
 
     /// The same, with one in-process test container (`test-service` or
@@ -551,6 +630,8 @@ impl Node {
             Some(service),
             None,
             None,
+            &[],
+            &[],
         )
     }
 
@@ -574,6 +655,8 @@ impl Node {
             Some(service),
             Some(authenticator),
             None,
+            &[],
+            &[],
         )
     }
 
@@ -604,6 +687,8 @@ impl Node {
             service,
             None,
             Some((archive_dir, cluster_dir)),
+            &[],
+            &[],
         )
     }
 
@@ -617,6 +702,8 @@ impl Node {
         service: Option<&'static str>,
         authenticator: Option<TestAuthenticator>,
         directories: Option<(TempDir, TempDir)>,
+        driver_properties: &[&str],
+        module_arguments: &[&str],
     ) -> Option<Self> {
         // The aeron directory is the process id **and** this name
         // (`temp_aeron_dir`), and `cargo test` runs a binary's cases on
@@ -644,6 +731,11 @@ impl Node {
             "-Daeron.archive.control.channel=aeron:udp?endpoint=localhost:{}",
             ports.archive(id)
         ));
+        properties.extend(
+            driver_properties
+                .iter()
+                .map(|property| (*property).to_owned()),
+        );
         let property_refs: Vec<&str> = properties.iter().map(String::as_str).collect();
 
         let mut driver = OwnArchivingMediaDriver::start(&name, archive_dir.path(), &property_refs)?;
@@ -684,6 +776,11 @@ impl Node {
             // this as `withLeaderHeartbeatTimeoutNs`.
             "-Daeron.cluster.leader.heartbeat.timeout=30s".to_owned(),
         ];
+        args.extend(
+            module_arguments
+                .iter()
+                .map(|argument| (*argument).to_owned()),
+        );
         match service {
             None => args.push("-Daeron.cluster.service.count=0".to_owned()),
             Some(name) => {

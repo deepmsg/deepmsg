@@ -129,7 +129,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long [`ConsensusModuleAgent::await_local_sockets_closed`] waits for the
 /// driver — see its note on why this build needs a deadline and the reference
 /// does not.
-const LOCAL_SOCKETS_CLOSED_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCAL_SOCKETS_CLOSED_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `ConsensusModule.Configuration.CLUSTER_INGRESS_FRAGMENT_LIMIT_DEFAULT` is 50;
 /// the consensus adapter polls with the same bound.
@@ -687,7 +687,7 @@ impl ConsensusModuleAgent {
             commit_position,
             appended_position,
             now_ns,
-            now_ns as u64,
+            election_rng_seed(now_ns, self.config.member_id),
         );
         self.election = Some(election);
         // `Election`'s constructor increments the election counter
@@ -1686,6 +1686,11 @@ impl ConsensusModuleAgent {
         let stop_result = self.try_stop_log_recording();
         self.stop_log_replication_session();
 
+        // `logPublisher.disconnect(errorHandler)` (`:300`), before the log
+        // subscription is closed: the publication goes first so that what reads
+        // it is told, and then the subscription that could no longer be served.
+        self.log_publisher.disconnect(&mut self.client);
+
         // The log subscription and the destinations on it hold sockets at this
         // member's **log** and catchup endpoints; the consensus subscription
         // below holds one at its consensus endpoint. The reference gives none
@@ -1861,7 +1866,8 @@ impl ConsensusModuleAgent {
             })?;
 
         self.log_publication_session_id = publication.session_id();
-        self.log_publisher.set_publication(publication);
+        self.log_publisher
+            .set_publication(&mut self.client, publication);
 
         // `addLogPublication` (`:1674-1683`): under MDC the leader is the only
         // writer, so every follower is a destination of its log publication.
@@ -2929,7 +2935,7 @@ impl ConsensusModuleAgent {
             commit_position,
             appended_position,
             now_ns,
-            now_ns as u64,
+            election_rng_seed(now_ns, self.config.member_id),
         );
         let _ = reason;
 
@@ -3433,6 +3439,15 @@ impl ElectionHost for ConsensusModuleAgent {
             self.await_local_sockets_closed(registration_id)?;
         }
 
+        // `logPublisher.disconnect(countedErrorHandler)` (`:1381`), beside the
+        // log adapter's and after it: the term's publication goes, so what
+        // reads it — this member's service, every follower's log
+        // subscription — is told its image is over. Leaving it alive is what
+        // makes the next term unjoinable: the service keeps the old image and
+        // never takes the `JoinLog` that would move it on
+        // (`BoundedLogAdapter.isDone`, `BoundedLogAdapter.java:115-118`).
+        self.log_publisher.disconnect(&mut self.client);
+
         self.last_quorum_backtrack_commit_position = NULL_POSITION;
 
         // `prepareForNewLeadership` (`:1382`): an operator switch is only
@@ -3451,6 +3466,56 @@ impl ElectionHost for ConsensusModuleAgent {
                 self.config.service_count,
                 self.log_recording_id,
             )?;
+
+            // `sessionManager.clearSessionsAfter(logPosition, leadershipTermId)`
+            // and `sessionManager.disconnectSessions()` (`:1392-1393`), in that
+            // order: a session opened past the committed position never existed,
+            // and every other one gives back the response publication and the
+            // counter the term that is ending held for it. The next term's
+            // `prepareSessionsForNewTerm` reconnects them, and its `connect`
+            // refuses a publication that was never given back — the leader then
+            // leaves the election on its first duty cycle with
+            // `response publication already added`, which is a cluster that
+            // re-elects for ever.
+            let leadership_term_id = self.leadership_term_id;
+            let member_id = self.config.member_id;
+            let leader_member_id = self.leader_member_id();
+            let service_count = self.config.service_count;
+            let commit_position_counter_id = self.counters.commit_position.counter_id();
+            {
+                let Self {
+                    client,
+                    sessions,
+                    egress,
+                    log_publisher,
+                    counters,
+                    recording_log,
+                    members,
+                    clock,
+                    ingress_endpoints,
+                    ..
+                } = self;
+                let mut ctx = SessionContext {
+                    client,
+                    log_publisher,
+                    egress,
+                    clock: &*clock,
+                    timed_out_counter: counters.timed_out_client,
+                    control_toggle: counters.control_toggle,
+                    leadership_term_id,
+                    member_id,
+                    leader_member_id,
+                    ingress_endpoints: &*ingress_endpoints,
+                    now_ns,
+                    recording_log,
+                    service_count,
+                    commit_position_counter_id,
+                    cluster_members: members.as_slice(),
+                };
+                sessions.clear_sessions_after(log_position, &mut ctx)?;
+            }
+            self.sessions.disconnect_sessions(&mut self.client);
+
             write_counter(&self.client, self.counters.commit_position, log_position);
             self.last_append_position = last_append_position;
             self.time_of_last_leader_update_ns = now_ns;
@@ -3658,15 +3723,16 @@ impl ElectionHost for ConsensusModuleAgent {
         // port possible — `LocalSocketAddressStatus.findNumberOfAddressesByRegistrationId`
         // counts the `LOCAL_SOCKADDR` counters that still name the id.
         //
-        // **Bounded here, and that is a deviation.** The reference waits
-        // without a deadline because its driver frees the endpoint — and every
-        // counter under it — when the last subscription leaves. This build's
-        // driver does not release receive endpoints yet (`receive_endpoints
-        // .rs::detach_subscription` is called from one place and the endpoint
-        // is kept), so a member whose log endpoint is shared with its own
-        // service container leaves the counter behind and the reference's wait
-        // never ends. Ten seconds is long past any driver turn; after it the
-        // close proceeds and a same-driver rebind is the caller's problem.
+        // **A bound, where the reference has none.** Its wait ends because the
+        // driver frees the endpoint — and the counters under it — once the
+        // endpoint's last subscription goes *and* its images are gone
+        // (`aeron_receive_channel_endpoint_try_remove_endpoint`,
+        // `media/aeron_receive_channel_endpoint.c:691-702`: the three stream
+        // refcounts at zero **and** `image_ref_count <= 0`). This build's driver
+        // has the same condition, so the wait ends the same way — after the
+        // image's liveness timeout. Thirty seconds is a bound on a wait that
+        // should take that long at most, kept so that a driver which never
+        // releases is a failure rather than a hung suite.
         let deadline = std::time::Instant::now() + LOCAL_SOCKETS_CLOSED_TIMEOUT;
         loop {
             self.idle()?;
@@ -3746,14 +3812,25 @@ impl ElectionHost for ConsensusModuleAgent {
             .unwrap_or(self.this_member_index);
 
         // `electionComplete` (`ConsensusModuleAgent.java:1905-1944`):
-        // `prepareSessionsForNewTerm(isLeaderStartup)` and then `connectIngress`.
-        // There are no sessions to prepare before P3-4d loads a snapshot, but
-        // the order is kept so that slice has the call where the reference has
-        // it.
+        // `prepareSessionsForNewTerm(isLeaderStartup)` **only on the leader**
+        // (`:1911-1922` is inside its role check), and then `connectIngress`,
+        // which every role does.
+        //
+        // The role gate is load-bearing now that preparing a session means
+        // reconnecting its response publication: a follower that took the call
+        // would publish into a client's response channel for a session only the
+        // leader answers, and would keep a publication the next term's
+        // `prepareForNewLeadership` does not know to disconnect.
         let is_leader_startup = self.node_startup_election;
         self.node_startup_election = false;
-        self.sessions
-            .prepare_sessions_for_new_term(is_leader_startup, now_ns);
+        if self.role == Role::Leader {
+            self.sessions.prepare_sessions_for_new_term(
+                &mut self.client,
+                self.config.cluster_id,
+                is_leader_startup,
+                now_ns,
+            )?;
+        }
         self.connect_ingress()?;
 
         Ok(())
@@ -4114,6 +4191,25 @@ fn channel_uri_media_is_udp(channel: &str) -> bool {
 fn replace_port_with_wildcard(endpoint: &str) -> Option<String> {
     let index = endpoint.rfind(':')?;
     Some(format!("{}0", &endpoint[..=index]))
+}
+
+/// The seed of one election's canvass backoff: the clock **and the member**.
+///
+/// The member is in it because this build's cluster clock counts
+/// milliseconds (`MillisecondClusterClock`, `clock.rs:69`), so `time_nanos()`
+/// is a millisecond value scaled up and every member that enters an election
+/// inside the same millisecond — which is what a partition does — would hand
+/// its generator the identical seed. The streams then draw identical
+/// nomination delays, every member nominates in the same millisecond, every
+/// ballot splits, and the cluster cannot elect at all: measured on the
+/// partition scenario as six consecutive rounds with the three members'
+/// nomination deadlines equal to the millisecond (`records/P3-6c.md`).
+///
+/// The reference has no such coupling to have to avoid: its `Random`
+/// (`ConsensusModule.java:2131`) is seeded from `System.nanoTime`, which is
+/// nanoseconds and per-process.
+fn election_rng_seed(now_ns: i64, member_id: i32) -> u64 {
+    (now_ns as u64) ^ (member_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 fn storage_space_refusal(error: &ClusterError) -> bool {

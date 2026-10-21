@@ -2021,6 +2021,29 @@ impl Conductor {
 
         let _ = self.receiver.remove_image(registration_id);
 
+        // `aeron_driver_conductor_image_transition_to_linger` (`:1642-1675`):
+        // the cool-down the removal above leaves behind is cleared again when
+        // the subscription that read the image rejoins — otherwise no `SETUP`
+        // and no frame from that session can ever make another image
+        // (`aeron_data_packet_dispatcher.c:503-506`, `:410-413`), and a
+        // publisher still sending is never heard from again. Read off the
+        // **last** matching link, as the reference's loop leaves it; a
+        // subscription that says `rejoin=false` — the cluster's own log
+        // subscription (`Election.java:1376`) — keeps its cool-down.
+        let rejoin = self
+            .subscriptions
+            .readers_of(registration_id)
+            .iter()
+            .fold(true, |_, link| link.is_rejoin);
+
+        if rejoin {
+            let _ = self.receiver.remove_cool_down(
+                image.endpoint_id,
+                image.stream_id,
+                image.session_id,
+            );
+        }
+
         // A reader that has not been told yet is told now: the normal path has
         // already said so as the image left DRAINING (`:1642-1675`), and a
         // **revoked** one has not — it goes LINGER→DONE without a linger to

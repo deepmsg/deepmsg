@@ -151,9 +151,15 @@ impl UdpTransport {
                 socket.set_multicast_ttl(params.ttl)?;
             }
         } else {
-            // `:147-154`: a unicast transport binds and nothing else — and
-            // this is the bind whose failure the reference composes from the
-            // descriptor and the address.
+            // `:147-154`: a unicast transport binds and nothing else, and it is
+            // the bind whose failure the reference composes from the descriptor
+            // and the address. **No reuse options**: the `SO_REUSEADDR` /
+            // `SO_REUSEPORT` pair at `:168-190` is inside the *multicast* branch
+            // — the `else` of `if (!is_multicast)`, whose first act is that
+            // bind. Setting them here as well looks like the same behaviour and
+            // is not: a receive destination naming an address another socket of
+            // this driver already holds would bind instead of being refused,
+            // which is what `mds_added_destination` caught.
             socket.bind(bind).map_err(OpenError::Bind)?;
         }
 

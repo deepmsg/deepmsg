@@ -108,16 +108,41 @@ impl LogPublisher {
         }
     }
 
-    /// Take the log publication, once, when the election creates it.
+    /// Take the log publication, when the election creates it.
     ///
-    /// `LogPublisher.publication(ExclusivePublication)` (`LogPublisher.java:69`).
+    /// `LogPublisher.publication(ExclusivePublication)` (`LogPublisher.java:69-76`):
+    /// a previous publication is **closed**, not dropped. Dropping one tells
+    /// the driver nothing — a `Publication` is `REMOVE_PUBLICATION`'s
+    /// registration id and nothing else — so the old log publication would go
+    /// on existing for the life of the client, with every reader it has
+    /// (the member's service, a follower's log subscription) holding an image
+    /// that can never advance and is never told it is over. A re-elected
+    /// cluster then cannot join the new term at all: the container waits in
+    /// `joinActiveLog` for an image it will not let go of
+    /// (`BoundedLogAdapter.isDone`, `BoundedLogAdapter.java:115-118`), and the
+    /// consensus module waits for the ack that join never sends.
     ///
     /// # Errors
     ///
-    /// Nothing; the reference closes a previous publication here and this one
-    /// simply replaces it, because the only caller creates it once per term.
-    pub fn set_publication(&mut self, publication: ExclusivePublication) {
+    /// None returned: the close is best effort, as the reference's
+    /// `CloseHelper`-style call is. A refusal leaves the old publication
+    /// behind, which is the state this existed in before — not a new failure.
+    pub fn set_publication(&mut self, client: &mut Client, publication: ExclusivePublication) {
+        self.disconnect(client);
         self.publication = Some(publication);
+    }
+
+    /// Give the log publication back (`LogPublisher.disconnect`,
+    /// `LogPublisher.java:83-89`).
+    ///
+    /// Called from `prepareForNewLeadership` (`ConsensusModuleAgent.java:1381`)
+    /// and from `close` (`:300`), in that order of importance: the first is
+    /// what makes the *next* term joinable at once rather than after a liveness
+    /// timeout, and it is the one this build used to leave out.
+    pub fn disconnect(&mut self, client: &mut Client) {
+        if let Some(publication) = self.publication.take() {
+            let _ = client.remove_publication(publication.registration_id(), COMMAND_TIMEOUT);
+        }
     }
 
     /// The publication, for an extension or a snapshot taker that needs the

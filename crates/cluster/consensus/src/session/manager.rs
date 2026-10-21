@@ -846,7 +846,25 @@ impl SessionManager {
     }
 
     /// `prepareSessionsForNewTerm` (`SessionManager.java:932-967`).
-    pub fn prepare_sessions_for_new_term(&mut self, is_startup: bool, now_ns: i64) {
+    ///
+    /// The re-election arm is two passes, and the first is the one this build
+    /// used to leave out: every open session **reconnects** — the term's
+    /// `prepareForNewLeadership` disconnected them, response publications and
+    /// all — before the second marks the new-leader event pending. Without the
+    /// reconnect the event below is sent into a session with no publication,
+    /// and the client, which kept its session through the partition, never
+    /// learns where the cluster is.
+    ///
+    /// # Errors
+    ///
+    /// The reconnect's: a session counter that cannot be built or is refused.
+    pub fn prepare_sessions_for_new_term(
+        &mut self,
+        client: &mut Client,
+        cluster_id: i32,
+        is_startup: bool,
+        now_ns: i64,
+    ) -> Result<(), ClusterError> {
         if is_startup {
             for session in self.sessions.iter_mut() {
                 if session.is_open() {
@@ -856,10 +874,36 @@ impl SessionManager {
         } else {
             for session in self.sessions.iter_mut() {
                 if session.is_open() {
+                    session.connect(client, cluster_id)?;
+                }
+            }
+
+            for session in self.sessions.iter_mut() {
+                if session.is_open() {
                     session.set_time_of_last_activity_ns(now_ns);
                     session.set_new_leader_event_pending(true);
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// `disconnectSessions` (`SessionManager.java:444-452`): every session
+    /// gives back the response publication and the counter the term that is
+    /// ending was holding.
+    ///
+    /// Called from `prepareForNewLeadership` (`ConsensusModuleAgent.java:1393`),
+    /// beside `clearSessionsAfter` and after it. The next term's
+    /// `prepareSessionsForNewTerm` reconnects what this one lets go, and its
+    /// `connect` refuses a publication that was never given back — the leader
+    /// then falls out of the election on its first duty cycle with
+    /// `cluster: response publication already added`, which is a cluster that
+    /// re-elects for ever.
+    pub fn disconnect_sessions(&mut self, client: &mut Client) {
+        for session in self.sessions.iter_mut() {
+            session.unlink_ingress_image();
+            session.disconnect(client);
         }
     }
 
