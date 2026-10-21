@@ -1686,6 +1686,11 @@ impl ConsensusModuleAgent {
         let stop_result = self.try_stop_log_recording();
         self.stop_log_replication_session();
 
+        // `logPublisher.disconnect(errorHandler)` (`:300`), before the log
+        // subscription is closed: the publication goes first so that what reads
+        // it is told, and then the subscription that could no longer be served.
+        self.log_publisher.disconnect(&mut self.client);
+
         // The log subscription and the destinations on it hold sockets at this
         // member's **log** and catchup endpoints; the consensus subscription
         // below holds one at its consensus endpoint. The reference gives none
@@ -1861,7 +1866,8 @@ impl ConsensusModuleAgent {
             })?;
 
         self.log_publication_session_id = publication.session_id();
-        self.log_publisher.set_publication(publication);
+        self.log_publisher
+            .set_publication(&mut self.client, publication);
 
         // `addLogPublication` (`:1674-1683`): under MDC the leader is the only
         // writer, so every follower is a destination of its log publication.
@@ -3432,6 +3438,15 @@ impl ElectionHost for ConsensusModuleAgent {
             self.remove_log_subscription(registration_id)?;
             self.await_local_sockets_closed(registration_id)?;
         }
+
+        // `logPublisher.disconnect(countedErrorHandler)` (`:1381`), beside the
+        // log adapter's and after it: the term's publication goes, so what
+        // reads it — this member's service, every follower's log
+        // subscription — is told its image is over. Leaving it alive is what
+        // makes the next term unjoinable: the service keeps the old image and
+        // never takes the `JoinLog` that would move it on
+        // (`BoundedLogAdapter.isDone`, `BoundedLogAdapter.java:115-118`).
+        self.log_publisher.disconnect(&mut self.client);
 
         self.last_quorum_backtrack_commit_position = NULL_POSITION;
 
