@@ -268,9 +268,10 @@ fn a_stopped_follower_catches_up_through_the_leaders_archive() {
 /// — so a replay cannot fill it and the election takes the archive-to-archive
 /// replication (`Election.java:897-958`).
 ///
-/// The reference's `useResponseChannels=true` arm is `n/a:0e` here:
-/// response-mode replication is the archive client's, and it is not in this
-/// build.
+/// The reference's `useResponseChannels=true` arm — the same scenario with the
+/// member string's seventh attribute — is
+/// `tests/interop/cluster_response_replication.rs`: a response-channel copy,
+/// which the archive's `ReplicationSession` serves since P3-0e.
 #[test]
 fn a_member_that_missed_a_term_is_caught_up_by_replication() {
     let _serial = serial();

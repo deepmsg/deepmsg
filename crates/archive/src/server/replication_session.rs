@@ -35,10 +35,15 @@
 //!
 //! # What is here, and what is not
 //!
-//! **Nine of the twelve states walk, and every route through the machine ends
-//! at the tenth.** `CONNECT` was first and the rest arrived one commit at a
-//! time, in the order they are listed in [`State`]; what each one does, and
-//! what it is observable through, is that state's own note.
+//! **Eleven of the twelve states walk, and every route through the machine
+//! ends at the twelfth.** `CONNECT` was first and the rest arrived one commit
+//! at a time, in the order they are listed in [`State`]; what each one does,
+//! and what it is observable through, is that state's own note.
+//!
+//! `REPLAY_TOKEN` and `GET_ARCHIVE_PROXY` — the pair a **response-channel**
+//! copy takes — were the last two in, and they are where a replication over a
+//! response channel stops being a refusal: the token is asked for, the second
+//! publication is made over it, and the replay goes out through that proxy.
 //!
 //! The two that do not walk are `CATCHUP` and `ATTEMPT_LIVE_JOIN`, the
 //! live-merge pair. They are named and documented rather than stubbed, and that
@@ -51,7 +56,8 @@
 use std::time::Duration;
 
 use deepmsg_client::client::{
-    AsyncDestination, AsyncDestinationPoll, AsyncNextSessionId, AsyncNextSessionIdPoll, Client,
+    AsyncAdd, AsyncAddPoll, AsyncDestination, AsyncDestinationPoll, AsyncNextSessionId,
+    AsyncNextSessionIdPoll, Client,
 };
 use deepmsg_client::image::ImageView;
 use deepmsg_codec::archive::recording_signal::RecordingSignal;
@@ -64,7 +70,7 @@ use crate::client::async_connect::{
 };
 use crate::client::context::ArchiveContext;
 use crate::client::descriptor_poller::RecordingDescriptor;
-use crate::client::proxy::ReplayParams;
+use crate::client::proxy::{ArchiveProxy, ReplayParams};
 use crate::client::replay_merge::LIVE_ADD_MAX_WINDOW;
 use crate::mark::NULL_VALUE;
 use crate::server::conductor::{
@@ -93,6 +99,14 @@ const TAGS_KEY: &str = "tags";
 const CONTROL_MODE_MANUAL: &str = "manual";
 /// `CommonContext.RESPONSE_CORRELATION_ID_PARAM_NAME`.
 const RESPONSE_CORRELATION_ID_KEY: &str = "response-correlation-id";
+/// `CommonContext.TERM_LENGTH_PARAM_NAME` (`CommonContext.java:263`).
+const TERM_LENGTH_KEY: &str = "term-length";
+/// `CommonContext.TERM_ID_PARAM_NAME` (`CommonContext.java:267`).
+const TERM_ID_KEY: &str = "term-id";
+/// `CommonContext.INITIAL_TERM_ID_PARAM_NAME` (`CommonContext.java:271`).
+const INITIAL_TERM_ID_KEY: &str = "initial-term-id";
+/// `CommonContext.TERM_OFFSET_PARAM_NAME` (`CommonContext.java:275`).
+const TERM_OFFSET_KEY: &str = "term-offset";
 /// `AeronArchive.NULL_LENGTH` (`AeronArchive.java:106`), which is `NULL_VALUE`:
 /// a replay with no length follows the source (`:115-117`).
 const NULL_LENGTH: i64 = NULL_VALUE;
@@ -358,9 +372,19 @@ pub struct ReplicationSession {
     /// request carries and `REPLAY` passes on to the source.
     file_io_max_length: i32,
     /// `replayToken` (`:111`): the token a replay over a **response channel**
-    /// needs, or `NULL_VALUE`. Nothing in this build asks for one — see
-    /// [`State::ReplayToken`].
+    /// needs, or `NULL_VALUE`. Asked for by [`State::ReplayToken`].
     replay_token: i64,
+    /// The add of the second publication, while the driver has not answered it
+    /// — `responsePublicationRegistrationId` before it is an id
+    /// (`ReplicationSession.java:92-95`).
+    response_add: Option<AsyncAdd>,
+    /// `responsePublicationRegistrationId` (`:93`): the registration id of the
+    /// publication a replay token buys, or `NULL_VALUE`.
+    response_publication_registration_id: i64,
+    /// `responseArchiveProxy` (`:95`): a proxy over that publication, once it
+    /// is connected with a window. `REPLAY` sends through it when it is there
+    /// and through the source's own proxy when it is not (`:716-719`).
+    response_archive_proxy: Option<ArchiveProxy>,
     /// `srcReplaySessionId` (`:78`): the session the **source's replay** runs
     /// under, which is what `AWAIT_IMAGE` looks for at the destination.
     src_replay_session_id: i64,
@@ -551,6 +575,51 @@ fn extend_channel_uri(
     Ok(uri.build())
 }
 
+/// The channel `GET_ARCHIVE_PROXY` builds its second publication on
+/// (`ReplicationSession.java:613-624`).
+///
+/// The source's control request channel, with three changes and one addition:
+/// the recording subscription's registration id becomes the response
+/// correlation (`:614`), the term is 64 KiB (`:620`), and the three term
+/// *positions* are taken out (`:615-618` null them) — a channel copied from a
+/// stream that had a position would name a place in a log this publication does
+/// not share.
+fn proxy_publication_channel(
+    control_request_channel: &str,
+    registration_id: i64,
+) -> Result<String, String> {
+    let mut uri = ChannelUri::parse(control_request_channel)
+        .map_err(|error| format!("{control_request_channel} is not a channel: {error}"))?;
+
+    uri.put(RESPONSE_CORRELATION_ID_KEY, registration_id.to_string());
+    uri.put(TERM_LENGTH_KEY, (64 * 1024).to_string());
+    uri.remove(TERM_ID_KEY);
+    uri.remove(INITIAL_TERM_ID_KEY);
+    uri.remove(TERM_OFFSET_KEY);
+
+    Ok(uri.build())
+}
+
+/// Whether the proxy publication is connected and has room to offer
+/// (`ReplicationSession.java:636-660`).
+///
+/// The window is the driver's `position_limit` counter minus the publication's
+/// position, which is what every offer is judged against — the same question
+/// [`crate::server::replay_session::position_limit`] answers for a replay.
+fn proxy_publication_is_ready(client: &Client, registration_id: i64) -> bool {
+    let Some(publication) = client.exclusive_publication(registration_id) else {
+        return false;
+    };
+
+    let window = client
+        .counters_reader()
+        .and_then(|counters| counters.value(publication.position_limit_counter_id()))
+        .and_then(|limit| publication.available_window(limit))
+        .unwrap_or(0);
+
+    publication.is_connected() == Some(true) && window > 0
+}
+
 impl ReplicationSession {
     /// A session that has not started: `state = CONNECT`
     /// (`ReplicationSession.java:110`).
@@ -605,6 +674,9 @@ impl ReplicationSession {
             recording_subscription: None,
             file_io_max_length,
             replay_token: NULL_VALUE,
+            response_add: None,
+            response_publication_registration_id: NULL_VALUE,
+            response_archive_proxy: None,
             src_replay_session_id: NULL_VALUE,
             credentials,
             now_ms: 0,
@@ -717,8 +789,8 @@ impl ReplicationSession {
             State::ReplicateDescriptor => self.replicate_descriptor(client, catalog, now_ms),
             State::SrcRecordingPosition => self.src_recording_position(client, now_ms),
             State::Extend => self.extend(client),
-            State::ReplayToken => self.replay_token(),
-            State::GetArchiveProxy => self.get_archive_proxy(),
+            State::ReplayToken => self.replay_token(client, now_ms),
+            State::GetArchiveProxy => self.get_archive_proxy(client, now_ms),
             State::Replay => self.replay(client, now_ms),
             State::AwaitImage => self.await_image(client, now_ms),
             State::Replicate => self.replicate(client, now_ms),
@@ -1363,48 +1435,165 @@ impl ReplicationSession {
 
     /// `ReplicationSession.replayToken` (`:569-605`).
     ///
-    /// **A pass-through for every channel this build serves.** The state exists
-    /// to ask the source for a token when the copy runs over a **response
-    /// channel** (`:573-575` is the whole of its guard), and the token is what
-    /// `GET_ARCHIVE_PROXY` turns into a second publication for an image that is
-    /// not this session's.
+    /// The token is what a replay over a **response channel** needs: the image
+    /// that drives the copy is not the one this session's `REPLAY` will start,
+    /// so the source has to be asked to hand its replay to the image named by
+    /// the token. Every other channel is a pass-through (`:573-575` is the
+    /// whole of the guard).
     ///
-    /// No criterion in this slice reaches a response-channel replication (plan
-    /// §3.2) and the request behind it — `requestReplayToken`, template 105 — is
-    /// not built, so a session that did take that branch **ends loudly** rather
-    /// than walking on to build a publication out of a token it never asked
-    /// for. A silent pass-through there would be a session that looks like it
-    /// works and copies nothing.
-    fn replay_token(&mut self) -> Result<(), String> {
+    /// The two halves are the shape every request state here has: ask on one
+    /// turn, read the answer on a later one, and neither blocks. The answer's
+    /// `relevantId` **is** the token (`:598-600`).
+    fn replay_token(&mut self, client: &mut Client, now_ms: i64) -> Result<(), String> {
         if self.replay_token != NULL_VALUE || !self.replication_channel_is_response() {
             self.go_to(State::GetArchiveProxy);
 
             return Ok(());
         }
 
-        Err(
-            "a replication over a response channel needs a replay token, which \
-             this build does not ask for"
-                .to_owned(),
-        )
-    }
+        if self.active_correlation_id == NULL_VALUE {
+            let correlation_id = {
+                let Some(archive) = self.src_archive.as_mut() else {
+                    return Err("no source archive: the connect did not finish".to_owned());
+                };
 
-    /// `ReplicationSession.getArchiveProxy` (`:606-665`).
-    ///
-    /// The reference's **first branch is this whole state** for a session that
-    /// has no token (`:610-614`), and that is every session this build drives:
-    /// [`State::ReplayToken`] is the only thing that sets one and it refuses to
-    /// ask. The rest — a second publication on the source's control channel,
-    /// waited for until it is connected and has a window — is therefore not
-    /// built, and a session that somehow reached it says so rather than
-    /// producing a proxy that is not there.
-    fn get_archive_proxy(&mut self) -> Result<(), String> {
-        if self.replay_token != NULL_VALUE {
-            return Err("a replay token needs a second publication, which this \
-                        build does not make"
-                .to_owned());
+                archive
+                    .next_correlation_id(client)
+                    .map_err(|error| error.to_string())?
+            };
+
+            let offered = {
+                let Some(archive) = self.src_archive.as_mut() else {
+                    return Ok(());
+                };
+
+                archive
+                    .proxy_mut()
+                    .request_replay_token(client, correlation_id, self.request.src_recording_id)
+                    .is_ok()
+            };
+
+            if !offered {
+                return self.expire_or_hold(now_ms, "failed to send replay token request");
+            }
+
+            self.track_action(correlation_id, now_ms);
+
+            return Ok(());
         }
 
+        let answer = {
+            let Some(archive) = self.src_archive.as_mut() else {
+                return Ok(());
+            };
+
+            archive
+                .poll_for_response(client, self.active_correlation_id)
+                .map_err(|error| error.to_string())?
+        };
+
+        let Some(token) = answer else {
+            return self.expire_or_hold(now_ms, "failed to get replay token");
+        };
+
+        self.replay_token = token;
+        self.go_to(State::GetArchiveProxy);
+
+        Ok(())
+    }
+
+    /// `ReplicationSession.getArchiveProxy` (`:606-665`): the second
+    /// publication a token buys, and the proxy over it.
+    ///
+    /// The publication is built **from the source's control request channel**
+    /// with `response-correlation-id=<the recording subscription's registration
+    /// id>`, a term length of 64 KiB and no term position (`:613-624`): it is a
+    /// *response* publication, so it sends only to the address its image's SM
+    /// came from — which is why its stream id is the source's control stream
+    /// and why `REPLAY` through it is answered where the first one's answers
+    /// are. The id that identifies the image is the **destination's** recording
+    /// subscription (`:614`), created by [`State::Extend`] two states ago.
+    ///
+    /// A session without a token is a session on a plain channel, and this
+    /// whole state is the reference's first branch for it (`:610-614`).
+    ///
+    /// **Nothing here blocks.** The publication is asked for asynchronously
+    /// and taken up on a later turn, the way [`State::Connect`] gets its
+    /// session id: this runs inside the conductor's turn, where a blocking
+    /// command is a deadlock (the module note).
+    fn get_archive_proxy(&mut self, client: &mut Client, now_ms: i64) -> Result<(), String> {
+        if self.replay_token == NULL_VALUE {
+            self.go_to(State::Replay);
+
+            return Ok(());
+        }
+
+        if self.response_publication_registration_id == NULL_VALUE {
+            if self.response_add.is_none() {
+                let Some(registration_id) = self.recording_subscription else {
+                    return Err(
+                        "no recording subscription: the extend did not finish, and its \
+                         registration id is what the proxy publication answers for"
+                            .to_owned(),
+                    );
+                };
+                let Some(control_request_channel) = self.context.control_request_channel.as_deref()
+                else {
+                    return Err("the source's control request channel is not set".to_owned());
+                };
+                let channel = proxy_publication_channel(control_request_channel, registration_id)?;
+                let timeout = Duration::from_nanos(
+                    u64::try_from(self.context.message_timeout_ns).unwrap_or(u64::MAX),
+                );
+
+                self.response_add = Some(
+                    client
+                        .async_add_exclusive_publication(
+                            &channel,
+                            self.context.control_request_stream_id,
+                            timeout,
+                        )
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+
+            let Some(add) = self.response_add else {
+                return Ok(());
+            };
+
+            match client.async_add_poll(add) {
+                AsyncAddPoll::Ready => {
+                    self.response_publication_registration_id = add.registration_id();
+                    self.response_add = None;
+                }
+                AsyncAddPoll::Awaiting => {
+                    return self.expire_or_hold(now_ms, "the proxy publication was not added");
+                }
+                AsyncAddPoll::Failed(error) => {
+                    return Err(format!("the proxy publication was refused: {error}"));
+                }
+                AsyncAddPoll::Unknown => {
+                    return Err("the proxy publication's add was already answered".to_owned());
+                }
+            }
+        }
+
+        // `:636-660`: connected, and with room to offer. Both are the driver's
+        // and neither is a deadline of its own — the state's action deadline is
+        // what gives up on them.
+        let ready = proxy_publication_is_ready(client, self.response_publication_registration_id);
+
+        if !ready {
+            return self.expire_or_hold(now_ms, "the proxy publication is not ready to offer");
+        }
+
+        let mut proxy = ArchiveProxy::new(&self.context, self.response_publication_registration_id);
+
+        if let Some(archive) = self.src_archive.as_ref() {
+            proxy.set_control_session_id(archive.control_session_id());
+        }
+
+        self.response_archive_proxy = Some(proxy);
         self.go_to(State::Replay);
 
         Ok(())
@@ -1488,22 +1677,38 @@ impl ReplicationSession {
                     .map_err(|error| error.to_string())?
             };
 
-            let offered = {
-                let Some(archive) = self.src_archive.as_mut() else {
-                    return Ok(());
-                };
-
-                archive
-                    .proxy_mut()
+            // `:716-719`: the token's proxy when there is one. The request is
+            // the same either way; what changes is the publication it goes out
+            // on, and so which image the source's replay is addressed to.
+            let (recording_id, stream_id) = (self.request.src_recording_id, self.replay_stream_id);
+            let offered = match self.response_archive_proxy.as_mut() {
+                Some(proxy) => proxy
                     .replay(
                         client,
                         correlation_id,
-                        self.request.src_recording_id,
+                        recording_id,
                         &channel,
-                        self.replay_stream_id,
+                        stream_id,
                         &params,
                     )
-                    .is_ok()
+                    .is_ok(),
+                None => {
+                    let Some(archive) = self.src_archive.as_mut() else {
+                        return Ok(());
+                    };
+
+                    archive
+                        .proxy_mut()
+                        .replay(
+                            client,
+                            correlation_id,
+                            recording_id,
+                            &channel,
+                            stream_id,
+                            &params,
+                        )
+                        .is_ok()
+                }
             };
 
             if !offered {
@@ -1954,6 +2159,16 @@ impl ReplicationSession {
             archive.close(client);
         }
 
+        // `CloseHelper.close(countedErrorHandler, responsePublication)`
+        // (`:207`): the second publication is this session's, and a copy over a
+        // response channel would leave one behind per replication otherwise.
+        if self.response_publication_registration_id != NULL_VALUE {
+            let registration_id =
+                std::mem::replace(&mut self.response_publication_registration_id, NULL_VALUE);
+            self.response_archive_proxy = None;
+            crate::server::replay_session::close_publication(client, registration_id);
+        }
+
         self.notices.push(ReplicationNotice::Signal {
             recording_id: self.dst_recording_id,
             subscription_id: NULL_VALUE,
@@ -2222,6 +2437,36 @@ mod tests {
             !channel.contains("session-id="),
             "and no session id, which is the one channel that may not carry \
              one: {channel}"
+        );
+    }
+
+    /// **The proxy publication's channel is the source's control channel with
+    /// three positions taken out and two things put on** (`:613-624`): the
+    /// recording subscription's registration id as the response correlation,
+    /// and a 64 KiB term. A channel that named a term position would name a
+    /// place in a log this publication does not share (`:615-618`).
+    #[test]
+    fn the_proxy_publication_names_the_subscription_and_no_position() {
+        let channel = proxy_publication_channel(
+            "aeron:udp?endpoint=localhost:8010|term-id=7|initial-term-id=3|term-offset=64",
+            4_242,
+        )
+        .expect("a channel");
+
+        assert!(
+            channel.contains("response-correlation-id=4242"),
+            "the destination subscription the answers belong to: {channel}"
+        );
+        assert!(channel.contains("term-length=65536"), "{channel}");
+        assert!(
+            !channel.contains("term-id=")
+                && !channel.contains("initial-term-id=")
+                && !channel.contains("term-offset="),
+            "no position at all: {channel}"
+        );
+        assert!(
+            channel.contains("endpoint=localhost:8010"),
+            "and the source it is aimed at is kept: {channel}"
         );
     }
 
