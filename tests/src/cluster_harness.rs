@@ -1637,6 +1637,51 @@ pub struct BackupOptions {
     pub credentials: Option<TestCredentials>,
 }
 
+/// Where a backup's cluster is — the three strings the reference's fixture
+/// builds for a backup beside Java nodes (`TestCluster.java:590-597`).
+///
+/// A backup beside this harness's own members gets them from [`Ports`]
+/// ([`Self::from_ports`]). The interop suite is the other arrangement: the
+/// members are Java processes whose consensus endpoints come from
+/// `ClusterPorts`, and the backup's own driver has to bind an endpoint none of
+/// that table names.
+#[derive(Clone, Debug)]
+pub struct BackupTarget {
+    /// `aeron.cluster.id` — the cluster's, not the backup's own.
+    pub cluster_id: i32,
+    /// `aeron.cluster.members`, as the cluster advertises it. The backup also
+    /// reads the log supplier's archive endpoint out of the **response**
+    /// (`ClusterBackupAgent.java:558-590`), so this only has to be well formed.
+    pub member_string: String,
+    /// `aeron.cluster.consensus.endpoints`: every member's consensus endpoint,
+    /// comma separated. The query publication is created per member from this.
+    pub consensus_endpoints: String,
+    /// The endpoint the backup's own query publication binds — the channel a
+    /// member answers the backup query on (`TestCluster.java:591-592`).
+    pub consensus_endpoint: String,
+    /// What the backup's driver directory is named after. It carries the port
+    /// block, because `cargo test` runs a binary's cases on one process's
+    /// threads and two drivers that share a directory collide.
+    pub name: String,
+}
+
+impl BackupTarget {
+    /// The target for a cluster [`Ports`] describes: the harness's own.
+    #[must_use]
+    pub fn from_ports(ports: &Ports, member_string: &str) -> Self {
+        Self {
+            cluster_id: CLUSTER_ID,
+            member_string: member_string.to_owned(),
+            consensus_endpoints: (0..MEMBER_COUNT)
+                .map(|id| format!("localhost:{}", ports.consensus(id)))
+                .collect::<Vec<_>>()
+                .join(","),
+            consensus_endpoint: format!("localhost:{}", ports.backup_consensus()),
+            name: format!("cluster-backup-{}", ports.base()),
+        }
+    }
+}
+
 /// What a case's backup offers the cluster and its archive.
 ///
 /// The reference's three suppliers (`Null`, `Simple`, `ChallengeResponse`)
@@ -1708,6 +1753,24 @@ impl BackupNode {
         archive_dir: TempDir,
         cluster_dir: TempDir,
     ) -> Option<Self> {
+        Self::start_with_target(
+            BackupTarget::from_ports(ports, member_string),
+            faults,
+            options,
+            archive_dir,
+            cluster_dir,
+        )
+    }
+
+    /// The same, against a cluster whose endpoints this harness did not hand
+    /// out — the interop suite's backup beside Java nodes.
+    pub fn start_with_target(
+        target: BackupTarget,
+        faults: &Faults,
+        options: BackupOptions,
+        archive_dir: TempDir,
+        cluster_dir: TempDir,
+    ) -> Option<Self> {
         let properties: Vec<String> = archive::PROPERTIES
             .iter()
             .map(|property| (*property).to_owned())
@@ -1715,30 +1778,23 @@ impl BackupNode {
         let property_refs: Vec<&str> = properties.iter().map(String::as_str).collect();
 
         let mut driver =
-            OwnArchivingMediaDriver::start(
-                &format!("cluster-backup-{}", ports.base()),
-                archive_dir.path(),
-                &property_refs,
-            )?;
+            OwnArchivingMediaDriver::start(&target.name, archive_dir.path(), &property_refs)?;
         driver
             .await_ready(DEADLINE)
             .expect("the backup's archive comes up");
 
-        let consensus_endpoints = (0..MEMBER_COUNT)
-            .map(|id| format!("localhost:{}", ports.consensus(id)))
-            .collect::<Vec<_>>()
-            .join(",");
+        let consensus_endpoints = target.consensus_endpoints;
 
         let mut properties = Properties::new();
         properties
             .apply_args(vec![
                 format!("-Daeron.dir={}", driver.aeron_dir().display()),
                 format!("-Daeron.cluster.dir={}", cluster_dir.path().display()),
-                format!("-Daeron.cluster.id={CLUSTER_ID}"),
-                format!("-Daeron.cluster.members={member_string}"),
+                format!("-Daeron.cluster.id={}", target.cluster_id),
+                format!("-Daeron.cluster.members={}", target.member_string),
                 format!(
-                    "-Daeron.cluster.consensus.channel=aeron:udp?endpoint=localhost:{}",
-                    ports.backup_consensus()
+                    "-Daeron.cluster.consensus.channel=aeron:udp?endpoint={}",
+                    target.consensus_endpoint
                 ),
                 format!("-Daeron.cluster.consensus.endpoints={consensus_endpoints}"),
                 format!(

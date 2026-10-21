@@ -301,6 +301,12 @@ impl Options {
 /// binds its endpoints), and a client that names `ingressEndpoints` is told
 /// `id=endpoint` instead. Both spellings are produced here so a scenario
 /// cannot get one of them from a different base than the other.
+///
+/// **A base belongs below `net.ipv4.ip_local_port_range`** (32768 on this
+/// machine): inside it any process may take a port mid-run, and a cluster that
+/// loses one of its own endpoints to, say, `avahi-daemon` fails in a way that
+/// reads as a member dying for no reason (the member's follower log handover
+/// binds its own log endpoint, `Election.java:1362`).
 #[derive(Clone, Copy, Debug)]
 pub struct ClusterPorts {
     base: u16,
@@ -433,6 +439,35 @@ impl TestCluster {
     /// [`NodeImpl::Rust`], [`DriverImpl::Deepmsg`]) or when a node or container
     /// does not start.
     pub fn start(test_name: &str, members: &[MemberSpec], options: Options) -> Option<Self> {
+        Self::start_inner(test_name, members, options, Vec::new())
+    }
+
+    /// [`Self::start`], with some members' `cluster.dir` and `archive.dir`
+    /// supplied by the caller — `(member id, archive dir, cluster dir)`, the
+    /// order [`BackupNode::into_directories`] hands them over in.
+    ///
+    /// The reference's `startStaticNodeFromBackup` (`TestCluster.java:623-687`)
+    /// starts a member over the two directories a backup wrote: they are not
+    /// this fixture's to create, and `deleteDirOnStart` is `false` because what
+    /// is in them *is* the thing under test. The driver's own directory is
+    /// still new — the reference deletes and recreates that one.
+    ///
+    /// [`BackupNode::into_directories`]: crate::cluster_harness::BackupNode::into_directories
+    pub fn start_over_directories(
+        test_name: &str,
+        members: &[MemberSpec],
+        options: Options,
+        directories: Vec<(i32, TempDir, TempDir)>,
+    ) -> Option<Self> {
+        Self::start_inner(test_name, members, options, directories)
+    }
+
+    fn start_inner(
+        test_name: &str,
+        members: &[MemberSpec],
+        options: Options,
+        mut directories: Vec<(i32, TempDir, TempDir)>,
+    ) -> Option<Self> {
         assert!(!members.is_empty(), "a cluster needs at least one member");
         for member in members {
             assert!(
@@ -478,11 +513,22 @@ impl TestCluster {
             if nodes.iter().any(|node| node.id == member.id) {
                 continue;
             }
+            let supplied = directories
+                .iter()
+                .position(|(id, _, _)| *id == member.id)
+                .map(|index| directories.remove(index));
+            let (archive, cluster) = match supplied {
+                Some((_, archive, cluster)) => (archive, cluster),
+                None => (
+                    TempDir::new(&format!("{test_name}-{}-archive", member.id)),
+                    TempDir::new(&format!("{test_name}-{}-cluster", member.id)),
+                ),
+            };
             nodes.push(Node {
                 id: member.id,
                 aeron: TempDir::new(&format!("{test_name}-{}-aeron", member.id)),
-                cluster: TempDir::new(&format!("{test_name}-{}-cluster", member.id)),
-                archive: TempDir::new(&format!("{test_name}-{}-archive", member.id)),
+                cluster,
+                archive,
                 service_count: i32::try_from(
                     members.iter().filter(|other| other.id == member.id).count(),
                 )
@@ -490,6 +536,11 @@ impl TestCluster {
                 process: None,
             });
         }
+        assert!(
+            directories.is_empty(),
+            "directories were supplied for members that are not in the table: {:?}",
+            directories.iter().map(|(id, _, _)| *id).collect::<Vec<_>>()
+        );
 
         let containers = members
             .iter()
@@ -1038,6 +1089,25 @@ impl TestCluster {
         }
     }
 
+    /// Where a member's archive listens: the endpoint the member string
+    /// advertises for it, or a kernel-chosen port when the string names zero
+    /// (which is what [`Options::default`] builds).
+    fn archive_control_channel(&self, member: i32) -> String {
+        use deepmsg_cluster_common::member::{ClusterMember, find_member};
+
+        let endpoint = ClusterMember::parse_list(&self.options.members_string())
+            .ok()
+            .and_then(|members| {
+                find_member(&members, member).map(|found| found.archive_endpoint.clone())
+            })
+            .filter(|endpoint| !endpoint.ends_with(":0"));
+
+        endpoint.map_or_else(
+            || "aeron:udp?endpoint=localhost:0".to_owned(),
+            |endpoint| format!("aeron:udp?endpoint={endpoint}"),
+        )
+    }
+
     fn spawn_java_node(&self, index: usize) -> Process {
         let node = &self.nodes[index];
         let mut args: Vec<String> = AGRONA_JVM_ARGS
@@ -1053,7 +1123,17 @@ impl TestCluster {
             "-Daeron.archive.dir={}",
             node.archive.path().display()
         ));
-        args.push("-Daeron.archive.control.channel=aeron:udp?endpoint=localhost:0".to_owned());
+        // The member string says where a member's archive is reachable, and a
+        // backup dials that endpoint — it reads it out of the cluster's
+        // response and connects there (`ClusterBackupAgent.java:578-590`).
+        // The reference's fixture gives every archive the same fixed endpoint
+        // it puts in the member string (`TestCluster.java:275`,
+        // `:2189-2192`); a member string that names port zero keeps the
+        // kernel-chosen port.
+        args.push(format!(
+            "-Daeron.archive.control.channel={}",
+            self.archive_control_channel(node.id)
+        ));
         args.push("-Daeron.archive.replication.channel=aeron:udp?endpoint=localhost:0".to_owned());
         args.push(format!("-Daeron.cluster.id={}", self.options.cluster_id));
         args.push(format!("-Daeron.cluster.member.id={}", node.id));
