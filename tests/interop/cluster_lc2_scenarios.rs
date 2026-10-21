@@ -284,6 +284,7 @@ fn a_full_partition_heals_and_the_cluster_elects_again() {
     let session_timeout = "-Daeron.cluster.session.timeout=60s";
     let properties = &|_id: i32| -> Vec<String> {
         vec![
+            "-Daeron.image.liveness.timeout=1000ms".to_owned(),
             "-Ddeepmsg.debug.receive.data.loss.from.millis=8000".to_owned(),
             "-Ddeepmsg.debug.receive.data.loss.until.millis=14000".to_owned(),
             "-Ddeepmsg.debug.receive.data.loss.drop.heartbeats=true".to_owned(),

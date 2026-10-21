@@ -129,7 +129,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long [`ConsensusModuleAgent::await_local_sockets_closed`] waits for the
 /// driver — see its note on why this build needs a deadline and the reference
 /// does not.
-const LOCAL_SOCKETS_CLOSED_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCAL_SOCKETS_CLOSED_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `ConsensusModule.Configuration.CLUSTER_INGRESS_FRAGMENT_LIMIT_DEFAULT` is 50;
 /// the consensus adapter polls with the same bound.
@@ -3658,15 +3658,16 @@ impl ElectionHost for ConsensusModuleAgent {
         // port possible — `LocalSocketAddressStatus.findNumberOfAddressesByRegistrationId`
         // counts the `LOCAL_SOCKADDR` counters that still name the id.
         //
-        // **Bounded here, and that is a deviation.** The reference waits
-        // without a deadline because its driver frees the endpoint — and every
-        // counter under it — when the last subscription leaves. This build's
-        // driver does not release receive endpoints yet (`receive_endpoints
-        // .rs::detach_subscription` is called from one place and the endpoint
-        // is kept), so a member whose log endpoint is shared with its own
-        // service container leaves the counter behind and the reference's wait
-        // never ends. Ten seconds is long past any driver turn; after it the
-        // close proceeds and a same-driver rebind is the caller's problem.
+        // **A bound, where the reference has none.** Its wait ends because the
+        // driver frees the endpoint — and the counters under it — once the
+        // endpoint's last subscription goes *and* its images are gone
+        // (`aeron_receive_channel_endpoint_try_remove_endpoint`,
+        // `media/aeron_receive_channel_endpoint.c:691-702`: the three stream
+        // refcounts at zero **and** `image_ref_count <= 0`). This build's driver
+        // has the same condition, so the wait ends the same way — after the
+        // image's liveness timeout. Thirty seconds is a bound on a wait that
+        // should take that long at most, kept so that a driver which never
+        // releases is a failure rather than a hung suite.
         let deadline = std::time::Instant::now() + LOCAL_SOCKETS_CLOSED_TIMEOUT;
         loop {
             self.idle()?;
