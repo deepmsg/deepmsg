@@ -306,6 +306,16 @@ impl ClusterSession {
         }
     }
 
+    /// Forget the ingress image, so the next term links its own
+    /// (`ClusterSession.unlinkIngressImage`, `ClusterSession.java:487-490`).
+    ///
+    /// The reference drops a reference to the image object; this build holds the
+    /// image's session id, which is the same question asked of a different
+    /// value — the next term's ingress image is a different session.
+    pub fn unlink_ingress_image(&mut self) {
+        self.ingress_image_session_id = -1;
+    }
+
     /// The principal the authenticator accepted.
     pub fn encoded_principal(&self) -> &[u8] {
         &self.encoded_principal
@@ -494,6 +504,55 @@ impl ClusterSession {
             COMMAND_TIMEOUT,
         )?;
         self.response_publication_id = publication.registration_id();
+        Ok(())
+    }
+
+    /// `ClusterSession.connect` (`ClusterSession.java:196-219`): a session that
+    /// outlives a term re-creates the counter and the response publication it
+    /// gave back when the term ended.
+    ///
+    /// Synchronous where [`Self::async_connect`] is not, because the reference's
+    /// is, and because of what runs right after it: `prepareSessionsForNewTerm`
+    /// calls this and then marks the new-leader event pending
+    /// (`SessionManager.java:939-964`), so the event that goes out on the next
+    /// duty cycle has to have a publication to go out on. Without one the send
+    /// reports success into nothing: the client never learns where the cluster
+    /// moved to, keeps offering to the old leader, and gets `CLOSED` (-4) from
+    /// a publication the conductor took away from it — measured on the LC-2
+    /// partition case, for a whole minute (`records/P3-6c.md`).
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] when the counter's key or label cannot be built or the
+    /// counter itself is refused. A refused **publication** is not an error
+    /// here: the reference reports it through its error handler as a counted
+    /// `WARN` and leaves the session open, and every send path already treats
+    /// "no response publication" as "not sent yet"
+    /// ([`Self::is_response_publication_connected`]).
+    pub fn connect(&mut self, client: &mut Client, cluster_id: i32) -> Result<(), ClusterError> {
+        if self.response_publication_id != NULL_VALUE {
+            return Err(ClusterError::Cluster(
+                "response publication already added".to_owned(),
+            ));
+        }
+
+        let spec = counters::session_counter(cluster_id, self.id, &self.session_info)?;
+        let counter = client.add_counter(
+            CLUSTER_SESSION_TYPE_ID,
+            spec.key(),
+            spec.label(),
+            COMMAND_TIMEOUT,
+        )?;
+        self.counter_registration_id = counter.registration_id();
+
+        if let Ok(registration_id) = client.add_publication(
+            &self.response_channel,
+            self.response_stream_id,
+            COMMAND_TIMEOUT,
+        ) {
+            self.response_publication_id = registration_id;
+        }
+
         Ok(())
     }
 

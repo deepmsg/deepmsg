@@ -3466,6 +3466,56 @@ impl ElectionHost for ConsensusModuleAgent {
                 self.config.service_count,
                 self.log_recording_id,
             )?;
+
+            // `sessionManager.clearSessionsAfter(logPosition, leadershipTermId)`
+            // and `sessionManager.disconnectSessions()` (`:1392-1393`), in that
+            // order: a session opened past the committed position never existed,
+            // and every other one gives back the response publication and the
+            // counter the term that is ending held for it. The next term's
+            // `prepareSessionsForNewTerm` reconnects them, and its `connect`
+            // refuses a publication that was never given back — the leader then
+            // leaves the election on its first duty cycle with
+            // `response publication already added`, which is a cluster that
+            // re-elects for ever.
+            let leadership_term_id = self.leadership_term_id;
+            let member_id = self.config.member_id;
+            let leader_member_id = self.leader_member_id();
+            let service_count = self.config.service_count;
+            let commit_position_counter_id = self.counters.commit_position.counter_id();
+            {
+                let Self {
+                    client,
+                    sessions,
+                    egress,
+                    log_publisher,
+                    counters,
+                    recording_log,
+                    members,
+                    clock,
+                    ingress_endpoints,
+                    ..
+                } = self;
+                let mut ctx = SessionContext {
+                    client,
+                    log_publisher,
+                    egress,
+                    clock: &*clock,
+                    timed_out_counter: counters.timed_out_client,
+                    control_toggle: counters.control_toggle,
+                    leadership_term_id,
+                    member_id,
+                    leader_member_id,
+                    ingress_endpoints: &*ingress_endpoints,
+                    now_ns,
+                    recording_log,
+                    service_count,
+                    commit_position_counter_id,
+                    cluster_members: members.as_slice(),
+                };
+                sessions.clear_sessions_after(log_position, &mut ctx)?;
+            }
+            self.sessions.disconnect_sessions(&mut self.client);
+
             write_counter(&self.client, self.counters.commit_position, log_position);
             self.last_append_position = last_append_position;
             self.time_of_last_leader_update_ns = now_ns;
@@ -3768,8 +3818,12 @@ impl ElectionHost for ConsensusModuleAgent {
         // it.
         let is_leader_startup = self.node_startup_election;
         self.node_startup_election = false;
-        self.sessions
-            .prepare_sessions_for_new_term(is_leader_startup, now_ns);
+        self.sessions.prepare_sessions_for_new_term(
+            &mut self.client,
+            self.config.cluster_id,
+            is_leader_startup,
+            now_ns,
+        )?;
         self.connect_ingress()?;
 
         Ok(())
