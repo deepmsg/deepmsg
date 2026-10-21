@@ -1062,6 +1062,43 @@ impl Node {
         self.launch_thread(launched);
     }
 
+    /// The reference's `cleanStart` (`TestCluster.startStaticNode(index, true)`,
+    /// which sets `deleteArchiveOnStart` and `deleteDirOnStart`): this member's
+    /// archive and cluster directories are **emptied** before it starts again,
+    /// so it comes back with no log at all and has to be caught up from the
+    /// leader's archive. [`Self::restart`] is the dirty half — the same
+    /// directories, the log it had.
+    pub fn restart_empty(&mut self, launched: &mpsc::Sender<(i32, Result<(), String>)>) {
+        self.stop();
+
+        // The driver first, as in [`Self::restart_whole`]: its `Drop` removes
+        // the aeron directory, which is the path the next one creates.
+        if let Some(mut driver) = self.driver.take() {
+            driver.stop().expect("the driver stops");
+        }
+
+        for directory in [self.archive_dir.path(), self.cluster_dir.path()] {
+            let entries = std::fs::read_dir(directory).expect("the directory lists");
+            for entry in entries {
+                let entry = entry.expect("an entry");
+                let path = entry.path();
+                if entry.file_type().expect("a type").is_dir() {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+
+        let refs: Vec<&str> = self.driver_properties.iter().map(String::as_str).collect();
+        let name = self.name.clone();
+        let mut driver = OwnArchivingMediaDriver::start(&name, self.archive_dir.path(), &refs)
+            .expect("the driver comes back up on an empty archive");
+        driver.await_ready(DEADLINE).expect("the driver is ready");
+        self.driver = Some(driver);
+        self.launch_thread(launched);
+    }
+
     pub fn id(&self) -> i32 {
         self.id
     }

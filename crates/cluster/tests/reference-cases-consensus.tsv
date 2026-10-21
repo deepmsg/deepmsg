@@ -121,7 +121,7 @@ system	ClusterNetworkTopologyTest	shouldLogReplicate	A	P3-6c	client			n/a:topolo
 system	ClusterNetworkTopologyTest	shouldMatchPatternSplitAcrossReads	A	P3-6c	client			n/a:fixture-self-test
 system	ClusterNetworkTopologyTest	shouldMatchPatternSplitAcrossBufferBoundary	A	P3-6c	client			n/a:fixture-self-test
 system	ClusterTest	shouldStopFollowerAndRestartFollower	A	P3-6c	counter,cm-object			a_stopped_follower_catches_up_through_the_leaders_archive (weakened: counters and commit position, not the service's message count)
-system	ClusterTest	shouldStopFollowerAndRestartFollowerGracefully	A	P3-6c	counter,cm-object,client			(deferred: F1 - a follower's clean stop with the client still offering)
+system	ClusterTest	shouldStopFollowerAndRestartFollowerGracefully	A	P3-6c	counter,cm-object,client			a_follower_stopped_and_restarted_is_invisible_to_the_client (weakened: no service to await termination of)
 system	ClusterTest	shouldNotifyClientOfNewLeader	A	P3-6c	counter,cm-object,client			the_surviving_members_elect_a_new_leader_and_keep_committing (weakened: the counters, not the client's leadership event)
 system	ClusterTest	shouldStopLeaderAndFollowersThenRestartAllWithSnapshot	A	P3-6c	counter,client			(deferred: F3 - every member restarts off its own snapshot)
 system	ClusterTest	shouldConnectAndDisconnectClient	A	P3-6c	counter,client			a_client_connects_opens_a_session_sends_a_message_and_closes (weakened: one member, no service)
@@ -138,14 +138,14 @@ system	ClusterTest	shouldElectSameLeaderAfterLoosingQuorum	A	P3-6c	stub-service,
 system	ClusterTest	shouldElectNewLeaderAfterGracefulLeaderClose	A	P3-6c	counter,client			the_surviving_members_elect_a_new_leader_and_keep_committing (weakened: a killed leader, not a graceful close)
 system	ClusterTest	shouldHandleClusterStartWhereMostNamesBecomeResolvableDuringElection	A	P3-6c	counter,client			n/a:name-resolution
 system	ClusterTest	shouldEchoMessagesThenContinueOnNewLeader	A	P3-6c	stub-service,counter,client			the_surviving_members_elect_a_new_leader_and_keep_committing (weakened: our client on the new leader, not the reference client's redirect)
-system	ClusterTest	shouldStopLeaderAndRestartAsFollower	A	P3-6c	counter			(deferred: F1 - the old leader comes back as a follower)
-system	ClusterTest	shouldStopLeaderAndRestartAsFollowerWithSendingAfter	A	P3-6c	counter,client			(deferred: F1 - the same, with the client sending after)
-system	ClusterTest	shouldStopLeaderAndRestartAsFollowerWithSendingAfterThenStopLeader	A	P3-6c	counter,client			(deferred: F1 - the same, and then a second leader failure)
-system	ClusterTest	shouldAcceptMessagesAfterSingleNodeCleanRestart	A	P3-6c	stub-service,counter,client			(deferred: F1 - a clean restart, not a dirty one)
+system	ClusterTest	shouldStopLeaderAndRestartAsFollower	A	P3-6c	counter			a_stopped_leader_comes_back_as_a_follower
+system	ClusterTest	shouldStopLeaderAndRestartAsFollowerWithSendingAfter	A	P3-6c	counter,client			a_stopped_leader_comes_back_as_a_follower_and_the_client_keeps_sending
+system	ClusterTest	shouldStopLeaderAndRestartAsFollowerWithSendingAfterThenStopLeader	A	P3-6c	counter,client			a_stopped_leader_comes_back_as_a_follower_then_the_new_leader_stops
+system	ClusterTest	shouldAcceptMessagesAfterSingleNodeCleanRestart	A	P3-6c	stub-service,counter,client			a_follower_restarted_on_an_empty_directory_catches_up (weakened: no service to count messages, so the commit positions carry it)
 system	ClusterTest	shouldReplaySnapshotTakenWhileDown	A	P3-6c	stub-service,counter,client			(deferred: F3 - a follower replays the snapshot taken while it was down)
 system	ClusterTest	shouldTolerateMultipleLeaderFailures	A	P3-6c	counter,client			the_surviving_members_elect_a_new_leader_and_keep_committing (weakened: one leader failure)
 system	ClusterTest	shouldRecoverAfterTwoLeaderNodesFailAndComeBackUpAtSameTime	A	P3-6c	counter,client			(deferred: F1 - two leaders fail and return together)
-system	ClusterTest	shouldAcceptMessagesAfterTwoNodeCleanRestart	A	P3-6c	stub-service,counter,client			(deferred: F1 - two clean restarts)
+system	ClusterTest	shouldAcceptMessagesAfterTwoNodeCleanRestart	A	P3-6c	stub-service,counter,client			two_followers_restarted_on_empty_directories_catch_up (weakened: same)
 system	ClusterTest	shouldRecoverWithUncommittedMessagesAfterRestartWhenNewCommitPosExceedsPreviousAppendedPos	A	P3-6c	stub-service,counter,client			(deferred: F1 - uncommitted entries across a restart, commit past the old append)
 system	ClusterTest	shouldRecoverWithUncommittedMessagesAfterRestartWhenNewCommitPosIsLessThanPreviousAppendedPos	A	P3-6c	counter,client			(deferred: F1 - the same, commit short of the old append)
 system	ClusterTest	shouldCallOnRoleChangeOnBecomingLeader	A	P3-6c	stub-service,counter			(deferred: F2 - the container's role-change event)
