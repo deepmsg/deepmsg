@@ -713,16 +713,30 @@ impl PublicationImage {
         self.subscribers.has_working_positions()
     }
 
-    /// Whether the stream has been read to its end (`is_drained`): everything
-    /// received has been read.
+    /// Whether the stream has been read to its end (`is_drained`): every
+    /// **active** reader is at or past the **rebuild position**
+    /// (`aeron_publication_image_is_drained`,
+    /// `aeron-driver/src/main/c/aeron_publication_image.h:291-311`).
+    ///
+    /// The rebuild position, not the high-water mark. The gap between them is
+    /// exactly the case this answers: a receiver that has rebuilt everything
+    /// up to `rcv-pos` and has a **hole** above it is drained of what it has,
+    /// and an image that compared against `rcv-hwm` instead would wait for a
+    /// reader to reach a position no reader may ever read — the frames in the
+    /// hole were never received and, once the publisher is gone, never will be.
+    /// That is a partition's ordinary state: the log's tail above the commit
+    /// position is unread by design, so the service's reader stops at the
+    /// commit position while `rcv-hwm` sits past it, and the old image then
+    /// stays `DRAINING` for ever — never announced, so the container never
+    /// lets go of it and never joins the next term (`records/P3-6c.md`).
     pub fn is_drained(&self, counters: &CounterManager, regions: &CounterRegions<'_>) -> bool {
-        let hwm = counters.value(regions, self.counters.rcv_hwm).unwrap_or(0);
+        let rebuild_position = counters.value(regions, self.counters.rcv_pos).unwrap_or(0);
         let min = self
             .subscribers
             .min_active_position(counters, regions)
             .unwrap_or(i64::MAX);
 
-        min >= hwm
+        min >= rebuild_position
     }
 
     /// Counters' ids, for the conductor's record.
