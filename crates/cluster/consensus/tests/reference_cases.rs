@@ -77,6 +77,9 @@ fn the_na_vocabulary_stays_closed() {
         "n/a:removed-upstream",
         "n/a:java-injection",
         "n/a:fixture-self-test",
+        "n/a:name-resolution",
+        "n/a:topology-fixture",
+        "n/a:fixture-shape",
     ];
     for row in rows() {
         let d = row.disposition.as_str();
