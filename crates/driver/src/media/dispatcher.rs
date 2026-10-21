@@ -439,6 +439,30 @@ impl DataPacketDispatcher {
         }
     }
 
+    /// Forget a cool-down, so a `SETUP` or a frame from that session can ask
+    /// for an image again (`remove_cool_down`,
+    /// `aeron_data_packet_dispatcher.h:164-169`, which is
+    /// `remove_matching_state` for `IMAGE_COOL_DOWN`).
+    ///
+    /// The conductor sends this when an image leaves for `LINGER` and the
+    /// subscription that read it rejoins
+    /// (`aeron_driver_conductor_image_transition_to_linger`,
+    /// `aeron_driver_conductor.c:1642-1675`). Without it the cool-down
+    /// [`Self::remove_image`] leaves behind is **permanent**: a `SETUP` in
+    /// that state creates nothing (`:503-506`) and a frame in that state
+    /// elicits nothing (`:410-413`), so a publisher that is still sending is
+    /// never heard from again — which is a whole cluster that cannot re-elect
+    /// after a partition has killed its images.
+    pub fn remove_cool_down(&mut self, stream_id: i32, session_id: i32) {
+        let Some((_, interest)) = self.streams.iter_mut().find(|(id, _)| *id == stream_id) else {
+            return;
+        };
+
+        if interest.state_of(session_id) == ImageState::CoolDown {
+            interest.state.retain(|(id, _)| *id != session_id);
+        }
+    }
+
     /// Whether an image is wanted here at all
     /// (`has_interest_in`, `:359-374`).
     pub fn has_interest_in(&self, stream_id: i32, session_id: i32) -> bool {

@@ -182,6 +182,19 @@ pub enum ReceiverCommand {
         /// Which one.
         registration_id: i64,
     },
+    /// Forget the cool-down an image left behind, so a `SETUP` or a frame from
+    /// that session can ask for another one
+    /// (`aeron_driver_receiver_proxy_on_remove_cool_down`,
+    /// `aeron-driver/src/main/c/aeron_driver_receiver_proxy.c:194-211`).
+    RemoveCoolDown {
+        /// The endpoint the image was read through — the cool-down lives in
+        /// *its* dispatcher.
+        endpoint_id: u64,
+        /// The stream the image was of.
+        stream_id: i32,
+        /// The session the image was of.
+        session_id: i32,
+    },
     /// Refuse an image: a client rejected it, and its publisher has to be told
     /// (`aeron_driver_receiver_on_invalidate_image`,
     /// `aeron-driver/src/main/c/aeron_driver_receiver.c:633-649`).
@@ -630,6 +643,26 @@ impl ReceiverProxy {
     pub fn remove_image(&self, registration_id: i64) -> io::Result<()> {
         self.commands
             .send(ReceiverCommand::RemoveImage { registration_id })
+            .map_err(|_| stopped())
+    }
+
+    /// Tell the receiver an image that has gone leaves no cool-down behind.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn remove_cool_down(
+        &self,
+        endpoint_id: u64,
+        stream_id: i32,
+        session_id: i32,
+    ) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::RemoveCoolDown {
+                endpoint_id,
+                stream_id,
+                session_id,
+            })
             .map_err(|_| stopped())
     }
 
@@ -1255,6 +1288,19 @@ impl ReceiverThread {
                                     );
                                 }
                             }
+                        }
+                    }
+                    ReceiverCommand::RemoveCoolDown {
+                        endpoint_id,
+                        stream_id,
+                        session_id,
+                    } => {
+                        if let Some((_, endpoint)) =
+                            self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
+                        {
+                            endpoint
+                                .dispatcher_mut()
+                                .remove_cool_down(stream_id, session_id);
                         }
                     }
                     ReceiverCommand::InvalidateImage {
