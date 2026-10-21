@@ -151,21 +151,15 @@ impl UdpTransport {
                 socket.set_multicast_ttl(params.ttl)?;
             }
         } else {
-            // `:168-174`: the reference sets `SO_REUSEADDR` on **every**
-            // receiving descriptor, multicast or not, before it binds — the
-            // `SO_REUSEPORT` beside it is the multicast-only half. Without it a
-            // port another socket of this driver still holds cannot be bound
-            // again, and a member re-joining its own log endpoint after an
-            // election cannot: `prepareForNewLeadership` removes the log
-            // subscription and waits (`Election.java:1365-1375`,
-            // `await_local_sockets_closed`), but the endpoint is kept while its
-            // image lives, so the wait runs out and the rebind answers
-            // `Address already in use`.
-            socket.set_reuse_address()?;
-
-            // `:147-154`: a unicast transport binds and nothing else — and
-            // this is the bind whose failure the reference composes from the
-            // descriptor and the address.
+            // `:147-154`: a unicast transport binds and nothing else, and it is
+            // the bind whose failure the reference composes from the descriptor
+            // and the address. **No reuse options**: the `SO_REUSEADDR` /
+            // `SO_REUSEPORT` pair at `:168-190` is inside the *multicast* branch
+            // — the `else` of `if (!is_multicast)`, whose first act is that
+            // bind. Setting them here as well looks like the same behaviour and
+            // is not: a receive destination naming an address another socket of
+            // this driver already holds would bind instead of being refused,
+            // which is what `mds_added_destination` caught.
             socket.bind(bind).map_err(OpenError::Bind)?;
         }
 
