@@ -774,3 +774,381 @@ fn a_follower_stopped_and_restarted_is_invisible_to_the_client() {
         node.stop();
     }
 }
+
+/// **A follower that misses a single message catches up on the way back**
+/// (`ClusterTest.shouldCatchUpAfterFollowerMissesOneMessage`,
+/// `ClusterTest.java:2960`).
+///
+/// The smallest catch-up there is: one commit while the follower is away, and
+/// the returning member has to close as a follower with that commit in its own
+/// counter. A case that passes with ten messages can still hide an off-by-one
+/// in the replay's start position, which is why the reference has this one as
+/// well as the larger ones.
+#[test]
+fn a_follower_that_missed_one_message_catches_up() {
+    let _serial = serial();
+    let ports = Ports::new();
+    let Some((mut nodes, counters, faults)) = start_cluster(&ports) else {
+        return;
+    };
+
+    let leader = the_leader(&counters);
+    let follower = (0..MEMBER_COUNT)
+        .find(|id| *id != leader)
+        .expect("a follower");
+
+    let Some(mut client) = ClientSide::start(&ports, leader) else {
+        announce_skip();
+        return;
+    };
+    let session = open_session(&mut client, &faults);
+
+    // One message before it goes, one while it is away.
+    let mut last = counters[leader as usize]
+        .commit_position()
+        .expect("the leader's commit");
+    client.send(&session, b"before", &faults);
+    wait_until("the first message", &faults, || {
+        client.poll_events();
+        counters[leader as usize]
+            .commit_position()
+            .is_some_and(|position| position > last)
+    });
+    last = counters[leader as usize]
+        .commit_position()
+        .expect("a commit");
+
+    nodes[follower as usize].stop();
+    client.send(&session, b"the message it misses", &faults);
+    wait_until("the missed message to commit", &faults, || {
+        client.poll_events();
+        counters[leader as usize]
+            .commit_position()
+            .is_some_and(|position| position > last)
+    });
+    let missed = counters[leader as usize]
+        .commit_position()
+        .expect("a commit");
+
+    let (relaunch_tx, relaunch_rx) = mpsc::channel();
+    nodes[follower as usize].restart(&relaunch_tx);
+    await_launched(&faults, &relaunch_rx, 1);
+
+    wait_with_state(
+        "the returning member to reach the commit it missed",
+        &faults,
+        CATCHUP_DEADLINE,
+        || {
+            counters[follower as usize].election_state() == Some(ELECTION_CLOSED)
+                && counters[follower as usize].role() == Some(ROLE_FOLLOWER)
+                && counters[follower as usize]
+                    .commit_position()
+                    .is_some_and(|position| position >= missed)
+        },
+        || {
+            let member = &counters[follower as usize];
+            format!(
+                "member {follower}: role={:?} election={:?} append={:?} commit={:?}; the \
+                 commit it missed was {missed}",
+                member.role(),
+                member.election_state(),
+                member.append_position(),
+                member.commit_position(),
+            )
+        },
+    );
+
+    for node in &mut nodes {
+        node.stop();
+    }
+}
+
+/// **A follower that stopped part way through a term catches up**
+/// (`ClusterTest.shouldRecoverWhenFollowerArrivesPartWayThroughTerm`,
+/// `ClusterTest.java:2670`).
+///
+/// Ten commits land while it is away, all of them in the term it left, so the
+/// replay has to start inside a term it is already holding rather than at the
+/// term boundary a replication would use.
+#[test]
+fn a_follower_back_part_way_through_a_term_catches_up() {
+    let _serial = serial();
+    let ports = Ports::new();
+    let Some((mut nodes, counters, faults)) = start_cluster(&ports) else {
+        return;
+    };
+
+    let leader = the_leader(&counters);
+    let follower = (0..MEMBER_COUNT)
+        .find(|id| *id != leader)
+        .expect("a follower");
+
+    let Some(mut client) = ClientSide::start(&ports, leader) else {
+        announce_skip();
+        return;
+    };
+    let session = open_session(&mut client, &faults);
+
+    let mut last = counters[leader as usize]
+        .commit_position()
+        .expect("the leader's commit");
+    client.send(&session, b"the message before the stop", &faults);
+    wait_until("the first message", &faults, || {
+        client.poll_events();
+        counters[leader as usize]
+            .commit_position()
+            .is_some_and(|position| position > last)
+    });
+
+    nodes[follower as usize].stop();
+    for index in 0..10u8 {
+        last = counters[leader as usize]
+            .commit_position()
+            .expect("a commit");
+        client.send(&session, &[b'a' + index; 16], &faults);
+        wait_until("each message to commit", &faults, || {
+            client.poll_events();
+            counters[leader as usize]
+                .commit_position()
+                .is_some_and(|position| position > last)
+        });
+    }
+    let target = counters[leader as usize]
+        .commit_position()
+        .expect("a commit");
+
+    let (relaunch_tx, relaunch_rx) = mpsc::channel();
+    nodes[follower as usize].restart(&relaunch_tx);
+    await_launched(&faults, &relaunch_rx, 1);
+
+    wait_with_state(
+        "the returning member to reach the ten commits it missed",
+        &faults,
+        CATCHUP_DEADLINE,
+        || {
+            counters[follower as usize].election_state() == Some(ELECTION_CLOSED)
+                && counters[follower as usize].role() == Some(ROLE_FOLLOWER)
+                && counters[follower as usize]
+                    .commit_position()
+                    .is_some_and(|position| position >= target)
+        },
+        || {
+            let member = &counters[follower as usize];
+            format!(
+                "member {follower}: role={:?} election={:?} append={:?} commit={:?}; the \
+                 leader's commit was {target}",
+                member.role(),
+                member.election_state(),
+                member.append_position(),
+                member.commit_position(),
+            )
+        },
+    );
+
+    for node in &mut nodes {
+        node.stop();
+    }
+}
+
+/// **A follower that also missed an election catches up**
+/// (`ClusterTest.shouldRecoverWhenFollowerArrivePartWayThroughTermAfterMissingElection`,
+/// `ClusterTest.java:2720`).
+///
+/// The member is away for more than messages: while it is down the leader stops
+/// too, and the two that are left elect a later term. So the returning member
+/// is behind in **terms**, not only in position, and the way back is the
+/// replication path rather than a replay of its own term.
+#[test]
+fn a_follower_back_after_missing_an_election_catches_up() {
+    let _serial = serial();
+    let ports = Ports::new();
+    let Some((mut nodes, counters, faults)) = start_cluster(&ports) else {
+        return;
+    };
+
+    let leader = the_leader(&counters);
+    let away = (0..MEMBER_COUNT)
+        .find(|id| *id != leader)
+        .expect("a follower");
+    let first_term = counters[leader as usize]
+        .leadership_term_id()
+        .expect("the first term");
+
+    // It goes first, and then the leader follows it: the two members that are
+    // left are the leader (restarted) and the other follower, which is a quorum.
+    nodes[away as usize].stop();
+    nodes[leader as usize].stop();
+
+    let (relaunch_tx, relaunch_rx) = mpsc::channel();
+    nodes[leader as usize].restart(&relaunch_tx);
+    await_launched(&faults, &relaunch_rx, 1);
+
+    wait_with_state(
+        "the two that are left to elect a later term",
+        &faults,
+        CATCHUP_DEADLINE,
+        || {
+            (0..MEMBER_COUNT).filter(|id| *id != away).all(|id| {
+                counters[id as usize].election_state() == Some(ELECTION_CLOSED)
+                    && counters[id as usize]
+                        .leadership_term_id()
+                        .is_some_and(|term| term > first_term)
+            })
+        },
+        || {
+            format!(
+                "terms {:?}, election {:?}",
+                (0..MEMBER_COUNT)
+                    .map(|id| counters[id as usize].leadership_term_id())
+                    .collect::<Vec<_>>(),
+                (0..MEMBER_COUNT)
+                    .map(|id| counters[id as usize].election_state())
+                    .collect::<Vec<_>>(),
+            )
+        },
+    );
+
+    let second_leader = the_leader(&counters);
+    let mut last = counters[second_leader as usize]
+        .commit_position()
+        .expect("the new leader's commit");
+    {
+        let Some(mut client) = ClientSide::start(&ports, second_leader) else {
+            announce_skip();
+            return;
+        };
+        let session = open_session(&mut client, &faults);
+        for index in 0..5u8 {
+            client.send(&session, &[b'A' + index; 16], &faults);
+            wait_until("each message to commit", &faults, || {
+                client.poll_events();
+                counters[second_leader as usize]
+                    .commit_position()
+                    .is_some_and(|position| position > last)
+            });
+            last = counters[second_leader as usize]
+                .commit_position()
+                .expect("a commit");
+        }
+    }
+    let target = counters[second_leader as usize]
+        .commit_position()
+        .expect("the new leader's commit");
+
+    // ---- and the member that missed the election comes back ----------------
+    let (back_tx, back_rx) = mpsc::channel();
+    nodes[away as usize].restart(&back_tx);
+    await_launched(&faults, &back_rx, 1);
+
+    wait_with_state(
+        "the member that missed the election to catch up",
+        &faults,
+        CATCHUP_DEADLINE,
+        || {
+            counters[away as usize].election_state() == Some(ELECTION_CLOSED)
+                && counters[away as usize].role() == Some(ROLE_FOLLOWER)
+                && counters[away as usize]
+                    .commit_position()
+                    .is_some_and(|position| position >= target)
+        },
+        || {
+            let member = &counters[away as usize];
+            format!(
+                "member {away}: role={:?} election={:?} term={:?} append={:?} commit={:?}; the \
+                 new term's commit was {target}",
+                member.role(),
+                member.election_state(),
+                member.leadership_term_id(),
+                member.append_position(),
+                member.commit_position(),
+            )
+        },
+    );
+
+    for node in &mut nodes {
+        node.stop();
+    }
+}
+
+/// **The client keeps sending while a follower is away and comes back**
+/// (`ClusterTest.shouldRecoverWhileMessagesContinue`,
+/// `ClusterTest.java:1940`).
+///
+/// The reference runs a publisher in a thread through the outage; this build
+/// sends from the test's own thread between the steps, which is the same
+/// question — messages committed on both sides of the stop — without a second
+/// client. What it asserts is the end state: every member's commit is the
+/// leader's.
+#[test]
+fn messages_continue_across_a_follower_restart() {
+    let _serial = serial();
+    let ports = Ports::new();
+    let Some((mut nodes, counters, faults)) = start_cluster(&ports) else {
+        return;
+    };
+
+    let leader = the_leader(&counters);
+    let follower = (0..MEMBER_COUNT)
+        .find(|id| *id != leader)
+        .expect("a follower");
+
+    let Some(mut client) = ClientSide::start(&ports, leader) else {
+        announce_skip();
+        return;
+    };
+    let session = open_session(&mut client, &faults);
+
+    let mut last = counters[leader as usize]
+        .commit_position()
+        .expect("the leader's commit");
+    let mut offer = |client: &mut ClientSide, counters: &[NodeCounters], payload: u8| {
+        client.send(&session, &[payload; 16], &faults);
+        wait_until("a message to commit", &faults, || {
+            client.poll_events();
+            counters[leader as usize]
+                .commit_position()
+                .is_some_and(|position| position > last)
+        });
+        last = counters[leader as usize]
+            .commit_position()
+            .expect("a commit");
+    };
+
+    offer(&mut client, &counters, b'1');
+    nodes[follower as usize].stop();
+    offer(&mut client, &counters, b'2');
+    offer(&mut client, &counters, b'3');
+
+    let (relaunch_tx, relaunch_rx) = mpsc::channel();
+    nodes[follower as usize].restart(&relaunch_tx);
+    await_launched(&faults, &relaunch_rx, 1);
+    offer(&mut client, &counters, b'4');
+
+    let target = counters[leader as usize]
+        .commit_position()
+        .expect("a commit");
+    wait_with_state(
+        "every member to be at the leader's commit",
+        &faults,
+        CATCHUP_DEADLINE,
+        || {
+            (0..MEMBER_COUNT).all(|id| {
+                counters[id as usize]
+                    .commit_position()
+                    .is_some_and(|position| position >= target)
+            })
+        },
+        || {
+            format!(
+                "commits {:?}, target {target}",
+                (0..MEMBER_COUNT)
+                    .map(|id| counters[id as usize].commit_position())
+                    .collect::<Vec<_>>(),
+            )
+        },
+    );
+
+    for node in &mut nodes {
+        node.stop();
+    }
+}

@@ -157,7 +157,7 @@ system	ClusterTest	shouldEnterElectionWhenRecordingStopsUnexpectedlyOnLeaderOfSi
 system	ClusterTest	shouldEnterElectionWhenLosesQuorumUnexpectedlyOnLeaderOfSingleNodeCluster	A	P3-4f	counter,cm-object,client			
 system	ClusterTest	shouldCloseClientOnTimeout	A	P3-6c	counter,cm-object,client			(deferred: F4 - the timed-out-client counter at the session timeout)
 system	ClusterTest	shouldCloseClientAfterClusterBecomesUnavailable	A	P3-6c	counter,client			(deferred: F4 - the client's own new-leader timeout)
-system	ClusterTest	shouldRecoverWhileMessagesContinue	A	P3-6c	stub-service,counter,client			(deferred: F1 - a follower restarted while the publisher runs)
+system	ClusterTest	shouldRecoverWhileMessagesContinue	A	P3-6c	stub-service,counter,client			messages_continue_across_a_follower_restart (weakened: offered from the test's thread between steps, not a publisher thread)
 system	ClusterTest	shouldCatchupFromEmptyLog	A	P3-6c	stub-service,counter,client			(deferred: F1 - a member whose log is empty catches up)
 system	ClusterTest	shouldCatchupFromEmptyLogThenSnapshotAfterShutdownAndFollowerCleanStart	A	P3-6c	stub-service,counter,client			(deferred: F3 - an empty log, a shutdown snapshot and a clean start)
 system	ClusterTest	shouldCatchUpTwoFreshNodesAfterRestart	A	P3-6c	stub-service,counter,client			(deferred: F1 - two fresh nodes after a restart)
@@ -167,14 +167,14 @@ system	ClusterTest	shouldRecoverWhenLeaderHasAppendedMoreThanFollower	A	P3-6c	co
 system	ClusterTest	shouldRecoverWhenFollowerIsMultipleTermsBehind	A	P3-6c	stub-service,counter,client			a_member_that_missed_a_term_is_caught_up_by_replication
 system	ClusterTest	shouldRecoverWhenFollowerIsMultipleTermsBehindFromEmptyLog	A	P3-6c	stub-service,counter,client			(deferred: F1 - the same, from an empty log)
 system	ClusterTest	shouldRecoverWhenFollowerWithInitialSnapshotAndArchivePurgeThenIsMultipleTermsBehind	A	P3-6c	stub-service,counter,client			(deferred: F3 - a snapshot, a purged archive, then a term behind)
-system	ClusterTest	shouldRecoverWhenFollowerArrivesPartWayThroughTerm	A	P3-6c	stub-service,counter,client			(deferred: F1 - a follower back part way through a term)
-system	ClusterTest	shouldRecoverWhenFollowerArrivePartWayThroughTermAfterMissingElection	A	P3-6c	stub-service,counter,client			(deferred: F1 - the same, having missed an election)
+system	ClusterTest	shouldRecoverWhenFollowerArrivesPartWayThroughTerm	A	P3-6c	stub-service,counter,client			a_follower_back_part_way_through_a_term_catches_up (weakened: ten commits, the commit position)
+system	ClusterTest	shouldRecoverWhenFollowerArrivePartWayThroughTermAfterMissingElection	A	P3-6c	stub-service,counter,client			a_follower_back_after_missing_an_election_catches_up (weakened: three members, so one survivor is the quorum while it is away)
 system	ClusterTest	shouldRecoverWhenLastSnapshotIsMarkedInvalid	A	P3-6c	stub-service,counter,client			(deferred: F3 - an invalidated latest snapshot is replayed)
 system	ClusterTest	shouldRecoverWhenLastSnapshotForShutdownIsMarkedInvalid	A	P3-4f	stub-service,counter,client			
 system	ClusterTest	shouldHandleMultipleElections	A	P3-6c	counter,client			(deferred: F2 - two leader failures in a row, the leadership events counted)
 system	ClusterTest	shouldRecoverWhenLastSnapshotIsInvalidBetweenTwoElections	A	P3-6c	stub-service,counter,client			(deferred: F3 - an invalidation between two elections)
 system	ClusterTest	shouldRecoverWhenLastTwosSnapshotsAreInvalidAfterElection	A	P3-6c	stub-service,counter,client			(deferred: F3 - the last two snapshots invalid)
-system	ClusterTest	shouldCatchUpAfterFollowerMissesOneMessage	A	P3-6c	client			(deferred: F1 - one missed message)
+system	ClusterTest	shouldCatchUpAfterFollowerMissesOneMessage	A	P3-6c	client			a_follower_that_missed_one_message_catches_up (weakened: the commit position, not a service's message count)
 system	ClusterTest	shouldCatchUpAfterFollowerMissesTimerRegistration	A	P3-6c	client			(deferred: F1 - one missed timer registration)
 system	ClusterTest	shouldAllowChangingTermBufferLengthAndMtuAfterRecordingLogIsTruncatedToTheLatestSnapshot	A	P3-6c	java-injection,stub-service,counter,client		hook:service-supplier	a_restarted_cluster_takes_a_new_term_length_and_mtu_after_a_snapshot_seed (weakened: no checksum service)
 system	ClusterTest	shouldRecoverWhenFollowersIsMultipleTermsBehindFromEmptyLogAndPartialLogWithoutCommittedLogEntry	A	P3-6c	stub-service,counter,client			(deferred: F1 - an empty log and a partial log behind, the recording logs compared)
