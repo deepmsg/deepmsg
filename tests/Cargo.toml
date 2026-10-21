@@ -132,6 +132,13 @@ name = "cluster_response_replication"
 path = "interop/cluster_response_replication.rs"
 required-features = ["interop"]
 
+# P3-6c / LC-2: the reference's own `AeronCluster` against a cluster whose
+# members are all ours.
+[[test]]
+name = "cluster_lc2_scenarios"
+path = "interop/cluster_lc2_scenarios.rs"
+required-features = ["interop"]
+
 # The three recording events, decoded by the reference's own
 # `RecordingEventsAdapter` — the reader they exist for, and the only one that
 # can say the bytes are the schema's rather than ours.
