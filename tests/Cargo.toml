@@ -117,6 +117,21 @@ name = "replication_reference_archive"
 path = "interop/replication_reference_archive.rs"
 required-features = ["interop"]
 
+# P3-0e's route: the copy's channel is a **response** channel, so the
+# destination's session asks the source for a replay token, makes the second
+# publication over it, and replays through that proxy.
+[[test]]
+name = "replication_response_channel"
+path = "interop/replication_response_channel.rs"
+required-features = ["interop"]
+
+# The cluster-level judge of the same route: a member string with an archive
+# response endpoint, and a restarted follower that can only catch up over it.
+[[test]]
+name = "cluster_response_replication"
+path = "interop/cluster_response_replication.rs"
+required-features = ["interop"]
+
 # The three recording events, decoded by the reference's own
 # `RecordingEventsAdapter` — the reader they exist for, and the only one that
 # can say the bytes are the schema's rather than ours.

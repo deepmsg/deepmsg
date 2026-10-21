@@ -157,10 +157,11 @@ pub const PORT_BASE_ENV: &str = "CLUSTER_HARNESS_PORT_BASE";
 
 impl Ports {
     pub fn new() -> Self {
-        // A block of fifty per run, because the highest offset used is +35 (a
-        // second client's egress port is +30 plus its offset). Eighty blocks,
-        // 21000..25200 — below the kernel's ephemeral range, which is where a
-        // random `pid %` would otherwise land.
+        // A block of fifty per run, because the highest offset used is +47 (a
+        // member's archive response endpoint; a second client's egress port is
+        // +30 plus its offset). Eighty blocks, 21000..25200 — below the
+        // kernel's ephemeral range, which is where a random `pid %` would
+        // otherwise land.
         //
         // ★ **The block is per *process*, and two processes can land on the
         // same one**: `pid %` is not a reservation, and this repository is
@@ -202,7 +203,8 @@ impl Ports {
 
     /// The first port of this run's block, for a test that needs a port of its
     /// own past every offset the cluster uses (the highest is `+35`; a backup
-    /// takes `+43` and `+44`).
+    /// takes `+43` and `+44`, and a member's archive response endpoint `+45`
+    /// to `+47`).
     #[must_use]
     pub const fn base(&self) -> u16 {
         self.base
@@ -269,6 +271,18 @@ impl Ports {
     /// the catchup endpoint it cannot be a port the kernel picks.
     pub fn archive(&self, member_id: i32) -> u16 {
         self.base + 40 + u16::try_from(member_id).unwrap()
+    }
+
+    /// The `archiveResponseEndpoint` of the member string's seventh attribute
+    /// (`ClusterMember.java:477-479`: "to which the archive control response
+    /// channel can be reached").
+    ///
+    /// A follower's log replication puts it on the copy's channel as
+    /// `control=<this>|control-mode=response` (`CMA:2964-2972`), which is what
+    /// makes a member string with the attribute ask for a response-channel
+    /// copy.
+    pub fn archive_response(&self, member_id: i32) -> u16 {
+        self.base + 45 + u16::try_from(member_id).unwrap()
     }
 
     /// Where a backup's own consensus **subscription** listens
@@ -353,6 +367,31 @@ pub fn members(ports: &Ports) -> String {
                 ports.consensus(id),
                 ports.log(id),
                 ports.archive(id),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// The same, with the seventh attribute — the endpoint each member's archive
+/// answers a **response-mode** replication on (`ClusterMember.java:576-604`,
+/// `TestCluster.java:1893-1896`).
+///
+/// A member string with it is what makes a follower's log replication take the
+/// response-channel route: `newLogReplication` asks the cluster for the
+/// leader's response endpoint and rewrites the copy's channel to name it
+/// (`CMA:2964-2972`).
+#[must_use]
+pub fn members_with_response_endpoints(ports: &Ports) -> String {
+    (0..MEMBER_COUNT)
+        .map(|id| {
+            format!(
+                "{id},localhost:{},localhost:{},localhost:{},localhost:0,localhost:{},localhost:{}",
+                ports.ingress(id),
+                ports.consensus(id),
+                ports.log(id),
+                ports.archive(id),
+                ports.archive_response(id),
             )
         })
         .collect::<Vec<_>>()
