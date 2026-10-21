@@ -55,7 +55,7 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 fn start_cluster(
     ports: &Ports,
     module_arguments: &[&str],
-) -> Option<(Vec<Node>, Vec<NodeCounters>)> {
+) -> Option<(Vec<Node>, Vec<NodeCounters>, Faults)> {
     start_cluster_with(ports, module_arguments, &|_| Vec::new())
 }
 
@@ -65,7 +65,7 @@ fn start_cluster_with(
     ports: &Ports,
     module_arguments: &[&str],
     driver_properties: &dyn Fn(i32) -> Vec<String>,
-) -> Option<(Vec<Node>, Vec<NodeCounters>)> {
+) -> Option<(Vec<Node>, Vec<NodeCounters>, Faults)> {
     let faults = Faults::default();
     let (launched_tx, launched_rx) = mpsc::channel();
     let member_string = members(ports);
@@ -102,7 +102,7 @@ fn start_cluster_with(
             .all(|node| node.election_state() == Some(ELECTION_CLOSED))
     });
 
-    Some((nodes, counters))
+    Some((nodes, counters, faults))
 }
 
 /// The leader the counters name, once there is exactly one.
@@ -198,13 +198,14 @@ fn await_leader(counters: &[NodeCounters], faults: &Faults) -> i32 {
 fn a_java_client_echoes_through_our_three_node_cluster() {
     let _serial = serial();
     let ports = Ports::new();
-    let Some((mut nodes, counters)) = start_cluster(&ports, &[]) else {
+    let Some((mut nodes, counters, faults)) = start_cluster(&ports, &[]) else {
         return;
     };
 
-    await_leader(&counters, &Faults::default());
+    await_leader(&counters, &faults);
 
     let reading = java_client_echoes(&ports, 5);
+    faults.check();
     assert!(
         reading.contains("RECEIVED 5"),
         "the reference's client read five echoes back through our cluster: {reading}"
@@ -227,17 +228,18 @@ fn an_appointed_leader_is_the_one_that_serves() {
     let ports = Ports::new();
     let appointed = 1;
     let argument = format!("-Daeron.cluster.appointed.leader.id={appointed}");
-    let Some((mut nodes, counters)) = start_cluster(&ports, &[argument.as_str()]) else {
+    let Some((mut nodes, counters, faults)) = start_cluster(&ports, &[argument.as_str()]) else {
         return;
     };
 
-    let leader = await_leader(&counters, &Faults::default());
+    let leader = await_leader(&counters, &faults);
     assert_eq!(
         appointed, leader,
         "the appointed member leads, not whichever election won"
     );
 
     let reading = java_client_echoes(&ports, 3);
+    faults.check();
     assert!(
         reading.contains("RECEIVED 3"),
         "the reference's client echoes through the appointed leader: {reading}"
@@ -288,17 +290,18 @@ fn a_full_partition_heals_and_the_cluster_elects_again() {
         ]
     };
 
-    let Some((mut nodes, counters)) =
+    let Some((mut nodes, counters, faults)) =
         start_cluster_with(&ports, &[heartbeat, session_timeout], properties)
     else {
         return;
     };
 
-    await_leader(&counters, &Faults::default());
+    await_leader(&counters, &faults);
 
     // 300 messages at 100 ms: the run spans the 8-14 s window with room on both
     // sides, and the reference's client has to keep its session across it.
     let reading = java_client_echoes_at(&ports, 300, 100);
+    faults.check();
     assert!(
         reading.contains("RECEIVED 300"),
         "the reference's client read every echo across the partition: {reading}"
