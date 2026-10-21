@@ -580,6 +580,7 @@ impl Node {
     /// `module_arguments` to the consensus module's command line
     /// (`aeron.cluster.appointed.leader.id` and the other per-member settings
     /// a scenario picks).
+    #[allow(clippy::too_many_arguments)] // one per thing a case varies
     pub fn start_with_properties(
         id: i32,
         ports: &Ports,

@@ -30,6 +30,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use deepmsg_cluster::config::CONSENSUS_STREAM_ID_DEFAULT as CONSENSUS_STREAM;
 use deepmsg_tests::aeron_tests;
 use deepmsg_tests::cluster_harness::{
     ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters, Ports, ROLE_LEADER, announce_skip,
@@ -250,28 +251,43 @@ fn an_appointed_leader_is_the_one_that_serves() {
     }
 }
 
-/// **A full partition heals and the cluster elects again**
-/// (`ClusterTest.shouldFormClusterAfterFullPartition`).
+/// **A consensus partition heals, the cluster elects again, and the
+/// reference's client offers on the far side of it**
+/// (`ClusterTest.shouldFormClusterAfterFullPartition`, `ClusterTest.java:3502-3559`).
 ///
-/// Every member's **receive** side is blacked out for a window
-/// (`debug.receive.data.loss.from/until.millis`, heartbeats included,
-/// `crates/driver/src/config.rs`), so nobody hears anybody: the leader steps
-/// down on its heartbeat timeout and every member canvasses. When the window
-/// closes the cluster has to elect and take the reference's client's messages
-/// again — the client is still offering, one every 100 ms, across the window.
+/// Every member stops hearing every other member's **consensus** traffic for a
+/// window (`debug.receive.data.loss.*` on stream 108, heartbeats included,
+/// `crates/driver/src/config.rs`), so no member can append an opinion and the
+/// leader steps down on its heartbeat timeout. When the window closes the
+/// cluster has to elect again, and the reference's client — one client, one
+/// session, connected before the window — has to have its next message
+/// answered after it.
 ///
-/// Why the whole cluster and not the leader alone: the window is a driver
-/// setting, decided before the cluster starts, and which member leads is not
-/// known until it has elected. A *selective* partition needs an instrument that
-/// can be switched while the driver runs, which this build's `debug.*.data.loss`
-/// family deliberately does not have (`media/receive_loss.rs`, module note); the
-/// leader-only shape is recorded as the gap that instrument would close.
+/// # Why the consensus stream only
+///
+/// That is the reference's own shape: its case enables a
+/// `StreamIdLossGenerator` on `consensusStreamId` and nothing else
+/// (`ClusterTest.java:3526-3530`). The log is what makes the difference. A
+/// blackout that also stops the log leaves the leader's log ahead of its
+/// commit position — uncommitted entries it appended while it could not reach
+/// a quorum — and the container's log reader is bounded by the commit position
+/// (`BoundedLogAdapter.poll(commitPosition)`, `BoundedLogAdapter.java:100-108`).
+/// Its old image therefore never drains, is never announced unavailable, and
+/// the new term's `JoinLog` is never taken: the consensus module waits in
+/// `awaitServicesReady` for an ack that cannot come. That is what the case
+/// below (`a_full_receive_blackout_...`, ignored) shows, and it is why this
+/// one is the consensus stream's.
+///
+/// # Why no traffic during the window
+///
+/// For the same reason, from the other end: messages offered *during* the
+/// blackout are appended by the leader and never committed, which is the same
+/// uncommitted tail. The reference's case sends one message before the outage
+/// and its next after `reconnectClient()`; this one keeps the **same** session
+/// and offers its second message once the window has closed, which is the
+/// stronger of the two readings.
 #[test]
-#[ignore = "P3-6c: the cluster re-elects after the partition heals, but the \
-            reference's client cannot offer again (OFFER_FAILED -1) — the \
-            new-leader event, the session, or its ingress publication. \
-            See records/P3-6c.md."]
-fn a_full_partition_heals_and_the_cluster_elects_again() {
+fn a_consensus_partition_heals_and_the_cluster_elects_again() {
     let _serial = serial();
     let ports = Ports::new();
     // The harness starts members with a 30 s heartbeat timeout, and a leader
@@ -279,8 +295,107 @@ fn a_full_partition_heals_and_the_cluster_elects_again() {
     // (`agent/mod.rs:955-962`): three seconds here, so the partition outlasts
     // the timeout and every member really does step down.
     let heartbeat = "-Daeron.cluster.leader.heartbeat.timeout=3s";
-    // Longer than the partition, so no session is closed for age while the
-    // cluster is deaf.
+    // Longer than the partition, so the client's session is not closed for age
+    // while the cluster is deaf.
+    let session_timeout = "-Daeron.cluster.session.timeout=60s";
+    // The window is measured from the consensus stream's **first** frame,
+    // which is the cluster starting: 15 s is past every member's election and
+    // past the probe's compile-and-connect, and 21 s is well inside the 40 s
+    // the client waits before its second message.
+    let properties = &|_id: i32| -> Vec<String> {
+        vec![
+            "-Daeron.image.liveness.timeout=1000ms".to_owned(),
+            format!("-Ddeepmsg.debug.receive.data.loss.stream.id={CONSENSUS_STREAM}"),
+            "-Ddeepmsg.debug.receive.data.loss.from.millis=15000".to_owned(),
+            "-Ddeepmsg.debug.receive.data.loss.until.millis=21000".to_owned(),
+            "-Ddeepmsg.debug.receive.data.loss.drop.heartbeats=true".to_owned(),
+        ]
+    };
+
+    let Some((mut nodes, counters, faults)) =
+        start_cluster_with(&ports, &[heartbeat, session_timeout], properties)
+    else {
+        return;
+    };
+
+    await_leader(&counters, &faults);
+
+    // Two messages 40 s apart: the first is answered before the window, the
+    // pause spans it, and the second is offered after it — same client, same
+    // session.
+    let reading = java_client_echoes_at(&ports, 2, 40_000);
+    faults.check();
+    assert!(
+        reading.contains("RECEIVED 2"),
+        "the reference's client was answered on both sides of the partition: {reading}; \
+         roles {:?}, terms {:?}, election {:?}",
+        (0..MEMBER_COUNT)
+            .map(|id| counters[id as usize].role())
+            .collect::<Vec<_>>(),
+        (0..MEMBER_COUNT)
+            .map(|id| counters[id as usize].leadership_term_id())
+            .collect::<Vec<_>>(),
+        (0..MEMBER_COUNT)
+            .map(|id| counters[id as usize].election_state())
+            .collect::<Vec<_>>(),
+    );
+
+    // And the cluster really did elect again rather than merely survive: one
+    // leader, every member closed, and the leader's term past its first.
+    let leader = await_leader(&counters, &faults);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while Instant::now() < deadline
+        && !counters
+            .iter()
+            .all(|node| node.election_state() == Some(ELECTION_CLOSED))
+    {
+        faults.check();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        counters
+            .iter()
+            .all(|node| node.election_state() == Some(ELECTION_CLOSED)),
+        "every member's election closes again; states {:?}",
+        (0..MEMBER_COUNT)
+            .map(|id| counters[id as usize].election_state())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        counters[leader as usize].leadership_term_id().unwrap_or(0) >= 1,
+        "the leader that serves after the partition is in a later term: {:?}",
+        (0..MEMBER_COUNT)
+            .map(|id| counters[id as usize].leadership_term_id())
+            .collect::<Vec<_>>()
+    );
+
+    for node in &mut nodes {
+        node.stop();
+    }
+}
+
+/// **A full receive blackout leaves every container holding its old log
+/// image.** Ignored: this is the measurement that says why the case above is
+/// the consensus stream's, not a criterion anyone passes.
+///
+/// Every member stops hearing **everything** — log, consensus, ingress — for
+/// the same window, and the client offers throughout it (one message every
+/// 100 ms). Measured state after the window, with the defects the diagnosis
+/// found fixed: the cluster elects, the followers form log images, and then
+/// every container sits on an image that cannot drain —
+/// `position` 7008, its only reader at 6816 because the commit position is
+/// 6816 — so `JoinLog` is never taken and the consensus module spins in
+/// `awaitServicesReady`. See `records/P3-6c.md` §4.
+#[test]
+#[ignore = "P3-6c: a full receive blackout leaves the leader's log ahead of \
+            its commit position, and the container's old image then never \
+            drains (from 6912/7008 to 6816, measured) — the new term's \
+            JoinLog is never taken and the module waits in \
+            awaitServicesReady. See records/P3-6c.md."]
+fn a_full_receive_blackout_leaves_the_container_holding_its_log_image() {
+    let _serial = serial();
+    let ports = Ports::new();
+    let heartbeat = "-Daeron.cluster.leader.heartbeat.timeout=3s";
     let session_timeout = "-Daeron.cluster.session.timeout=60s";
     let properties = &|_id: i32| -> Vec<String> {
         vec![
@@ -299,8 +414,6 @@ fn a_full_partition_heals_and_the_cluster_elects_again() {
 
     await_leader(&counters, &faults);
 
-    // 300 messages at 100 ms: the run spans the 8-14 s window with room on both
-    // sides, and the reference's client has to keep its session across it.
     let reading = java_client_echoes_at(&ports, 300, 100);
     faults.check();
     assert!(
