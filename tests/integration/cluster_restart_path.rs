@@ -35,8 +35,14 @@ use std::time::{Duration, Instant};
 use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_tests::cluster_harness::{
     CATCHUP_DEADLINE, ClientSide, ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters, Ports,
-    ROLE_FOLLOWER, ROLE_LEADER, announce_skip, await_launched, members, wait_until,
+    ROLE_FOLLOWER, ROLE_LEADER, announce_skip, await_launched, members_of, wait_until,
 };
+
+/// The reference's **five-member** shape: the cases where a majority has to
+/// stay alive while others are away (`ClusterTest`'s five-node rows). With
+/// three members, two away is no quorum at all and a client cannot even open a
+/// session.
+const FIVE: i32 = 5;
 
 /// The scenarios here bind ports derived from the **process** id
 /// (`cluster_harness::Ports`), so `cargo test`'s parallel threads would race
@@ -51,16 +57,21 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
 /// Three members, launched, with their counters — or `None` when this machine
 /// cannot stand a driver up.
 fn start_cluster(ports: &Ports) -> Option<(Vec<Node>, Vec<NodeCounters>, Faults)> {
-    let member_string = members(ports);
+    start_cluster_of(ports, MEMBER_COUNT)
+}
+
+/// [`start_cluster`] for a cluster of `count` members.
+fn start_cluster_of(ports: &Ports, count: i32) -> Option<(Vec<Node>, Vec<NodeCounters>, Faults)> {
+    let member_string = members_of(ports, count);
     let faults = Faults::default();
     let (launched_tx, launched_rx) = mpsc::channel();
 
     let mut nodes = Vec::new();
-    for id in 0..MEMBER_COUNT {
+    for id in 0..count {
         let node = Node::start(id, ports, &member_string, &faults, &launched_tx)?;
         nodes.push(node);
     }
-    await_launched(&faults, &launched_rx, MEMBER_COUNT);
+    await_launched(&faults, &launched_rx, count);
 
     let counters: Vec<NodeCounters> = nodes
         .iter()
@@ -1427,6 +1438,354 @@ fn two_failed_leaders_come_back_together() {
     assert!(
         term > second_term,
         "the term they closed in is later than the second leader's: {term} <= {second_term}"
+    );
+
+    for node in &mut nodes {
+        node.stop();
+    }
+}
+
+/// **Two fresh members come back together, with a quorum left alive while they
+/// are away** (`ClusterTest.shouldCatchUpTwoFreshNodesAfterRestart`,
+/// `ClusterTest.java:2060`).
+///
+/// Five members, which is the reference's shape and the reason this row is not
+/// one of the three-member ones: two away leave three, and three is a quorum, so
+/// the commits keep landing while the members are gone.
+#[test]
+#[ignore = "P3-6c: the five-member fixture's first use does not commit for the client it was opened with: with three of five alive a fresh client commits (640 -> 1024) while the older client's offers stop landing (its publication reads position 640 although offer returns Ok). See records/P3-6c.md 6.8."]
+fn two_fresh_members_come_back_to_a_five_member_cluster() {
+    let _serial = serial();
+    let ports = Ports::new();
+    let Some((mut nodes, counters, faults)) = start_cluster_of(&ports, FIVE) else {
+        return;
+    };
+
+    let leader = the_leader(&counters);
+    let away: Vec<i32> = (0..FIVE).filter(|id| *id != leader).take(2).collect();
+
+    let Some(mut client) = ClientSide::start(&ports, leader) else {
+        announce_skip();
+        return;
+    };
+    let session = open_session(&mut client, &faults);
+    let mut last = counters[leader as usize]
+        .commit_position()
+        .expect("the leader's commit");
+    for index in 0..3u8 {
+        client.send(&session, &[b'i' + index; 16], &faults);
+        wait_until("each message to commit", &faults, || {
+            client.poll_events();
+            counters[leader as usize]
+                .commit_position()
+                .is_some_and(|position| position > last)
+        });
+        last = counters[leader as usize]
+            .commit_position()
+            .expect("a commit");
+    }
+
+    // ---- two of them go, and the other three carry on ---------------------
+    for member in &away {
+        nodes[*member as usize].stop();
+    }
+    // A session opened before the stops is the question, not the instrument: a
+    // fresh client proves the cluster takes messages at all with three of five.
+    {
+        let Some(mut fresh) = ClientSide::start_at(&ports, leader, 1) else {
+            announce_skip();
+            return;
+        };
+        let fresh_session = open_session(&mut fresh, &faults);
+        let before = counters[leader as usize]
+            .commit_position()
+            .expect("the leader's commit");
+        fresh.send(
+            &fresh_session,
+            b"a fresh client with three of five",
+            &faults,
+        );
+        wait_with_state(
+            "a fresh client's message to commit with three of five",
+            &faults,
+            CATCHUP_DEADLINE,
+            || {
+                fresh.poll_events();
+                counters[leader as usize]
+                    .commit_position()
+                    .is_some_and(|position| position > before)
+            },
+            || {
+                format!(
+                    "roles {:?}, appends {:?}, commits {:?}, terms {:?}, election {:?}; \
+                     fresh client {}",
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].role())
+                        .collect::<Vec<_>>(),
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].append_position())
+                        .collect::<Vec<_>>(),
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].commit_position())
+                        .collect::<Vec<_>>(),
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].leadership_term_id())
+                        .collect::<Vec<_>>(),
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].election_state())
+                        .collect::<Vec<_>>(),
+                    "<read after the loop>",
+                )
+            },
+        );
+        last = counters[leader as usize]
+            .commit_position()
+            .expect("a commit");
+    }
+    for index in 0..5u8 {
+        client.send(&session, &[b'j' + index; 16], &faults);
+        let deadline = Instant::now() + CATCHUP_DEADLINE;
+        loop {
+            faults.check();
+            client.poll_events();
+            if counters[leader as usize]
+                .commit_position()
+                .is_some_and(|position| position > last)
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "a message committed with three of five; roles {:?}, appends {:?}, commits \
+                     {:?}, terms {:?}, election {:?}; leader {leader} had {last}; client {}",
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].role())
+                        .collect::<Vec<_>>(),
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].append_position())
+                        .collect::<Vec<_>>(),
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].commit_position())
+                        .collect::<Vec<_>>(),
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].leadership_term_id())
+                        .collect::<Vec<_>>(),
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].election_state())
+                        .collect::<Vec<_>>(),
+                    client.ingress_publication_state(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        last = counters[leader as usize]
+            .commit_position()
+            .expect("a commit");
+    }
+
+    // ---- and both come back on their own directories ----------------------
+    let (relaunch_tx, relaunch_rx) = mpsc::channel();
+    for member in &away {
+        nodes[*member as usize].restart(&relaunch_tx);
+    }
+    await_launched(
+        &faults,
+        &relaunch_rx,
+        i32::try_from(away.len()).expect("two"),
+    );
+
+    wait_with_state(
+        "both returning members to catch up",
+        &faults,
+        CATCHUP_DEADLINE,
+        || {
+            away.iter().all(|id| {
+                counters[*id as usize].election_state() == Some(ELECTION_CLOSED)
+                    && counters[*id as usize].role() == Some(ROLE_FOLLOWER)
+                    && counters[*id as usize]
+                        .commit_position()
+                        .is_some_and(|position| position >= last)
+            })
+        },
+        || {
+            format!(
+                "roles {:?}, commits {:?}; the leader's commit was {last}",
+                away.iter()
+                    .map(|id| counters[*id as usize].role())
+                    .collect::<Vec<_>>(),
+                away.iter()
+                    .map(|id| counters[*id as usize].commit_position())
+                    .collect::<Vec<_>>(),
+            )
+        },
+    );
+
+    // And they are live followers: one more message reaches them.
+    client.send(&session, b"after both came back", &faults);
+    wait_with_state(
+        "a message committed with both back",
+        &faults,
+        CATCHUP_DEADLINE,
+        || {
+            client.poll_events();
+            away.iter().all(|id| {
+                counters[*id as usize]
+                    .commit_position()
+                    .is_some_and(|position| position > last)
+            })
+        },
+        || {
+            format!(
+                "leader commit={:?}, member commits {:?} (target {last})",
+                counters[leader as usize].commit_position(),
+                away.iter()
+                    .map(|id| counters[*id as usize].commit_position())
+                    .collect::<Vec<_>>(),
+            )
+        },
+    );
+
+    for node in &mut nodes {
+        node.stop();
+    }
+}
+
+/// **A member with an empty log that is several terms behind catches up**
+/// (`ClusterTest.shouldRecoverWhenFollowerIsMultipleTermsBehindFromEmptyLog`,
+/// `ClusterTest.java:2520`).
+///
+/// Five members again: one goes, and while it is away the cluster changes leader
+/// twice — which takes a live majority, and is why the three-member harness
+/// cannot ask this question.
+#[test]
+#[ignore = "P3-6c: same five-member blocker - recorded as a lead, not a flake. See records/P3-6c.md 6.8."]
+fn a_member_three_terms_behind_comes_back_to_a_five_member_cluster() {
+    let _serial = serial();
+    let ports = Ports::new();
+    let Some((mut nodes, counters, faults)) = start_cluster_of(&ports, FIVE) else {
+        return;
+    };
+
+    let away = (0..FIVE)
+        .find(|id| counters[*id as usize].role() == Some(ROLE_FOLLOWER))
+        .expect("a follower");
+    nodes[away as usize].stop();
+
+    // Two leader changes while it is away: each one stops the current leader,
+    // lets the rest elect, and brings the stopped member back as a follower.
+    let mut term = counters[the_leader(&counters) as usize]
+        .leadership_term_id()
+        .expect("the first term");
+    for _ in 0..2 {
+        let current = the_leader(&counters);
+        nodes[current as usize].stop();
+        wait_with_state(
+            "the rest to elect a later term",
+            &faults,
+            CATCHUP_DEADLINE,
+            || {
+                (0..FIVE).any(|id| {
+                    counters[id as usize].role() == Some(ROLE_LEADER)
+                        && counters[id as usize]
+                            .leadership_term_id()
+                            .is_some_and(|value| value > term)
+                })
+            },
+            || {
+                format!(
+                    "terms {:?}, roles {:?}, election {:?}",
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].leadership_term_id())
+                        .collect::<Vec<_>>(),
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].role())
+                        .collect::<Vec<_>>(),
+                    (0..FIVE)
+                        .map(|id| counters[id as usize].election_state())
+                        .collect::<Vec<_>>(),
+                )
+            },
+        );
+        let elected = (0..FIVE)
+            .find(|id| counters[*id as usize].role() == Some(ROLE_LEADER))
+            .expect("a leader");
+        term = counters[elected as usize]
+            .leadership_term_id()
+            .expect("the term");
+
+        let (tx, rx) = mpsc::channel();
+        nodes[current as usize].restart(&tx);
+        await_launched(&faults, &rx, 1);
+        wait_with_state(
+            "the returning leader to close as a follower",
+            &faults,
+            CATCHUP_DEADLINE,
+            || {
+                counters[current as usize].election_state() == Some(ELECTION_CLOSED)
+                    && counters[current as usize].role() == Some(ROLE_FOLLOWER)
+            },
+            || {
+                let member = &counters[current as usize];
+                format!(
+                    "member {current}: role={:?} election={:?} term={:?}",
+                    member.role(),
+                    member.election_state(),
+                    member.leadership_term_id(),
+                )
+            },
+        );
+    }
+
+    let leader = the_leader(&counters);
+    let Some(mut client) = ClientSide::start(&ports, leader) else {
+        announce_skip();
+        return;
+    };
+    let session = open_session(&mut client, &faults);
+    let mut last = counters[leader as usize]
+        .commit_position()
+        .expect("the leader's commit");
+    for index in 0..5u8 {
+        client.send(&session, &[b'k' + index; 16], &faults);
+        wait_until("each message to commit", &faults, || {
+            client.poll_events();
+            counters[leader as usize]
+                .commit_position()
+                .is_some_and(|position| position > last)
+        });
+        last = counters[leader as usize]
+            .commit_position()
+            .expect("a commit");
+    }
+
+    // ---- and the member that missed both terms comes back -----------------
+    let (back_tx, back_rx) = mpsc::channel();
+    nodes[away as usize].restart(&back_tx);
+    await_launched(&faults, &back_rx, 1);
+
+    wait_with_state(
+        "the member three terms behind to catch up",
+        &faults,
+        CATCHUP_DEADLINE,
+        || {
+            counters[away as usize].election_state() == Some(ELECTION_CLOSED)
+                && counters[away as usize].role() == Some(ROLE_FOLLOWER)
+                && counters[away as usize]
+                    .commit_position()
+                    .is_some_and(|position| position >= last)
+        },
+        || {
+            let member = &counters[away as usize];
+            format!(
+                "member {away}: role={:?} election={:?} term={:?} append={:?} commit={:?}; the \
+                 leader's commit was {last}",
+                member.role(),
+                member.election_state(),
+                member.leadership_term_id(),
+                member.append_position(),
+                member.commit_position(),
+            )
+        },
     );
 
     for node in &mut nodes {
