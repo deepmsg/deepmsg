@@ -216,7 +216,15 @@ struct BackupSide {
 
 impl BackupSide {
     fn start(ports: &Ports) -> Option<Self> {
-        let driver = OwnDriver::start("cluster-backup-query")?;
+        // The name carries the case's port block, as every other driver this
+        // harness starts does (`cluster-node-{id}-{base}`,
+        // `cluster-harness-client-{base}`, `cluster-backup-{base}`):
+        // `ReferenceDriver::start_with_env` **removes** the directory it is
+        // about to use (`tests/src/driver.rs`), so two cases of this binary
+        // sharing a name delete each other's CnC file while they run on
+        // threads of one process. That is what CI showed: both cases failing
+        // at the connect below with `Cnc(NotFound)`.
+        let driver = OwnDriver::start(&format!("cluster-backup-query-{}", ports.base()))?;
         let mut client = Client::connect(driver.aeron_dir()).expect("the backup's client connects");
 
         // The response channel is the backup's own consensus channel: the
@@ -536,4 +544,40 @@ fn a_backup_query_finds_the_snapshot_at_or_before_its_log_position() {
     for node in &mut nodes {
         node.stop();
     }
+}
+
+/// **Two backups in one process have directories of their own** — the
+/// regression guard for the shared driver name that made both cases of this
+/// binary delete each other's CnC file (CI, the post-merge run of #135: both
+/// panicked at the connect in [`BackupSide::start`] with `Cnc(NotFound)`).
+///
+/// `ReferenceDriver::start_with_env` removes the directory it is about to use,
+/// so sharing a name across cases is sharing a directory — and the second case
+/// to start deletes the first one's. Every other driver this harness starts
+/// carries the case's port block in its name; this asserts the backup's does.
+#[test]
+fn two_backups_in_one_process_have_directories_of_their_own() {
+    static BASE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    let base = *BASE.get_or_init(|| Ports::new().base());
+    let first = Ports::with_base(base + 200);
+    let second = Ports::with_base(base + 264);
+
+    let Some(first_backup) = BackupSide::start(&first) else {
+        announce_skip();
+        return;
+    };
+    let Some(second_backup) = BackupSide::start(&second) else {
+        announce_skip();
+        return;
+    };
+
+    assert_ne!(
+        first_backup._driver.aeron_dir(),
+        second_backup._driver.aeron_dir(),
+        "two cases' backups must not share an aeron directory"
+    );
+    // The property CI lost: the first backup's CnC is still connectable after
+    // the second one started.
+    let _client = Client::connect(first_backup._driver.aeron_dir())
+        .expect("the first backup's CnC survives the second backup's start");
 }
