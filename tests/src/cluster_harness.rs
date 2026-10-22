@@ -157,11 +157,12 @@ pub const PORT_BASE_ENV: &str = "CLUSTER_HARNESS_PORT_BASE";
 
 impl Ports {
     pub fn new() -> Self {
-        // A block of fifty per run, because the highest offset used is +47 (a
-        // member's archive response endpoint; a second client's egress port is
-        // +30 plus its offset). Eighty blocks, 21000..25200 — below the
-        // kernel's ephemeral range, which is where a random `pid %` would
-        // otherwise land.
+        // A block of sixty per run, because a **five-member** cluster needs
+        // +0..+4 (ingress), +10..+14 (consensus), +20..+24 (log), +40..+44
+        // (archive) and +47..+51 (each member's archive response endpoint),
+        // with the backup's two ports at +45 and +46 and the client's egress
+        // at +30. Eighty blocks, 21000..25800 — below the kernel's ephemeral
+        // range, which is where a random `pid %` would otherwise land.
         //
         // ★ **The block is per *process*, and two processes can land on the
         // same one**: `pid %` is not a reservation, and this repository is
@@ -173,7 +174,7 @@ impl Ports {
         let base = std::env::var(PORT_BASE_ENV)
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or_else(|| 21_000 + (u16::try_from(std::process::id() % 80).unwrap()) * 50);
+            .unwrap_or_else(|| 21_000 + (u16::try_from(std::process::id() % 80).unwrap()) * 60);
 
         Self {
             base,
@@ -282,20 +283,20 @@ impl Ports {
     /// makes a member string with the attribute ask for a response-channel
     /// copy.
     pub fn archive_response(&self, member_id: i32) -> u16 {
-        self.base + 45 + u16::try_from(member_id).unwrap()
+        self.base + 47 + u16::try_from(member_id).unwrap()
     }
 
     /// Where a backup's own consensus **subscription** listens
     /// (`TestCluster.java:591-592`: the consensus channel with the backup's
     /// endpoint on it).
     pub fn backup_consensus(&self) -> u16 {
-        self.base + 43
+        self.base + 45
     }
 
     /// Where a backup's archive receives the cluster's log and snapshots —
     /// `aeron.cluster.backup.catchup.endpoint` (`TestCluster.java:599`).
     pub fn backup_catchup(&self) -> u16 {
-        self.base + 44
+        self.base + 46
     }
 
     pub fn ingress_channel(&self, member_id: i32) -> String {
@@ -394,7 +395,15 @@ impl Default for Ports {
 /// archive, so it is a real port (`Ports::archive`); a follower's catchup
 /// endpoint is resolved at run time and stays `:0`.
 pub fn members(ports: &Ports) -> String {
-    (0..MEMBER_COUNT)
+    members_of(ports, MEMBER_COUNT)
+}
+
+/// [`members`] for a cluster of `count` members — the reference's five-member
+/// cases need the same string with two more entries
+/// (`ClusterTest.java:1877-1905` is written for any count).
+#[must_use]
+pub fn members_of(ports: &Ports, count: i32) -> String {
+    (0..count)
         .map(|id| {
             format!(
                 "{id},localhost:{},localhost:{},localhost:{},localhost:0,localhost:{}",
@@ -1059,6 +1068,43 @@ impl Node {
     /// cluster id can be taken again.
     pub fn restart(&mut self, launched: &mpsc::Sender<(i32, Result<(), String>)>) {
         assert!(self.is_stopped(), "a running node cannot be restarted");
+        self.launch_thread(launched);
+    }
+
+    /// The reference's `cleanStart` (`TestCluster.startStaticNode(index, true)`,
+    /// which sets `deleteArchiveOnStart` and `deleteDirOnStart`): this member's
+    /// archive and cluster directories are **emptied** before it starts again,
+    /// so it comes back with no log at all and has to be caught up from the
+    /// leader's archive. [`Self::restart`] is the dirty half — the same
+    /// directories, the log it had.
+    pub fn restart_empty(&mut self, launched: &mpsc::Sender<(i32, Result<(), String>)>) {
+        self.stop();
+
+        // The driver first, as in [`Self::restart_whole`]: its `Drop` removes
+        // the aeron directory, which is the path the next one creates.
+        if let Some(mut driver) = self.driver.take() {
+            driver.stop().expect("the driver stops");
+        }
+
+        for directory in [self.archive_dir.path(), self.cluster_dir.path()] {
+            let entries = std::fs::read_dir(directory).expect("the directory lists");
+            for entry in entries {
+                let entry = entry.expect("an entry");
+                let path = entry.path();
+                if entry.file_type().expect("a type").is_dir() {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+
+        let refs: Vec<&str> = self.driver_properties.iter().map(String::as_str).collect();
+        let name = self.name.clone();
+        let mut driver = OwnArchivingMediaDriver::start(&name, self.archive_dir.path(), &refs)
+            .expect("the driver comes back up on an empty archive");
+        driver.await_ready(DEADLINE).expect("the driver is ready");
+        self.driver = Some(driver);
         self.launch_thread(launched);
     }
 
