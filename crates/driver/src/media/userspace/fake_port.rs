@@ -436,7 +436,7 @@ mod tests {
                 if frame.bytes[0] == 0x11 {
                     Disposition::Keep(Binding {
                         slot: 7,
-                        port: 44000,
+                        port: 14000,
                         generation: 3,
                     })
                 } else {
@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(
             Binding {
                 slot: 7,
-                port: 44000,
+                port: 14000,
                 generation: 3
             },
             kept[0].0

@@ -382,9 +382,9 @@ mod tests {
     fn an_answer_that_arrives_again_updates_the_row() {
         let mut fixture = Fixture::new();
         let mut cache = NameResolverCache::new(2000);
-        let name = "somewhere:40456";
-        let first = address(RES_TYPE_NAME_TO_IP4, 40456, [127, 0, 0, 1]);
-        let second = address(RES_TYPE_NAME_TO_IP4, 40457, [10, 0, 0, 1]);
+        let name = "somewhere:10456";
+        let first = address(RES_TYPE_NAME_TO_IP4, 10456, [127, 0, 0, 1]);
+        let second = address(RES_TYPE_NAME_TO_IP4, 10457, [10, 0, 0, 1]);
         let regions = fixture.holder.open();
 
         assert!(cache.add_or_update(
@@ -478,20 +478,20 @@ mod tests {
         assert!(address(RES_TYPE_NAME_TO_IP4, 1, [0, 0, 0, 0]).is_wildcard());
         assert!(!address(RES_TYPE_NAME_TO_IP4, 1, [0, 0, 0, 1]).is_wildcard());
 
-        let loopback: SocketAddr = "[::1]:40456".parse().expect("an address");
+        let loopback: SocketAddr = "[::1]:10456".parse().expect("an address");
         assert!(CacheAddress::from_socket_addr(loopback).is_wildcard());
         assert_eq!(
             RES_TYPE_NAME_TO_IP6,
             CacheAddress::from_socket_addr(loopback).res_type
         );
         assert_eq!(
-            40456,
+            10456,
             CacheAddress::from_socket_addr(loopback)
                 .to_socket_addr()
                 .port()
         );
 
-        let routable: SocketAddr = "[2001:db8::1]:40456".parse().expect("an address");
+        let routable: SocketAddr = "[2001:db8::1]:10456".parse().expect("an address");
         assert!(!CacheAddress::from_socket_addr(routable).is_wildcard());
     }
 }

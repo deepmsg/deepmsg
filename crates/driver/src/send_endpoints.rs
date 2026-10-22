@@ -11,7 +11,7 @@
 //!
 //! # Sharing is by canonical form, not by URI
 //!
-//! `aeron:udp?endpoint=localhost:40123` and `aeron:udp?endpoint=127.0.0.1:40123`
+//! `aeron:udp?endpoint=localhost:10123` and `aeron:udp?endpoint=127.0.0.1:10123`
 //! are the *same endpoint* — same canonical form — and a driver that made two
 //! sockets for them would send every datagram twice and report two channel
 //! statuses for one channel. The one exception is `tags=`: two channels that
@@ -868,7 +868,7 @@ mod tests {
 
         let first = endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123"),
+                channel("aeron:udp?endpoint=127.0.0.1:10123"),
                 &defaults(),
                 &DriverConfig::default(),
                 0,
@@ -885,7 +885,7 @@ mod tests {
         // different URI, the same canonical form.
         let second = endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123|mtu=1408"),
+                channel("aeron:udp?endpoint=127.0.0.1:10123|mtu=1408"),
                 &defaults(),
                 &DriverConfig::default(),
                 0,
@@ -917,7 +917,7 @@ mod tests {
     /// rather than a leak.
     #[test]
     fn a_channel_that_named_no_port_is_given_one_until_it_is_gone() {
-        const MANAGED: u16 = 40300;
+        const MANAGED: u16 = 10300;
 
         let mut fixture = Fixture::new();
         let (mut counters, regions) = fixture.open();
@@ -966,7 +966,7 @@ mod tests {
         );
 
         assert_eq!(
-            "no available ports in range 40300 40300",
+            "no available ports in range 10300 10300",
             refused.expect_err("a full range").to_string()
         );
         assert_eq!(1, endpoints.entries().len(), "a refusal adds nothing");
@@ -1007,7 +1007,7 @@ mod tests {
 
         let one = endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123|tags=1"),
+                channel("aeron:udp?endpoint=127.0.0.1:10123|tags=1"),
                 &defaults(),
                 &DriverConfig::default(),
                 0,
@@ -1021,7 +1021,7 @@ mod tests {
 
         let two = endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123|tags=2"),
+                channel("aeron:udp?endpoint=127.0.0.1:10123|tags=2"),
                 &defaults(),
                 &DriverConfig::default(),
                 0,
@@ -1045,7 +1045,7 @@ mod tests {
 
         endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123|tags=5"),
+                channel("aeron:udp?endpoint=127.0.0.1:10123|tags=5"),
                 &defaults(),
                 &DriverConfig::default(),
                 0,
@@ -1061,7 +1061,7 @@ mod tests {
         // itself, which the reference refuses with the addresses named.
         let error = endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40124|tags=5"),
+                channel("aeron:udp?endpoint=127.0.0.1:10124|tags=5"),
                 &defaults(),
                 &DriverConfig::default(),
                 0,
@@ -1337,8 +1337,8 @@ mod tests {
         // `so-sndbuf=1m` is a socket that was opened with one. A test whose
         // parameters said zero would be testing a different endpoint from the
         // one the channel describes.
-        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-sndbuf=1m";
-        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40123|so-sndbuf=2m";
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:10123|so-sndbuf=1m";
+        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:10123|so-sndbuf=2m";
 
         endpoints
             .get_or_add(
@@ -1377,8 +1377,8 @@ mod tests {
                 error,
                 EndpointError::ChannelValidation(ref message) if message ==
                     "so-sndbuf=2097152 does not match existing value of 1048576: \
-                     existingChannel=aeron:udp?endpoint=127.0.0.1:40123|so-sndbuf=1m \
-                     channel=aeron:udp?endpoint=127.0.0.1:40123|so-sndbuf=2m"
+                     existingChannel=aeron:udp?endpoint=127.0.0.1:10123|so-sndbuf=1m \
+                     channel=aeron:udp?endpoint=127.0.0.1:10123|so-sndbuf=2m"
             ),
             "{error}"
         );
@@ -1387,7 +1387,7 @@ mod tests {
         assert!(
             endpoints
                 .get_or_add(
-                    channel("aeron:udp?endpoint=127.0.0.1:40123"),
+                    channel("aeron:udp?endpoint=127.0.0.1:10123"),
                     &defaults(),
                     &DriverConfig::default(),
                     0,
@@ -1411,7 +1411,7 @@ mod tests {
 
         let outcome = endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123"),
+                channel("aeron:udp?endpoint=127.0.0.1:10123"),
                 &defaults(),
                 &DriverConfig::default(),
                 0,
@@ -1449,7 +1449,7 @@ mod tests {
         // `media/aeron_send_channel_endpoint.c:202-210`). The channel named no
         // local port, so the kernel chose one, and the label is where a reader
         // finds which.
-        let uri = "aeron:udp?endpoint=127.0.0.1:40123";
+        let uri = "aeron:udp?endpoint=127.0.0.1:10123";
         assert_eq!(format!("snd-channel: {uri} {bound}"), descriptor.label);
 
         // Its key is the channel's length and the channel
@@ -1478,7 +1478,7 @@ mod tests {
 
         let outcome = endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123"),
+                channel("aeron:udp?endpoint=127.0.0.1:10123"),
                 &defaults(),
                 &DriverConfig::default(),
                 0,
@@ -1527,7 +1527,7 @@ mod tests {
 
         // The socket's address, not the channel's: the channel's `endpoint` is
         // where this endpoint *sends*, and it is a different address entirely.
-        assert_ne!("127.0.0.1:40123", bound);
+        assert_ne!("127.0.0.1:10123", bound);
 
         let key = regions.reader().key(id).expect("a key");
         assert_eq!(
@@ -1562,7 +1562,7 @@ mod tests {
 
         let outcome = endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123"),
+                channel("aeron:udp?endpoint=127.0.0.1:10123"),
                 &defaults(),
                 &DriverConfig::default(),
                 0,
@@ -1578,7 +1578,7 @@ mod tests {
 
         let error = endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123"),
+                channel("aeron:udp?endpoint=127.0.0.1:10123"),
                 &defaults(),
                 &DriverConfig::default(),
                 0,
@@ -1601,8 +1601,8 @@ mod tests {
     fn an_endpoint_is_collected_only_when_it_is_idle_and_unused() {
         let entry = SendChannelEndpointEntry {
             id: 1,
-            channel: channel("aeron:udp?endpoint=127.0.0.1:40123"),
-            current_data_addr: "127.0.0.1:40123".parse().expect("an address"),
+            channel: channel("aeron:udp?endpoint=127.0.0.1:10123"),
+            current_data_addr: "127.0.0.1:10123".parse().expect("an address"),
             channel_status_counter_id: 0,
             status: EndpointStatus::Active,
             refcount: 1,
@@ -1642,7 +1642,7 @@ mod tests {
 
         let id = endpoints
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40123"),
+                channel("aeron:udp?endpoint=127.0.0.1:10123"),
                 &defaults(),
                 &DriverConfig::default(),
                 0,

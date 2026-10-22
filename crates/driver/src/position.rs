@@ -550,7 +550,7 @@ mod tests {
     fn the_local_address_key_holds_the_channel_status_and_the_address() {
         let key = LocalSockaddrKey {
             channel_status_id: 42,
-            local_sockaddr: "127.0.0.1:40456",
+            local_sockaddr: "127.0.0.1:10456",
         }
         .encode();
 
@@ -561,7 +561,7 @@ mod tests {
             "the channel status this address belongs to"
         );
         assert_eq!(15i32.to_le_bytes(), key[4..8], "the address's length");
-        assert_eq!(b"127.0.0.1:40456", &key[8..23]);
+        assert_eq!(b"127.0.0.1:10456", &key[8..23]);
         assert!(
             key[23..].iter().all(|byte| 0 == *byte),
             "everything past the address is zero"
@@ -575,7 +575,7 @@ mod tests {
         let read = deepmsg_cnc::counters::LocalSocketAddress::decode(&key).expect("a key we wrote");
 
         assert_eq!(42, read.channel_status_id);
-        assert_eq!("127.0.0.1:40456", read.address);
+        assert_eq!("127.0.0.1:10456", read.address);
     }
 
     /// The counter itself: type 14, the address in its label beside the channel
@@ -594,7 +594,7 @@ mod tests {
                 RECEIVE_LOCAL_SOCKADDR_NAME,
                 7,
                 42,
-                "127.0.0.1:40456",
+                "127.0.0.1:10456",
                 1_000,
             )
             .expect("a counter")
@@ -619,7 +619,7 @@ mod tests {
             Some((
                 LOCAL_SOCKADDR_TYPE_ID,
                 7,
-                "rcv-local-sockaddr: 42 127.0.0.1:40456".to_owned()
+                "rcv-local-sockaddr: 42 127.0.0.1:10456".to_owned()
             )),
             found
         );

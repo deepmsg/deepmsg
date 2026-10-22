@@ -989,7 +989,7 @@ mod tests {
 
     #[test]
     fn a_channels_nak_delay_is_read_or_left_to_the_driver() {
-        let named = resolve_subscription("aeron:udp?endpoint=127.0.0.1:40123|nak-delay=2ms")
+        let named = resolve_subscription("aeron:udp?endpoint=127.0.0.1:10123|nak-delay=2ms")
             .expect("a subscription");
 
         assert_eq!(
@@ -999,7 +999,7 @@ mod tests {
         );
 
         let silent =
-            resolve_subscription("aeron:udp?endpoint=127.0.0.1:40123").expect("a subscription");
+            resolve_subscription("aeron:udp?endpoint=127.0.0.1:10123").expect("a subscription");
 
         assert_eq!(
             None, silent.nak_delay_ns,
@@ -1013,7 +1013,7 @@ mod tests {
         // subscription standing (`aeron_publication_image.c:113-117`); this
         // refuses the subscription, which is the same answer a client can act
         // on, delivered earlier.
-        let error = resolve_subscription("aeron:udp?endpoint=127.0.0.1:40123|nak-delay=soon")
+        let error = resolve_subscription("aeron:udp?endpoint=127.0.0.1:10123|nak-delay=soon")
             .expect_err("a duration that is not one");
 
         assert!(
@@ -1040,10 +1040,10 @@ mod tests {
     #[test]
     fn a_congestion_control_is_a_subscriptions_to_name_and_the_images_to_read() {
         for uri in [
-            "aeron:udp?endpoint=127.0.0.1:40123",
-            "aeron:udp?endpoint=127.0.0.1:40123|cc=static",
-            "aeron:udp?endpoint=127.0.0.1:40123|cc=cubic",
-            "aeron:udp?endpoint=127.0.0.1:40123|cc=nonsense",
+            "aeron:udp?endpoint=127.0.0.1:10123",
+            "aeron:udp?endpoint=127.0.0.1:10123|cc=static",
+            "aeron:udp?endpoint=127.0.0.1:10123|cc=cubic",
+            "aeron:udp?endpoint=127.0.0.1:10123|cc=nonsense",
         ] {
             resolve_subscription(uri)
                 .unwrap_or_else(|error| panic!("{uri} makes a subscription: {error}"));
@@ -1097,7 +1097,7 @@ mod tests {
         // is not an invisible number: the term length goes out in the SETUP
         // frame and is the length of the log file the receiver maps.
         let config = config();
-        let params = resolve_ok("aeron:udp?endpoint=localhost:40456");
+        let params = resolve_ok("aeron:udp?endpoint=localhost:10456");
 
         assert_eq!(config.term_buffer_length, params.term_length);
         assert_eq!(config.mtu_length, params.mtu_length);
@@ -1138,7 +1138,7 @@ mod tests {
 
         assert_eq!(
             Infer,
-            resolve_subscription("aeron:udp?endpoint=127.0.0.1:40123")
+            resolve_subscription("aeron:udp?endpoint=127.0.0.1:10123")
                 .expect("a subscription")
                 .group
                 .clone(),
@@ -1152,7 +1152,7 @@ mod tests {
             ("group=false", ForceFalse),
             ("group=nonsense", ForceFalse),
         ] {
-            let uri = format!("aeron:udp?endpoint=127.0.0.1:40123|{named}");
+            let uri = format!("aeron:udp?endpoint=127.0.0.1:10123|{named}");
             assert_eq!(
                 expected,
                 resolve_subscription(&uri).expect("a subscription").group,
@@ -1162,7 +1162,7 @@ mod tests {
 
         // And the consideration moves the default with it, which is the whole
         // reason it is a setting.
-        let parsed = ChannelUri::parse(b"aeron:udp?endpoint=127.0.0.1:40123").expect("a URI");
+        let parsed = ChannelUri::parse(b"aeron:udp?endpoint=127.0.0.1:10123").expect("a URI");
         let mut config = config();
         config.receiver_group_consideration = ForceTrue;
         assert_eq!(
@@ -1352,7 +1352,7 @@ mod tests {
         };
 
         let params = resolve_with_tag(
-            "aeron:udp?endpoint=127.0.0.1:40123|session-id=tag:5",
+            "aeron:udp?endpoint=127.0.0.1:10123|session-id=tag:5",
             |tag| (5 == tag).then_some(named),
         )
         .expect("the tag names a publication");
@@ -1371,7 +1371,7 @@ mod tests {
         // (`aeron_driver_uri.c:277-300`), so a URI that names them overrides
         // what the tag gave.
         let explicit = resolve_with_tag(
-            "aeron:udp?endpoint=127.0.0.1:40123|session-id=tag:5|mtu=2048",
+            "aeron:udp?endpoint=127.0.0.1:10123|session-id=tag:5|mtu=2048",
             |_| Some(named),
         )
         .expect("the tag names a publication");
@@ -1384,7 +1384,7 @@ mod tests {
     /// it, and the tag is not a number at all.
     #[test]
     fn a_tag_that_names_no_publication_is_refused() {
-        let error = resolve("aeron:udp?endpoint=127.0.0.1:40123|session-id=tag:42")
+        let error = resolve("aeron:udp?endpoint=127.0.0.1:10123|session-id=tag:42")
             .expect_err("no publication carries the tag");
 
         assert_eq!(

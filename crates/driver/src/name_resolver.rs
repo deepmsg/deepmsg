@@ -774,7 +774,7 @@ mod tests {
         assert!(
             matches!(
                 resolver.resolve(
-                    "127.0.0.1:40456",
+                    "127.0.0.1:10456",
                     "endpoint",
                     false,
                     AddressFamily::Inet,
@@ -890,8 +890,8 @@ mod tests {
     #[test]
     fn a_failure_carries_what_the_resolver_said() {
         assert_eq!(
-            Resolution::Found("127.0.0.1:40456".parse().expect("an address")),
-            Resolution::Found("127.0.0.1:40456".parse().expect("an address"))
+            Resolution::Found("127.0.0.1:10456".parse().expect("an address")),
+            Resolution::Found("127.0.0.1:10456".parse().expect("an address"))
         );
 
         let refused = Resolution::Failed("Unable to resolve host=(x): (forced)".to_owned());
@@ -901,8 +901,8 @@ mod tests {
         assert!(what.contains("(forced)"), "{what}");
 
         assert_eq!(
-            Lookup::Found("elsewhere:40456".to_owned()),
-            Lookup::Found("elsewhere:40456".to_owned()),
+            Lookup::Found("elsewhere:10456".to_owned()),
+            Lookup::Found("elsewhere:10456".to_owned()),
             "and a lookup's third answer is a name, not an address"
         );
     }

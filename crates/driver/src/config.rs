@@ -5658,7 +5658,7 @@ mod tests {
             ),
             ("deepmsg.dpdk.rx.descriptors", "2048"),
             ("deepmsg.dpdk.rx.burst", "64"),
-            ("deepmsg.dpdk.ephemeral.ports", "40000-40100"),
+            ("deepmsg.dpdk.ephemeral.ports", "10000-10100"),
             ("deepmsg.dpdk.arp.timeout.ms", "1500"),
         ])
         .expect("a config");
@@ -5674,7 +5674,7 @@ mod tests {
         );
         assert_eq!(1024, config.dpdk.tx_descriptors, "the design's default");
         assert_eq!(2048, config.dpdk.rx_descriptors);
-        assert_eq!(40000..=40100, config.dpdk.ephemeral_ports);
+        assert_eq!(10000..=10100, config.dpdk.ephemeral_ports);
         assert_eq!(Duration::from_millis(1500), config.dpdk.arp_timeout);
         // The largest burst a port will take, which is the value that used to
         // be accepted-and-ignored like every other one.
@@ -5707,8 +5707,8 @@ mod tests {
                 "deepmsg.dpdk.static.neighbours",
                 "10.10.0.2=zz:00:00:00:00:02",
             ),
-            ("deepmsg.dpdk.ephemeral.ports", "40000"),
-            ("deepmsg.dpdk.ephemeral.ports", "40100-40000"),
+            ("deepmsg.dpdk.ephemeral.ports", "10000"),
+            ("deepmsg.dpdk.ephemeral.ports", "10100-10000"),
             // Below the port's floor. **These are the interesting ones**: a
             // setting in here is one the driver used to accept and start on,
             // and the port it built then answered nothing — the failure showed

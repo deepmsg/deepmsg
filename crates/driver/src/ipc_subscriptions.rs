@@ -2582,8 +2582,8 @@ mod tests {
 
     #[test]
     fn a_spy_matches_the_channel_it_spells_the_same_way() {
-        let spy = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:40123");
-        let channel = publication_channel("aeron:udp?endpoint=127.0.0.1:40123");
+        let spy = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:10123");
+        let channel = publication_channel("aeron:udp?endpoint=127.0.0.1:10123");
 
         assert!(spy.spy_matches(&channel, 1001, 100));
 
@@ -2592,7 +2592,7 @@ mod tests {
 
         // And a named session is looked for, not merely allowed: the wildcard
         // is the link that named none (`:74-79`).
-        let named = spy_link(1001, Some(100), "aeron:udp?endpoint=127.0.0.1:40123");
+        let named = spy_link(1001, Some(100), "aeron:udp?endpoint=127.0.0.1:10123");
         assert!(named.spy_matches(&channel, 1001, 100));
         assert!(!named.spy_matches(&channel, 1001, 101));
     }
@@ -2603,20 +2603,20 @@ mod tests {
         // clients wrote: the form is the two sides and nothing else, so a spy
         // whose URI carries parameters the publisher's never mentioned is
         // reading the same channel (`media/aeron_udp_channel.c:148-208`).
-        let spy = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:40123|mtu=1408");
-        let channel = publication_channel("aeron:udp?endpoint=127.0.0.1:40123");
+        let spy = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:10123|mtu=1408");
+        let channel = publication_channel("aeron:udp?endpoint=127.0.0.1:10123");
 
         assert!(spy.spy_matches(&channel, 1001, 100));
 
         // What it does **not** do is see through two spellings of one address:
         // a name and the address it resolves to are two channels here, and a
         // spy that wrote the name reads nothing.
-        let by_name = spy_link(1001, None, "aeron:udp?endpoint=localhost:40123");
+        let by_name = spy_link(1001, None, "aeron:udp?endpoint=localhost:10123");
         assert!(!by_name.spy_matches(&channel, 1001, 100));
 
         // And a different endpoint is a different channel, and no session
         // makes it the same one.
-        let elsewhere = publication_channel("aeron:udp?endpoint=127.0.0.1:40124");
+        let elsewhere = publication_channel("aeron:udp?endpoint=127.0.0.1:10124");
         assert!(!spy.spy_matches(&elsewhere, 1001, 100));
     }
 
@@ -2624,9 +2624,9 @@ mod tests {
     fn a_channel_tag_matches_a_spy_that_the_canonical_form_would_not() {
         // `tags=` is the other way two channels are the same channel, and it is
         // the one that reaches across different endpoints (`:96-98`).
-        let spy = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:40123|tags=17,3");
-        let tagged_elsewhere = publication_channel("aeron:udp?endpoint=127.0.0.1:49999|tags=17,1");
-        let untagged_elsewhere = publication_channel("aeron:udp?endpoint=127.0.0.1:49999");
+        let spy = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:10123|tags=17,3");
+        let tagged_elsewhere = publication_channel("aeron:udp?endpoint=127.0.0.1:19999|tags=17,1");
+        let untagged_elsewhere = publication_channel("aeron:udp?endpoint=127.0.0.1:19999");
 
         assert!(spy.spy_matches(&tagged_elsewhere, 1001, 100));
         assert!(
@@ -2640,7 +2640,7 @@ mod tests {
         // An untagged spy never matches by tag, whatever the publication says —
         // `AERON_URI_INVALID_TAG` is the absence of a tag, not a value two
         // channels can share (`:94-95`).
-        let untagged = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:40123");
+        let untagged = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:10123");
         assert!(!untagged.spy_matches(&tagged_elsewhere, 1001, 100));
     }
 
@@ -2650,7 +2650,7 @@ mod tests {
 
         assert!(ipc.spy_channel.is_none());
         assert!(!ipc.spy_matches(
-            &publication_channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            &publication_channel("aeron:udp?endpoint=127.0.0.1:10123"),
             1001,
             100
         ));
@@ -2738,7 +2738,7 @@ mod tests {
             "a UDP subscription on the same stream is a different channel"
         );
 
-        let spy = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:40123");
+        let spy = spy_link(1001, None, "aeron:udp?endpoint=127.0.0.1:10123");
         assert!(!spy.is_ipc_link());
         assert!(
             !spy.matches(&publication(100, 1001, false)),

@@ -444,7 +444,7 @@ mod tests {
                     destination: OWN,
                     identification: 1,
                 },
-                source_port: 40000,
+                source_port: 10000,
                 destination_port: to,
                 payload_length: payload.len(),
             },
@@ -658,7 +658,7 @@ mod tests {
         let stack = stack(&wire);
         let transport = UserspaceTransport::open(
             Arc::clone(&stack),
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 40470)),
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 10470)),
             None,
             Affinity::Receiver,
         )
@@ -680,11 +680,11 @@ mod tests {
     fn a_second_bind_is_eaddr_inuse() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let _first = open(&stack, 40471);
+        let _first = open(&stack, 10471);
 
         let failure = UserspaceTransport::open(
             Arc::clone(&stack),
-            SocketAddr::from((OWN, 40471)),
+            SocketAddr::from((OWN, 10471)),
             None,
             Affinity::Receiver,
         )
@@ -694,7 +694,7 @@ mod tests {
             panic!("a bind failure, not an io error");
         };
         assert_eq!(Some(libc::EADDRINUSE), failure.source.raw_os_error());
-        assert_eq!(SocketAddr::from((OWN, 40471)), failure.address);
+        assert_eq!(SocketAddr::from((OWN, 10471)), failure.address);
         assert_eq!(-1, failure.fd);
     }
 
@@ -704,18 +704,18 @@ mod tests {
     fn a_frame_arrives_as_a_datagram_with_its_source() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let mut transport = open(&stack, 40472);
+        let mut transport = open(&stack, 10472);
 
         send_udp(
             &mut wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500),
-            40472,
+            10472,
             b"aeron frame",
         );
         stack.pump();
 
         let received = receive(&mut transport);
         assert_eq!(1, received.len());
-        assert_eq!(SocketAddr::from((PEER, 40000)), received[0].0);
+        assert_eq!(SocketAddr::from((PEER, 10000)), received[0].0);
         assert_eq!(b"aeron frame", &received[0].1[..]);
     }
 
@@ -725,12 +725,12 @@ mod tests {
     fn an_aeron_frame_crosses_unchanged() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let mut transport = open(&stack, 40473);
+        let mut transport = open(&stack, 10473);
 
         let aeron: Vec<u8> = (0..255u8).collect();
         send_udp(
             &mut wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500),
-            40473,
+            10473,
             &aeron,
         );
         stack.pump();
@@ -744,12 +744,12 @@ mod tests {
     fn a_datagram_reports_the_length_that_arrived() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let mut transport = open(&stack, 40474);
+        let mut transport = open(&stack, 10474);
 
         let long = vec![0x5a; 100];
         send_udp(
             &mut wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500),
-            40474,
+            10474,
             &long,
         );
         stack.pump();
@@ -775,7 +775,7 @@ mod tests {
     fn the_receive_buffer_is_the_ring_in_bytes() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let transport = open(&stack, 40475);
+        let transport = open(&stack, 10475);
 
         let expected = stack.params().ring_capacity() * stack.params().mtu;
         assert_eq!(expected, transport.receive_buffer_size().expect("a size"));
@@ -791,13 +791,13 @@ mod tests {
     fn the_port_comes_back_the_moment_the_transport_goes() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let transport = open(&stack, 40476);
+        let transport = open(&stack, 10476);
         assert_eq!(1, stack.bound_ports());
 
         drop(transport);
 
         assert_eq!(0, stack.bound_ports());
-        let _again = open(&stack, 40476);
+        let _again = open(&stack, 10476);
     }
 
     /// Frames waiting in a ring are dropped with the transport that owned it:
@@ -806,12 +806,12 @@ mod tests {
     fn a_new_transport_does_not_inherit_the_frames_of_the_old_one() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let first = open(&stack, 40477);
+        let first = open(&stack, 10477);
 
         let slot = first.binding().slot;
         send_udp(
             &mut wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500),
-            40477,
+            10477,
             b"for the old one",
         );
         stack.pump();
@@ -822,7 +822,7 @@ mod tests {
         );
 
         drop(first);
-        let mut second = open(&stack, 40477);
+        let mut second = open(&stack, 10477);
 
         assert_eq!(0, stack.ring(slot).expect("a ring").len(), "gone with it");
         assert!(receive(&mut second).is_empty());
@@ -835,22 +835,22 @@ mod tests {
         let wire = Wire::new();
         let stack = stack(&wire);
 
-        let mut unconnected = open(&stack, 40478);
+        let mut unconnected = open(&stack, 10478);
         assert!(unconnected.connected_address().is_none());
         unconnected
-            .reconnect(SocketAddr::from((PEER, 40000)))
+            .reconnect(SocketAddr::from((PEER, 10000)))
             .expect("a reconnect");
         assert!(unconnected.connected_address().is_none(), "left alone");
 
         let mut connected = UserspaceTransport::open(
             Arc::clone(&stack),
-            SocketAddr::from((OWN, 40479)),
-            Some(SocketAddr::from((PEER, 40000))),
+            SocketAddr::from((OWN, 10479)),
+            Some(SocketAddr::from((PEER, 10000))),
             Affinity::Receiver,
         )
         .expect("a transport");
 
-        let elsewhere = SocketAddr::from((Ipv4Addr::new(10, 10, 0, 8), 40001));
+        let elsewhere = SocketAddr::from((Ipv4Addr::new(10, 10, 0, 8), 10001));
         connected.reconnect(elsewhere).expect("a reconnect");
         assert_eq!(Some(elsewhere), connected.connected_address());
     }
@@ -862,11 +862,11 @@ mod tests {
     fn a_frame_from_a_peer_teaches_its_mac() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let _transport = open(&stack, 40481);
+        let _transport = open(&stack, 10481);
 
         send_udp(
             &mut wire.port(Side::B, [0x02, 0, 0, 0, 0, 0x02], 1500),
-            40481,
+            10481,
             b"hello",
         );
         stack.pump();
@@ -884,7 +884,7 @@ mod tests {
     fn an_arp_request_from_the_wire_is_answered() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let _transport = open(&stack, 40482);
+        let _transport = open(&stack, 10482);
 
         let asker = [0x02, 0, 0, 0, 0, 0x02];
         let mut bytes = vec![0u8; 64];
@@ -942,7 +942,7 @@ mod tests {
     fn a_request_for_another_address_is_not_answered() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let _transport = open(&stack, 40483);
+        let _transport = open(&stack, 10483);
 
         let mut bytes = vec![0u8; 64];
         let written = frame::write_arp(
@@ -982,13 +982,13 @@ mod tests {
     fn a_frame_leaves_with_the_next_hops_mac() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let mut transport = open(&stack, 40484);
+        let mut transport = open(&stack, 10484);
         stack.insert_neighbour(PEER, [0x02, 0, 0, 0, 0, 0x02]);
 
         assert_eq!(
             1,
             transport
-                .send(Some(SocketAddr::from((PEER, 40999))), &[b"aeron payload"])
+                .send(Some(SocketAddr::from((PEER, 10999))), &[b"aeron payload"])
                 .expect("a send")
         );
 
@@ -1007,8 +1007,8 @@ mod tests {
                 };
                 assert_eq!(OWN, ipv4.source);
                 assert_eq!(PEER, ipv4.destination);
-                assert_eq!(40484, datagram.source_port, "from the port it bound");
-                assert_eq!(40999, datagram.destination_port);
+                assert_eq!(10484, datagram.source_port, "from the port it bound");
+                assert_eq!(10999, datagram.destination_port);
                 assert_eq!(b"aeron payload", datagram.payload);
 
                 Disposition::Consumed
@@ -1023,14 +1023,14 @@ mod tests {
     fn a_batch_goes_out_as_a_batch() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let mut transport = open(&stack, 40485);
+        let mut transport = open(&stack, 10485);
         stack.insert_neighbour(PEER, [0x02, 0, 0, 0, 0, 0x02]);
 
         assert_eq!(
             3,
             transport
                 .send(
-                    Some(SocketAddr::from((PEER, 40999))),
+                    Some(SocketAddr::from((PEER, 10999))),
                     &[b"one", b"two", b"three"]
                 )
                 .expect("a send")
@@ -1044,8 +1044,8 @@ mod tests {
     fn an_off_link_destination_needs_a_gateway() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let mut transport = open(&stack, 40486);
-        let far = SocketAddr::from((Ipv4Addr::new(10, 10, 9, 9), 40999));
+        let mut transport = open(&stack, 10486);
+        let far = SocketAddr::from((Ipv4Addr::new(10, 10, 9, 9), 10999));
 
         assert_eq!(
             Some(libc::ENETUNREACH),
@@ -1071,7 +1071,7 @@ mod tests {
             ),
             None,
         ));
-        let mut transport = open(&stack, 40487);
+        let mut transport = open(&stack, 10487);
         stack.insert_neighbour(gateway, [0x02, 0, 0, 0, 0, 0xfe]);
 
         assert_eq!(
@@ -1114,12 +1114,12 @@ mod tests {
     fn sending_without_a_neighbour_is_back_pressure() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let mut transport = open(&stack, 40480);
+        let mut transport = open(&stack, 10480);
 
         assert_eq!(
             0,
             transport
-                .send(Some(SocketAddr::from((PEER, 40000))), &[b"nothing"])
+                .send(Some(SocketAddr::from((PEER, 10000))), &[b"nothing"])
                 .expect("back pressure, not a failure")
         );
         assert_eq!(1, stack.counters().arp_miss.load(Ordering::Relaxed));

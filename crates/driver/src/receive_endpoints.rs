@@ -10,9 +10,9 @@
 //! to one channel are one socket, and a driver that made two would read every
 //! datagram twice and answer each of them twice. The difference is what the
 //! *channel* means on this side. A send endpoint binds the interface; a receive
-//! endpoint binds the endpoint parameter — so `aeron:udp?endpoint=localhost:40123`
-//! and `aeron:udp?endpoint=127.0.0.1:40123` are one receiving socket, and a
-//! subscription that names `localhost:40124` is a *different* one even though
+//! endpoint binds the endpoint parameter — so `aeron:udp?endpoint=localhost:10123`
+//! and `aeron:udp?endpoint=127.0.0.1:10123` are one receiving socket, and a
+//! subscription that names `localhost:10124` is a *different* one even though
 //! it is the same publisher's port as its counterpart's.
 //!
 //! # Reference counts
@@ -678,6 +678,13 @@ mod tests {
     /// the tests that are not about the window.
     const SMALL_WINDOW: usize = 1024;
 
+    // The ports the tests below **bind** are in `1xxxx`, not `4xxxx`:
+    // `/proc/sys/net/ipv4/ip_local_port_range` is `32768 60999` on the machines
+    // this runs on, so a fixed port in `4xxxx` is one any outgoing connection
+    // can already be holding — CI met `(98) Address already in use` on 40233
+    // for exactly that reason. `1xxxx` is below the ephemeral range and below
+    // the block the cluster tests take (`21000..25860`).
+
     #[repr(align(64))]
     struct Region(Vec<u8>);
 
@@ -791,7 +798,7 @@ mod tests {
         // An ordinary subscription's endpoint carries the rule.
         let (_, _, endpoint) = ReceiveChannelEndpoints::default()
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40231"),
+                channel("aeron:udp?endpoint=127.0.0.1:10231"),
                 &TransportParams::default(),
                 &config(spec.clone()),
                 SMALL_WINDOW,
@@ -805,7 +812,7 @@ mod tests {
 
         assert!(
             endpoint.expect("a new endpoint").drops_data(
-                "127.0.0.1:40232".parse().expect("an address"),
+                "127.0.0.1:10232".parse().expect("an address"),
                 &datagram,
                 4218,
                 7,
@@ -820,7 +827,7 @@ mod tests {
         // whole while the reader's copy is missing a range" is built.
         let (_, _, endpoint) = ReceiveChannelEndpoints::default()
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40233|init-term-id=7"),
+                channel("aeron:udp?endpoint=127.0.0.1:10233|init-term-id=7"),
                 &TransportParams::default(),
                 &config(spec),
                 SMALL_WINDOW,
@@ -836,7 +843,7 @@ mod tests {
 
         assert!(
             !endpoint.drops_data(
-                "127.0.0.1:40234".parse().expect("an address"),
+                "127.0.0.1:10234".parse().expect("an address"),
                 &datagram,
                 4218,
                 7,
@@ -846,14 +853,14 @@ mod tests {
             "an endpoint the skip names is left alone",
         );
         assert!(
-            !endpoint.drops_control("127.0.0.1:40234".parse().expect("an address"), &datagram),
+            !endpoint.drops_control("127.0.0.1:10234".parse().expect("an address"), &datagram),
             "and a range rule has no opinion about a handshake anyway",
         );
 
         // And a driver configured with no rule drops nothing at all.
         let (_, _, endpoint) = ReceiveChannelEndpoints::default()
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40235"),
+                channel("aeron:udp?endpoint=127.0.0.1:10235"),
                 &TransportParams::default(),
                 &DriverConfig::default(),
                 SMALL_WINDOW,
@@ -866,7 +873,7 @@ mod tests {
             .expect("an endpoint");
 
         assert!(!endpoint.expect("a new endpoint").drops_data(
-            "127.0.0.1:40236".parse().expect("an address"),
+            "127.0.0.1:10236".parse().expect("an address"),
             &datagram,
             4218,
             7,
@@ -882,7 +889,7 @@ mod tests {
 
         let (_, id, _) = ReceiveChannelEndpoints::default()
             .get_or_add(
-                channel("aeron:udp?endpoint=127.0.0.1:40223"),
+                channel("aeron:udp?endpoint=127.0.0.1:10223"),
                 &TransportParams::default(),
                 &DriverConfig::default(),
                 // A window no receive buffer can be smaller than: this test is
@@ -903,7 +910,7 @@ mod tests {
         // so the address is that port — and a reader that gets the whole label
         // knows which socket it is looking at.
         assert_eq!(
-            "rcv-channel: aeron:udp?endpoint=127.0.0.1:40223 127.0.0.1:40223",
+            "rcv-channel: aeron:udp?endpoint=127.0.0.1:10223 127.0.0.1:10223",
             label(&regions, id)
         );
     }
@@ -945,9 +952,9 @@ mod tests {
         let mut endpoints = ReceiveChannelEndpoints::new();
         let config = DriverConfig::default();
 
-        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40243|so-rcvbuf=1m";
-        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40243|so-rcvbuf=2m";
-        const SILENT: &str = "aeron:udp?endpoint=127.0.0.1:40243";
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:10243|so-rcvbuf=1m";
+        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:10243|so-rcvbuf=2m";
+        const SILENT: &str = "aeron:udp?endpoint=127.0.0.1:10243";
 
         endpoints
             .get_or_add(
@@ -982,8 +989,8 @@ mod tests {
                 error,
                 ReceiveEndpointErrorKind::ChannelValidation(ref message) if message ==
                     "so-rcvbuf=2097152 does not match existing value of 1048576: \
-                     existingChannel=aeron:udp?endpoint=127.0.0.1:40243|so-rcvbuf=1m \
-                     channel=aeron:udp?endpoint=127.0.0.1:40243|so-rcvbuf=2m"
+                     existingChannel=aeron:udp?endpoint=127.0.0.1:10243|so-rcvbuf=1m \
+                     channel=aeron:udp?endpoint=127.0.0.1:10243|so-rcvbuf=2m"
             ),
             "{error}"
         );
@@ -1031,8 +1038,8 @@ mod tests {
         // clause reachable at all. A manual channel's destinations arrive one
         // at a time from clients, so it is asking to *join* a socket rather
         // than to describe one, and the reference leaves it alone entirely.
-        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40253|so-rcvbuf=1m";
-        const MANUAL: &str = "aeron:udp?endpoint=127.0.0.1:40253|control-mode=manual|so-rcvbuf=2m";
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:10253|so-rcvbuf=1m";
+        const MANUAL: &str = "aeron:udp?endpoint=127.0.0.1:10253|control-mode=manual|so-rcvbuf=2m";
 
         let (id, _, _) = endpoints
             .get_or_add(
@@ -1073,8 +1080,8 @@ mod tests {
         let mut endpoints = ReceiveChannelEndpoints::new();
         let config = DriverConfig::default();
 
-        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:40263|so-rcvbuf=1m";
-        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:40263|so-rcvbuf=2m";
+        const FIRST: &str = "aeron:udp?endpoint=127.0.0.1:10263|so-rcvbuf=1m";
+        const SECOND: &str = "aeron:udp?endpoint=127.0.0.1:10263|so-rcvbuf=2m";
 
         let (id, _, _) = endpoints
             .get_or_add(
@@ -1129,8 +1136,8 @@ mod tests {
         let (mut counters, regions) = fixture.open();
         let mut endpoints = ReceiveChannelEndpoints::new();
         endpoints.set_port_range(PortRange {
-            low: 40310,
-            high: 40311,
+            low: 10310,
+            high: 10311,
         });
 
         let open = |counters: &mut CounterManager,
@@ -1170,14 +1177,14 @@ mod tests {
 
         assert_ne!(first_id, second_id, "two channels, two sockets");
         assert_eq!(
-            Some(40310),
+            Some(10310),
             first
                 .destinations()
                 .first()
                 .map(|(_, destination)| destination.managed_port())
         );
         assert_eq!(
-            Some(40311),
+            Some(10311),
             second
                 .destinations()
                 .first()
@@ -1193,7 +1200,7 @@ mod tests {
         );
 
         assert_eq!(
-            "no available ports in range 40310 40311",
+            "no available ports in range 10310 10311",
             refused.expect_err("a full range").to_string()
         );
 
@@ -1201,14 +1208,14 @@ mod tests {
         // — and the conductor gives the port back on that news
         // (`ReceiverEvent::DestinationReleased`).
         drop(second);
-        endpoints.free_managed_port(40311);
+        endpoints.free_managed_port(10311);
 
         let (third_id, third) =
             open(&mut counters, &mut endpoints, SECOND, 10).expect("the port came back");
 
         assert_ne!(second_id, third_id);
         assert_eq!(
-            Some(40311),
+            Some(10311),
             third
                 .expect("a new endpoint")
                 .destinations()

@@ -1035,8 +1035,8 @@ mod tests {
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
 
-        let local = SocketAddr::from((Ipv4Addr::new(10, 10, 0, 1), 40456));
-        let peer = SocketAddr::from((Ipv4Addr::new(10, 10, 0, 2), 40500));
+        let local = SocketAddr::from((Ipv4Addr::new(10, 10, 0, 1), 10456));
+        let peer = SocketAddr::from((Ipv4Addr::new(10, 10, 0, 2), 10500));
 
         let connected =
             allocate_transport_counter(&mut manager, &regions, local, Some(peer), 1).expect("room");
@@ -1046,11 +1046,11 @@ mod tests {
         let counters = published(&regions, type_id::TRANSPORT);
         assert_eq!(2, counters.len(), "one per transport");
         assert_eq!(
-            "dpdk transport: 10.10.0.1:40456 -> 10.10.0.2:40500",
+            "dpdk transport: 10.10.0.1:10456 -> 10.10.0.2:10500",
             counters[0].label
         );
         assert_eq!(
-            "dpdk transport: 10.10.0.1:40456 -> *", counters[1].label,
+            "dpdk transport: 10.10.0.1:10456 -> *", counters[1].label,
             "a transport that was not connected hears from anyone, and says so"
         );
         assert_eq!(0, manager.value(&regions, connected).expect("a value"));

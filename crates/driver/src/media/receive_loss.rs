@@ -671,7 +671,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     fn loopback() -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40456)
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 10456)
     }
 
     /// A `DATA` frame of `payload` bytes on `stream_id`, at `term_id`/`offset`.

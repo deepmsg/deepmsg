@@ -892,8 +892,8 @@ mod tests {
                 destination: Ipv4Addr::new(10, 77, 0, 2),
                 identification,
             },
-            source_port: 42001,
-            destination_port: 40999,
+            source_port: 12001,
+            destination_port: 10999,
             payload_length,
         }
     }
@@ -1202,8 +1202,8 @@ mod tests {
 
         let zero_sum = (0..=u16::MAX).find_map(|payload| {
             let mut datagram = [0u8; UDP_HEADER_LENGTH + 2];
-            datagram[0..2].copy_from_slice(&42001u16.to_be_bytes());
-            datagram[2..4].copy_from_slice(&40999u16.to_be_bytes());
+            datagram[0..2].copy_from_slice(&12001u16.to_be_bytes());
+            datagram[2..4].copy_from_slice(&10999u16.to_be_bytes());
             datagram[4..6].copy_from_slice(&10u16.to_be_bytes());
             datagram[8..10].copy_from_slice(&payload.to_be_bytes());
 
