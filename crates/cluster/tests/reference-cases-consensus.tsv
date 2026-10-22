@@ -142,7 +142,7 @@ system	ClusterTest	shouldStopLeaderAndRestartAsFollower	A	P3-6c	counter			a_stop
 system	ClusterTest	shouldStopLeaderAndRestartAsFollowerWithSendingAfter	A	P3-6c	counter,client			a_stopped_leader_comes_back_as_a_follower_and_the_client_keeps_sending
 system	ClusterTest	shouldStopLeaderAndRestartAsFollowerWithSendingAfterThenStopLeader	A	P3-6c	counter,client			a_stopped_leader_comes_back_as_a_follower_then_the_new_leader_stops
 system	ClusterTest	shouldAcceptMessagesAfterSingleNodeCleanRestart	A	P3-6c	stub-service,counter,client			a_follower_restarted_on_an_empty_directory_catches_up (weakened: no service to count messages, so the commit positions carry it)
-system	ClusterTest	shouldReplaySnapshotTakenWhileDown	A	P3-6c	stub-service,counter,client			(deferred: F3 - a follower replays the snapshot taken while it was down)
+system	ClusterTest	shouldReplaySnapshotTakenWhileDown	A	P3-6c	stub-service,counter,client			(deferred: F3 - the returning member stalls in FollowerCatchupAwait with 9 of 10 applied, its append stuck at 256; the shape is in cluster_snapshot_recovery.rs, ignored; records/P3-6c.md §15)
 system	ClusterTest	shouldTolerateMultipleLeaderFailures	A	P3-6c	counter,client			the_surviving_members_elect_a_new_leader_and_keep_committing (weakened: one leader failure)
 system	ClusterTest	shouldRecoverAfterTwoLeaderNodesFailAndComeBackUpAtSameTime	A	P3-6c	counter,client			(deferred: F1 - two leaders fail and return together)
 system	ClusterTest	shouldAcceptMessagesAfterTwoNodeCleanRestart	A	P3-6c	stub-service,counter,client			two_followers_restarted_on_empty_directories_catch_up (weakened: same)
@@ -159,9 +159,9 @@ system	ClusterTest	shouldCloseClientOnTimeout	A	P3-6c	counter,cm-object,client		
 system	ClusterTest	shouldCloseClientAfterClusterBecomesUnavailable	A	P3-6c	counter,client			(deferred: F4 - the client's own new-leader timeout)
 system	ClusterTest	shouldRecoverWhileMessagesContinue	A	P3-6c	stub-service,counter,client			messages_continue_across_a_follower_restart (weakened: offered from the test's thread between steps, not a publisher thread)
 system	ClusterTest	shouldCatchupFromEmptyLog	A	P3-6c	stub-service,counter,client			a_member_with_an_empty_log_catches_up (weakened: the commit position, and the member is one of three)
-system	ClusterTest	shouldCatchupFromEmptyLogThenSnapshotAfterShutdownAndFollowerCleanStart	A	P3-6c	stub-service,counter,client			(deferred: F3 - an empty log, a shutdown snapshot and a clean start)
+system	ClusterTest	shouldCatchupFromEmptyLogThenSnapshotAfterShutdownAndFollowerCleanStart	A	P3-6c	stub-service,counter,client			(deferred: F3 - a clean-start member has its archive refuse `unknown recording id: -1` and never applies; records/P3-6c.md §15)
 system	ClusterTest	shouldCatchUpTwoFreshNodesAfterRestart	A	P3-6c	stub-service,counter,client			(deferred: needs five members - with three, two away is no quorum at all, and a client cannot even open a session)
-system	ClusterTest	shouldReplayMultipleSnapshotsWithEmptyFollowerLog	A	P3-6c	stub-service,counter,client			(deferred: F3 - two snapshots replayed into an empty follower log)
+system	ClusterTest	shouldReplayMultipleSnapshotsWithEmptyFollowerLog	A	P3-6c	stub-service,counter,client			(deferred: F3 - the same `unknown recording id: -1` refusal; records/P3-6c.md §15)
 system	ClusterTest	shouldRecoverQuicklyAfterKillingFollowersThenRestartingOne	A	P3-6c	counter,client			(deferred: F2 - quorum lost by killing both followers)
 system	ClusterTest	shouldRecoverWhenLeaderHasAppendedMoreThanFollower	A	P3-6c	counter,client			a_leader_and_a_follower_come_back_after_both_stopped (weakened: three members, and no service to count messages)
 system	ClusterTest	shouldRecoverWhenFollowerIsMultipleTermsBehind	A	P3-6c	stub-service,counter,client			a_member_that_missed_a_term_is_caught_up_by_replication

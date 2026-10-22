@@ -62,6 +62,9 @@ use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH as MESSAGE_HEADER_LENGTH;
 use deepmsg_codec_cluster::session_connect_request_codec::SessionConnectRequestEncoder;
 use deepmsg_codec_cluster::session_event_codec::SessionEventDecoder;
+use deepmsg_codec_cluster::session_keep_alive_codec::{
+    SBE_BLOCK_LENGTH as SESSION_KEEP_ALIVE_BLOCK_LENGTH, SessionKeepAliveEncoder,
+};
 use deepmsg_codec_cluster::session_message_header_codec::SessionMessageHeaderEncoder;
 use deepmsg_codec_cluster::{ReadBuf, WriteBuf};
 use deepmsg_driver::idle::Strategy;
@@ -2401,6 +2404,28 @@ impl ClientSide {
     }
 
     /// Offer one session message on the open session.
+    /// `AeronCluster.sendKeepAlive` (`AeronCluster.java:437-460`): the session
+    /// message the cluster counts as liveness, not as traffic.
+    ///
+    /// The reference's client sends one every `keepAliveIntervalNs` (one
+    /// second), so its ingress publication is never idle. This test client
+    /// sends only what a case asks for — and a member's driver drops an idle
+    /// publication's image after its ten-second liveness timeout, so a wait
+    /// longer than that (stopping a member takes about thirty) has to send
+    /// these itself. `diag_idle_publication` is the reading that found it.
+    pub fn send_keep_alive(&self, session: &SessionEvent, faults: &Faults) {
+        let length = MESSAGE_HEADER_LENGTH + usize::from(SESSION_KEEP_ALIVE_BLOCK_LENGTH);
+        let mut buffer = vec![0_u8; length];
+        let encoder = SessionKeepAliveEncoder::default()
+            .wrap(WriteBuf::new(&mut buffer), MESSAGE_HEADER_LENGTH);
+        let mut header = encoder.header(0);
+        let mut keep_alive = header.parent().expect("the encoder the header wrapped");
+        keep_alive
+            .leadership_term_id(session.leadership_term_id)
+            .cluster_session_id(session.cluster_session_id);
+        offer_message(self, faults, &buffer[..length]);
+    }
+
     pub fn send(&self, session: &SessionEvent, payload: &[u8], faults: &Faults) {
         let message = ingress_message(
             session.leadership_term_id,

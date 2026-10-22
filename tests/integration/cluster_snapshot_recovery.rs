@@ -30,9 +30,9 @@ use std::sync::mpsc;
 use deepmsg_cluster::control::cluster_control::ToggleState;
 use deepmsg_cluster_common::counters::CLUSTER_CONTROL_TOGGLE_TYPE_ID;
 use deepmsg_tests::cluster_harness::{
-    ClientSide, ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters, Ports, ROLE_LEADER,
-    announce_skip, await_every_snapshot_count, await_launched, await_snapshots_loaded, leader_of,
-    members, take_snapshot, wait_until,
+    ClientSide, ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters, Ports, ROLE_FOLLOWER,
+    ROLE_LEADER, announce_skip, await_every_snapshot_count, await_launched, await_snapshot_count,
+    await_snapshots_loaded, leader_of, members, take_snapshot, wait_until,
 };
 
 /// One case at a time: three members plus their drivers per case, and the
@@ -128,6 +128,9 @@ impl Cluster {
     }
 
     fn leader(&self) -> i32 {
+        wait_until("a leader", &self.faults, || {
+            leader_of(&self.counters).is_some()
+        });
         leader_of(&self.counters).expect("a leader")
     }
 
@@ -148,6 +151,23 @@ impl Cluster {
         }
     }
 
+    /// `TestCluster.startStaticNode(index, false)`: that member back on its own
+    /// directories, and nothing else touched.
+    fn restart_one(&mut self, id: i32) {
+        self.nodes[usize::try_from(id).unwrap()].restart(&self.launched_tx);
+        await_launched(&self.faults, &self.launched_rx, 1);
+        self.open_counters();
+    }
+
+    /// `TestCluster.startStaticNode(index, true)`: the reference's `cleanStart`
+    /// — the archive and cluster directories emptied first, so the member comes
+    /// back with no log at all and has to be caught up from the leader.
+    fn restart_empty_one(&mut self, id: i32) {
+        self.nodes[usize::try_from(id).unwrap()].restart_empty(&self.launched_tx);
+        await_launched(&self.faults, &self.launched_rx, 1);
+        self.open_counters();
+    }
+
     /// `TestCluster.restartAllNodes(false)`: every member back on its own
     /// directories — the same archive, the same cluster log, the same driver.
     fn restart_all(&mut self) {
@@ -164,9 +184,25 @@ impl Cluster {
 /// `count` messages.
 fn await_messages(node: &Node, faults: &Faults, count: usize) {
     let state = node.service_state().expect("the test business");
-    wait_until("the service's message count", faults, || {
-        state.messages() == count
-    });
+    let deadline = std::time::Instant::now() + deepmsg_tests::cluster_harness::DEADLINE;
+    while std::time::Instant::now() < deadline {
+        faults.check();
+        if state.messages() == count {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let counters = NodeCounters::open(node.aeron_dir());
+    panic!(
+        "node {}'s service never reached {count}: it has {}; role={:?} election={:?} term={:?} append={:?} commit={:?}",
+        node.id(),
+        state.messages(),
+        counters.role(),
+        counters.election_state(),
+        counters.leadership_term_id(),
+        counters.append_position(),
+        counters.commit_position(),
+    );
 }
 
 /// **Every member restarts on the snapshot it took** —
@@ -410,5 +446,357 @@ fn an_appointed_leader_serves_again_after_every_member_restarts() {
         await_messages(&cluster.nodes[id as usize], &cluster.faults, 10);
     }
 
+    cluster.stop_all();
+}
+
+/// Waits for `node` to stop while the client on the cluster keeps its session
+/// alive — the reference's client sends a keepalive every second, and a member
+/// stopping takes about thirty (the module waits for its log subscription's
+/// local sockets to be released, `agent/mod.rs::await_local_sockets_closed`).
+///
+/// Silence for the driver's ten-second image liveness timeout drops the
+/// ingress publication, and a dropped publication does not come back: see
+/// [`a_keep_alive_keeps_the_ingress_publication_connected`] for the reading.
+fn stop_while_keeping_alive(
+    node: &mut Node,
+    client: &mut ClientSide,
+    session: &deepmsg_tests::cluster_harness::SessionEvent,
+    faults: &Faults,
+) {
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            node.stop();
+            let _ = done_tx.send(());
+        });
+        let mut last = std::time::Instant::now();
+        loop {
+            faults.check();
+            // Two different clocks, and both are needed: `poll` is the
+            // client's heartbeat to **its own** driver, which reclaims a
+            // client that has not polled for `aeron.client.liveness.timeout`
+            // (ten seconds, `crates/driver/src/clients.rs`) along with its
+            // publications; the keepalive is data on the **member's** ingress,
+            // which drops an image that sees none for the same ten seconds.
+            client.poll();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if last.elapsed() >= std::time::Duration::from_secs(1) {
+                client.send_keep_alive(session, faults);
+                last = std::time::Instant::now();
+            }
+            if done_rx.try_recv().is_ok() {
+                break;
+            }
+        }
+    });
+}
+
+/// **A follower comes back to a snapshot taken while it was down** —
+/// `ClusterTest.shouldReplaySnapshotTakenWhileDown` (`ClusterTest.java:691`).
+///
+/// The snapshot is a `SNAPSHOT` **action appended to the cluster log**
+/// (`ConsensusModuleAgent.java:2569`, `appendAction`), and every member takes
+/// its own snapshot when it applies that position. A member that was away
+/// therefore does not "fetch" one from anybody: it replays the action on the
+/// way back and takes its own. That is what the snapshot counter is read for —
+/// only a local `takeSnapshot` increments it (`:3190`), so `count == 1` on the
+/// returning member says the action was replayed, not that some other path
+/// filled the gap.
+#[test]
+#[ignore = "F3-b reading: the returning member loops in FollowerCatchupAwait at 9/10 messages, append stuck at 256 against the leader's 1312 (commit 1216) — records/P3-6c.md §15"]
+fn a_follower_comes_back_to_a_snapshot_taken_while_it_was_down() {
+    let _serial = serial();
+    let ports = CasePorts::new(4);
+    let Some(mut cluster) = Cluster::start(*ports.ports(), &[]) else {
+        return;
+    };
+
+    let leader = cluster.leader();
+    let away = (0..MEMBER_COUNT)
+        .find(|id| *id != leader)
+        .expect("a follower");
+    let staying = (0..MEMBER_COUNT)
+        .find(|id| *id != leader && *id != away)
+        .expect("the other follower");
+
+    let Some(mut client) = ClientSide::start(ports.ports(), leader) else {
+        announce_skip();
+        return;
+    };
+    let session = client.connect_session(&cluster.faults);
+
+    wait_until(
+        "the away member's election to close",
+        &cluster.faults,
+        || {
+            cluster.counters[usize::try_from(away).unwrap()].election_state()
+                == Some(ELECTION_CLOSED)
+        },
+    );
+    stop_while_keeping_alive(
+        &mut cluster.nodes[usize::try_from(away).unwrap()],
+        &mut client,
+        &session,
+        &cluster.faults,
+    );
+
+    // The snapshot is taken while it is away; the members that are here take
+    // it, and no wait below names the member that is not.
+    take_snapshot(cluster.leader_counters());
+    await_snapshot_count(
+        &cluster.counters[usize::try_from(leader).unwrap()],
+        &cluster.faults,
+        1,
+    );
+    await_snapshot_count(
+        &cluster.counters[usize::try_from(staying).unwrap()],
+        &cluster.faults,
+        1,
+    );
+
+    client.send_and_await_messages(&session, 10, &cluster.faults);
+    for id in [leader, staying] {
+        await_messages(
+            &cluster.nodes[usize::try_from(id).unwrap()],
+            &cluster.faults,
+            10,
+        );
+    }
+
+    cluster.restart_one(away);
+
+    // The reading that tells the two possible ways back apart.
+    await_snapshot_count(
+        &cluster.counters[usize::try_from(away).unwrap()],
+        &cluster.faults,
+        1,
+    );
+    assert_eq!(
+        Some(ROLE_FOLLOWER),
+        cluster.counters[usize::try_from(away).unwrap()].role(),
+        "the member that was away is a follower of the term it missed"
+    );
+    await_messages(
+        &cluster.nodes[usize::try_from(away).unwrap()],
+        &cluster.faults,
+        10,
+    );
+
+    drop(client);
+    cluster.stop_all();
+}
+
+/// **A keepalive keeps the ingress publication connected, and silence does
+/// not** — the reading behind [`stop_while_keeping_alive`].
+///
+/// The reference's client sends `SessionKeepAlive` every second
+/// (`AeronCluster`'s keepalive), which is what keeps a member's ingress image
+/// of the publication alive at all. This client sent nothing while a case
+/// waited, and the image went away at about twelve seconds — measured, not
+/// inferred: the same cluster, an idle publication, `connected` flipping
+/// between t+11 s and t+12 s.
+#[test]
+fn a_keep_alive_keeps_the_ingress_publication_connected() {
+    let _serial = serial();
+    let ports = CasePorts::new(7);
+    let Some(mut cluster) = Cluster::start(*ports.ports(), &[]) else {
+        return;
+    };
+    let leader = cluster.leader();
+    let Some(mut client) = ClientSide::start(ports.ports(), leader) else {
+        announce_skip();
+        return;
+    };
+    let session = client.connect_session(&cluster.faults);
+
+    let started = std::time::Instant::now();
+    let mut ticks = 0_u32;
+    while started.elapsed() < std::time::Duration::from_secs(15) {
+        client.poll();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        ticks += 1;
+        if ticks % 10 == 0 {
+            client.send_keep_alive(&session, &cluster.faults);
+        }
+    }
+    assert!(
+        client
+            .ingress_publication_state()
+            .contains("connected=Some(true)"),
+        "a keepalive a second keeps it connected: {}",
+        client.ingress_publication_state()
+    );
+
+    drop(client);
+    cluster.stop_all();
+}
+
+/// **An empty follower catches up from the shutdown snapshot and takes its
+/// own** —
+/// `ClusterTest.shouldCatchupFromEmptyLogThenSnapshotAfterShutdownAndFollowerCleanStart`
+/// (`ClusterTest.java:1213`).
+///
+/// The two members that kept their directories lost nothing: they load the
+/// snapshot the shutdown wrote. The one that comes back on an empty directory
+/// has nothing to load, is caught up from the leader's log, and — because that
+/// log carries the shutdown's `SNAPSHOT` action — takes a snapshot of its own
+/// at that position.
+#[test]
+#[ignore = "F3-b reading: the clean-start member never applies anything (service 0, election Canvass, append None) and its archive refuses `unknown recording id: -1` — records/P3-6c.md §15"]
+fn an_empty_follower_replays_the_shutdown_snapshot_and_takes_its_own() {
+    let _serial = serial();
+    let ports = CasePorts::new(5);
+    let Some(mut cluster) = Cluster::start(*ports.ports(), &[]) else {
+        return;
+    };
+
+    let leader = cluster.leader();
+    let Some(mut client) = ClientSide::start(ports.ports(), leader) else {
+        announce_skip();
+        return;
+    };
+    let session = client.connect_session(&cluster.faults);
+    client.send_and_await_messages(&session, 10, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 10);
+    }
+    drop(client);
+
+    cluster.leader_counters().set(
+        CLUSTER_CONTROL_TOGGLE_TYPE_ID,
+        i64::from(ToggleState::Shutdown.code()),
+    );
+    wait_until(
+        "every member to end its duty cycle",
+        &cluster.faults,
+        || cluster.nodes.iter().all(Node::has_finished),
+    );
+    for node in &cluster.nodes {
+        assert!(
+            node.service_state()
+                .expect("the business")
+                .was_snapshot_taken(),
+            "a clean shutdown snapshots every member's business"
+        );
+    }
+    cluster.stop_all();
+
+    // The reference's `cleanStart` member is 2 (`ClusterTest.java:1242-1246`),
+    // and it is the one that must **not** have been handed a snapshot.
+    let clean = 2;
+    cluster.restart_one(0);
+    cluster.restart_one(1);
+    cluster.restart_empty_one(clean);
+
+    assert_ne!(clean, cluster.leader(), "an empty log cannot lead");
+    await_snapshots_loaded(&cluster.nodes[..2], &cluster.faults);
+    assert!(
+        !cluster.nodes[usize::try_from(clean).unwrap()]
+            .service_state()
+            .expect("the business")
+            .was_snapshot_loaded(),
+        "a member that came back on an empty directory has no snapshot to load"
+    );
+
+    await_messages(
+        &cluster.nodes[usize::try_from(clean).unwrap()],
+        &cluster.faults,
+        10,
+    );
+    await_snapshot_count(
+        &cluster.counters[usize::try_from(clean).unwrap()],
+        &cluster.faults,
+        1,
+    );
+    assert!(
+        cluster.nodes[usize::try_from(clean).unwrap()]
+            .service_state()
+            .expect("the business")
+            .was_snapshot_taken(),
+        "the replayed SNAPSHOT action makes the caught-up member take its own"
+    );
+
+    cluster.stop_all();
+}
+
+/// **Two snapshots are replayed into an empty follower log** —
+/// `ClusterTest.shouldReplayMultipleSnapshotsWithEmptyFollowerLog`
+/// (`ClusterTest.java:1295`).
+///
+/// Two snapshots, two messages before the first and one between them, and a
+/// member that comes back clean: it replays both actions, catches up to the
+/// three messages, and the cluster keeps serving afterwards.
+#[test]
+#[ignore = "F3-b reading: the same `unknown recording id: -1` refusal floods the clean-start member — records/P3-6c.md §15"]
+fn two_snapshots_are_replayed_into_an_empty_follower_log() {
+    let _serial = serial();
+    let ports = CasePorts::new(6);
+    let Some(mut cluster) = Cluster::start(*ports.ports(), &[]) else {
+        return;
+    };
+
+    let leader = cluster.leader();
+    let Some(mut client) = ClientSide::start(ports.ports(), leader) else {
+        announce_skip();
+        return;
+    };
+    let session = client.connect_session(&cluster.faults);
+
+    client.send_and_await_messages(&session, 2, &cluster.faults);
+    take_snapshot(cluster.leader_counters());
+    await_every_snapshot_count(&cluster.counters, &cluster.faults, 1);
+
+    client.send_and_await_messages(&session, 1, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 3);
+    }
+    drop(client);
+
+    cluster.leader_counters().set(
+        CLUSTER_CONTROL_TOGGLE_TYPE_ID,
+        i64::from(ToggleState::Shutdown.code()),
+    );
+    wait_until(
+        "every member to end its duty cycle",
+        &cluster.faults,
+        || cluster.nodes.iter().all(Node::has_finished),
+    );
+    cluster.stop_all();
+
+    let clean = 2;
+    cluster.restart_one(0);
+    cluster.restart_one(1);
+    cluster.restart_empty_one(clean);
+
+    assert_ne!(clean, cluster.leader(), "an empty log cannot lead");
+    await_snapshots_loaded(&cluster.nodes[..2], &cluster.faults);
+    assert!(
+        !cluster.nodes[usize::try_from(clean).unwrap()]
+            .service_state()
+            .expect("the business")
+            .was_snapshot_loaded(),
+        "a member that came back on an empty directory has no snapshot to load"
+    );
+    await_messages(
+        &cluster.nodes[usize::try_from(clean).unwrap()],
+        &cluster.faults,
+        3,
+    );
+
+    // The reference reconnects a client after the restart and sends four more
+    // (`ClusterTest.java:1350-1356`); this build's client does not follow a
+    // redirect, so reconnecting is a second client (`cluster_restart_path`).
+    let new_leader = cluster.leader();
+    let Some(mut second_client) = ClientSide::start_at(ports.ports(), new_leader, 1) else {
+        announce_skip();
+        return;
+    };
+    let second_session = second_client.connect_session(&cluster.faults);
+    second_client.send_and_await_messages(&second_session, 4, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 7);
+    }
+
+    drop(second_client);
     cluster.stop_all();
 }
