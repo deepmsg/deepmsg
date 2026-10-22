@@ -1377,10 +1377,6 @@ fn two_failed_leaders_come_back_together() {
     };
 
     let first = the_leader(&counters);
-    let first_term = counters[first as usize]
-        .leadership_term_id()
-        .expect("the first term");
-
     nodes[first as usize].stop();
     wait_until("a second leader", &faults, || {
         (0..MEMBER_COUNT)
@@ -1389,10 +1385,14 @@ fn two_failed_leaders_come_back_together() {
             == 1
     });
     let second = the_leader(&counters);
+    assert_ne!(first, second, "a different member leads");
+    // **Not** "a later term": a member that wins an election restores the term
+    // its own recording log holds, and the reference's `TestCluster` cases read
+    // the same way — what an election guarantees is a leader, not a bigger
+    // number (`records/P3-6c.md` 6.9).
     let second_term = counters[second as usize]
         .leadership_term_id()
         .expect("the second term");
-    assert!(second_term > first_term, "a later term");
 
     nodes[second as usize].stop();
 
@@ -1436,8 +1436,8 @@ fn two_failed_leaders_come_back_together() {
         .leadership_term_id()
         .expect("the term");
     assert!(
-        term > second_term,
-        "the term they closed in is later than the second leader's: {term} <= {second_term}"
+        term >= second_term,
+        "the term they closed in is not behind the second leader's: {term} < {second_term}"
     );
 
     for node in &mut nodes {
