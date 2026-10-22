@@ -47,6 +47,7 @@ use deepmsg_archive::client::archive::{Archive, RecordingEvent};
 use deepmsg_archive::client::async_connect::NoCredentials;
 use deepmsg_archive::client::descriptor_poller::RecordingDescriptor;
 use deepmsg_archive::server::conductor::UNKNOWN_REPLAY;
+use deepmsg_archive::server::recording_pos::ANY_ARCHIVE_ID;
 use deepmsg_archive::server::recording_pos::{
     find_counter_id_by_recording, find_counter_id_by_session, parse_key,
 };
@@ -328,6 +329,10 @@ pub struct ConsensusModuleAgent {
     /// The archive-to-archive replication this agent is driving, if any. The
     /// election holds the same handle; the session is the agent's (plan Q1).
     log_replication: Option<AgentLogReplication>,
+    /// When the destination recording's position counter is read next
+    /// (`RecordingReplication.progressCheckDeadlineNs`, `:75`): on the leader
+    /// heartbeat interval, because the lookup walks the counter directory.
+    log_replication_position_read_ns: i64,
     uncommitted_timers: std::collections::VecDeque<(i64, i64)>,
     expired_timer_count: deepmsg_cluster_common::collections::HashMap<i64, i64>,
     live_log_destination: String,
@@ -632,6 +637,7 @@ impl ConsensusModuleAgent {
             timer,
             log_replay: None,
             log_replication: None,
+            log_replication_position_read_ns: 0,
             uncommitted_timers: std::collections::VecDeque::new(),
             expired_timer_count: deepmsg_cluster_common::collections::HashMap::default(),
             live_log_destination: String::new(),
@@ -3006,6 +3012,55 @@ impl ConsensusModuleAgent {
         Err(error)
     }
 
+    /// The counter half of `RecordingReplication.pollDstRecordingPosition`
+    /// (`:87-95`, `:221-235`): the **destination recording's** own position,
+    /// handed to the handle the election polls.
+    ///
+    /// It lives on this side because the counters do (plan Q1's split, the same
+    /// one that put the deadline in the election), and it is read on
+    /// `leaderHeartbeatIntervalNs` — the reference's `progressCheckDeadlineNs`
+    /// — because the lookup walks the counter directory, and a walk a duty
+    /// cycle is exactly the cost that made a whole benchmark lie once.
+    ///
+    /// A copy that is *copying* need not be signalling anything, so without
+    /// this the election's progress clock would see a healthy replication as
+    /// stalled; a copy that has stopped need not stop signalling either, so
+    /// without the clock it would never be caught. The two halves are one
+    /// mechanism in the reference and one in this build too — the read here,
+    /// the deadline there.
+    fn read_destination_recording_position(&mut self) {
+        let now_ns = self.clock.time_nanos();
+        if now_ns < self.log_replication_position_read_ns {
+            return;
+        }
+        self.log_replication_position_read_ns = now_ns + self.config.leader_heartbeat_interval_ns;
+
+        let recording_id = self.log_recording_id;
+        if recording_id == NULL_VALUE {
+            return;
+        }
+
+        // `RecordingPos.findCounterIdByRecording(counters, recordingId,
+        // archiveId)` (`RecordingReplication.java:224`): matched by the
+        // recording the key names, which is also what makes it the live
+        // counter (`RecordingPos.isActive`, `:292-298`) rather than one left
+        // behind by a recording that ended.
+        let Some(counters) = self.client.counters_reader() else {
+            return;
+        };
+        let Some(counter_id) =
+            find_counter_id_by_recording(&counters, recording_id, ANY_ARCHIVE_ID)
+        else {
+            return;
+        };
+        let Some(position) = counters.value(counter_id) else {
+            return;
+        };
+        if let Some(replication) = self.log_replication.as_ref() {
+            replication.handle().observe_position(position);
+        }
+    }
+
     /// `ClusterMember.addConsensusPublications` (`ClusterMember.java:927-953`):
     /// one exclusive publication per other member, on the consensus channel
     /// with that member's endpoint.
@@ -3922,6 +3977,8 @@ impl ElectionHost for ConsensusModuleAgent {
                 // not a reason to stop the agent.
                 Err(error) => self.report_counted_error(Some(&error)),
             }
+
+            self.read_destination_recording_position();
         }
 
         Ok(work)

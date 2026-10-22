@@ -146,15 +146,34 @@ impl RecordingReplication {
         self.synced.load(Ordering::Acquire)
     }
 
+    /// `pollDstRecordingPosition`'s write (`:221-235`): the destination
+    /// recording's position **counter**, read by the election because a copy
+    /// that is copying need not be signalling anything. Answers whether it
+    /// moved, which is what the progress clock is refreshed on.
+    pub fn observe_position(&self, position: i64) -> bool {
+        if position > self.position() {
+            self.position.store(position, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
     /// `poll(nowNs)` (`:176`).
     ///
-    /// **Deliberately empty.** The reference advances its archive client and
-    /// its progress deadlines here; in this build the archive session is
+    /// **Deliberately empty.** The reference does three things here: advance
+    /// its archive client, read the destination recording's position counter
+    /// every `progressCheckIntervalNs` (`:87-95`), and expire
+    /// `progressDeadlineNs` (`:97-107`). In this build the archive client is
     /// advanced by the agent's [`ElectionHost::poll_archive_events`] and the
-    /// deadline lives in the election (`replication_deadline_ns`), because
-    /// this handle is polled from inside the election's turn and cannot borrow
-    /// the agent. The split is plan Q1: same thread, once per turn, and a
-    /// handful of atomics rather than a `Mutex` on every poll.
+    /// counter is read there too (`read_destination_recording_position`, which
+    /// writes through [`Self::observe_position`]); the **two** deadlines live
+    /// in the election — `replication_deadline_ns` for the commit wait after a
+    /// copy has ended, `replication_progress_deadline_ns` for a copy that has
+    /// stopped moving — because this handle is polled from inside the
+    /// election's turn and cannot borrow the agent. The split is plan Q1: same
+    /// thread, once per turn, and a handful of atomics rather than a `Mutex` on
+    /// every poll.
     ///
     /// [`ElectionHost::poll_archive_events`]: crate::election::ElectionHost::poll_archive_events
     pub fn poll(&self, _now_ns: i64) {}
