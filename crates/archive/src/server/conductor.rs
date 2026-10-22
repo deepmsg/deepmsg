@@ -792,6 +792,12 @@ pub const NULL_RECORD_ID: i64 = -1;
 /// the whole line).
 pub const UNKNOWN_RECORDING: i64 = 5;
 
+/// `ArchiveException.UNKNOWN_REPLAY` (`client/ArchiveException.java:59`), the
+/// refusal a replay stop gets for an id no replay is registered under — and
+/// the one refusal the cluster's `pollArchiveEvents` answers with a counted
+/// error instead of a throw (`ConsensusModuleAgent.java:2089-2094`).
+pub const UNKNOWN_REPLAY: i64 = 6;
+
 /// `ArchiveException.ACTIVE_LISTING` (`client/ArchiveException.java:34`), the
 /// relevant id of the refusal a second listing on one session gets
 /// (`ArchiveConductor.java:690-694`).

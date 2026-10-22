@@ -21,7 +21,9 @@
 //!   subscription is already gone has done what it was asked to do.
 //! * [`Archive::poll_for_recording_signals`] and
 //!   [`Archive::check_for_error_response`] are the same read without a request:
-//!   "tell me what has happened".
+//!   "tell me what has happened". [`Archive::poll_recording_event`] is the same
+//!   read for a caller that wants both a replication's signal **and** the
+//!   archive's refusal of it, untouched.
 //!
 //! # A deadline per operation, and a deadline per connect
 //!
@@ -128,6 +130,37 @@ pub struct RecordingSignal {
     pub position: i64,
     /// Which signal it was — `START`, `STOP`, `DELETE` and the rest.
     pub signal: deepmsg_codec::archive::recording_signal::RecordingSignal,
+}
+
+/// What one non-blocking poll of the control channel found.
+///
+/// The two are told apart here rather than by the caller because they arrive
+/// on the same subscription and in the same slot
+/// (`ConsensusModuleAgent.java:2071-2104` is the reference telling them
+/// apart).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordingEvent {
+    /// A recording event for this archive session.
+    Signal(RecordingSignal),
+    /// A control response that is an error: the archive refused something.
+    Refusal(ControlRefusal),
+}
+
+/// A `ControlResponse` with `code == ERROR`, as it arrived.
+///
+/// `error_code` is the **archive's** number (`ArchiveException`'s:
+/// `5` unknown recording, `6` unknown replay, `11` storage space, …), which
+/// the wire carries in the response's `relevantId`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlRefusal {
+    /// The session the refusal was sent on.
+    pub control_session_id: i64,
+    /// The request it is about — a replication's id, for a replication.
+    pub correlation_id: i64,
+    /// The archive's own error code.
+    pub error_code: i64,
+    /// The archive's words.
+    pub message: String,
 }
 
 /// `ARCHIVE_ERROR_CODE_GENERIC` (`:40`): where the codes the client remaps
@@ -1994,8 +2027,8 @@ impl Archive {
         )
     }
 
-    /// Poll the control channel **once** for a recording signal, with no
-    /// request in flight.
+    /// Poll the control channel **once** while a replication is running, with
+    /// no request in flight.
     ///
     /// This is what a cluster's duty cycle does with its own
     /// `RecordingSignalPoller` (`ConsensusModuleAgent.java:2061-2075`): a
@@ -2003,44 +2036,75 @@ impl Archive {
     /// `REPLICATE_END` events, not as answers, and they have to be read while
     /// the replication is waiting rather than only inside a blocking call.
     ///
-    /// Answers the signal when this session's poller read one, and `None` for
-    /// any other message. A control response that is not a signal is left in
-    /// the poller exactly as the blocking waits leave it — this method never
-    /// consumes an answer.
+    /// **Two kinds of message, and the second one matters.** A poll that
+    /// completes on a `ControlResponse` with `code == ERROR` is the archive
+    /// refusing something — a replication that the source archive would not
+    /// serve answers under **the replication's own correlation id**
+    /// (`ReplicationSession.error`, `:923-926`). The reference's callers read
+    /// that as an `ArchiveException` (`ConsensusModuleAgent.java:2074-2098`,
+    /// `ClusterBackupAgent.java:1063-1088`); a caller that only takes signals
+    /// never learns the copy is over, which is a stall with no error in it.
+    ///
+    /// So this returns the raw material: the signal, or the refusal. Any other
+    /// completed poll — an `OK` control response, or a message from another
+    /// control session — is `None`, as both reference callers ignore it.
+    ///
+    /// [`Self::poll_for_recording_signals`] is the C-shaped sibling
+    /// (`aeron_archive_poll_for_recording_signals`): it **dispatches** the
+    /// signal to this client's handler and turns a refusal into an
+    /// [`ArchiveError`], which is what a caller that only wants an error
+    /// number needs. This one hands both to the caller instead, because a
+    /// cluster's duty cycle routes a signal by its correlation id and reports a
+    /// refusal with the archive's own words.
     ///
     /// # Errors
     ///
     /// [`ControlResponseError`]'s mapped form when the message was malformed.
-    pub fn poll_recording_signal(
+    pub fn poll_recording_event(
         &mut self,
         client: &mut Client,
-    ) -> Result<Option<RecordingSignal>, ArchiveError> {
+    ) -> Result<Option<RecordingEvent>, ArchiveError> {
         self.control_response_poller
             .poll(client)
             .map_err(map_poller_error)?;
 
         if !self.control_response_poller.is_poll_complete()
-            || !self.control_response_poller.is_recording_signal()
             || self.control_response_poller.control_session_id() != self.control_session_id
         {
             return Ok(None);
         }
 
-        let signal = RecordingSignal {
+        if self.control_response_poller.is_recording_signal() {
+            let signal = RecordingSignal {
+                control_session_id: self.control_response_poller.control_session_id(),
+                correlation_id: self.control_response_poller.correlation_id(),
+                recording_id: self.control_response_poller.recording_id(),
+                subscription_id: self.control_response_poller.subscription_id(),
+                position: self.control_response_poller.position(),
+                signal: self
+                    .control_response_poller
+                    .recording_signal()
+                    .unwrap_or(deepmsg_codec::archive::recording_signal::RecordingSignal::NullVal),
+            };
+
+            self.dispatch_recording_signal();
+
+            return Ok(Some(RecordingEvent::Signal(signal)));
+        }
+
+        if !(self.control_response_poller.is_control_response()
+            && self.control_response_poller.is_code_error())
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(RecordingEvent::Refusal(ControlRefusal {
             control_session_id: self.control_response_poller.control_session_id(),
             correlation_id: self.control_response_poller.correlation_id(),
-            recording_id: self.control_response_poller.recording_id(),
-            subscription_id: self.control_response_poller.subscription_id(),
-            position: self.control_response_poller.position(),
-            signal: self
-                .control_response_poller
-                .recording_signal()
-                .unwrap_or(deepmsg_codec::archive::recording_signal::RecordingSignal::NullVal),
-        };
-
-        self.dispatch_recording_signal();
-
-        Ok(Some(signal))
+            error_code: self.control_response_poller.relevant_id(),
+            message: String::from_utf8_lossy(self.control_response_poller.error_message())
+                .into_owned(),
+        })))
     }
 
     // -----------------------------------------------------------------------

@@ -755,7 +755,7 @@ impl Election {
             return Ok(work);
         }
 
-        work += host.poll_archive_events();
+        work += host.poll_archive_events()?;
         let (replication_done, position) = {
             let replication = self.log_replication.as_ref().expect("just checked");
             replication.poll(now_ns);

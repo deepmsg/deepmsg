@@ -177,8 +177,8 @@ impl ElectionHost for Mock {
         self.calls.push("election_complete");
         Ok(())
     }
-    fn poll_archive_events(&mut self) -> usize {
-        0
+    fn poll_archive_events(&mut self) -> Result<usize, ClusterError> {
+        Ok(0)
     }
     fn node_state(&mut self) -> &mut NodeStateFile {
         &mut self.node_state

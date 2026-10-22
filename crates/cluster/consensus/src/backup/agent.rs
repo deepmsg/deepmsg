@@ -41,12 +41,17 @@
 //! * **`aeron.cluster.member.endpoints` is not consulted** (`P3-0e`), so the
 //!   seventh member attribute (`archiveResponseEndpoint`) is the only source of
 //!   the cluster archive's MDC response channel.
-//! * **An error answer on the local archive's control channel is not consumed**
-//!   by [`Archive::poll_recording_signal`], which reads signals only. A failure
-//!   there therefore surfaces as a stalled progress (and a reset) rather than as
-//!   the reference's immediate `ArchiveException`; a storage-space refusal that
-//!   arrives on a *request* is still seen, because the request's wait reads it.
+//! * **An error answer on the local archive's control channel is returned, not
+//!   thrown.** The reference throws the `ArchiveException` out of its duty
+//!   cycle and ends the agent for `STORAGE_SPACE`
+//!   (`ClusterBackupAgent.java:1063-1088`); this build's `poll` cannot throw, so
+//!   [`Archive::poll_recording_event`] hands the refusal over and the cycle
+//!   returns it as `ClusterError::ArchiveRefused`. `do_work` then applies the
+//!   same two answers the reference does (`:1122-1128`): `STORAGE_SPACE` ends
+//!   the backup, everything else is counted and resets it. A backup that used
+//!   to report only a stalled progress now reports the archive's own words.
 
+use deepmsg_archive::client::archive::RecordingEvent;
 use deepmsg_archive::client::async_connect::{AsyncConnect, Credentials, Polled};
 use deepmsg_archive::client::proxy::ReplayParams;
 use deepmsg_archive::client::{Archive, ArchiveContext, Handlers, NoCredentials};
@@ -641,23 +646,39 @@ impl ClusterBackupAgent {
     /// signals, which is how a snapshot replication learns it is making
     /// progress.
     fn poll_backup_archive_events(&mut self) -> Result<usize, ClusterError> {
-        let signal = {
+        let event = {
             let Some(archive) = self.backup_archive.as_mut() else {
                 return Ok(0);
             };
-            archive.poll_recording_signal(&mut self.client)
+            archive.poll_recording_event(&mut self.client)
         };
 
-        let signal = match signal {
-            Ok(signal) => signal,
+        let event = match event {
+            Ok(event) => event,
             Err(error) => {
                 self.count_error(&ClusterError::from(error));
                 return Ok(0);
             }
         };
 
-        let Some(signal) = signal else {
-            return Ok(0);
+        let signal = match event {
+            Some(RecordingEvent::Signal(signal)) => signal,
+            // `ClusterBackupAgent.pollBackupArchiveEvents` (`:1063-1088`): a
+            // control-response ERROR is an `ArchiveException` — counted, and
+            // for `STORAGE_SPACE` the agent ends rather than carry on copying
+            // into a filesystem that has none.
+            Some(RecordingEvent::Refusal(refusal)) => {
+                // `ClusterBackupAgent.pollBackupArchiveEvents` (`:1063-1088`): a
+                // control-response ERROR is thrown as the `ArchiveException` it
+                // is. Returning it is this build's throw, and `do_work` is where
+                // the reference's two answers to one live (`:1122-1128` ends the
+                // backup for `STORAGE_SPACE`, everything else resets it).
+                return Err(ClusterError::ArchiveRefused {
+                    code: refusal.error_code,
+                    message: refusal.message,
+                });
+            }
+            None => return Ok(0),
         };
 
         if let Some(replication) = self.snapshot_replication.as_mut() {

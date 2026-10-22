@@ -281,10 +281,17 @@ pub trait ElectionHost {
     /// outer take-and-put-back drops the `Election` instead (plan §4.5).
     fn election_complete(&mut self, now_ns: i64) -> Result<(), ClusterError>;
 
-    /// Poll archive events (recording signals). `pollArchiveEvents()` at
-    /// `:2061`. Called from `idle()` and from the slow tick; returns the work
-    /// count.
-    fn poll_archive_events(&mut self) -> usize;
+    /// Poll archive events: a replication's recording signals, and the
+    /// **control-response errors** that answer under the replication's own
+    /// correlation id. `pollArchiveEvents()` at `:2061`. Called from `idle()`
+    /// and from the election's replication state; returns the work count.
+    ///
+    /// # Errors
+    ///
+    /// The archive's refusal, for the arm the reference throws on
+    /// (`ConsensusModuleAgent.java:2096-2098`). The reference throws out of its
+    /// duty cycle; this build returns the error to one.
+    fn poll_archive_events(&mut self) -> Result<usize, ClusterError>;
 
     // ---- added by P3-5a-beta: the `Context` accessors the election reads ----
     //

@@ -43,9 +43,10 @@ use std::mem;
 use std::time::Duration;
 
 use deepmsg_archive::client::Handlers;
-use deepmsg_archive::client::archive::Archive;
+use deepmsg_archive::client::archive::{Archive, RecordingEvent};
 use deepmsg_archive::client::async_connect::NoCredentials;
 use deepmsg_archive::client::descriptor_poller::RecordingDescriptor;
+use deepmsg_archive::server::conductor::UNKNOWN_REPLAY;
 use deepmsg_archive::server::recording_pos::{
     find_counter_id_by_recording, find_counter_id_by_session, parse_key,
 };
@@ -852,7 +853,7 @@ impl ConsensusModuleAgent {
                 .update_activity_timestamp(self.clock.time_millis());
         }
 
-        work += self.poll_archive_events();
+        work += self.poll_archive_events()?;
 
         // `ClusterSession.asyncConnect`'s two commands were deferred to here by
         // the ingress callback (see `session::ingress`).
@@ -1989,7 +1990,7 @@ impl ConsensusModuleAgent {
                 "unexpected Aeron close".to_owned(),
             ));
         }
-        let _ = self.poll_archive_events();
+        self.poll_archive_events()?;
         Ok(())
     }
 
@@ -2946,6 +2947,65 @@ impl ConsensusModuleAgent {
 }
 
 impl ConsensusModuleAgent {
+    /// `ConsensusModuleAgent.pollArchiveEvents` (`:2074-2098`): a completed
+    /// poll that is a **control response with `code == ERROR`** while a
+    /// replication is running.
+    ///
+    /// The reference has three arms, in this order:
+    ///
+    /// * the correlation id is one of this member's **catchup replays**: the
+    ///   member's replay ids are cleared and the error is counted
+    ///   (`"catchup replay failed - …"`);
+    /// * `UNKNOWN_REPLAY`: the replay is no longer relevant, also counted;
+    /// * everything else: `throw new ArchiveException(…)` out of the duty
+    ///   cycle, which is how the counted error handler hears it.
+    ///
+    /// A refusal here is the archive saying a copy it accepted will not be
+    /// served — the destination recording in the way, the source recording
+    /// gone, the source archive refusing. Taking only the signals and dropping
+    /// this answer is what leaves a member waiting for a replication that has
+    /// already failed, with nothing said: the election's replication deadline
+    /// is refreshed by every leader heartbeat, so it never fires.
+    fn report_replication_refusal(
+        &mut self,
+        refusal: deepmsg_archive::client::archive::ControlRefusal,
+    ) -> Result<(), ClusterError> {
+        if let Some(member) = self
+            .members
+            .iter_mut()
+            .find(|member| member.catchup_replay_correlation_id == refusal.correlation_id)
+        {
+            member.catchup_replay_session_id = -1;
+            member.catchup_replay_correlation_id = -1;
+            self.report_counted_error(Some(&ClusterError::ClusterEvent(format!(
+                "catchup replay failed - {} (correlation id {})",
+                refusal.message, refusal.correlation_id,
+            ))));
+            return Ok(());
+        }
+
+        if refusal.error_code == UNKNOWN_REPLAY {
+            self.report_counted_error(Some(&ClusterError::ClusterEvent(format!(
+                "replay no longer relevant - {} (correlation id {})",
+                refusal.message, refusal.correlation_id,
+            ))));
+            return Ok(());
+        }
+
+        // The archive's own variant, not `Cluster`: `doWork` classifies one of
+        // these (`STORAGE_SPACE` ends the agent, `:446-450`) and the display
+        // keeps the archive's number beside its words.
+        let error = ClusterError::ArchiveRefused {
+            code: refusal.error_code,
+            message: format!(
+                "member {}: {} (correlation id {})",
+                self.config.member_id, refusal.message, refusal.correlation_id,
+            ),
+        };
+        self.report_counted_error(Some(&error));
+        Err(error)
+    }
+
     /// `ClusterMember.addConsensusPublications` (`ClusterMember.java:927-953`):
     /// one exclusive publication per other member, on the consensus channel
     /// with that member's endpoint.
@@ -3836,20 +3896,26 @@ impl ElectionHost for ConsensusModuleAgent {
         Ok(())
     }
 
-    fn poll_archive_events(&mut self) -> usize {
+    fn poll_archive_events(&mut self) -> Result<usize, ClusterError> {
         // The reference polls its `RecordingSignalPoller` here (`:2061-2075`).
         // A replication's progress arrives as `EXTEND`/`SYNC`/`STOP`/
         // `REPLICATE_END` signals rather than as answers, so the control
         // channel is read once per turn while a replication is running; with
         // no replication there is nothing to read and the branch costs one
-        // `Option` test.
+        // `Option` test. The same slot also carries the archive's **refusal**
+        // of a copy it had accepted, which is read here and handed to
+        // [`Self::report_replication_refusal`].
         let mut work = usize::from(self.client.poll());
 
         if self.log_replication.is_some() {
-            match self.archive.poll_recording_signal(&mut self.client) {
-                Ok(Some(signal)) => {
+            match self.archive.poll_recording_event(&mut self.client) {
+                Ok(Some(RecordingEvent::Signal(signal))) => {
                     work += 1;
                     self.route_recording_signal(signal);
+                }
+                Ok(Some(RecordingEvent::Refusal(refusal))) => {
+                    work += 1;
+                    self.report_replication_refusal(refusal)?;
                 }
                 Ok(None) => {}
                 // The signal channel failing is the reference's counted error,
@@ -3858,7 +3924,7 @@ impl ElectionHost for ConsensusModuleAgent {
             }
         }
 
-        work
+        Ok(work)
     }
 
     fn node_state(&mut self) -> &mut NodeStateFile {
@@ -6113,7 +6179,7 @@ impl ConsensusModuleAgent {
             }
             match work {
                 Some(0) | None => {
-                    self.poll_archive_events();
+                    self.poll_archive_events()?;
                     self.idle()?;
                 }
                 Some(_) => {
