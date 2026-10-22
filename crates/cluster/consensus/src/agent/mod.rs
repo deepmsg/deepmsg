@@ -43,9 +43,11 @@ use std::mem;
 use std::time::Duration;
 
 use deepmsg_archive::client::Handlers;
-use deepmsg_archive::client::archive::Archive;
+use deepmsg_archive::client::archive::{Archive, RecordingEvent};
 use deepmsg_archive::client::async_connect::NoCredentials;
 use deepmsg_archive::client::descriptor_poller::RecordingDescriptor;
+use deepmsg_archive::server::conductor::UNKNOWN_REPLAY;
+use deepmsg_archive::server::recording_pos::ANY_ARCHIVE_ID;
 use deepmsg_archive::server::recording_pos::{
     find_counter_id_by_recording, find_counter_id_by_session, parse_key,
 };
@@ -327,6 +329,13 @@ pub struct ConsensusModuleAgent {
     /// The archive-to-archive replication this agent is driving, if any. The
     /// election holds the same handle; the session is the agent's (plan Q1).
     log_replication: Option<AgentLogReplication>,
+    /// The deployment's counted-error handler, after the counter has moved
+    /// (`LaunchComponents::error_handler`).
+    error_handler: Option<CountedErrorHandler>,
+    /// When the destination recording's position counter is read next
+    /// (`RecordingReplication.progressCheckDeadlineNs`, `:75`): on the leader
+    /// heartbeat interval, because the lookup walks the counter directory.
+    log_replication_position_read_ns: i64,
     uncommitted_timers: std::collections::VecDeque<(i64, i64)>,
     expired_timer_count: deepmsg_cluster_common::collections::HashMap<i64, i64>,
     live_log_destination: String,
@@ -352,6 +361,11 @@ pub struct ConsensusModuleAgent {
     snapshot_duration: SnapshotDuration,
 }
 
+/// What a deployment does with a counted error, once the counter has moved —
+/// the tail of `ConsensusModule.Context.countedErrorHandler`
+/// (`ConsensusModule.java:1857`).
+pub type CountedErrorHandler = Box<dyn Fn(&ClusterError) + Send + Sync>;
+
 /// The two objects a deployment names by class and a test supplies in process
 /// (`ConsensusModule.Context.authenticatorSupplier` and
 /// `authorisationServiceSupplier`, `ConsensusModule.java:1683-1690`).
@@ -361,6 +375,16 @@ pub struct LaunchComponents {
     pub authenticator: Option<Box<dyn Authenticator>>,
     /// `None` means the name in `aeron.cluster.authorisation.service.supplier`.
     pub authorisation_service: Option<Box<dyn AuthorisationService>>,
+    /// What a deployment does with a counted error after the counter has moved
+    /// — the tail of `ConsensusModule.Context.countedErrorHandler`
+    /// (`ConsensusModule.java:1857`).
+    ///
+    /// `TestCluster` passes `ClusterTests.errorHandler` (`ClusterTest.java:565`),
+    /// whose point is the split this build's [`ClusterError::is_warning`]
+    /// mirrors: a **WARN** is printed, an **ERROR** fails the test
+    /// (`ClusterTests.java:77-98`). `None` is this build's own reporting, which
+    /// is the counter and a line on stderr.
+    pub error_handler: Option<CountedErrorHandler>,
 }
 
 impl ConsensusModuleAgent {
@@ -401,6 +425,7 @@ impl ConsensusModuleAgent {
             None => authenticator_for(&config.authenticator_supplier)
                 .map_err(|error| ClusterError::Cluster(error.to_string()))?,
         };
+        let error_handler = components.error_handler;
         let authorisation_service = match components.authorisation_service {
             Some(service) => service,
             None => authorisation_service_for(config.authorisation_service_supplier.as_deref())
@@ -598,6 +623,7 @@ impl ConsensusModuleAgent {
             log_adapter: crate::log::LogAdapter::new(),
             live_log_subscription_id: NULL_VALUE,
             append_position: None,
+            error_handler,
             state: ModuleState::Init,
             role: Role::Follower,
             election: None,
@@ -631,6 +657,7 @@ impl ConsensusModuleAgent {
             timer,
             log_replay: None,
             log_replication: None,
+            log_replication_position_read_ns: 0,
             uncommitted_timers: std::collections::VecDeque::new(),
             expired_timer_count: deepmsg_cluster_common::collections::HashMap::default(),
             live_log_destination: String::new(),
@@ -852,7 +879,7 @@ impl ConsensusModuleAgent {
                 .update_activity_timestamp(self.clock.time_millis());
         }
 
-        work += self.poll_archive_events();
+        work += self.poll_archive_events()?;
 
         // `ClusterSession.asyncConnect`'s two commands were deferred to here by
         // the ingress callback (see `session::ingress`).
@@ -1440,6 +1467,16 @@ impl ConsensusModuleAgent {
         }
     }
 
+    /// The same, for an error the agent holds as a [`ClusterError`]: counted,
+    /// printed, and handed to the deployment's handler
+    /// (`ConsensusModule.Context.countedErrorHandler`).
+    fn report_cluster_error(&self, error: &ClusterError) {
+        self.report_counted_error(Some(error));
+        if let Some(handler) = &self.error_handler {
+            handler(error);
+        }
+    }
+
     /// `onTerminationPosition` (`:1183-1193`): a follower records where the
     /// leader will stop. The consensus dispatcher that will call this is
     /// `P3-5b`/`P3-6a`; until it exists a one-member cluster has no leader to
@@ -1989,7 +2026,7 @@ impl ConsensusModuleAgent {
                 "unexpected Aeron close".to_owned(),
             ));
         }
-        let _ = self.poll_archive_events();
+        self.poll_archive_events()?;
         Ok(())
     }
 
@@ -2946,6 +2983,114 @@ impl ConsensusModuleAgent {
 }
 
 impl ConsensusModuleAgent {
+    /// `ConsensusModuleAgent.pollArchiveEvents` (`:2074-2098`): a completed
+    /// poll that is a **control response with `code == ERROR`** while a
+    /// replication is running.
+    ///
+    /// The reference has three arms, in this order:
+    ///
+    /// * the correlation id is one of this member's **catchup replays**: the
+    ///   member's replay ids are cleared and the error is counted
+    ///   (`"catchup replay failed - …"`);
+    /// * `UNKNOWN_REPLAY`: the replay is no longer relevant, also counted;
+    /// * everything else: `throw new ArchiveException(…)` out of the duty
+    ///   cycle, which is how the counted error handler hears it.
+    ///
+    /// A refusal here is the archive saying a copy it accepted will not be
+    /// served — the destination recording in the way, the source recording
+    /// gone, the source archive refusing. Taking only the signals and dropping
+    /// this answer is what leaves a member waiting for a replication that has
+    /// already failed, with nothing said: the election's replication deadline
+    /// is refreshed by every leader heartbeat, so it never fires.
+    fn report_replication_refusal(
+        &mut self,
+        refusal: deepmsg_archive::client::archive::ControlRefusal,
+    ) -> Result<(), ClusterError> {
+        if let Some(member) = self
+            .members
+            .iter_mut()
+            .find(|member| member.catchup_replay_correlation_id == refusal.correlation_id)
+        {
+            member.catchup_replay_session_id = -1;
+            member.catchup_replay_correlation_id = -1;
+            self.report_counted_error(Some(&ClusterError::ClusterEvent(format!(
+                "catchup replay failed - {} (correlation id {})",
+                refusal.message, refusal.correlation_id,
+            ))));
+            return Ok(());
+        }
+
+        if refusal.error_code == UNKNOWN_REPLAY {
+            self.report_counted_error(Some(&ClusterError::ClusterEvent(format!(
+                "replay no longer relevant - {} (correlation id {})",
+                refusal.message, refusal.correlation_id,
+            ))));
+            return Ok(());
+        }
+
+        // The archive's own variant, not `Cluster`: `doWork` classifies one of
+        // these (`STORAGE_SPACE` ends the agent, `:446-450`) and the display
+        // keeps the archive's number beside its words.
+        let error = ClusterError::ArchiveRefused {
+            code: refusal.error_code,
+            message: format!(
+                "member {}: {} (correlation id {})",
+                self.config.member_id, refusal.message, refusal.correlation_id,
+            ),
+        };
+        self.report_cluster_error(&error);
+        Err(error)
+    }
+
+    /// The counter half of `RecordingReplication.pollDstRecordingPosition`
+    /// (`:87-95`, `:221-235`): the **destination recording's** own position,
+    /// handed to the handle the election polls.
+    ///
+    /// It lives on this side because the counters do (plan Q1's split, the same
+    /// one that put the deadline in the election), and it is read on
+    /// `leaderHeartbeatIntervalNs` — the reference's `progressCheckDeadlineNs`
+    /// — because the lookup walks the counter directory, and a walk a duty
+    /// cycle is exactly the cost that made a whole benchmark lie once.
+    ///
+    /// A copy that is *copying* need not be signalling anything, so without
+    /// this the election's progress clock would see a healthy replication as
+    /// stalled; a copy that has stopped need not stop signalling either, so
+    /// without the clock it would never be caught. The two halves are one
+    /// mechanism in the reference and one in this build too — the read here,
+    /// the deadline there.
+    fn read_destination_recording_position(&mut self) {
+        let now_ns = self.clock.time_nanos();
+        if now_ns < self.log_replication_position_read_ns {
+            return;
+        }
+        self.log_replication_position_read_ns = now_ns + self.config.leader_heartbeat_interval_ns;
+
+        let recording_id = self.log_recording_id;
+        if recording_id == NULL_VALUE {
+            return;
+        }
+
+        // `RecordingPos.findCounterIdByRecording(counters, recordingId,
+        // archiveId)` (`RecordingReplication.java:224`): matched by the
+        // recording the key names, which is also what makes it the live
+        // counter (`RecordingPos.isActive`, `:292-298`) rather than one left
+        // behind by a recording that ended.
+        let Some(counters) = self.client.counters_reader() else {
+            return;
+        };
+        let Some(counter_id) =
+            find_counter_id_by_recording(&counters, recording_id, ANY_ARCHIVE_ID)
+        else {
+            return;
+        };
+        let Some(position) = counters.value(counter_id) else {
+            return;
+        };
+        if let Some(replication) = self.log_replication.as_ref() {
+            replication.handle().observe_position(position);
+        }
+    }
+
     /// `ClusterMember.addConsensusPublications` (`ClusterMember.java:927-953`):
     /// one exclusive publication per other member, on the consensus channel
     /// with that member's endpoint.
@@ -3836,29 +3981,37 @@ impl ElectionHost for ConsensusModuleAgent {
         Ok(())
     }
 
-    fn poll_archive_events(&mut self) -> usize {
+    fn poll_archive_events(&mut self) -> Result<usize, ClusterError> {
         // The reference polls its `RecordingSignalPoller` here (`:2061-2075`).
         // A replication's progress arrives as `EXTEND`/`SYNC`/`STOP`/
         // `REPLICATE_END` signals rather than as answers, so the control
         // channel is read once per turn while a replication is running; with
         // no replication there is nothing to read and the branch costs one
-        // `Option` test.
+        // `Option` test. The same slot also carries the archive's **refusal**
+        // of a copy it had accepted, which is read here and handed to
+        // [`Self::report_replication_refusal`].
         let mut work = usize::from(self.client.poll());
 
         if self.log_replication.is_some() {
-            match self.archive.poll_recording_signal(&mut self.client) {
-                Ok(Some(signal)) => {
+            match self.archive.poll_recording_event(&mut self.client) {
+                Ok(Some(RecordingEvent::Signal(signal))) => {
                     work += 1;
                     self.route_recording_signal(signal);
+                }
+                Ok(Some(RecordingEvent::Refusal(refusal))) => {
+                    work += 1;
+                    self.report_replication_refusal(refusal)?;
                 }
                 Ok(None) => {}
                 // The signal channel failing is the reference's counted error,
                 // not a reason to stop the agent.
                 Err(error) => self.report_counted_error(Some(&error)),
             }
+
+            self.read_destination_recording_position();
         }
 
-        work
+        Ok(work)
     }
 
     fn node_state(&mut self) -> &mut NodeStateFile {
@@ -6113,7 +6266,7 @@ impl ConsensusModuleAgent {
             }
             match work {
                 Some(0) | None => {
-                    self.poll_archive_events();
+                    self.poll_archive_events()?;
                     self.idle()?;
                 }
                 Some(_) => {

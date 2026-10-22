@@ -198,6 +198,15 @@ pub struct Election {
     /// The replication position the last turn saw, for the progress clock
     /// (`RecordingReplication.poll`'s `progressDeadlineNs`).
     replication_progress_position: i64,
+    /// `RecordingReplication.progressDeadlineNs` (`:74`): how long the copy may
+    /// go without moving before it is a failure.
+    ///
+    /// **Separate from [`Self::replication_deadline_ns`], and that separation
+    /// is the point**: the other one is refreshed by every leader heartbeat
+    /// (`on_new_leadership_term`, `on_commit_position`), so a replication that
+    /// stopped moving — or ended without stopping — would never expire under
+    /// it. Only a position that moved refreshes this one.
+    replication_progress_deadline_ns: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +277,7 @@ impl Election {
             nomination_deadline_ns: 0,
             replication_deadline_ns: 0,
             replication_progress_position: -1,
+            replication_progress_deadline_ns: 0,
         }
     }
 
@@ -743,6 +753,10 @@ impl Election {
                     now_ns,
                 )?);
                 self.replication_deadline_ns = now_ns + host.leader_heartbeat_timeout_ns();
+                // `RecordingReplication`'s constructor (`:65-66`): the progress
+                // clock starts now, and the first counter read is one interval
+                // away.
+                self.replication_progress_deadline_ns = now_ns + host.leader_heartbeat_timeout_ns();
                 self.replication_progress_position = -1;
                 work += 1;
             } else {
@@ -755,7 +769,14 @@ impl Election {
             return Ok(work);
         }
 
-        work += host.poll_archive_events();
+        work += host.poll_archive_events()?;
+
+        // The **counter** half of the reference's progress check
+        // (`pollDstRecordingPosition`, `:87-95`, `:221-235`) is the agent's:
+        // it is the side that owns the counters, and it feeds the value into
+        // this handle on its own interval (see `ConsensusModuleAgent::
+        // poll_archive_events`). By the time the position is read here it is
+        // therefore the counter's, not only the signals'.
         let (replication_done, position) = {
             let replication = self.log_replication.as_ref().expect("just checked");
             replication.poll(now_ns);
@@ -764,15 +785,37 @@ impl Election {
                 replication.position(),
             )
         };
-        // `RecordingReplication.poll`'s progress clock (`:185-201`): a position
-        // that moved buys another heartbeat timeout, and one that has not
-        // moved is the replication failing — whether or not it ever ended.
-        // This is where the check lives in this build (plan Q1: the handle's
-        // `poll` cannot read the agent, so the election that drives it keeps
-        // the deadline).
+
+        // `progressDeadlineNs` (`:97-107`): only a position that moved buys
+        // another heartbeat timeout. The leader's heartbeats do **not**, which
+        // is what lets a copy that stopped moving say so instead of being kept
+        // alive by the very act of waiting for it.
+        //
+        // Both of the reference's sentences are here, and the second one is
+        // reachable where the reference's is not: `RecordingReplication.poll`
+        // returns as soon as `hasReplicationEnded` (`:78-81`), so the
+        // reference can only ever name a copy that reached its stop position
+        // **without** saying it ended. This build keeps the clock running until
+        // the copy has **stopped**, because "ended but never stopped" is the
+        // stall that was measured (records/P3-6c.md §7.7) and the clock is the
+        // only thing that can end that wait. **Deviation, deliberate.**
         if position > self.replication_progress_position {
             self.replication_progress_position = position;
-            self.replication_deadline_ns = now_ns + host.leader_heartbeat_timeout_ns();
+            self.replication_progress_deadline_ns = now_ns + host.leader_heartbeat_timeout_ns();
+        } else if now_ns >= self.replication_progress_deadline_ns {
+            // Two sentences, and they are **not the same kind of thing**: the
+            // reference throws the first as a WARN `TimeoutException` (`:101`)
+            // and the second as a plain `ClusterException` (`:105`), which is
+            // the default **ERROR** category — the one a deployment's error
+            // handler fails a test on. Same split here.
+            return Err(
+                if self.replication_stop_position == -1 || position < self.replication_stop_position
+                {
+                    ClusterError::Timeout("log replication has not progressed".to_owned())
+                } else {
+                    ClusterError::Cluster("log replication failed to stop".to_owned())
+                },
+            );
         }
 
         // The last position of the leadership is published after the completion
@@ -795,10 +838,6 @@ impl Election {
                     "timeout awaiting commit position".to_owned(),
                 ));
             }
-        } else if now_ns >= self.replication_deadline_ns {
-            return Err(ClusterError::Timeout(
-                "log replication has not progressed".to_owned(),
-            ));
         }
 
         Ok(work)

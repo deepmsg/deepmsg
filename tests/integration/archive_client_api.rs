@@ -51,7 +51,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use deepmsg_archive::client::archive::{
-    Archive, ArchiveError, Handlers, RecordingSignal, channel_with_session_id,
+    Archive, ArchiveError, Handlers, RecordingEvent, RecordingSignal, channel_with_session_id,
 };
 use deepmsg_archive::client::context::{CONTROL_CHANNEL_ENV, CONTROL_RESPONSE_CHANNEL_ENV};
 use deepmsg_archive::client::descriptor_poller::RecordingDescriptor;
@@ -2592,6 +2592,133 @@ fn a_replication_reaches_an_archive_in_another_process() {
     );
 
     let _ = replication_id;
+
+    archive.close(&client);
+    source_archive.close(&source_client);
+
+    media_driver.stop().expect("the destination driver stops");
+    source_driver.stop().expect("the source driver stops");
+}
+
+/// **A replication the source cannot serve comes back as an error on the
+/// channel the caller is already reading.**
+///
+/// `Archive::replicate` answers `OK` with the replication's id as soon as the
+/// **destination** archive has the session open: the source's catalog is read
+/// afterwards, in `ReplicationSession`'s own turn. A source recording that is
+/// not there makes that turn answer with an `ERROR` control response under the
+/// **replication's** correlation id (`ReplicationSession.error`, `:923-926`;
+/// the refusal itself is `:895-899`'s `unknown src recording id`).
+///
+/// That answer arrives on the same subscription and in the same slot as a
+/// replication's progress signals, so a caller that asks only for signals reads
+/// it as "nothing" — and a member waiting on a copy that has already failed
+/// waits for ever, because every leader heartbeat refreshes the deadline it is
+/// waiting under. `Archive::poll_recording_event` hands the refusal over
+/// instead; the cluster and the backup turn it into a counted error
+/// (`ConsensusModuleAgent.java:2074-2098`,
+/// `ClusterBackupAgent.java:1063-1088`).
+#[test]
+fn a_refused_replication_is_an_error_and_not_a_silence() {
+    let Some((mut media_driver, _archive_dir, mut client)) =
+        rig("archive-client-api-replication-refused")
+    else {
+        return;
+    };
+
+    // The source archive, on a control channel the destination can dial — the
+    // same arrangement as the cross-process copy above, because the refusal has
+    // to come from a session that was opened against a real source.
+    let [source_control_port] = free_udp_ports::<1>();
+    let source_control = format!("aeron:udp?endpoint=localhost:{source_control_port}");
+    let source_control_property = format!("-Daeron.archive.control.channel={source_control}");
+    let source_properties = ["-Daeron.threading.mode=SHARED", &source_control_property];
+    let source_archive_dir = TempDir::new("archive-client-api-replication-refused-source");
+
+    let Some(mut source_driver) = OwnArchivingMediaDriver::start(
+        "archive-client-api-replication-refused-source",
+        source_archive_dir.path(),
+        &source_properties,
+    ) else {
+        archiving_driver::announce_skip();
+        return;
+    };
+
+    source_driver
+        .await_ready(archive::DEADLINE)
+        .expect("the source archive comes up");
+
+    let mut source_client =
+        Client::connect(source_driver.aeron_dir()).expect("connect to the source driver");
+
+    let mut source_archive = Archive::connect(
+        &context(),
+        &mut source_client,
+        &mut NoCredentials,
+        Handlers::default(),
+    )
+    .expect("the source archive is connected");
+
+    // A recording the source **does** hold, so the id the request names is the
+    // only thing wrong with it.
+    let source = a_stopped_recording(&mut source_archive, &mut source_client);
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers::default(),
+    )
+    .expect("the destination archive is connected");
+
+    let mut params = ReplicationParams::new();
+    params.replication_channel = REPLICATION_CHANNEL.to_owned();
+
+    let replication_id = archive
+        .replicate(
+            &mut client,
+            source.recording_id + 1,
+            archive::CONTROL_STREAM_ID,
+            &source_control,
+            &params,
+        )
+        .expect("the destination archive accepts the request, which is the point");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut refusal = None;
+
+    while Instant::now() < deadline {
+        match archive.poll_recording_event(&mut client) {
+            Ok(Some(RecordingEvent::Refusal(refusal_event))) => {
+                refusal = Some(refusal_event);
+                break;
+            }
+            Ok(Some(RecordingEvent::Signal(signal))) => {
+                panic!("a replication that was refused still sent {signal:?}");
+            }
+            Ok(None) => {}
+            Err(error) => panic!("the signal channel: {error}"),
+        }
+        client.poll();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let refusal = refusal.expect("the source's refusal reaches this client");
+
+    assert_eq!(
+        replication_id, refusal.correlation_id,
+        "the refusal is about the replication the caller was given"
+    );
+    assert_eq!(
+        deepmsg_archive::server::conductor::UNKNOWN_RECORDING,
+        refusal.error_code,
+        "UNKNOWN_RECORDING, in the archive's own domain"
+    );
+    assert!(
+        refusal.message.contains("unknown src recording id"),
+        "and it is the source's own words: {}",
+        refusal.message
+    );
 
     archive.close(&client);
     source_archive.close(&source_client);

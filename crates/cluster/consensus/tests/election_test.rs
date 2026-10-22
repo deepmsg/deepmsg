@@ -502,8 +502,8 @@ impl ElectionHost for TestHost {
         self.election_complete_calls += 1;
         Ok(())
     }
-    fn poll_archive_events(&mut self) -> usize {
-        0
+    fn poll_archive_events(&mut self) -> Result<usize, ClusterError> {
+        Ok(0)
     }
     fn node_state(&mut self) -> &mut NodeStateFile {
         &mut self.node_state
@@ -1176,6 +1176,171 @@ fn notified_commit_position_cannot_go_backwards_upon_receiving_new_leadership_te
         )
         .unwrap();
     assert_eq!(election.notified_commit_position(), 100);
+}
+
+/// Drive a replication into existence and answer the handle the election kept.
+fn start_log_replication(host: &mut TestHost, sender: &mut RecordingSender) -> Election {
+    let mut election = new_election(&[0, 1], 1);
+    election.do_work(host, sender).unwrap();
+    election
+        .on_new_leadership_term(
+            host,
+            -1,
+            0,
+            100,
+            120,
+            0,
+            10,
+            20,
+            0,
+            RECORDING_ID,
+            0,
+            0,
+            LOG_SESSION_ID,
+            true,
+        )
+        .unwrap();
+    assert_eq!(election.state(), ElectionState::FollowerLogReplication);
+
+    host.advance(1);
+    election.do_work(host, sender).unwrap();
+    assert_eq!(election.state(), ElectionState::FollowerLogReplication);
+    election
+}
+
+/// **A copy that stops moving is a failure, even while the leader keeps
+/// heartbeating** (`RecordingReplication.poll`, `:97-107`).
+///
+/// The two clocks this build keeps are the point of the case: the leader's
+/// `newLeadershipTerm` refreshes the *commit-wait* deadline every interval
+/// (`Election.java:544-551`), and it must **not** refresh the progress one —
+/// otherwise a replication that stopped moving is kept alive by the very act
+/// of waiting for it, which is the stall `records/P3-6c.md` §7.7 measured.
+#[test]
+fn a_replication_that_stops_moving_fails_despite_the_heartbeats() {
+    let mut host = TestHost::new("replication-stalled", &[0, 1], 1);
+    let mut sender = RecordingSender::accepting();
+    let mut election = start_log_replication(&mut host, &mut sender);
+
+    election
+        .log_replication()
+        .expect("a replication")
+        .observe_position(40);
+
+    let mut failure = None;
+    for _ in 0..120 {
+        host.advance(200_000_000);
+        election
+            .on_new_leadership_term(
+                &mut host,
+                -1,
+                0,
+                100,
+                120,
+                0,
+                10,
+                20,
+                0,
+                RECORDING_ID,
+                0,
+                0,
+                LOG_SESSION_ID,
+                true,
+            )
+            .unwrap();
+        if let Err(error) = election.do_work(&mut host, &mut sender) {
+            failure = Some(error);
+            break;
+        }
+    }
+
+    let failure = failure.expect("a copy stuck below its stop position is a failure");
+    assert!(
+        matches!(&failure, ClusterError::Timeout(message) if message == "log replication has not progressed"),
+        "{failure}"
+    );
+}
+
+/// **A copy that said it ended but never said it stopped is a failure too** —
+/// the other of the reference's two sentences (`:97-107`), and the one the
+/// measured stall was in: `REPLICATE_END` arrived, the position reached the
+/// stop, and the `STOP` never did (`records/P3-6c.md` §7.7).
+///
+/// The reference cannot reach this sentence: its `poll` returns as soon as
+/// `hasReplicationEnded` (`:78-81`), so it only ever names a copy that reached
+/// the stop position *without* saying it ended. This build keeps the clock
+/// running until the copy has stopped — a deliberate deviation, because
+/// "ended, not stopped" is the shape that hung.
+#[test]
+fn a_replication_that_ended_without_stopping_is_a_failure() {
+    let mut host = TestHost::new("replication-ended", &[0, 1], 1);
+    let mut sender = RecordingSender::accepting();
+    let mut election = start_log_replication(&mut host, &mut sender);
+
+    {
+        let replication = election.log_replication().expect("a replication");
+        replication.observe_position(100);
+        replication.on_signal(1, 100, RecordingSignal::ReplicateEnd);
+    }
+
+    let mut failure = None;
+    for _ in 0..120 {
+        host.advance(200_000_000);
+        election
+            .on_new_leadership_term(
+                &mut host,
+                -1,
+                0,
+                100,
+                120,
+                0,
+                10,
+                20,
+                0,
+                RECORDING_ID,
+                0,
+                0,
+                LOG_SESSION_ID,
+                true,
+            )
+            .unwrap();
+        if let Err(error) = election.do_work(&mut host, &mut sender) {
+            failure = Some(error);
+            break;
+        }
+    }
+
+    let failure = failure.expect("a copy that ended but never stopped is a failure");
+    assert!(
+        matches!(&failure, ClusterError::Cluster(message) if message == "log replication failed to stop"),
+        "the reference throws this one as a ClusterException — ERROR, not the WARN \
+         TimeoutException its sibling is: {failure}"
+    );
+}
+
+/// **The destination recording's counter is what the progress clock reads**:
+/// a position that keeps moving keeps the replication alive past the timeout,
+/// without a single signal (`pollDstRecordingPosition`, `:221-235`).
+#[test]
+fn a_destination_counter_that_moves_keeps_the_replication_alive() {
+    let mut host = TestHost::new("replication-moving", &[0, 1], 1);
+    let mut sender = RecordingSender::accepting();
+    let mut election = start_log_replication(&mut host, &mut sender);
+
+    for step in 0..60 {
+        host.advance(200_000_000);
+        election
+            .log_replication()
+            .expect("a replication")
+            .observe_position(40 + step);
+        election.do_work(&mut host, &mut sender).unwrap();
+    }
+
+    assert_eq!(
+        election.state(),
+        ElectionState::FollowerLogReplication,
+        "a copy that is copying is not a copy that has stalled"
+    );
 }
 
 #[test]

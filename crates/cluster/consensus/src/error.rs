@@ -52,6 +52,29 @@ impl ClusterError {
     pub fn is_election_recoverable(&self) -> bool {
         matches!(self, Self::ClusterEvent(_) | Self::Timeout(_))
     }
+
+    /// The reference's `AeronException.Category`, as far as these variants go
+    /// (`AeronException.java:76-80` is the default, ERROR).
+    ///
+    /// * [`Self::ClusterEvent`] is the reference's `ClusterEvent`, which is
+    ///   **WARN** by construction (`ClusterEvent.java:35` — "does not require
+    ///   a stack trace, so it can be lighter-weight").
+    /// * [`Self::Timeout`] is the WARN-category `TimeoutException` the
+    ///   reference throws at every site this build has one for
+    ///   (`RecordingReplication.java:101`, `:945`).
+    /// * [`Self::Cluster`] and [`Self::ArchiveRefused`] are `ClusterException`
+    ///   and `ArchiveException`, both of which take the default: **ERROR**.
+    /// * [`Self::AgentTermination`] ends the duty cycle, so no handler decides
+    ///   anything about it.
+    ///
+    /// It matters because the reference's counted-error handler is the
+    /// deployment's (`TestCluster` passes `ClusterTests.errorHandler`,
+    /// `ClusterTest.java:565`) and that handler fails a test on an ERROR while
+    /// a WARN is only printed (`ClusterTests.java:77-98`).
+    #[must_use]
+    pub const fn is_warning(&self) -> bool {
+        matches!(self, Self::ClusterEvent(_) | Self::Timeout(_))
+    }
 }
 
 impl From<deepmsg_cluster_common::counters::CounterError> for ClusterError {
