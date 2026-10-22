@@ -1312,8 +1312,9 @@ fn a_replication_that_ended_without_stopping_is_a_failure() {
 
     let failure = failure.expect("a copy that ended but never stopped is a failure");
     assert!(
-        matches!(&failure, ClusterError::Timeout(message) if message == "log replication failed to stop"),
-        "{failure}"
+        matches!(&failure, ClusterError::Cluster(message) if message == "log replication failed to stop"),
+        "the reference throws this one as a ClusterException — ERROR, not the WARN \
+         TimeoutException its sibling is: {failure}"
     );
 }
 

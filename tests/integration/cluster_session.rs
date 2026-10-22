@@ -361,6 +361,7 @@ fn a_rejecting_authenticator_produces_an_authentication_rejected_event() {
         LaunchComponents {
             authenticator: Some(Box::new(RejectingAuthenticator)),
             authorisation_service: None,
+            ..LaunchComponents::default()
         },
     ) else {
         archiving_driver::announce_skip();

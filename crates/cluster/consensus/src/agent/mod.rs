@@ -329,6 +329,9 @@ pub struct ConsensusModuleAgent {
     /// The archive-to-archive replication this agent is driving, if any. The
     /// election holds the same handle; the session is the agent's (plan Q1).
     log_replication: Option<AgentLogReplication>,
+    /// The deployment's counted-error handler, after the counter has moved
+    /// (`LaunchComponents::error_handler`).
+    error_handler: Option<CountedErrorHandler>,
     /// When the destination recording's position counter is read next
     /// (`RecordingReplication.progressCheckDeadlineNs`, `:75`): on the leader
     /// heartbeat interval, because the lookup walks the counter directory.
@@ -358,6 +361,11 @@ pub struct ConsensusModuleAgent {
     snapshot_duration: SnapshotDuration,
 }
 
+/// What a deployment does with a counted error, once the counter has moved —
+/// the tail of `ConsensusModule.Context.countedErrorHandler`
+/// (`ConsensusModule.java:1857`).
+pub type CountedErrorHandler = Box<dyn Fn(&ClusterError) + Send + Sync>;
+
 /// The two objects a deployment names by class and a test supplies in process
 /// (`ConsensusModule.Context.authenticatorSupplier` and
 /// `authorisationServiceSupplier`, `ConsensusModule.java:1683-1690`).
@@ -367,6 +375,16 @@ pub struct LaunchComponents {
     pub authenticator: Option<Box<dyn Authenticator>>,
     /// `None` means the name in `aeron.cluster.authorisation.service.supplier`.
     pub authorisation_service: Option<Box<dyn AuthorisationService>>,
+    /// What a deployment does with a counted error after the counter has moved
+    /// — the tail of `ConsensusModule.Context.countedErrorHandler`
+    /// (`ConsensusModule.java:1857`).
+    ///
+    /// `TestCluster` passes `ClusterTests.errorHandler` (`ClusterTest.java:565`),
+    /// whose point is the split this build's [`ClusterError::is_warning`]
+    /// mirrors: a **WARN** is printed, an **ERROR** fails the test
+    /// (`ClusterTests.java:77-98`). `None` is this build's own reporting, which
+    /// is the counter and a line on stderr.
+    pub error_handler: Option<CountedErrorHandler>,
 }
 
 impl ConsensusModuleAgent {
@@ -407,6 +425,7 @@ impl ConsensusModuleAgent {
             None => authenticator_for(&config.authenticator_supplier)
                 .map_err(|error| ClusterError::Cluster(error.to_string()))?,
         };
+        let error_handler = components.error_handler;
         let authorisation_service = match components.authorisation_service {
             Some(service) => service,
             None => authorisation_service_for(config.authorisation_service_supplier.as_deref())
@@ -604,6 +623,7 @@ impl ConsensusModuleAgent {
             log_adapter: crate::log::LogAdapter::new(),
             live_log_subscription_id: NULL_VALUE,
             append_position: None,
+            error_handler,
             state: ModuleState::Init,
             role: Role::Follower,
             election: None,
@@ -1444,6 +1464,16 @@ impl ConsensusModuleAgent {
 
         if let Some(error) = error {
             eprintln!("cluster: {error}");
+        }
+    }
+
+    /// The same, for an error the agent holds as a [`ClusterError`]: counted,
+    /// printed, and handed to the deployment's handler
+    /// (`ConsensusModule.Context.countedErrorHandler`).
+    fn report_cluster_error(&self, error: &ClusterError) {
+        self.report_counted_error(Some(error));
+        if let Some(handler) = &self.error_handler {
+            handler(error);
         }
     }
 
@@ -3008,7 +3038,7 @@ impl ConsensusModuleAgent {
                 self.config.member_id, refusal.message, refusal.correlation_id,
             ),
         };
-        self.report_counted_error(Some(&error));
+        self.report_cluster_error(&error);
         Err(error)
     }
 

@@ -803,14 +803,19 @@ impl Election {
             self.replication_progress_position = position;
             self.replication_progress_deadline_ns = now_ns + host.leader_heartbeat_timeout_ns();
         } else if now_ns >= self.replication_progress_deadline_ns {
-            return Err(ClusterError::Timeout(
+            // Two sentences, and they are **not the same kind of thing**: the
+            // reference throws the first as a WARN `TimeoutException` (`:101`)
+            // and the second as a plain `ClusterException` (`:105`), which is
+            // the default **ERROR** category — the one a deployment's error
+            // handler fails a test on. Same split here.
+            return Err(
                 if self.replication_stop_position == -1 || position < self.replication_stop_position
                 {
-                    "log replication has not progressed".to_owned()
+                    ClusterError::Timeout("log replication has not progressed".to_owned())
                 } else {
-                    "log replication failed to stop".to_owned()
+                    ClusterError::Cluster("log replication failed to stop".to_owned())
                 },
-            ));
+            );
         }
 
         // The last position of the leadership is published after the completion

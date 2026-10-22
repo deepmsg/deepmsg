@@ -872,6 +872,19 @@ impl Node {
                 LaunchComponents {
                     authenticator: authenticator
                         .map(|authenticator| Box::new(authenticator) as Box<dyn Authenticator>),
+                    // The other half of `ClusterTest`'s
+                    // `ClusterTests.errorHandler` (`ClusterTest.java:565`,
+                    // `ClusterTests.java:77-98`): a **WARN** is printed by the
+                    // agent and goes no further, an **ERROR** is a failure —
+                    // and here a failure is what a case's waits panic with.
+                    error_handler: Some(Box::new({
+                        let faults = faults.clone();
+                        move |error: &deepmsg_cluster::ClusterError| {
+                            if !error.is_warning() {
+                                faults.record(format!("node {id}: {error}"));
+                            }
+                        }
+                    })),
                     ..LaunchComponents::default()
                 },
             ) {
