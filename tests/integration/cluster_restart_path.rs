@@ -157,7 +157,7 @@ fn send_ten(
 }
 
 /// **The leader the survivors deposed comes back as one of their followers**
-/// (`ClusterTest.shouldStopLeaderAndRestartAsFollower`, `ClusterTest.java:2167`).
+/// (`ClusterTest.shouldStopLeaderAndRestartAsFollower`, `ClusterTest.java:598`).
 ///
 /// The old leader is killed, the two survivors elect a later term, and the old
 /// leader is restarted **on its own directories**. It must close its election as
@@ -288,7 +288,7 @@ fn a_stopped_leader_comes_back_as_a_follower() {
 
 /// **The client keeps sending while the deposed leader comes back**
 /// (`ClusterTest.shouldStopLeaderAndRestartAsFollowerWithSendingAfter`,
-/// `ClusterTest.java:2190`).
+/// `ClusterTest.java:616`).
 ///
 /// The same shape as the case above, with the client's session held across it:
 /// the session is on the new leader (the old one's term ended with it), and a
@@ -393,7 +393,7 @@ fn a_stopped_leader_comes_back_as_a_follower_and_the_client_keeps_sending() {
 /// **The deposed leader comes back as a follower, and then the leader that
 /// replaced it stops too** (`ClusterTest
 /// .shouldStopLeaderAndRestartAsFollowerWithSendingAfterThenStopLeader`,
-/// `ClusterTest.java:2225`).
+/// `ClusterTest.java:638`).
 ///
 /// Two elections in a row with a member returning between them: the cluster has
 /// to take the returning member back into the second term as well, and elect a
@@ -498,7 +498,7 @@ fn a_stopped_leader_comes_back_as_a_follower_then_the_new_leader_stops() {
 
 /// **A follower restarted with an **empty** directory catches up and takes new
 /// messages** (`ClusterTest.shouldAcceptMessagesAfterSingleNodeCleanRestart`,
-/// `ClusterTest.java:2290`).
+/// `ClusterTest.java:666`).
 ///
 /// A clean restart in the reference's sense is `startStaticNode(index, true)`:
 /// `deleteArchiveOnStart` and `deleteDirOnStart`, so the member comes back with
@@ -599,7 +599,7 @@ fn a_follower_restarted_on_an_empty_directory_catches_up() {
 
 /// **Both followers restarted on empty directories come back**
 /// (`ClusterTest.shouldAcceptMessagesAfterTwoNodeCleanRestart`,
-/// `ClusterTest.java:2340`).
+/// `ClusterTest.java:778`).
 ///
 /// The leader is alone while both are away — no quorum — so this is also the
 /// case that says the leader holds its term across a short outage instead of
@@ -733,7 +733,7 @@ fn two_followers_restarted_on_empty_directories_catch_up() {
 
 /// **A follower stopped and restarted on its own directories is invisible to
 /// the client** (`ClusterTest.shouldStopFollowerAndRestartFollowerGracefully`,
-/// `ClusterTest.java:1180`).
+/// `ClusterTest.java:203`).
 ///
 /// The reference's "gracefully" is `consensusModule().close()` — the module's
 /// own close, not the `SHUTDOWN` toggle (which only a leader honours) and not a
@@ -838,7 +838,7 @@ fn a_follower_stopped_and_restarted_is_invisible_to_the_client() {
 
 /// **A follower that misses a single message catches up on the way back**
 /// (`ClusterTest.shouldCatchUpAfterFollowerMissesOneMessage`,
-/// `ClusterTest.java:2960`).
+/// `ClusterTest.java:1808`).
 ///
 /// The smallest catch-up there is: one commit while the follower is away, and
 /// the returning member has to close as a follower with that commit in its own
@@ -926,7 +926,7 @@ fn a_follower_that_missed_one_message_catches_up() {
 
 /// **A follower that stopped part way through a term catches up**
 /// (`ClusterTest.shouldRecoverWhenFollowerArrivesPartWayThroughTerm`,
-/// `ClusterTest.java:2670`).
+/// `ClusterTest.java:1532`).
 ///
 /// Ten commits land while it is away, all of them in the term it left, so the
 /// replay has to start inside a term it is already holding rather than at the
@@ -1179,7 +1179,7 @@ fn a_follower_back_after_missing_an_election_catches_up() {
 
 /// **The client keeps sending while a follower is away and comes back**
 /// (`ClusterTest.shouldRecoverWhileMessagesContinue`,
-/// `ClusterTest.java:1940`).
+/// `ClusterTest.java:1148`).
 ///
 /// The reference runs a publisher in a thread through the outage; this build
 /// sends from the test's own thread between the steps, which is the same
@@ -1261,7 +1261,7 @@ fn messages_continue_across_a_follower_restart() {
 }
 
 /// **A member whose log was never written catches up after a restart**
-/// (`ClusterTest.shouldCatchupFromEmptyLog`, `ClusterTest.java:1985`).
+/// (`ClusterTest.shouldCatchupFromEmptyLog`, `ClusterTest.java:1190`).
 ///
 /// The follower is stopped while its log holds nothing — it joined, voted, and
 /// the cluster went on without anything being committed through it. Ten
@@ -1338,7 +1338,7 @@ fn a_member_with_an_empty_log_catches_up() {
 
 /// **A leader that appended past a stopped follower, both cold-restarted, come
 /// back to one term** (`ClusterTest.shouldRecoverWhenLeaderHasAppendedMoreThanFollower`,
-/// `ClusterTest.java:2480`).
+/// `ClusterTest.java:1388`).
 ///
 /// The follower stops, ten commits land, and then the two that are left stop
 /// too — so nothing is up when the leader and that follower come back. Which of
@@ -1434,7 +1434,7 @@ fn a_leader_and_a_follower_come_back_after_both_stopped() {
 
 /// **Two leaders fail in turn and come back together**
 /// (`ClusterTest.shouldRecoverAfterTwoLeaderNodesFailAndComeBackUpAtSameTime`,
-/// `ClusterTest.java:2245`).
+/// `ClusterTest.java:750`).
 ///
 /// The first leader stops, a second is elected, and the second stops in turn;
 /// then both of them come back at the same moment and have to be taken in by the
@@ -1518,7 +1518,7 @@ fn two_failed_leaders_come_back_together() {
 
 /// **Two fresh members come back together, with a quorum left alive while they
 /// are away** (`ClusterTest.shouldCatchUpTwoFreshNodesAfterRestart`,
-/// `ClusterTest.java:2060`).
+/// `ClusterTest.java:1259`).
 ///
 /// Five members, which is the reference's shape and the reason this row is not
 /// one of the three-member ones: two away leave three, and three is a quorum, so
@@ -1723,7 +1723,7 @@ fn two_fresh_members_come_back_to_a_five_member_cluster() {
 
 /// **A member with an empty log that is several terms behind catches up**
 /// (`ClusterTest.shouldRecoverWhenFollowerIsMultipleTermsBehindFromEmptyLog`,
-/// `ClusterTest.java:2520`).
+/// `ClusterTest.java:1458`).
 ///
 /// Five members again: one goes, and while it is away the cluster changes leader
 /// twice — which takes a live majority, and is why the three-member harness
