@@ -127,6 +127,35 @@ fn open_session(
     session
 }
 
+/// Ten client messages, each waiting for `leader` to commit it — the
+/// reference's `sendMessages` + `awaitResponseMessageCount`
+/// (`ClusterTest.java:1568-1571`), read through the leader's commit position
+/// because these members run no service.
+fn send_ten(
+    client: &mut ClientSide,
+    counters: &[NodeCounters],
+    leader: i32,
+    session: &deepmsg_tests::cluster_harness::SessionEvent,
+    faults: &Faults,
+    base: u8,
+) {
+    let mut last = counters[leader as usize]
+        .commit_position()
+        .expect("the leader's commit");
+    for index in 0..10u8 {
+        client.send(session, &[base.wrapping_add(index); 16], faults);
+        wait_until("a message to commit", faults, || {
+            client.poll_events();
+            counters[leader as usize]
+                .commit_position()
+                .is_some_and(|position| position > last)
+        });
+        last = counters[leader as usize]
+            .commit_position()
+            .expect("the leader's commit");
+    }
+}
+
 /// **The leader the survivors deposed comes back as one of their followers**
 /// (`ClusterTest.shouldStopLeaderAndRestartAsFollower`, `ClusterTest.java:2167`).
 ///
@@ -982,19 +1011,32 @@ fn a_follower_back_part_way_through_a_term_catches_up() {
     }
 }
 
-/// **A follower that also missed an election catches up**
+/// **A member that missed a whole election catches up**
 /// (`ClusterTest.shouldRecoverWhenFollowerArrivePartWayThroughTermAfterMissingElection`,
-/// `ClusterTest.java:2720`).
+/// `ClusterTest.java:1558-1593`).
 ///
-/// The member is away for more than messages: while it is down the leader stops
-/// too, and the two that are left elect a later term. So the returning member
-/// is behind in **terms**, not only in position, and the way back is the
-/// replication path rather than a replay of its own term.
+/// The reference's five steps, in its order: ten messages, one follower away,
+/// ten more, **then the rest of the cluster goes down and comes back
+/// together**, a reconnected client sends ten more, and only then does the
+/// member that was away all along return — it is behind in **terms**, not only
+/// in position, and the way back is the replication path rather than a replay
+/// of its own term.
+///
+/// Two things this case deliberately does **not** ask for, both of them lessons
+/// this file has already paid for:
+///
+/// * a **later** term. The reference calls `awaitLeader()` and nothing else;
+///   a restarted leader resumes its own term (`is_leader_startup`), so
+///   "a leader" is the guarantee and "a later term" is not (§6.9 of the
+///   record);
+/// * a quorum that never breaks. Steps 3 and 4 leave the cluster with no
+///   member at all for a moment, which is the reference's shape too.
+///
+/// `weakened:` the reference reads each member's stub-service message count
+/// (`cluster.node(i).service().messageCount()`); these members run no service,
+/// so the evidence is the leader's **commit position** at each step and the
+/// returning member's commit against the last of them.
 #[test]
-#[ignore = "P3-6c: flaky - in a full-file run the two survivors stall instead of electing \
-            a later term: the restarted member reaches LeaderReady (term 1) while the \
-            other sits in FollowerLogReplication (term 0) for the whole budget. Passes \
-            alone (56 s). See records/P3-6c.md 6.7."]
 fn a_follower_back_after_missing_an_election_catches_up() {
     let _serial = serial();
     let ports = Ports::new();
@@ -1003,95 +1045,124 @@ fn a_follower_back_after_missing_an_election_catches_up() {
     };
 
     let leader = the_leader(&counters);
-    let away = (0..MEMBER_COUNT)
+    let follower_one = (0..MEMBER_COUNT)
         .find(|id| *id != leader)
         .expect("a follower");
-    let first_term = counters[leader as usize]
-        .leadership_term_id()
-        .expect("the first term");
+    let follower_two = (0..MEMBER_COUNT)
+        .find(|id| *id != leader && *id != follower_one)
+        .expect("a second follower");
 
-    // It goes first, and then the leader follows it: the two members that are
-    // left are the leader (restarted) and the other follower, which is a quorum.
-    nodes[away as usize].stop();
+    // 1. Ten messages through a client on the leader.
+    let Some(mut client) = ClientSide::start(&ports, leader) else {
+        announce_skip();
+        return;
+    };
+    let session = open_session(&mut client, &faults);
+    send_ten(&mut client, &counters, leader, &session, &faults, b'A');
+
+    // 2. One follower away, ten more.
+    nodes[follower_one as usize].stop();
+    send_ten(&mut client, &counters, leader, &session, &faults, b'K');
+
+    // 3. The rest of the cluster goes down — leader and the other follower.
+    nodes[follower_two as usize].stop();
     nodes[leader as usize].stop();
 
-    let (relaunch_tx, relaunch_rx) = mpsc::channel();
-    nodes[leader as usize].restart(&relaunch_tx);
-    await_launched(&faults, &relaunch_rx, 1);
+    // 4. ...and comes back together, on its own directories, and a client
+    // reconnects on whichever member is the leader of the term they close in.
+    for id in [leader, follower_two] {
+        let (relaunch_tx, relaunch_rx) = mpsc::channel();
+        nodes[id as usize].restart(&relaunch_tx);
+        await_launched(&faults, &relaunch_rx, 1);
+    }
 
     wait_with_state(
-        "the two that are left to elect a later term",
+        "the two that came back to close in one term",
         &faults,
         CATCHUP_DEADLINE,
         || {
-            (0..MEMBER_COUNT).filter(|id| *id != away).all(|id| {
-                counters[id as usize].election_state() == Some(ELECTION_CLOSED)
-                    && counters[id as usize]
-                        .leadership_term_id()
-                        .is_some_and(|term| term > first_term)
-            })
+            [leader, follower_two]
+                .iter()
+                .all(|id| counters[*id as usize].election_state() == Some(ELECTION_CLOSED))
+                && [leader, follower_two]
+                    .iter()
+                    .filter(|id| counters[**id as usize].role() == Some(ROLE_LEADER))
+                    .count()
+                    == 1
         },
         || {
             format!(
-                "terms {:?}, election {:?}",
+                "roles {:?}, terms {:?}, election {:?}, appends {:?}, commits {:?}",
+                (0..MEMBER_COUNT)
+                    .map(|id| counters[id as usize].role())
+                    .collect::<Vec<_>>(),
                 (0..MEMBER_COUNT)
                     .map(|id| counters[id as usize].leadership_term_id())
                     .collect::<Vec<_>>(),
                 (0..MEMBER_COUNT)
                     .map(|id| counters[id as usize].election_state())
                     .collect::<Vec<_>>(),
+                (0..MEMBER_COUNT)
+                    .map(|id| counters[id as usize].append_position())
+                    .collect::<Vec<_>>(),
+                (0..MEMBER_COUNT)
+                    .map(|id| counters[id as usize].commit_position())
+                    .collect::<Vec<_>>(),
             )
         },
     );
 
-    let second_leader = the_leader(&counters);
-    let mut last = counters[second_leader as usize]
-        .commit_position()
-        .expect("the new leader's commit");
-    {
-        let Some(mut client) = ClientSide::start(&ports, second_leader) else {
-            announce_skip();
-            return;
-        };
-        let session = open_session(&mut client, &faults);
-        for index in 0..5u8 {
-            client.send(&session, &[b'A' + index; 16], &faults);
-            wait_until("each message to commit", &faults, || {
-                client.poll_events();
-                counters[second_leader as usize]
-                    .commit_position()
-                    .is_some_and(|position| position > last)
-            });
-            last = counters[second_leader as usize]
-                .commit_position()
-                .expect("a commit");
-        }
-    }
-    let target = counters[second_leader as usize]
+    let new_leader = [leader, follower_two]
+        .into_iter()
+        .find(|id| counters[*id as usize].role() == Some(ROLE_LEADER))
+        .expect("a leader among the two");
+
+    // The client of the term before the outage cannot follow the new leader
+    // (this build's `ClientSide` does not act on a redirect), so the reference's
+    // `reconnectClient()` is a **second** client. The first is given back
+    // before it: two `ClientSide`s on one case would share their driver's
+    // aeron directory (the name is the port block's), and the second start
+    // removes that directory first. The egress offset keeps the second one off
+    // the first one's port as well.
+    drop(client);
+    let Some(mut second_client) = ClientSide::start_at(&ports, new_leader, 1) else {
+        announce_skip();
+        return;
+    };
+    let second_session = open_session(&mut second_client, &faults);
+    send_ten(
+        &mut second_client,
+        &counters,
+        new_leader,
+        &second_session,
+        &faults,
+        b'a',
+    );
+    let target = counters[new_leader as usize]
         .commit_position()
         .expect("the new leader's commit");
 
-    // ---- and the member that missed the election comes back ----------------
+    // 5. Only now does the member that missed the term come back.
     let (back_tx, back_rx) = mpsc::channel();
-    nodes[away as usize].restart(&back_tx);
+    nodes[follower_one as usize].restart(&back_tx);
     await_launched(&faults, &back_rx, 1);
 
     wait_with_state(
-        "the member that missed the election to catch up",
+        "the member that missed the term to catch up",
         &faults,
         CATCHUP_DEADLINE,
         || {
-            counters[away as usize].election_state() == Some(ELECTION_CLOSED)
-                && counters[away as usize].role() == Some(ROLE_FOLLOWER)
-                && counters[away as usize]
+            counters[follower_one as usize].election_state() == Some(ELECTION_CLOSED)
+                && counters[follower_one as usize].role() == Some(ROLE_FOLLOWER)
+                && counters[follower_one as usize]
                     .commit_position()
                     .is_some_and(|position| position >= target)
         },
         || {
-            let member = &counters[away as usize];
+            let member = &counters[follower_one as usize];
             format!(
-                "member {away}: role={:?} election={:?} term={:?} append={:?} commit={:?}; the \
-                 new term's commit was {target}",
+                "member {follower_one}: role={:?} election={:?} term={:?} append={:?} \
+                 commit={:?}; the new term's commit was {target}",
                 member.role(),
                 member.election_state(),
                 member.leadership_term_id(),
