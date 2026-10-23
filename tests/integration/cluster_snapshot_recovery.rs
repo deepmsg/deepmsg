@@ -1073,8 +1073,11 @@ fn a_snapshot_invalidated_between_two_elections() {
 /// member stopped, so the recovery is the first snapshot plus the log. The
 /// per-member counters are the reference's own: the member that was away for a
 /// snapshot replays its action and is one behind.
+///
+/// This row is also where a replayed `NewLeadershipTerm` had to start being
+/// applied **inside** the poll: the records after it in the same poll are
+/// cluster actions whose term check reads it (`records/P3-6c.md` §24).
 #[test]
-#[ignore = "F3-c reading: gets past its invalidation and its restart (`records/P3-6c.md` §21, §22) and now stalls on one `ack out of sequence` — the container takes a second snapshot at 1664 and acks it while the module is `Active`, so the ack is queued and never consumed and every later ack is shifted by one (has_reached at the next join: expected [ackId=2, logPosition=2144] vs received [ackId=2, logPosition=1664])"]
 fn the_last_two_snapshots_are_invalidated_after_an_election() {
     let _serial = serial();
     let ports = CasePorts::new(12);

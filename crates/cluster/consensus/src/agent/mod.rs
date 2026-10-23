@@ -6518,6 +6518,18 @@ struct AgentLogReplayHandler<'a> {
     trackers: &'a mut [PendingServiceMessageTracker],
     expired_timer_count: &'a mut deepmsg_cluster_common::collections::HashMap<i64, i64>,
     leadership_term_id: i64,
+    /// The agent's own `leadership_term_id`, written **inside the poll**.
+    ///
+    /// The reference applies a replayed `NewLeadershipTerm` where it meets it
+    /// (`ConsensusModuleAgent.java:1626`), and that matters beyond bookkeeping:
+    /// the records **after it in the same poll** are cluster actions whose
+    /// `onReplayClusterAction` decides by comparing the record's term with this
+    /// one (`:1580`). Deferring the write to the end of the poll — which this
+    /// did — makes every action that shares a poll with its own term record be
+    /// judged against the *previous* term and dropped, while the service
+    /// container executes it anyway and acks: the orphaned acks of
+    /// `records/P3-6c.md` §23.
+    agent_term: &'a mut i64,
     service_count: i32,
     state_change: Option<ModuleState>,
     /// `(leadershipTermId, logPosition, timestamp, termBaseLogPosition)` of the
@@ -6635,6 +6647,15 @@ impl LogReplayHandler for AgentLogReplayHandler<'_> {
         _time_unit: i32,
         _app_version: i32,
     ) -> Result<(), ClusterError> {
+        // Applied **here**, not after the poll: the reference's
+        // `leadershipTermId(leadershipTermId)` is synchronous
+        // (`ConsensusModuleAgent.java:1626`) for exactly that reason.
+        *self.agent_term = leadership_term_id;
+        self.leadership_term_id = leadership_term_id;
+        for tracker in self.trackers.iter_mut() {
+            tracker.set_leadership_term_id(leadership_term_id);
+        }
+
         self.new_leadership_term = Some((
             leadership_term_id,
             log_position,
@@ -6814,6 +6835,7 @@ impl ConsensusModuleAgent {
                 trackers,
                 expired_timer_count,
                 leadership_term_id: *leadership_term_id,
+                agent_term: leadership_term_id,
                 service_count: config.service_count,
                 state_change: None,
                 new_leadership_term: None,
@@ -6932,6 +6954,7 @@ impl ConsensusModuleAgent {
             trackers,
             expired_timer_count,
             leadership_term_id: *leadership_term_id,
+            agent_term: leadership_term_id,
             service_count: config.service_count,
             state_change: None,
             new_leadership_term: None,
