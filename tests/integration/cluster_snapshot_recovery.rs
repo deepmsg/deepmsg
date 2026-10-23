@@ -544,8 +544,12 @@ fn stop_while_keeping_alive(
 /// only a local `takeSnapshot` increments it (`:3190`), so `count == 1` on the
 /// returning member says the action was replayed, not that some other path
 /// filled the gap.
+///
+/// The reading this row once was — the returning member looping in
+/// `FollowerCatchupAwait`, its append stuck at 256 against the leader's 1312 —
+/// is gone once a new term starts from the log's **applied** position rather
+/// than its **appended** one (`records/P3-6c.md` §19).
 #[test]
-#[ignore = "F3-b reading: the returning member loops in FollowerCatchupAwait at 9/10 messages, append stuck at 256 against the leader's 1312 (commit 1216) — records/P3-6c.md §15"]
 fn a_follower_comes_back_to_a_snapshot_taken_while_it_was_down() {
     let _serial = serial();
     let ports = CasePorts::new(4);
@@ -866,8 +870,13 @@ fn client_on(
 /// more messages, and then the **second** snapshot is invalidated with every
 /// member stopped. What the restart must recover from is the first snapshot plus
 /// the log: nine messages, not six and not none.
+///
+/// The cross-term form is the reference's own row, and it used to stall a
+/// restarted member in `FollowerReplay` three runs in four. That stall is
+/// `records/P3-6c.md` §19's — a new term starting from the log's **appended**
+/// position instead of the **applied** one — and the same-term half is
+/// `the_snapshot_before_the_invalidated_one_is_what_the_cluster_comes_back_on`.
 #[test]
-#[ignore = "F3-c reading: the reference's cross-term half stalls a restarted member in FollowerReplay with no log recording; the same-term half is `the_snapshot_before_the_invalidated_one_is_what_the_cluster_comes_back_on` (records/P3-6c.md §16)"]
 fn the_last_snapshot_is_marked_invalid_and_the_one_before_it_is_used() {
     let _serial = serial();
     let ports = CasePorts::new(8);
@@ -981,8 +990,11 @@ fn the_snapshot_before_the_invalidated_one_is_what_the_cluster_comes_back_on() {
 ///
 /// A snapshot in the first term, nothing in the second, and the first one
 /// invalidated with every member stopped: the cluster comes back on the log.
+///
+/// The cross-term form used to stall a restarted member in `FollowerReplay`;
+/// it stops once a new term starts from the log's **applied** position rather
+/// than its **appended** one (`records/P3-6c.md` §19).
 #[test]
-#[ignore = "F3-c reading: the cross-term form stalls a restarted member in FollowerReplay (records/P3-6c.md §16)"]
 fn a_snapshot_invalidated_between_two_elections() {
     let _serial = serial();
     let ports = CasePorts::new(11);
