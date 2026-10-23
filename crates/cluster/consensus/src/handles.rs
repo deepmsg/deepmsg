@@ -68,6 +68,14 @@ pub enum RecordingSignal {
     /// `EXTEND(2)`: the recording is being extended; its position counter is
     /// looked up again.
     Extend = 2,
+    /// `REPLICATE(3)`: the destination archive has a recording descriptor for
+    /// the copy. **This is the signal that names the destination recording**
+    /// when the copy made a new one (`ReplicationSession.java:351`), and the
+    /// one a member with no recording of its own learns it from.
+    Replicate = 3,
+    /// `MERGE(4)`: a recording merged with a live stream. Carries a recording
+    /// id like every other signal, and nothing else here reads it.
+    Merge = 4,
     /// `SYNC(5)`.
     Sync = 5,
     /// `REPLICATE_END(7)`.
@@ -97,17 +105,23 @@ pub struct RecordingReplication {
 
 impl Default for RecordingReplication {
     fn default() -> Self {
-        Self::new(-1, -1)
+        Self::new(-1)
     }
 }
 
 impl RecordingReplication {
-    /// A replication of `recording_id` started under `correlation_id`, not yet
-    /// ended or stopped.
-    pub fn new(recording_id: i64, correlation_id: i64) -> Self {
+    /// A replication started under `correlation_id`, not yet ended or stopped.
+    ///
+    /// **It starts with no recording id**, which is the reference's
+    /// `recordingId = NULL_VALUE` (`RecordingReplication.java:39`). The id a
+    /// replication names is the **destination** recording's — the one this
+    /// member's archive mints when the copy makes a new recording — and only a
+    /// signal can say what it is. Seeding it with the source (the leader's)
+    /// recording id, as this did, is a different number in a different archive.
+    pub fn new(correlation_id: i64) -> Self {
         Self {
             correlation_id,
-            recording_id: Arc::new(AtomicI64::new(recording_id)),
+            recording_id: Arc::new(AtomicI64::new(-1)),
             position: Arc::new(AtomicI64::new(0)),
             replication_ended: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
@@ -185,7 +199,13 @@ impl RecordingReplication {
     /// read for this signal — for `EXTEND` that is the destination recording's
     /// **position counter**, re-read by the agent as the reference does
     /// (`:190-193`).
-    pub fn on_signal(&self, correlation_id: i64, position: i64, signal: RecordingSignal) {
+    pub fn on_signal(
+        &self,
+        correlation_id: i64,
+        recording_id: i64,
+        position: i64,
+        signal: RecordingSignal,
+    ) {
         if correlation_id != self.correlation_id {
             return;
         }
@@ -209,6 +229,17 @@ impl RecordingReplication {
         // a proxy publishes as its own.
         if position != -1 {
             self.position.store(position, Ordering::Release);
+        }
+
+        // `RecordingReplication.java:204-207`: and every signal that names a
+        // recording names the **destination** one — the recording the copy is
+        // being made into, which this archive minted and the member could not
+        // have known when it asked (`destinationRecordingId=NULL`). It is what
+        // `Election.onRecordingSignal` then writes to the agent's
+        // `logRecordingId` (`Election.java:281`), so a member whose copy made a
+        // **new** recording learns its id here and nowhere else.
+        if recording_id != -1 {
+            self.recording_id.store(recording_id, Ordering::Release);
         }
     }
 }

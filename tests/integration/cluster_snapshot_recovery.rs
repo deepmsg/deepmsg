@@ -687,8 +687,13 @@ fn a_keep_alive_keeps_the_ingress_publication_connected() {
 /// has nothing to load, is caught up from the leader's log, and — because that
 /// log carries the shutdown's `SNAPSHOT` action — takes a snapshot of its own
 /// at that position.
+///
+/// The clean-start member's reading — nothing applied, `Canvass` for ever, its
+/// archive refusing `unknown recording id: -1` — was a replication whose
+/// destination recording id never reached the member: the `REPLICATE` signal
+/// that names it was dropped and the signal was applied to the handle rather
+/// than to the election that writes the id down (`records/P3-6c.md` §20).
 #[test]
-#[ignore = "F3-b reading: the clean-start member never applies anything (service 0, election Canvass, append None) and its archive refuses `unknown recording id: -1` — records/P3-6c.md §15"]
 fn an_empty_follower_replays_the_shutdown_snapshot_and_takes_its_own() {
     let _serial = serial();
     let ports = CasePorts::new(5);
@@ -772,8 +777,11 @@ fn an_empty_follower_replays_the_shutdown_snapshot_and_takes_its_own() {
 /// Two snapshots, two messages before the first and one between them, and a
 /// member that comes back clean: it replays both actions, catches up to the
 /// three messages, and the cluster keeps serving afterwards.
+///
+/// The flood this row was — the same `unknown recording id: -1` — went with the
+/// destination recording id the `REPLICATE` signal carries and the election
+/// writes down (`records/P3-6c.md` §20).
 #[test]
-#[ignore = "F3-b reading: the same `unknown recording id: -1` refusal floods the clean-start member — records/P3-6c.md §15"]
 fn two_snapshots_are_replayed_into_an_empty_follower_log() {
     let _serial = serial();
     let ports = CasePorts::new(6);
@@ -1066,7 +1074,7 @@ fn a_snapshot_invalidated_between_two_elections() {
 /// per-member counters are the reference's own: the member that was away for a
 /// snapshot replays its action and is one behind.
 #[test]
-#[ignore = "F3-c reading: the cross-term form stalls a restarted member in FollowerReplay (records/P3-6c.md §16)"]
+#[ignore = "F3-c reading: no longer stalls (§20); it now fails at its own teardown — `invalidate_latest_snapshot`: `unknown leadershipTermId=1`, a recording log with a term-1 snapshot and no term-1 term entry — records/P3-6c.md §20.4"]
 fn the_last_two_snapshots_are_invalidated_after_an_election() {
     let _serial = serial();
     let ports = CasePorts::new(12);

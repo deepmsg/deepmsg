@@ -1482,6 +1482,7 @@ impl Election {
         &mut self,
         host: &mut dyn ElectionHost,
         correlation_id: i64,
+        recording_id: i64,
         position: i64,
         signal: RecordingSignal,
     ) -> Result<(), ClusterError> {
@@ -1490,7 +1491,13 @@ impl Election {
         }
 
         if let Some(replication) = &self.log_replication {
-            replication.on_signal(correlation_id, position, signal);
+            replication.on_signal(correlation_id, recording_id, position, signal);
+            // `logRecordingId(logReplication.recordingId())` (`:281`): the
+            // recording the copy is being made **into**, which the handle took
+            // from the signal a line above. This is the only place a member
+            // whose copy made a recording of its own — a clean start, where the
+            // destination id was `NULL` when it asked — ever learns that id, and
+            // every replay, truncation and extend it makes afterwards names it.
             let recording_id = replication.recording_id();
             host.set_log_recording_id(recording_id);
         }

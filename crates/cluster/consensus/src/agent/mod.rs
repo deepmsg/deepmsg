@@ -3474,7 +3474,7 @@ impl ElectionHost for ConsensusModuleAgent {
             &params,
         )?;
 
-        let handle = RecordingReplication::new(leader_recording_id, replication_id);
+        let handle = RecordingReplication::new(replication_id);
         self.log_replication = Some(AgentLogReplication::new(
             handle.clone(),
             leader_recording_id,
@@ -4915,6 +4915,12 @@ impl ConsensusModuleAgent {
             CodecSignal::START => crate::handles::RecordingSignal::Start,
             CodecSignal::STOP => crate::handles::RecordingSignal::Stop,
             CodecSignal::EXTEND => crate::handles::RecordingSignal::Extend,
+            // `REPLICATE` is the destination archive's "the copy has a
+            // recording descriptor" — the **only** signal that names the
+            // destination recording when the copy made a new one. Dropping it
+            // (this did) leaves a clean-start member with no recording id.
+            CodecSignal::REPLICATE => crate::handles::RecordingSignal::Replicate,
+            CodecSignal::MERGE => crate::handles::RecordingSignal::Merge,
             CodecSignal::SYNC => crate::handles::RecordingSignal::Sync,
             CodecSignal::REPLICATE_END => crate::handles::RecordingSignal::ReplicateEnd,
             CodecSignal::DELETE => {
@@ -4939,7 +4945,46 @@ impl ConsensusModuleAgent {
             signal.position
         };
 
-        handle.on_signal(signal.correlation_id, position, mapped);
+        // `CMA:2117-2120`: the signal goes to the **election**, which is both
+        // the state machine that reads it and the only thing that can write the
+        // destination recording's id back (`Election.onRecordingSignal`,
+        // `Election.java:269-282` → `logRecordingId(logReplication.recordingId())`).
+        //
+        // Applying it to the handle here instead — which this did — left a
+        // member that asked for a copy with **no** destination recording (a
+        // clean start, `destinationRecordingId=NULL`) naming `-1` for ever: the
+        // archive minted the recording, the signal carried its id, and the
+        // handle threw it away. The next `FollowerReplay` then asked the archive
+        // to replay `-1`, was refused (`unknown recording id: -1`), the refusal
+        // became an election error and the member went round
+        // `Canvass → FollowerReplay → Init` without ever applying a message.
+        //
+        // **Two ways in, and only one of them can name the election.** A signal
+        // read by `slowTickWork`'s poll arrives between the election's turns,
+        // when it sits in `self.election` — that is the reference's path, and
+        // the election is asked. A signal read by this call from
+        // `FollowerLogReplication` (`Election.java:924` → `pollArchiveEvents`)
+        // arrives while the election is **out of** `self.election`, running its
+        // own turn; its handler is already on the stack, so what it would have
+        // done is done here.
+        if let Some(mut election) = self.election.take() {
+            let result = election.on_recording_signal(
+                self,
+                signal.correlation_id,
+                signal.recording_id,
+                position,
+                mapped,
+            );
+            if election.state() != ElectionState::Closed {
+                self.election = Some(election);
+            }
+            if let Err(error) = result {
+                self.report_counted_error(Some(&error));
+            }
+        } else {
+            handle.on_signal(signal.correlation_id, signal.recording_id, position, mapped);
+            self.set_log_recording_id(handle.recording_id());
+        }
 
         if handle.has_replication_ended() && handle.has_stopped() {
             // `REPLICATE_END` and the destination's `STOP` have both arrived:
