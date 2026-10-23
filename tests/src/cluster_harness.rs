@@ -2775,6 +2775,26 @@ pub fn await_snapshots_loaded(nodes: &[Node], faults: &Faults) {
     });
 }
 
+/// `TestCluster.invalidateLatestSnapshot` (`TestCluster.java:2229-2240`): mark
+/// the member's newest valid snapshot invalid, in its own recording log.
+///
+/// The module must be stopped — it holds the file, and the whole point is what
+/// the **next** start reads. The write is at the entry's own offset
+/// (`RecordingLog::set_valid`), so the fault survives a crash as the reference's
+/// does; `force` is what puts it on the disk rather than in the page cache.
+pub fn invalidate_latest_snapshot(node: &Node) -> Result<usize, String> {
+    use deepmsg_cluster::persist::recording_log::{self, RecordingLog};
+
+    let path = node.cluster_dir().join(recording_log::FILENAME);
+    let mut log = RecordingLog::open(&path).map_err(|error| error.to_string())?;
+    let index = log
+        .invalidate_latest_snapshot()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "no valid snapshot to invalidate".to_owned())?;
+    log.force(1).map_err(|error| error.to_string())?;
+    Ok(index)
+}
+
 /// Announce a skip when the archiving driver is not available.
 pub fn announce_skip() {
     archiving_driver::announce_skip();

@@ -32,7 +32,8 @@ use deepmsg_cluster_common::counters::CLUSTER_CONTROL_TOGGLE_TYPE_ID;
 use deepmsg_tests::cluster_harness::{
     ClientSide, ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters, Ports, ROLE_FOLLOWER,
     ROLE_LEADER, announce_skip, await_every_snapshot_count, await_launched, await_snapshot_count,
-    await_snapshots_loaded, leader_of, members, take_snapshot, wait_until,
+    await_snapshots_loaded, invalidate_latest_snapshot, leader_of, members, take_snapshot,
+    wait_until,
 };
 
 /// One case at a time: three members plus their drivers per case, and the
@@ -120,11 +121,42 @@ impl Cluster {
     }
 
     fn await_closed(&self) {
-        wait_until("every member's election to close", &self.faults, || {
-            self.counters
+        let deadline = std::time::Instant::now() + deepmsg_tests::cluster_harness::DEADLINE;
+        while std::time::Instant::now() < deadline {
+            self.faults.check();
+            if self
+                .counters
                 .iter()
                 .all(|node| node.election_state() == Some(ELECTION_CLOSED))
-        });
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!(
+            "every member's election to close: election={:?} role={:?} term={:?} append={:?} commit={:?} faults={:?}",
+            self.counters
+                .iter()
+                .map(NodeCounters::election_state)
+                .collect::<Vec<_>>(),
+            self.counters
+                .iter()
+                .map(NodeCounters::role)
+                .collect::<Vec<_>>(),
+            self.counters
+                .iter()
+                .map(NodeCounters::leadership_term_id)
+                .collect::<Vec<_>>(),
+            self.counters
+                .iter()
+                .map(NodeCounters::append_position)
+                .collect::<Vec<_>>(),
+            self.counters
+                .iter()
+                .map(NodeCounters::commit_position)
+                .collect::<Vec<_>>(),
+            self.faults.snapshot(),
+        );
     }
 
     fn leader(&self) -> i32 {
@@ -153,6 +185,10 @@ impl Cluster {
 
     /// `TestCluster.startStaticNode(index, false)`: that member back on its own
     /// directories, and nothing else touched.
+    fn stop_one(&mut self, id: i32) {
+        self.nodes[usize::try_from(id).unwrap()].stop();
+    }
+
     fn restart_one(&mut self, id: i32) {
         self.nodes[usize::try_from(id).unwrap()].restart(&self.launched_tx);
         await_launched(&self.faults, &self.launched_rx, 1);
@@ -798,5 +834,296 @@ fn two_snapshots_are_replayed_into_an_empty_follower_log() {
     }
 
     drop(second_client);
+    cluster.stop_all();
+}
+
+/// A client that follows the cluster to a new leader: this build's `ClientSide`
+/// does not act on a redirect (`cluster_restart_path` makes the same move), so
+/// a case whose leader moves drops the old client and takes a second one whose
+/// egress port is its own.
+fn client_on(
+    ports: &Ports,
+    leader: i32,
+    faults: &Faults,
+    offset: u16,
+) -> Option<(ClientSide, deepmsg_tests::cluster_harness::SessionEvent)> {
+    let mut client = ClientSide::start_at(ports, leader, offset)?;
+    let session = client.connect_session(faults);
+    Some((client, session))
+}
+
+/// **The last snapshot is marked invalid, so the one before it is what the
+/// cluster comes back on** — `ClusterTest.shouldRecoverWhenLastSnapshotIsMarkedInvalid`
+/// (`ClusterTest.java:1597`).
+///
+/// Two snapshots (three messages each), a leader that goes and comes back, three
+/// more messages, and then the **second** snapshot is invalidated with every
+/// member stopped. What the restart must recover from is the first snapshot plus
+/// the log: nine messages, not six and not none.
+#[test]
+#[ignore = "F3-c reading: the reference's cross-term half stalls a restarted member in FollowerReplay with no log recording; the same-term half is `the_snapshot_before_the_invalidated_one_is_what_the_cluster_comes_back_on` (records/P3-6c.md §16)"]
+fn the_last_snapshot_is_marked_invalid_and_the_one_before_it_is_used() {
+    let _serial = serial();
+    let ports = CasePorts::new(8);
+    let Some(mut cluster) = Cluster::start(*ports.ports(), &[]) else {
+        return;
+    };
+
+    let leader0 = cluster.leader();
+    let Some(mut client) = ClientSide::start(ports.ports(), leader0) else {
+        announce_skip();
+        return;
+    };
+    let session = client.connect_session(&cluster.faults);
+    client.send_and_await_messages(&session, 3, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 3);
+    }
+
+    take_snapshot(cluster.leader_counters());
+    await_every_snapshot_count(&cluster.counters, &cluster.faults, 1);
+
+    client.send_and_await_messages(&session, 3, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 6);
+    }
+
+    take_snapshot(cluster.leader_counters());
+    await_every_snapshot_count(&cluster.counters, &cluster.faults, 2);
+
+    // The leader goes and comes back; the client cannot follow, so it is given
+    // back and a second one is opened on whoever leads now.
+    drop(client);
+    cluster.stop_one(leader0);
+    let leader1 = cluster.leader();
+    cluster.restart_one(leader0);
+    let Some((mut client, session)) = client_on(ports.ports(), leader1, &cluster.faults, 1) else {
+        announce_skip();
+        return;
+    };
+    client.send_and_await_messages(&session, 3, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 9);
+    }
+    drop(client);
+
+    cluster.stop_all();
+    for node in &cluster.nodes {
+        invalidate_latest_snapshot(node).expect("the latest snapshot is invalidated");
+    }
+    cluster.restart_all();
+    cluster.leader();
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 9);
+    }
+
+    cluster.stop_all();
+}
+
+/// **The snapshot before the invalidated one is what the cluster comes back
+/// on** — the same-term half of
+/// `ClusterTest.shouldRecoverWhenLastSnapshotIsMarkedInvalid`
+/// (`ClusterTest.java:1597`).
+///
+/// Two snapshots, the newest invalidated on every member with all of them
+/// stopped, and the restart must recover the six messages from the first
+/// snapshot plus the log. This is the reading that says the fallback itself
+/// works; the reference's row also moves the leader across a term, and that
+/// half is the one that stalls (`a_follower_comes_back_to_a_snapshot...`'s
+/// neighbour, rows 7-9 in `records/P3-6c.md` §16).
+#[test]
+fn the_snapshot_before_the_invalidated_one_is_what_the_cluster_comes_back_on() {
+    let _serial = serial();
+    let ports = CasePorts::new(10);
+    let Some(mut cluster) = Cluster::start(*ports.ports(), &[]) else {
+        return;
+    };
+    let leader = cluster.leader();
+    let Some(mut client) = ClientSide::start(ports.ports(), leader) else {
+        announce_skip();
+        return;
+    };
+    let session = client.connect_session(&cluster.faults);
+    client.send_and_await_messages(&session, 3, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 3);
+    }
+    take_snapshot(cluster.leader_counters());
+    await_every_snapshot_count(&cluster.counters, &cluster.faults, 1);
+    client.send_and_await_messages(&session, 3, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 6);
+    }
+    take_snapshot(cluster.leader_counters());
+    await_every_snapshot_count(&cluster.counters, &cluster.faults, 2);
+    drop(client);
+
+    cluster.stop_all();
+    for node in &cluster.nodes {
+        invalidate_latest_snapshot(node).expect("an invalidation");
+    }
+    cluster.restart_all();
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 6);
+    }
+    cluster.stop_all();
+}
+
+/// **The latest snapshot is invalidated between two elections** —
+/// `ClusterTest.shouldRecoverWhenLastSnapshotIsInvalidBetweenTwoElections`
+/// (`ClusterTest.java:1707`).
+///
+/// A snapshot in the first term, nothing in the second, and the first one
+/// invalidated with every member stopped: the cluster comes back on the log.
+#[test]
+#[ignore = "F3-c reading: the cross-term form stalls a restarted member in FollowerReplay (records/P3-6c.md §16)"]
+fn a_snapshot_invalidated_between_two_elections() {
+    let _serial = serial();
+    let ports = CasePorts::new(11);
+    let Some(mut cluster) = Cluster::start(*ports.ports(), &[]) else {
+        return;
+    };
+
+    let leader0 = cluster.leader();
+    let Some((mut client, session)) = client_on(ports.ports(), leader0, &cluster.faults, 0) else {
+        announce_skip();
+        return;
+    };
+    client.send_and_await_messages(&session, 3, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 3);
+    }
+
+    // Term one: the leader goes and comes back, three more messages.
+    drop(client);
+    cluster.stop_one(leader0);
+    let leader1 = cluster.leader();
+    cluster.restart_one(leader0);
+    let Some((mut client, session)) = client_on(ports.ports(), leader1, &cluster.faults, 1) else {
+        announce_skip();
+        return;
+    };
+    client.send_and_await_messages(&session, 3, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 6);
+    }
+
+    take_snapshot(cluster.leader_counters());
+    await_every_snapshot_count(&cluster.counters, &cluster.faults, 1);
+
+    // Term two: no snapshot at all.
+    drop(client);
+    cluster.stop_one(leader1);
+    let leader2 = cluster.leader();
+    cluster.restart_one(leader1);
+    let Some((mut client, session)) = client_on(ports.ports(), leader2, &cluster.faults, 1) else {
+        announce_skip();
+        return;
+    };
+    client.send_and_await_messages(&session, 3, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 9);
+    }
+    drop(client);
+
+    cluster.stop_all();
+    for node in &cluster.nodes {
+        invalidate_latest_snapshot(node).expect("the only snapshot is invalidated");
+    }
+    cluster.restart_all();
+    cluster.leader();
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 9);
+    }
+
+    cluster.stop_all();
+}
+
+/// **The last two snapshots are invalidated after an election** —
+/// `ClusterTest.shouldRecoverWhenLastTwosSnapshotsAreInvalidAfterElection`
+/// (`ClusterTest.java:1753`).
+///
+/// Three snapshots across two terms; the newest two are invalidated with every
+/// member stopped, so the recovery is the first snapshot plus the log. The
+/// per-member counters are the reference's own: the member that was away for a
+/// snapshot replays its action and is one behind.
+#[test]
+#[ignore = "F3-c reading: the cross-term form stalls a restarted member in FollowerReplay (records/P3-6c.md §16)"]
+fn the_last_two_snapshots_are_invalidated_after_an_election() {
+    let _serial = serial();
+    let ports = CasePorts::new(12);
+    let Some(mut cluster) = Cluster::start(*ports.ports(), &[]) else {
+        return;
+    };
+
+    let leader0 = cluster.leader();
+    let Some((mut client, session)) = client_on(ports.ports(), leader0, &cluster.faults, 0) else {
+        announce_skip();
+        return;
+    };
+    client.send_and_await_messages(&session, 3, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 3);
+    }
+    take_snapshot(cluster.leader_counters());
+    await_every_snapshot_count(&cluster.counters, &cluster.faults, 1);
+
+    // The leader goes and comes back; the snapshot after that is the second.
+    drop(client);
+    cluster.stop_one(leader0);
+    let leader1 = cluster.leader();
+    cluster.restart_one(leader0);
+    let Some((mut client, session)) = client_on(ports.ports(), leader1, &cluster.faults, 1) else {
+        announce_skip();
+        return;
+    };
+    client.send_and_await_messages(&session, 3, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 6);
+    }
+
+    take_snapshot(cluster.leader_counters());
+    for id in 0..MEMBER_COUNT {
+        // The member that was away for the first snapshot replays its action
+        // and is one behind (`ClusterTest.java:1795-1798`).
+        let expected = if id == leader0 { 1 } else { 2 };
+        await_snapshot_count(
+            &cluster.counters[usize::try_from(id).unwrap()],
+            &cluster.faults,
+            expected,
+        );
+    }
+
+    client.send_and_await_messages(&session, 3, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 9);
+    }
+
+    take_snapshot(cluster.leader_counters());
+    for id in 0..MEMBER_COUNT {
+        let expected = if id == leader0 { 2 } else { 3 };
+        await_snapshot_count(
+            &cluster.counters[usize::try_from(id).unwrap()],
+            &cluster.faults,
+            expected,
+        );
+    }
+    client.send_and_await_messages(&session, 3, &cluster.faults);
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 12);
+    }
+    drop(client);
+
+    cluster.stop_all();
+    for node in &cluster.nodes {
+        invalidate_latest_snapshot(node).expect("one invalidation");
+        invalidate_latest_snapshot(node).expect("and another");
+    }
+    cluster.restart_all();
+    cluster.leader();
+    for node in &cluster.nodes {
+        await_messages(node, &cluster.faults, 12);
+    }
+
     cluster.stop_all();
 }
