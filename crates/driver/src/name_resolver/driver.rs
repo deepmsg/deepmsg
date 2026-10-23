@@ -1698,7 +1698,7 @@ mod tests {
         }
 
         let mut frame = [0u8; 64];
-        let length = build_frame(&mut frame, &[hello(b"a:1", 40451)]).expect("room");
+        let length = build_frame(&mut frame, &[hello(b"a:1", 10451)]).expect("room");
         sender.send_to(&frame[..length], to).expect("sent");
 
         assert!(
@@ -1709,7 +1709,7 @@ mod tests {
 
         // A second datagram arrives, and the resolver is asked to work again at
         // the same moment: the deadline has not come, so it does not look.
-        let length = build_frame(&mut frame, &[hello(b"b:1", 40452)]).expect("room");
+        let length = build_frame(&mut frame, &[hello(b"b:1", 10452)]).expect("room");
         sender.send_to(&frame[..length], to).expect("sent");
         std::thread::sleep(Duration::from_millis(5));
 
@@ -1763,10 +1763,10 @@ mod tests {
         let entry = ResolutionDatagram {
             res_type: RES_TYPE_NAME_TO_IP4,
             res_flags: RES_FLAG_SELF,
-            udp_port: 40456,
+            udp_port: 10456,
             age_in_ms: 5,
             address: "0.0.0.0".parse().expect("an address"),
-            name: b"stranger:40456",
+            name: b"stranger:10456",
         };
         let mut frame = [0u8; 64];
         let length = build_frame(&mut frame, &[entry]).expect("room");
@@ -1807,7 +1807,7 @@ mod tests {
                     .expect("an address")
             ),
             resolver.resolve(
-                "stranger:40456",
+                "stranger:10456",
                 "endpoint",
                 false,
                 AddressFamily::Inet,

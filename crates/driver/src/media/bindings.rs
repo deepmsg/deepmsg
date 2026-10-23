@@ -720,18 +720,18 @@ mod tests {
 
         // A receive endpoint binds the endpoint its channel named, and one in
         // the port's net is the media's — there is no fallback from it.
-        assert!(serves("10.10.0.2:40500", None), "the port's own net");
+        assert!(serves("10.10.0.2:10500", None), "the port's own net");
         assert!(
-            serves("10.10.0.9:40500", None),
+            serves("10.10.0.9:10500", None),
             "anywhere in the port's net"
         );
 
         // A named address the media does not hold belongs to the kernel, which
         // is the thing that does hold it — this is every channel in the
         // system tests that names loopback.
-        assert!(!serves("127.0.0.1:40456", None), "loopback is the kernel's");
+        assert!(!serves("127.0.0.1:10456", None), "loopback is the kernel's");
         assert!(
-            !serves("192.168.1.5:40456", None),
+            !serves("192.168.1.5:10456", None),
             "and so is another interface's address"
         );
 
@@ -739,22 +739,22 @@ mod tests {
         // the media's — the peer decides only when a frame on a wire could not
         // reach it at all, which is loopback and nothing else.
         assert!(
-            serves("0.0.0.0:0", Some("10.10.0.2:40500")),
+            serves("0.0.0.0:0", Some("10.10.0.2:10500")),
             "a publication to the port's own net is the media's"
         );
         assert!(
-            serves("0.0.0.0:0", Some("192.0.2.5:40456")),
+            serves("0.0.0.0:0", Some("192.0.2.5:10456")),
             "and so is one to an address nobody holds at all — off this link, \
              which the media is then the one to refuse (`ENETUNREACH`)"
         );
         assert!(
-            serves("0.0.0.0:0", Some("10.10.1.7:40456")),
+            serves("0.0.0.0:0", Some("10.10.1.7:10456")),
             "and one to a routable address this machine may hold itself, which \
              is what a cross-media test's peer is: the answer does not depend \
              on what the machine has configured"
         );
         assert!(
-            !serves("0.0.0.0:0", Some("127.0.0.1:40456")),
+            !serves("0.0.0.0:0", Some("127.0.0.1:10456")),
             "but a publication to loopback is the kernel's, which is what every \
              channel in the system tests names"
         );
@@ -807,7 +807,7 @@ mod tests {
         // the one line that says the wildcard itself decides nothing.
         assert!(
             bindings
-                .stack_for(address("0.0.0.0:0"), Some(address("10.10.0.2:40500")), None)
+                .stack_for(address("0.0.0.0:0"), Some(address("10.10.0.2:10500")), None)
                 .is_some(),
             "a named destination that is not loopback is still the media's"
         );
@@ -870,7 +870,7 @@ mod tests {
 
         // A publication to the port's own net, which is the media's to carry.
         let ours = address("0.0.0.0:0");
-        let peer = address("10.10.0.2:40500");
+        let peer = address("10.10.0.2:10500");
 
         assert_eq!(
             Ok(()),
@@ -897,7 +897,7 @@ mod tests {
             Ok(()),
             bindings.refuse_mtu_over_what_it_can_carry(
                 ours,
-                Some(address("127.0.0.1:40456")),
+                Some(address("127.0.0.1:10456")),
                 None,
                 8192
             ),
@@ -923,7 +923,7 @@ mod tests {
     fn a_destination_off_the_link_with_no_gateway_is_refused() {
         let bindings = userspace();
         let ours = address("0.0.0.0:0");
-        let peer = address("192.0.2.5:40456");
+        let peer = address("192.0.2.5:10456");
 
         let refusal = bindings
             .refuse_a_destination_it_cannot_reach(ours, Some(peer), None, peer)
@@ -938,9 +938,9 @@ mod tests {
             Ok(()),
             bindings.refuse_a_destination_it_cannot_reach(
                 ours,
-                Some(address("10.10.0.2:40500")),
+                Some(address("10.10.0.2:10500")),
                 None,
-                address("10.10.0.2:40500")
+                address("10.10.0.2:10500")
             )
         );
 
@@ -985,9 +985,9 @@ mod tests {
             Ok(()),
             bindings.refuse_a_destination_it_cannot_reach(
                 ours,
-                Some(address("127.0.0.1:40456")),
+                Some(address("127.0.0.1:10456")),
                 None,
-                address("127.0.0.1:40456")
+                address("127.0.0.1:10456")
             ),
             "loopback is the kernel's to reach"
         );
@@ -1047,15 +1047,15 @@ mod tests {
         assert!(
             bindings
                 .stack_for(
-                    address("127.0.0.1:40456"),
-                    Some(address("127.0.0.1:40457")),
+                    address("127.0.0.1:10456"),
+                    Some(address("127.0.0.1:10457")),
                     None,
                 )
                 .is_none()
         );
         assert!(
             bindings
-                .stack_for(address("10.10.0.2:40500"), None, None)
+                .stack_for(address("10.10.0.2:10500"), None, None)
                 .is_none()
         );
     }
@@ -1069,7 +1069,7 @@ mod tests {
     /// "not supported".
     #[test]
     fn a_group_address_is_refused_by_the_media_that_has_no_groups() {
-        let group = channel("aeron:udp?endpoint=224.0.1.1:40456");
+        let group = channel("aeron:udp?endpoint=224.0.1.1:10456");
 
         assert!(
             TransportBindings::Default.refuse_channel(&group).is_ok(),
@@ -1081,7 +1081,7 @@ mod tests {
             .expect_err("the userspace media holds no groups");
 
         assert_eq!(
-            "the dpdk media does not serve multicast: 224.0.1.1:40456 is a group address",
+            "the dpdk media does not serve multicast: 224.0.1.1:10456 is a group address",
             refusal.to_string()
         );
         assert_eq!(
@@ -1093,7 +1093,7 @@ mod tests {
     /// The same for an IPv6 channel, which needs NDP.
     #[test]
     fn an_ipv6_channel_is_refused_by_the_media_that_has_no_ndp() {
-        let channel = channel("aeron:udp?endpoint=[::1]:40456");
+        let channel = channel("aeron:udp?endpoint=[::1]:10456");
 
         assert!(
             TransportBindings::Default.refuse_channel(&channel).is_ok(),
@@ -1105,7 +1105,7 @@ mod tests {
             .expect_err("the userspace media speaks IPv4 only");
 
         assert_eq!(
-            "the dpdk media does not serve IPv6: [::1]:40456",
+            "the dpdk media does not serve IPv6: [::1]:10456",
             refusal.to_string()
         );
     }
@@ -1114,7 +1114,7 @@ mod tests {
     /// refusals from being a blanket one.
     #[test]
     fn a_unicast_channel_is_served_by_both_media() {
-        let channel = channel("aeron:udp?endpoint=10.10.0.2:40500");
+        let channel = channel("aeron:udp?endpoint=10.10.0.2:10500");
 
         assert!(TransportBindings::Default.refuse_channel(&channel).is_ok());
         assert!(userspace().refuse_channel(&channel).is_ok());

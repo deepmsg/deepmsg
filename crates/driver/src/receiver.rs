@@ -2321,8 +2321,8 @@ mod tests {
     /// TTL **strictly larger** than the channel's own.
     #[test]
     fn only_a_larger_ttl_on_a_multicast_channel_is_an_asymmetry() {
-        let multicast = channel("aeron:udp?endpoint=224.0.1.1:40123|ttl=4");
-        let unicast = channel("aeron:udp?endpoint=127.0.0.1:40123");
+        let multicast = channel("aeron:udp?endpoint=224.0.1.1:10123|ttl=4");
+        let unicast = channel("aeron:udp?endpoint=127.0.0.1:10123");
 
         assert!(ttl_asymmetry(5, &multicast), "5 is more than the 4 we sent");
         assert!(!ttl_asymmetry(4, &multicast), "equal is the ordinary case");

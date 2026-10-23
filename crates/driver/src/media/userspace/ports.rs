@@ -341,7 +341,7 @@ impl PortTable {
 /// A bind failure in the shape the endpoints compose their report from.
 ///
 /// The descriptor is `-1` because there is none: the report's first line reads
-/// `failed to bind(-1, 10.10.0.1:40456)`, and the number is what says this
+/// `failed to bind(-1, 10.10.0.1:10456)`, and the number is what says this
 /// transport has no socket rather than that its socket is number minus one.
 fn failure(errno: libc::c_int, address: SocketAddr) -> BindFailure {
     BindFailure {
@@ -405,11 +405,11 @@ mod tests {
     #[test]
     fn a_second_bind_on_one_address_is_refused() {
         let table = table();
-        let address = SocketAddr::from((OWN, 40456));
-        table.bind(Some(OWN), 40456, None, address).expect("a bind");
+        let address = SocketAddr::from((OWN, 10456));
+        table.bind(Some(OWN), 10456, None, address).expect("a bind");
 
         let failure = table
-            .bind(Some(OWN), 40456, None, address)
+            .bind(Some(OWN), 10456, None, address)
             .expect_err("the second bind");
 
         assert_eq!(Some(libc::EADDRINUSE), failure.source.raw_os_error());
@@ -423,10 +423,10 @@ mod tests {
     #[test]
     fn the_wildcard_and_the_address_are_the_same_port() {
         let table = table();
-        let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 40456));
-        table.bind(None, 40456, None, address).expect("a bind");
+        let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 10456));
+        table.bind(None, 10456, None, address).expect("a bind");
 
-        assert!(table.bind(Some(OWN), 40456, None, address).is_err());
+        assert!(table.bind(Some(OWN), 10456, None, address).is_err());
     }
 
     /// G3: a wildcard binding hears what is addressed to the port's own
@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn a_connected_binding_hears_only_its_peer() {
         let table = table();
-        let subscriber = peer("10.10.0.9", 40000);
+        let subscriber = peer("10.10.0.9", 10000);
         let binding = table
             .bind(
                 Some(OWN),
@@ -484,10 +484,10 @@ mod tests {
         assert_eq!(Some(binding), table.lookup(OWN, OWN, 5002, subscriber));
         assert_eq!(
             None,
-            table.lookup(OWN, OWN, 5002, peer("10.10.0.9", 40001)),
+            table.lookup(OWN, OWN, 5002, peer("10.10.0.9", 10001)),
             "another port on the same host is somebody else"
         );
-        assert_eq!(None, table.lookup(OWN, OWN, 5002, peer("10.10.0.8", 40000)));
+        assert_eq!(None, table.lookup(OWN, OWN, 5002, peer("10.10.0.8", 10000)));
     }
 
     /// G12: the port is free the moment the binding is released — no
@@ -581,12 +581,12 @@ mod tests {
     /// whole range is.
     #[test]
     fn an_exhausted_ephemeral_range_is_an_error() {
-        let table = PortTable::new(4, 40000..=40001);
+        let table = PortTable::new(4, 10000..=10001);
         table
-            .bind(Some(OWN), 40000, None, SocketAddr::from((OWN, 40000)))
+            .bind(Some(OWN), 10000, None, SocketAddr::from((OWN, 10000)))
             .expect("a bind");
         table
-            .bind(Some(OWN), 40001, None, SocketAddr::from((OWN, 40001)))
+            .bind(Some(OWN), 10001, None, SocketAddr::from((OWN, 10001)))
             .expect("a bind");
 
         let failure = table

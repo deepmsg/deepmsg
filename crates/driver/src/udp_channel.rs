@@ -1248,7 +1248,7 @@ fn resolve_name(
             Err(UdpChannelError::UnknownHost(_) | UdpChannelError::Resolution(_)),
             Unresolved::Keep,
         ) => {
-            // The port survives and the address does not: `0.0.0.0:40456` is
+            // The port survives and the address does not: `0.0.0.0:10456` is
             // what "known, not resolvable" looks like here, and the port is
             // what a re-resolution asks about (`:5337-5343`).
             let (_, port_text, family) = split_address(text)?;
@@ -1681,7 +1681,7 @@ fn split_address(text: &str) -> Result<(&str, &str, AddressFamily), UdpChannelEr
 /// `aeron_udp_port_resolver`
 /// (`aeron-client/src/main/c/util/aeron_netutil.c:154-186`): a `strtoul` in
 /// base zero — hexadecimal and octal included — with the digits requirement but
-/// **no** trailing check, so `40123x` is port 40123.
+/// **no** trailing check, so `40123x` is port 10123.
 fn parse_port(text: &str) -> Result<u16, String> {
     let text = text.strip_prefix(':').unwrap_or(text);
 
@@ -1823,8 +1823,8 @@ mod tests {
         for (uri, expected) in [
             ("aeron:udp?endpoint=127.0.0.1:9999", Some("127.0.0.1:9999")),
             (
-                "aeron:udp?endpoint=10.10.0.2:40500",
-                Some("10.10.0.2:40500"),
+                "aeron:udp?endpoint=10.10.0.2:10500",
+                Some("10.10.0.2:10500"),
             ),
             (
                 "aeron:udp?term-length=64k|control-mode=dynamic|control=localhost:8338|fc=max",
@@ -1896,7 +1896,7 @@ mod tests {
     /// the frames would have gone exactly where it says.
     #[test]
     fn an_interface_the_media_holds_is_the_medias_to_answer() {
-        let uri = b"aeron:udp?endpoint=10.10.0.2:40123|interface=10.10.0.9/24";
+        let uri = b"aeron:udp?endpoint=10.10.0.2:10123|interface=10.10.0.9/24";
         let parsed = ChannelUri::parse(uri).expect("a URI");
         let media = Holds(Ipv4Addr::new(10, 10, 0, 9), 7);
 
@@ -1943,9 +1943,9 @@ mod tests {
 
     #[test]
     fn an_endpoint_is_where_a_subscription_listens_and_a_publication_sends() {
-        let channel = resolve("aeron:udp?endpoint=127.0.0.1:40123");
+        let channel = resolve("aeron:udp?endpoint=127.0.0.1:10123");
 
-        assert_eq!(ipv4("127.0.0.1:40123"), channel.remote_data);
+        assert_eq!(ipv4("127.0.0.1:10123"), channel.remote_data);
         assert_eq!(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             channel.local_data,
@@ -1962,11 +1962,11 @@ mod tests {
 
     #[test]
     fn the_canonical_form_names_both_sides_and_ignores_what_does_not_move_them() {
-        let one = resolve("aeron:udp?endpoint=127.0.0.1:40123");
-        let two = resolve("aeron:udp?endpoint=127.0.0.1:40123|mtu=1408");
+        let one = resolve("aeron:udp?endpoint=127.0.0.1:10123");
+        let two = resolve("aeron:udp?endpoint=127.0.0.1:10123|mtu=1408");
 
         assert_eq!(one.canonical_form, two.canonical_form);
-        assert_eq!("UDP-0.0.0.0:0-127.0.0.1:40123", one.canonical_form);
+        assert_eq!("UDP-0.0.0.0:0-127.0.0.1:10123", one.canonical_form);
     }
 
     #[test]
@@ -2090,11 +2090,11 @@ mod tests {
             UdpChannelError::InvalidChannel(
                 "explicit control expected with dynamic control mode".to_owned()
             ),
-            refuse("aeron:udp?endpoint=127.0.0.1:40123|control-mode=dynamic")
+            refuse("aeron:udp?endpoint=127.0.0.1:10123|control-mode=dynamic")
         );
 
         let channel = resolve(
-            "aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124|control-mode=dynamic",
+            "aeron:udp?endpoint=127.0.0.1:10123|control=127.0.0.1:10124|control-mode=dynamic",
         );
         assert_eq!(ControlMode::Dynamic, channel.control_mode);
         assert!(channel.has_explicit_control);
@@ -2104,9 +2104,9 @@ mod tests {
     /// a place to send datagrams (`:392-407`).
     #[test]
     fn a_spy_is_refused_as_a_destination() {
-        assert!(validate_destination_prefix(b"aeron:udp?endpoint=127.0.0.1:40123", "send").is_ok());
+        assert!(validate_destination_prefix(b"aeron:udp?endpoint=127.0.0.1:10123", "send").is_ok());
         assert!(matches!(
-            validate_destination_prefix(b"aeron-spy:aeron:udp?endpoint=127.0.0.1:40123", "send"),
+            validate_destination_prefix(b"aeron-spy:aeron:udp?endpoint=127.0.0.1:10123", "send"),
             Err(UdpChannelError::InvalidChannel(message))
                 if message.starts_with("Aeron spies are invalid as send destinations:")
         ));
@@ -2117,9 +2117,9 @@ mod tests {
     /// (`:4939-4942`, `:92-108`).
     #[test]
     fn a_spy_names_the_channel_after_its_prefix() {
-        let spy = resolve_spy_channel(b"aeron-spy:aeron:udp?endpoint=127.0.0.1:40123")
+        let spy = resolve_spy_channel(b"aeron-spy:aeron:udp?endpoint=127.0.0.1:10123")
             .expect("a spy channel");
-        let plain = resolve("aeron:udp?endpoint=127.0.0.1:40123");
+        let plain = resolve("aeron:udp?endpoint=127.0.0.1:10123");
 
         assert_eq!(plain.canonical_form, spy.canonical_form);
         assert_eq!(plain.remote_data, spy.remote_data);
@@ -2153,7 +2153,7 @@ mod tests {
     /// turns on.
     #[test]
     fn an_unresolvable_name_is_kept_for_a_destination_that_asks_for_it() {
-        let uri = b"aeron:udp?endpoint=not-a-host-at-all.invalid:40456";
+        let uri = b"aeron:udp?endpoint=not-a-host-at-all.invalid:10456";
         let parsed = ChannelUri::parse(uri).expect("a URI");
 
         assert!(
@@ -2167,12 +2167,12 @@ mod tests {
                 .expect("a channel that is kept");
 
         assert_eq!(
-            "0.0.0.0:40456".parse::<SocketAddr>().expect("an address"),
+            "0.0.0.0:10456".parse::<SocketAddr>().expect("an address"),
             kept.remote_data,
             "the wildcard, and the port it named"
         );
         assert_eq!(
-            Some("not-a-host-at-all.invalid:40456"),
+            Some("not-a-host-at-all.invalid:10456"),
             kept.endpoint_name.as_deref(),
             "the name is kept, because that is what a re-resolution asks about"
         );
@@ -2257,11 +2257,11 @@ mod tests {
     #[test]
     fn a_send_destination_is_a_udp_endpoint_with_a_port() {
         assert_eq!(
-            "127.0.0.1:40456".parse::<SocketAddr>().expect("an address"),
+            "127.0.0.1:10456".parse::<SocketAddr>().expect("an address"),
             validate_send_destination_uri(
                 &mut Names::System,
                 Unresolved::Refuse,
-                b"aeron:udp?endpoint=127.0.0.1:40456"
+                b"aeron:udp?endpoint=127.0.0.1:10456"
             )
             .expect("a destination")
         );
@@ -2274,7 +2274,7 @@ mod tests {
 
         // Not UDP at all.
         assert!(
-            refusal(b"aeron:ipc?endpoint=127.0.0.1:40456")
+            refusal(b"aeron:ipc?endpoint=127.0.0.1:10456")
                 .contains("incorrect URI format for destination")
         );
 
@@ -2294,7 +2294,7 @@ mod tests {
 
         // A key that belongs to the channel, not to a place inside it.
         for key in INVALID_DESTINATION_KEYS {
-            let channel = format!("aeron:udp?endpoint=127.0.0.1:40456|{key}=1");
+            let channel = format!("aeron:udp?endpoint=127.0.0.1:10456|{key}=1");
             assert!(
                 refusal(channel.as_bytes())
                     .contains(&format!("destinations must not contain the key: {key}")),
@@ -2304,7 +2304,7 @@ mod tests {
 
         // A response channel is a channel, not a destination.
         assert!(
-            refusal(b"aeron:udp?endpoint=127.0.0.1:40456|control-mode=response")
+            refusal(b"aeron:udp?endpoint=127.0.0.1:10456|control-mode=response")
                 .contains("destinations may not specify control-mode=response")
         );
     }
@@ -2319,19 +2319,19 @@ mod tests {
     #[test]
     fn the_control_mode_is_what_makes_a_channel_multi_destination() {
         assert!(
-            resolve("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual")
+            resolve("aeron:udp?endpoint=127.0.0.1:10123|control-mode=manual")
                 .is_multi_destination()
         );
         assert!(
             resolve(
-                "aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124|control-mode=dynamic"
+                "aeron:udp?endpoint=127.0.0.1:10123|control=127.0.0.1:10124|control-mode=dynamic"
             )
             .is_multi_destination()
         );
 
-        assert!(!resolve("aeron:udp?endpoint=127.0.0.1:40123").is_multi_destination());
+        assert!(!resolve("aeron:udp?endpoint=127.0.0.1:10123").is_multi_destination());
         assert!(
-            !resolve("aeron:udp?endpoint=127.0.0.1:40123|control-mode=nonsense")
+            !resolve("aeron:udp?endpoint=127.0.0.1:10123|control-mode=nonsense")
                 .is_multi_destination(),
             "an unknown control mode is no mode at all (`:309-323`)"
         );
@@ -2340,7 +2340,7 @@ mod tests {
         // (`media/aeron_udp_channel.h:147-151`), even though its channel now
         // resolves like any other.
         assert!(
-            !resolve("aeron:udp?endpoint=127.0.0.1:40123|control-mode=response")
+            !resolve("aeron:udp?endpoint=127.0.0.1:10123|control-mode=response")
                 .is_multi_destination()
         );
     }
@@ -2348,15 +2348,15 @@ mod tests {
     #[test]
     fn group_semantics_follow_the_multi_destination_category() {
         assert!(
-            resolve("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual").has_group_semantics()
+            resolve("aeron:udp?endpoint=127.0.0.1:10123|control-mode=manual").has_group_semantics()
         );
         assert!(
             resolve(
-                "aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124|control-mode=dynamic"
+                "aeron:udp?endpoint=127.0.0.1:10123|control=127.0.0.1:10124|control-mode=dynamic"
             )
             .has_group_semantics()
         );
-        assert!(!resolve("aeron:udp?endpoint=127.0.0.1:40123").has_group_semantics());
+        assert!(!resolve("aeron:udp?endpoint=127.0.0.1:10123").has_group_semantics());
     }
 
     #[test]
@@ -2366,7 +2366,7 @@ mod tests {
         // channel like any other.
         assert_eq!(
             ControlMode::None,
-            resolve("aeron:udp?endpoint=127.0.0.1:40123|control-mode=nonsense").control_mode
+            resolve("aeron:udp?endpoint=127.0.0.1:10123|control-mode=nonsense").control_mode
         );
     }
 
@@ -2416,15 +2416,15 @@ mod tests {
         );
         assert_eq!(
             deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
-            refuse("aeron:udp?endpoint=nosuchhost.invalid:40123").error_code()
+            refuse("aeron:udp?endpoint=nosuchhost.invalid:10123").error_code()
         );
         assert_eq!(
             deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
-            refuse("aeron:udp?endpoint=224.0.1.1:40123|ats=1").error_code()
+            refuse("aeron:udp?endpoint=224.0.1.1:10123|ats=1").error_code()
         );
         assert_eq!(
             deepmsg_cnc::command::ERROR_CODE_NOT_SUPPORTED,
-            refuse("aeron:udp?endpoint=224.0.1.1:40123|media-rcv-ts-offset=1").error_code()
+            refuse("aeron:udp?endpoint=224.0.1.1:10123|media-rcv-ts-offset=1").error_code()
         );
     }
 
@@ -2434,10 +2434,10 @@ mod tests {
         // multicast one: the reference resolves it in
         // `aeron_receive_channel_endpoint_set_group_tag`, which asks the
         // channel nothing about its kind (`:32-53`).
-        let named = resolve("aeron:udp?endpoint=127.0.0.1:40123|gtag=17");
+        let named = resolve("aeron:udp?endpoint=127.0.0.1:10123|gtag=17");
         assert_eq!(Some(17), named.group_tag);
 
-        let multicast = resolve("aeron:udp?endpoint=224.0.1.1:40123|gtag=-1");
+        let multicast = resolve("aeron:udp?endpoint=224.0.1.1:10123|gtag=-1");
         assert_eq!(
             Some(-1),
             multicast.group_tag,
@@ -2446,17 +2446,17 @@ mod tests {
 
         assert_eq!(
             None,
-            resolve("aeron:udp?endpoint=127.0.0.1:40123").group_tag
+            resolve("aeron:udp?endpoint=127.0.0.1:10123").group_tag
         );
 
         // The reference's reader is `strtoll(.., 0)` and requires the whole
         // value (`aeron_uri_get_int64`, `aeron-client/src/main/c/uri/aeron_uri.c:393-402`).
         assert_eq!(
             Some(16),
-            resolve("aeron:udp?endpoint=127.0.0.1:40123|gtag=0x10").group_tag
+            resolve("aeron:udp?endpoint=127.0.0.1:10123|gtag=0x10").group_tag
         );
         assert!(matches!(
-            refuse("aeron:udp?endpoint=127.0.0.1:40123|gtag=1x"),
+            refuse("aeron:udp?endpoint=127.0.0.1:10123|gtag=1x"),
             UdpChannelError::Uri(_)
         ));
 
@@ -2465,9 +2465,9 @@ mod tests {
         // the parameters an image is built from
         // (`aeron_driver_uri.c:494-495`), so a channel that carries it resolves
         // like any other.
-        let named = resolve("aeron:udp?endpoint=127.0.0.1:40123|group=true");
+        let named = resolve("aeron:udp?endpoint=127.0.0.1:10123|group=true");
         assert!(!named.is_multicast);
-        assert_eq!(ipv4("127.0.0.1:40123"), named.remote_data);
+        assert_eq!(ipv4("127.0.0.1:10123"), named.remote_data);
     }
 
     /// The interface this host would join a group on, asked of the kernel the
@@ -2480,13 +2480,13 @@ mod tests {
 
     #[test]
     fn a_multicast_endpoint_is_the_group_and_its_control_twin() {
-        let channel = resolve("aeron:udp?endpoint=224.0.1.1:40123");
+        let channel = resolve("aeron:udp?endpoint=224.0.1.1:10123");
 
         assert!(channel.is_multicast);
         assert!(channel.has_group_semantics());
-        assert_eq!(ipv4("224.0.1.1:40123"), channel.remote_data);
+        assert_eq!(ipv4("224.0.1.1:10123"), channel.remote_data);
         assert_eq!(
-            ipv4("224.0.1.2:40123"),
+            ipv4("224.0.1.2:10123"),
             channel.remote_control,
             "the control group is the data group with its last byte incremented"
         );
@@ -2499,7 +2499,7 @@ mod tests {
 
     #[test]
     fn a_multicast_channel_binds_the_interface_not_the_wildcard() {
-        let channel = resolve("aeron:udp?endpoint=224.0.1.1:40123");
+        let channel = resolve("aeron:udp?endpoint=224.0.1.1:10123");
         let interface = interface_of_this_host(AddressFamily::Inet);
 
         assert_eq!(channel.local_data, channel.local_control);
@@ -2508,7 +2508,7 @@ mod tests {
         assert!(!channel.local_data.ip().is_unspecified());
         assert!(!channel.has_explicit_control);
         assert_eq!(
-            format!("UDP-{}:0-224.0.1.1:40123", interface.address),
+            format!("UDP-{}:0-224.0.1.1:10123", interface.address),
             channel.canonical_form
         );
     }
@@ -2521,8 +2521,8 @@ mod tests {
         // The reference tries the literal first and then resolves
         // (`aeron_netutil.c:115-126`), and every unbracketed spec is resolved
         // as IPv4 (`aeron_parse_util.c:505-517`).
-        let named = resolve("aeron:udp?endpoint=127.0.0.1:40123|interface=localhost");
-        let literal = resolve("aeron:udp?endpoint=127.0.0.1:40123|interface=127.0.0.1");
+        let named = resolve("aeron:udp?endpoint=127.0.0.1:10123|interface=localhost");
+        let literal = resolve("aeron:udp?endpoint=127.0.0.1:10123|interface=127.0.0.1");
 
         assert_eq!(
             literal.local_data, named.local_data,
@@ -2533,7 +2533,7 @@ mod tests {
         // And it is a real name that is resolved, not a special case for this
         // one: a name that does not resolve is still refused.
         assert!(matches!(
-            refuse("aeron:udp?endpoint=127.0.0.1:40123|interface=nosuchhost.invalid"),
+            refuse("aeron:udp?endpoint=127.0.0.1:10123|interface=nosuchhost.invalid"),
             UdpChannelError::Resolution(_)
         ));
     }
@@ -2547,7 +2547,7 @@ mod tests {
         // and a multicast socket cannot send on or join through `0.0.0.0`, so
         // there is no wildcard to hand back — the lookup has to answer.
         assert!(
-            resolve("aeron:udp?endpoint=127.0.0.1:40123|interface=0.0.0.0")
+            resolve("aeron:udp?endpoint=127.0.0.1:10123|interface=0.0.0.0")
                 .local_data
                 .ip()
                 .is_unspecified()
@@ -2558,7 +2558,7 @@ mod tests {
         // — so the lookup finds nothing and the channel is refused rather than
         // silently bound.
         assert!(matches!(
-            refuse("aeron:udp?endpoint=224.0.1.1:40123|interface=0.0.0.0"),
+            refuse("aeron:udp?endpoint=224.0.1.1:10123|interface=0.0.0.0"),
             UdpChannelError::Resolution(_)
         ));
 
@@ -2566,7 +2566,7 @@ mod tests {
         // resolves to (`aeron_udp_channel.c:140`), and the kernel picks.
         assert_eq!(
             interface_of_this_host(AddressFamily::Inet).address,
-            resolve("aeron:udp?endpoint=224.0.1.1:40123|interface=0.0.0.0/0")
+            resolve("aeron:udp?endpoint=224.0.1.1:10123|interface=0.0.0.0/0")
                 .local_data
                 .ip()
         );
@@ -2574,10 +2574,10 @@ mod tests {
 
     #[test]
     fn a_multicast_six_group_is_incremented_at_the_end_of_its_sixteen_bytes() {
-        let channel = resolve("aeron:udp?endpoint=[ff02::1]:40123");
+        let channel = resolve("aeron:udp?endpoint=[ff02::1]:10123");
 
         assert_eq!(
-            "[ff02::2]:40123".parse::<SocketAddr>().expect("an address"),
+            "[ff02::2]:10123".parse::<SocketAddr>().expect("an address"),
             channel.remote_control
         );
         assert!(channel.is_multicast);
@@ -2586,11 +2586,11 @@ mod tests {
     #[test]
     fn a_group_whose_last_byte_is_even_is_refused() {
         assert!(matches!(
-            refuse("aeron:udp?endpoint=224.0.1.2:40123"),
+            refuse("aeron:udp?endpoint=224.0.1.2:10123"),
             UdpChannelError::Resolution(_)
         ));
         assert!(matches!(
-            refuse("aeron:udp?endpoint=[ff02::2]:40123"),
+            refuse("aeron:udp?endpoint=[ff02::2]:10123"),
             UdpChannelError::Resolution(_)
         ));
 
@@ -2598,14 +2598,14 @@ mod tests {
         // so what a client sees is a generic error.
         assert_eq!(
             deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
-            refuse("aeron:udp?endpoint=224.0.1.2:40123").error_code()
+            refuse("aeron:udp?endpoint=224.0.1.2:10123").error_code()
         );
     }
 
     #[test]
     fn a_group_is_the_same_endpoint_whatever_the_tag_says() {
-        let tagged = resolve("aeron:udp?endpoint=224.0.1.1:40123|tags=7");
-        let plain = resolve("aeron:udp?endpoint=224.0.1.1:40123");
+        let tagged = resolve("aeron:udp?endpoint=224.0.1.1:10123|tags=7");
+        let plain = resolve("aeron:udp?endpoint=224.0.1.1:10123");
 
         assert_eq!(7, tagged.tag_id, "the tag is still read");
         assert_eq!(
@@ -2619,26 +2619,26 @@ mod tests {
         let source = ipv4("127.0.0.1:5555");
 
         assert_eq!(
-            ipv4("224.0.1.2:40123"),
-            resolve("aeron:udp?endpoint=224.0.1.1:40123").control_address(source),
+            ipv4("224.0.1.2:10123"),
+            resolve("aeron:udp?endpoint=224.0.1.1:10123").control_address(source),
             "a group answers on its control twin, not to whoever wrote"
         );
         assert_eq!(
-            ipv4("127.0.0.1:40124"),
-            resolve("aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124")
+            ipv4("127.0.0.1:10124"),
+            resolve("aeron:udp?endpoint=127.0.0.1:10123|control=127.0.0.1:10124")
                 .control_address(source)
         );
         assert_eq!(
             source,
-            resolve("aeron:udp?endpoint=127.0.0.1:40123").control_address(source)
+            resolve("aeron:udp?endpoint=127.0.0.1:10123").control_address(source)
         );
     }
 
     #[test]
     fn a_multicast_endpoint_with_a_control_address_ignores_it() {
-        let channel = resolve("aeron:udp?endpoint=224.0.1.1:40123|control=127.0.0.1:40124");
+        let channel = resolve("aeron:udp?endpoint=224.0.1.1:10123|control=127.0.0.1:10124");
 
-        assert_eq!(ipv4("224.0.1.2:40123"), channel.remote_control);
+        assert_eq!(ipv4("224.0.1.2:10123"), channel.remote_control);
         assert!(!channel.has_explicit_control);
         assert_eq!(channel.local_data, channel.local_control);
     }
@@ -2647,28 +2647,28 @@ mod tests {
     fn the_hop_limit_is_read_the_way_strtoull_reads_it() {
         let hop_limit = |uri: &str| resolve(uri).multicast_ttl;
 
-        assert_eq!(0, hop_limit("aeron:udp?endpoint=224.0.1.1:40123"));
-        assert_eq!(16, hop_limit("aeron:udp?endpoint=224.0.1.1:40123|ttl=0x10"));
-        assert_eq!(8, hop_limit("aeron:udp?endpoint=224.0.1.1:40123|ttl=010"));
+        assert_eq!(0, hop_limit("aeron:udp?endpoint=224.0.1.1:10123"));
+        assert_eq!(16, hop_limit("aeron:udp?endpoint=224.0.1.1:10123|ttl=0x10"));
+        assert_eq!(8, hop_limit("aeron:udp?endpoint=224.0.1.1:10123|ttl=010"));
         assert_eq!(
             255,
-            hop_limit("aeron:udp?endpoint=224.0.1.1:40123|ttl=300"),
+            hop_limit("aeron:udp?endpoint=224.0.1.1:10123|ttl=300"),
             "clamped rather than refused"
         );
         assert_eq!(
             0,
-            hop_limit("aeron:udp?endpoint=224.0.1.1:40123|ttl=slow"),
+            hop_limit("aeron:udp?endpoint=224.0.1.1:10123|ttl=slow"),
             "text with no digits at all is zero, not an error"
         );
         assert_eq!(
             255,
-            hop_limit("aeron:udp?endpoint=224.0.1.1:40123|ttl=-1"),
+            hop_limit("aeron:udp?endpoint=224.0.1.1:10123|ttl=-1"),
             "a sign wraps in `strtoull` before it clamps"
         );
 
         assert_eq!(
             0,
-            resolve("aeron:udp?endpoint=127.0.0.1:40123|ttl=3").multicast_ttl,
+            resolve("aeron:udp?endpoint=127.0.0.1:10123|ttl=3").multicast_ttl,
             "a unicast channel has no hop limit at all (`:389`, `:446`, `:472`)"
         );
     }
@@ -2676,8 +2676,8 @@ mod tests {
     #[test]
     fn a_port_is_read_the_way_strtoul_reads_it() {
         assert_eq!(
-            ipv4("127.0.0.1:40123"),
-            resolve("aeron:udp?endpoint=127.0.0.1:40123x").remote_data,
+            ipv4("127.0.0.1:10123"),
+            resolve("aeron:udp?endpoint=127.0.0.1:10123x").remote_data,
             "the reference never looks past the digits"
         );
         assert_eq!(
@@ -2712,8 +2712,8 @@ mod tests {
     #[test]
     fn a_host_is_resolved_by_the_system_when_it_is_not_a_literal() {
         assert_eq!(
-            ipv4("127.0.0.1:40123"),
-            resolve("aeron:udp?endpoint=localhost:40123").remote_data
+            ipv4("127.0.0.1:10123"),
+            resolve("aeron:udp?endpoint=localhost:10123").remote_data
         );
     }
 
@@ -2766,7 +2766,7 @@ mod tests {
             asked: std::cell::RefCell::new(Vec::new()),
         };
 
-        let uri = b"aeron:udp?endpoint=ReResTestEndpoint:40456";
+        let uri = b"aeron:udp?endpoint=ReResTestEndpoint:10456";
         let parsed = ChannelUri::parse(uri).expect("a URI");
         let channel = UdpChannel::resolve_with(
             &mut Names::Built {
@@ -2790,7 +2790,7 @@ mod tests {
             "the resolver was asked about the host, without the port"
         );
         assert_eq!(
-            ipv4("10.1.2.3:40456"),
+            ipv4("10.1.2.3:10456"),
             channel.remote_data,
             "and the channel kept its own port"
         );
@@ -2798,7 +2798,7 @@ mod tests {
         // A literal is not a question for a resolver at all
         // (`aeron_name_resolver.c:158-178`): a channel that names an address
         // cannot be steered by one.
-        let uri = b"aeron:udp?endpoint=127.0.0.1:40456";
+        let uri = b"aeron:udp?endpoint=127.0.0.1:10456";
         let parsed = ChannelUri::parse(uri).expect("a URI");
         let channel = UdpChannel::resolve_with(
             &mut Names::Built {
@@ -2816,7 +2816,7 @@ mod tests {
         )
         .expect("a channel");
 
-        assert_eq!(ipv4("127.0.0.1:40456"), channel.remote_data);
+        assert_eq!(ipv4("127.0.0.1:10456"), channel.remote_data);
         assert_eq!(1, stub.asked.borrow().len(), "still just the one question");
 
         // And the call was **measured**, which is what the reference's
@@ -2842,12 +2842,12 @@ mod tests {
     #[test]
     fn an_explicit_control_address_binds_the_local_side_to_it() {
         // `aeron_udp_channel.c:442-464`.
-        let channel = resolve("aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124");
+        let channel = resolve("aeron:udp?endpoint=127.0.0.1:10123|control=127.0.0.1:10124");
 
-        assert_eq!(ipv4("127.0.0.1:40124"), channel.local_data);
-        assert_eq!(ipv4("127.0.0.1:40124"), channel.local_control);
+        assert_eq!(ipv4("127.0.0.1:10124"), channel.local_data);
+        assert_eq!(ipv4("127.0.0.1:10124"), channel.local_control);
         assert_eq!(
-            ipv4("127.0.0.1:40123"),
+            ipv4("127.0.0.1:10123"),
             channel.remote_data,
             "the data still goes to the endpoint"
         );
@@ -2855,16 +2855,16 @@ mod tests {
         assert!(
             channel
                 .canonical_form
-                .starts_with("UDP-127.0.0.1:40124-127.0.0.1:40123")
+                .starts_with("UDP-127.0.0.1:10124-127.0.0.1:10123")
         );
     }
 
     #[test]
     fn a_six_channel_is_bracketed_in_its_canonical_form() {
-        let channel = resolve("aeron:udp?endpoint=[::1]:40123");
+        let channel = resolve("aeron:udp?endpoint=[::1]:10123");
 
         assert_eq!(
-            "[::1]:40123".parse::<SocketAddr>().ok(),
+            "[::1]:10123".parse::<SocketAddr>().ok(),
             Some(channel.remote_data)
         );
         assert_eq!(
@@ -2872,7 +2872,7 @@ mod tests {
             channel.local_data,
             "the wildcard follows the endpoint's family"
         );
-        assert_eq!("UDP-[::]:0-[::1]:40123", channel.canonical_form);
+        assert_eq!("UDP-[::]:0-[::1]:10123", channel.canonical_form);
     }
 
     #[test]
@@ -2880,7 +2880,7 @@ mod tests {
         // No brackets means the last colon reads as the port separator, so the
         // host is everything before it — which is not an address.
         assert!(matches!(
-            refuse("aeron:udp?endpoint=::1:40123"),
+            refuse("aeron:udp?endpoint=::1:10123"),
             UdpChannelError::Resolution(_)
         ));
         // A bracketed address with no port is likewise refused: an endpoint
@@ -2891,7 +2891,7 @@ mod tests {
         ));
         // Unbalanced brackets are not an address at all.
         assert!(matches!(
-            refuse("aeron:udp?endpoint=[::1:40123"),
+            refuse("aeron:udp?endpoint=[::1:10123"),
             UdpChannelError::Resolution(_)
         ));
     }
@@ -2899,7 +2899,7 @@ mod tests {
     #[test]
     fn the_socket_buffer_and_window_parameters_are_read_as_sizes() {
         let channel =
-            resolve("aeron:udp?endpoint=127.0.0.1:40123|so-sndbuf=1m|so-rcvbuf=128k|rcv-wnd=64k");
+            resolve("aeron:udp?endpoint=127.0.0.1:10123|so-sndbuf=1m|so-rcvbuf=128k|rcv-wnd=64k");
 
         assert_eq!(1024 * 1024, channel.socket_sndbuf_length);
         assert_eq!(128 * 1024, channel.socket_rcvbuf_length);
@@ -2915,7 +2915,7 @@ mod tests {
     fn an_interface_by_address_is_looked_up_on_this_host() {
         // The loopback address is on every host this runs on, and the lookup
         // is the kernel's — which is what the address-bearing arm exists for.
-        let channel = resolve("aeron:udp?endpoint=127.0.0.1:40123|interface=127.0.0.1");
+        let channel = resolve("aeron:udp?endpoint=127.0.0.1:10123|interface=127.0.0.1");
 
         assert_eq!(IpAddr::V4(Ipv4Addr::LOCALHOST), channel.local_data.ip());
         assert_eq!(0, channel.local_data.port(), "no port was named");
@@ -2923,7 +2923,7 @@ mod tests {
 
     #[test]
     fn the_wildcard_interface_is_taken_as_written() {
-        let channel = resolve("aeron:udp?endpoint=127.0.0.1:40123|interface=0.0.0.0");
+        let channel = resolve("aeron:udp?endpoint=127.0.0.1:10123|interface=0.0.0.0");
 
         assert_eq!(IpAddr::V4(Ipv4Addr::UNSPECIFIED), channel.local_data.ip());
         assert_eq!(0, channel.interface_index);
@@ -2931,15 +2931,15 @@ mod tests {
 
     #[test]
     fn an_interface_this_host_does_not_have_is_refused() {
-        let error = refuse("aeron:udp?endpoint=127.0.0.1:40123|interface=10.255.255.1");
+        let error = refuse("aeron:udp?endpoint=127.0.0.1:10123|interface=10.255.255.1");
 
         assert!(matches!(error, UdpChannelError::Resolution(_)), "{error}");
         assert!(matches!(
-            refuse("aeron:udp?endpoint=127.0.0.1:40123|interface={nosuchiface}"),
+            refuse("aeron:udp?endpoint=127.0.0.1:10123|interface={nosuchiface}"),
             UdpChannelError::Resolution(_)
         ));
         assert!(matches!(
-            refuse("aeron:udp?endpoint=127.0.0.1:40123|interface=not-an-address"),
+            refuse("aeron:udp?endpoint=127.0.0.1:10123|interface=not-an-address"),
             UdpChannelError::Resolution(_)
         ));
     }
@@ -2947,9 +2947,9 @@ mod tests {
     #[test]
     fn the_unsupported_parameters_are_named_rather_than_dropped() {
         for uri in [
-            "aeron:udp?endpoint=127.0.0.1:40123|media-rcv-ts-offset=0",
-            "aeron:udp?endpoint=127.0.0.1:40123|channel-rcv-ts-offset=0",
-            "aeron:udp?endpoint=127.0.0.1:40123|ats=1",
+            "aeron:udp?endpoint=127.0.0.1:10123|media-rcv-ts-offset=0",
+            "aeron:udp?endpoint=127.0.0.1:10123|channel-rcv-ts-offset=0",
+            "aeron:udp?endpoint=127.0.0.1:10123|ats=1",
         ] {
             let error = refuse(uri);
             assert!(
@@ -2965,10 +2965,10 @@ mod tests {
         // (`aeron_udp_channel.c:346-381`), and a response channel names its
         // control address the way a manual one does.
         let response = resolve(
-            "aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124|control-mode=response",
+            "aeron:udp?endpoint=127.0.0.1:10123|control=127.0.0.1:10124|control-mode=response",
         );
         let manual = resolve(
-            "aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124|control-mode=manual",
+            "aeron:udp?endpoint=127.0.0.1:10123|control=127.0.0.1:10124|control-mode=manual",
         );
 
         assert_eq!(ControlMode::Response, response.control_mode);

@@ -1081,27 +1081,27 @@ mod tests {
         let mut unicast = build(
             &mut counters,
             &regions,
-            "aeron:udp?endpoint=127.0.0.1:40123",
+            "aeron:udp?endpoint=127.0.0.1:10123",
         );
         let manual = build(
             &mut counters,
             &regions,
-            "aeron:udp?endpoint=127.0.0.1:40124|control-mode=manual",
+            "aeron:udp?endpoint=127.0.0.1:10124|control-mode=manual",
         );
         let multicast = build(
             &mut counters,
             &regions,
-            "aeron:udp?endpoint=224.0.1.1:40125",
+            "aeron:udp?endpoint=224.0.1.1:10125",
         );
         let response = build(
             &mut counters,
             &regions,
-            "aeron:udp?endpoint=127.0.0.1:40126|control-mode=response",
+            "aeron:udp?endpoint=127.0.0.1:10126|control-mode=response",
         );
         let unaddressed = build(
             &mut counters,
             &regions,
-            "aeron:udp?control=127.0.0.1:40127|control-mode=manual",
+            "aeron:udp?control=127.0.0.1:10127|control-mode=manual",
         );
 
         let just_inside = TIMEOUT_START_NS + DESTINATION_TIMEOUT_NS;
@@ -1187,7 +1187,7 @@ mod tests {
         let bindings = TransportBindings::Userspace(stack);
 
         let endpoint = SendChannelEndpoint::create(
-            channel("aeron:udp?endpoint=10.10.0.2:40500"),
+            channel("aeron:udp?endpoint=10.10.0.2:10500"),
             &mut ports(),
             &bindings,
             &TransportParams::default(),
@@ -1212,7 +1212,7 @@ mod tests {
 
         let label = &published[0].label;
         assert!(
-            label.starts_with("dpdk transport: 0.0.0.0:") && label.ends_with("-> 10.10.0.2:40500"),
+            label.starts_with("dpdk transport: 0.0.0.0:") && label.ends_with("-> 10.10.0.2:10500"),
             "the label names the wildcard the endpoint bound and the peer it \
              was connected to: {label}"
         );
@@ -1243,7 +1243,7 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let mut endpoint = SendChannelEndpoint::create(
-            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123"),
             &mut ports(),
             &crate::media::TransportBindings::Default,
             &TransportParams::default(),
@@ -1256,14 +1256,14 @@ mod tests {
         )
         .expect("an endpoint");
 
-        let moved: SocketAddr = "127.0.0.2:40123".parse().expect("an address");
+        let moved: SocketAddr = "127.0.0.2:10123".parse().expect("an address");
         endpoint
-            .on_resolution_change("somewhere:40123", moved)
+            .on_resolution_change("somewhere:10123", moved)
             .expect("the transport reconnects");
 
         assert_eq!(moved, endpoint.remote_data_addr());
         assert_eq!(
-            Some("127.0.0.1:40123"),
+            Some("127.0.0.1:10123"),
             endpoint.endpoint_name(),
             "and the name it was parsed with is kept, which is what a re-resolution asks about"
         );
@@ -1275,7 +1275,7 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let mut endpoint = SendChannelEndpoint::create(
-            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123"),
             &mut ports(),
             &crate::media::TransportBindings::Default,
             &TransportParams::default(),
@@ -1319,7 +1319,7 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let endpoint = SendChannelEndpoint::create(
-            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123"),
             &mut ports(),
             &crate::media::TransportBindings::Default,
             &TransportParams::default(),
@@ -1609,7 +1609,7 @@ mod tests {
 
         let error = SendChannelEndpoint::create(
             channel(&format!(
-                "aeron:udp?endpoint=127.0.0.1:40123|control={bound}"
+                "aeron:udp?endpoint=127.0.0.1:10123|control={bound}"
             )),
             &mut ports(),
             &crate::media::TransportBindings::Default,
@@ -1648,7 +1648,7 @@ mod tests {
         );
         assert!(
             report.text().contains(&format!(
-                "[aeron_send_channel_endpoint_create, aeron_send_channel_endpoint.c:142] uri=aeron:udp?endpoint=127.0.0.1:40123|control={bound}"
+                "[aeron_send_channel_endpoint_create, aeron_send_channel_endpoint.c:142] uri=aeron:udp?endpoint=127.0.0.1:10123|control={bound}"
             )),
             "{}",
             report.text()
@@ -1747,7 +1747,7 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let mut endpoint = SendChannelEndpoint::create(
-            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123"),
             &mut ports(),
             &crate::media::TransportBindings::Default,
             &TransportParams::default(),
@@ -1772,7 +1772,7 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let mut endpoint = SendChannelEndpoint::create(
-            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123|control-mode=manual"),
             &mut ports(),
             &crate::media::TransportBindings::Default,
             &TransportParams::default(),
@@ -1799,8 +1799,8 @@ mod tests {
                 &counters,
                 &regions,
                 0,
-                channel("aeron:udp?endpoint=127.0.0.1:40124"),
-                Some("127.0.0.1:40124".parse().expect("an address")),
+                channel("aeron:udp?endpoint=127.0.0.1:10124"),
+                Some("127.0.0.1:10124".parse().expect("an address")),
                 42,
             );
 
@@ -1823,7 +1823,7 @@ mod tests {
         let destination = listener.local_addr().expect("a bound address");
 
         let mut endpoint = SendChannelEndpoint::create(
-            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123|control-mode=manual"),
             &mut ports(),
             &crate::media::TransportBindings::Default,
             &TransportParams::default(),
@@ -1843,7 +1843,7 @@ mod tests {
                 &counters,
                 &regions,
                 0,
-                channel("aeron:udp?endpoint=127.0.0.1:40124"),
+                channel("aeron:udp?endpoint=127.0.0.1:10124"),
                 Some(destination),
                 42,
             );

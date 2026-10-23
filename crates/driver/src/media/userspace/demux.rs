@@ -302,7 +302,7 @@ mod tests {
                     destination: OWN,
                     identification: 1,
                 },
-                source_port: 40000,
+                source_port: 10000,
                 destination_port: to,
                 payload_length: aeron.len(),
             },
@@ -337,30 +337,30 @@ mod tests {
         let stack = stack(&wire);
         let far = &mut far_end(&wire);
 
-        let mut vlan = udp_frame(frame_type::DATA, 40500, b"x");
+        let mut vlan = udp_frame(frame_type::DATA, 10500, b"x");
         vlan[12..14].copy_from_slice(&ETHERNET_TYPE_VLAN.to_be_bytes());
         send(far, &vlan);
 
-        let mut tcp = udp_frame(frame_type::DATA, 40500, b"x");
+        let mut tcp = udp_frame(frame_type::DATA, 10500, b"x");
         tcp[frame::ETHERNET_HEADER_LENGTH + 9] = 6;
         fix_ipv4_checksum(&mut tcp);
         send(far, &tcp);
 
-        let mut fragmented = udp_frame(frame_type::DATA, 40500, b"x");
+        let mut fragmented = udp_frame(frame_type::DATA, 10500, b"x");
         fragmented[frame::ETHERNET_HEADER_LENGTH + 6..frame::ETHERNET_HEADER_LENGTH + 8]
             .copy_from_slice(&0x2000u16.to_be_bytes());
         send(far, &fragmented);
 
-        let mut options = udp_frame(frame_type::DATA, 40500, b"x");
+        let mut options = udp_frame(frame_type::DATA, 10500, b"x");
         options[frame::ETHERNET_HEADER_LENGTH] = 0x46;
         send(far, &options);
 
-        let mut corrupt = udp_frame(frame_type::DATA, 40500, b"x");
+        let mut corrupt = udp_frame(frame_type::DATA, 10500, b"x");
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xff;
         send(far, &corrupt);
 
-        send(far, &udp_frame(frame_type::DATA, 40500, b"x"));
+        send(far, &udp_frame(frame_type::DATA, 10500, b"x"));
 
         assert_eq!(6, stack.pump(), "every frame was read, and one was claimed");
 
@@ -391,14 +391,14 @@ mod tests {
         let stack = stack(&wire);
         let far = &mut far_end(&wire);
 
-        send(far, &udp_frame(frame_type::DATA, 40501, b"data"));
-        send(far, &udp_frame(frame_type::PAD, 40501, b""));
-        send(far, &udp_frame(frame_type::SETUP, 40501, b"setup"));
-        send(far, &udp_frame(frame_type::SM, 40501, b"status"));
-        send(far, &udp_frame(frame_type::NAK, 40501, b"nak"));
-        send(far, &udp_frame(frame_type::ERR, 40501, b"error"));
-        send(far, &udp_frame(frame_type::RTTM, 40501, b"rtt"));
-        send(far, &udp_frame(0x7fff, 40501, b"something else"));
+        send(far, &udp_frame(frame_type::DATA, 10501, b"data"));
+        send(far, &udp_frame(frame_type::PAD, 10501, b""));
+        send(far, &udp_frame(frame_type::SETUP, 10501, b"setup"));
+        send(far, &udp_frame(frame_type::SM, 10501, b"status"));
+        send(far, &udp_frame(frame_type::NAK, 10501, b"nak"));
+        send(far, &udp_frame(frame_type::ERR, 10501, b"error"));
+        send(far, &udp_frame(frame_type::RTTM, 10501, b"rtt"));
+        send(far, &udp_frame(0x7fff, 10501, b"something else"));
 
         stack.pump();
 
@@ -419,11 +419,11 @@ mod tests {
     fn a_claimed_datagram_is_not_counted() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        bind(&stack, 40502);
+        bind(&stack, 10502);
 
         send(
             &mut far_end(&wire),
-            &udp_frame(frame_type::DATA, 40502, b"mine"),
+            &udp_frame(frame_type::DATA, 10502, b"mine"),
         );
         assert_eq!(1, stack.pump());
 
@@ -440,7 +440,7 @@ mod tests {
         let wire = Wire::new();
         let stack = stack(&wire);
 
-        let mut bytes = udp_frame(frame_type::DATA, 40503, b"elsewhere");
+        let mut bytes = udp_frame(frame_type::DATA, 10503, b"elsewhere");
         bytes[0..6].copy_from_slice(&[0x02, 0, 0, 0, 0, 0x09]);
         send(&mut far_end(&wire), &bytes);
 
@@ -577,7 +577,7 @@ mod tests {
         let wire = Wire::new();
         let stack = stack(&wire);
 
-        let mut bytes = udp_frame(frame_type::DATA, 40504, b"x");
+        let mut bytes = udp_frame(frame_type::DATA, 10504, b"x");
         bytes[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
         send(&mut far_end(&wire), &bytes);
 

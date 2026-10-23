@@ -2168,7 +2168,7 @@ mod tests {
             7,
             SESSION_ID,
             STREAM_ID,
-            b"aeron:udp?endpoint=127.0.0.1:40123",
+            b"aeron:udp?endpoint=127.0.0.1:10123",
             1408,
             term_length,
             CHANNEL_WINDOW,
@@ -2303,7 +2303,7 @@ mod tests {
                 ttl: 0,
             };
 
-            let uri = "aeron:udp?endpoint=127.0.0.1:40123";
+            let uri = "aeron:udp?endpoint=127.0.0.1:10123";
             let parsed = ChannelUri::parse(uri.as_bytes()).expect("a URI");
             let channel = crate::udp_channel::UdpChannel::resolve(uri.as_bytes(), &parsed)
                 .expect("a channel");
@@ -2536,7 +2536,7 @@ mod tests {
     fn an_image_takes_a_destination_once() {
         let mut fixture = Fixture::new();
         let before = fixture.image.connections.len();
-        let address: SocketAddr = "127.0.0.1:40124".parse().expect("an address");
+        let address: SocketAddr = "127.0.0.1:10124".parse().expect("an address");
 
         let second = DestinationId::for_test(1);
 
@@ -2585,7 +2585,7 @@ mod tests {
         let mut fixture = Fixture::new();
         let before = fixture.image.connections.len();
         let source: SocketAddr = "127.0.0.1:5556".parse().expect("a source");
-        let control: SocketAddr = "127.0.0.1:40125".parse().expect("a control address");
+        let control: SocketAddr = "127.0.0.1:10125".parse().expect("a control address");
         let second = DestinationId::for_test(1);
 
         fixture

@@ -1937,7 +1937,7 @@ mod tests {
         }
 
         fn local_address(&self) -> io::Result<SocketAddr> {
-            Ok(SocketAddr::from(([127, 0, 0, 1], 40123)))
+            Ok(SocketAddr::from(([127, 0, 0, 1], 10123)))
         }
 
         fn receive_buffer_size(&self) -> io::Result<usize> {
@@ -1953,10 +1953,10 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let first = ReceiveDestination::attach(
-            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123"),
             0,
             &crate::media::TransportBindings::Default,
-            stub(40123),
+            stub(10123),
             &mut counters,
             &regions,
             7,
@@ -1968,10 +1968,10 @@ mod tests {
         .expect("a destination");
 
         let second = ReceiveDestination::attach(
-            channel("aeron:udp?endpoint=127.0.0.1:40124"),
+            channel("aeron:udp?endpoint=127.0.0.1:10124"),
             0,
             &crate::media::TransportBindings::Default,
-            stub(40124),
+            stub(10124),
             &mut counters,
             &regions,
             8,
@@ -2012,10 +2012,10 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let mut with_control = ReceiveDestination::attach(
-            channel("aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123|control=127.0.0.1:10124"),
             0,
             &crate::media::TransportBindings::Default,
-            stub(40123),
+            stub(10123),
             &mut counters,
             &regions,
             7,
@@ -2027,10 +2027,10 @@ mod tests {
         .expect("a destination");
 
         let without = ReceiveDestination::attach(
-            channel("aeron:udp?endpoint=127.0.0.1:40125"),
+            channel("aeron:udp?endpoint=127.0.0.1:10125"),
             0,
             &crate::media::TransportBindings::Default,
-            stub(40125),
+            stub(10125),
             &mut counters,
             &regions,
             7,
@@ -2059,13 +2059,13 @@ mod tests {
         assert!(!with_control.re_resolution_required(past + RECEIVE_DESTINATION_TIMEOUT_NS));
 
         assert_eq!(
-            Some("127.0.0.1:40124"),
+            Some("127.0.0.1:10124"),
             with_control.control_name(),
             "and the name asked about is the one the channel wrote"
         );
 
         // The answer moves the address the ask goes to, and nothing else.
-        let moved: SocketAddr = "127.0.0.2:40124".parse().expect("an address");
+        let moved: SocketAddr = "127.0.0.2:10124".parse().expect("an address");
         with_control.update_control_address(moved);
         assert_eq!(Some(moved), with_control.setup_address());
 
@@ -2092,10 +2092,10 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let with_control = ReceiveDestination::attach(
-            channel("aeron:udp?endpoint=127.0.0.1:40123|control=127.0.0.1:40124"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123|control=127.0.0.1:10124"),
             0,
             &crate::media::TransportBindings::Default,
-            stub(40123),
+            stub(10123),
             &mut counters,
             &regions,
             7,
@@ -2111,16 +2111,16 @@ mod tests {
             "the channel named a control address"
         );
         assert_eq!(
-            Some("127.0.0.1:40124".parse().expect("an address")),
+            Some("127.0.0.1:10124".parse().expect("an address")),
             with_control.setup_address(),
             "and the ask goes to it"
         );
 
         let without = ReceiveDestination::attach(
-            channel("aeron:udp?endpoint=127.0.0.1:40125"),
+            channel("aeron:udp?endpoint=127.0.0.1:10125"),
             0,
             &crate::media::TransportBindings::Default,
-            stub(40125),
+            stub(10125),
             &mut counters,
             &regions,
             8,
@@ -2153,10 +2153,10 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
-            channel("aeron:udp?endpoint=127.0.0.1:40223|control-mode=manual"),
+            channel("aeron:udp?endpoint=127.0.0.1:10223|control-mode=manual"),
             None,
             &crate::media::TransportBindings::Default,
-            stub(40223),
+            stub(10223),
             1,
             16,
             &mut counters,
@@ -2214,10 +2214,10 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
-            channel("aeron:udp?endpoint=127.0.0.1:40224|control-mode=manual"),
+            channel("aeron:udp?endpoint=127.0.0.1:10224|control-mode=manual"),
             None,
             &crate::media::TransportBindings::Default,
-            stub(40224),
+            stub(10224),
             1,
             16,
             &mut counters,
@@ -2262,10 +2262,10 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
-            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123|control-mode=manual"),
             None,
             &crate::media::TransportBindings::Default,
-            stub(40123),
+            stub(10123),
             1,
             16,
             &mut counters,
@@ -2284,10 +2284,10 @@ mod tests {
         );
 
         let added = ReceiveDestination::attach(
-            channel("aeron:udp?endpoint=127.0.0.1:40124"),
+            channel("aeron:udp?endpoint=127.0.0.1:10124"),
             0,
             &crate::media::TransportBindings::Default,
-            stub(40124),
+            stub(10124),
             &mut counters,
             &regions,
             8,
@@ -2303,11 +2303,11 @@ mod tests {
         assert_eq!(Some(added_id), endpoint.destination_id(0));
 
         let (removed_id, removed) = endpoint
-            .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40124"))
+            .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:10124"))
             .expect("the destination that was added");
 
         assert_eq!(
-            channel("aeron:udp?endpoint=127.0.0.1:40124").canonical_form,
+            channel("aeron:udp?endpoint=127.0.0.1:10124").canonical_form,
             removed.channel().canonical_form,
             "and it is the one that was added"
         );
@@ -2318,7 +2318,7 @@ mod tests {
         assert_eq!(0, endpoint.destination_count());
         assert!(
             endpoint
-                .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40999"))
+                .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:10999"))
                 .is_none(),
             "a channel no destination has removes nothing"
         );
@@ -2337,10 +2337,10 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
-            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123|control-mode=manual"),
             None,
             &crate::media::TransportBindings::Default,
-            stub(40123),
+            stub(10123),
             1,
             16,
             &mut counters,
@@ -2356,7 +2356,7 @@ mod tests {
 
         let first_id = endpoint.add_destination(
             ReceiveDestination::attach(
-                channel("aeron:udp?endpoint=127.0.0.1:40124"),
+                channel("aeron:udp?endpoint=127.0.0.1:10124"),
                 0,
                 &crate::media::TransportBindings::Default,
                 Box::new(Sent::default()),
@@ -2375,7 +2375,7 @@ mod tests {
         // hole the first leaves.
         let last_id = endpoint.add_destination(
             ReceiveDestination::attach(
-                channel("aeron:udp?endpoint=127.0.0.1:40125"),
+                channel("aeron:udp?endpoint=127.0.0.1:10125"),
                 0,
                 &crate::media::TransportBindings::Default,
                 Box::new(second.clone()),
@@ -2391,7 +2391,7 @@ mod tests {
         );
 
         let (removed, _) = endpoint
-            .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40124"))
+            .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:10124"))
             .expect("the first destination");
         assert_eq!(first_id, removed);
         assert_eq!(
@@ -2400,7 +2400,7 @@ mod tests {
             "the destination that is left has moved into the slot the first one had"
         );
 
-        let control = "127.0.0.1:40500".parse().expect("an address");
+        let control = "127.0.0.1:10500".parse().expect("an address");
         let sent = endpoint
             .send_sm(first_id, control, 1_001, 42, 3, 4_096, 8_192, 0)
             .expect("nothing to send is not a failure");
@@ -2427,10 +2427,10 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
-            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123|control-mode=manual"),
             None,
             &crate::media::TransportBindings::Default,
-            stub(40123),
+            stub(10123),
             1,
             16,
             &mut counters,
@@ -2447,7 +2447,7 @@ mod tests {
 
         let first_id = endpoint.add_destination(
             ReceiveDestination::attach(
-                channel("aeron:udp?endpoint=127.0.0.1:40124"),
+                channel("aeron:udp?endpoint=127.0.0.1:10124"),
                 0,
                 &crate::media::TransportBindings::Default,
                 Box::new(first.clone()),
@@ -2464,7 +2464,7 @@ mod tests {
 
         let second_id = endpoint.add_destination(
             ReceiveDestination::attach(
-                channel("aeron:udp?endpoint=127.0.0.1:40125"),
+                channel("aeron:udp?endpoint=127.0.0.1:10125"),
                 0,
                 &crate::media::TransportBindings::Default,
                 Box::new(second.clone()),
@@ -2481,7 +2481,7 @@ mod tests {
 
         assert_ne!(first_id, second_id, "two destinations, two handles");
 
-        let control = "127.0.0.1:40500".parse().expect("an address");
+        let control = "127.0.0.1:10500".parse().expect("an address");
         endpoint
             .send_sm(second_id, control, 1_001, 42, 3, 4_096, 8_192, 0)
             .expect("sent");
@@ -2522,7 +2522,7 @@ mod tests {
         let sent = Sent::default();
 
         let endpoint = ReceiveChannelEndpoint::with_transport(
-            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123"),
             group_tag,
             &crate::media::TransportBindings::Default,
             Box::new(sent.clone()),
@@ -2557,7 +2557,7 @@ mod tests {
         let sent = Sent::default();
 
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
-            channel("aeron:udp?endpoint=127.0.0.1:40124|control=127.0.0.1:40125"),
+            channel("aeron:udp?endpoint=127.0.0.1:10124|control=127.0.0.1:10125"),
             None,
             &crate::media::TransportBindings::Default,
             Box::new(sent.clone()),
@@ -2578,7 +2578,7 @@ mod tests {
 
         assert_eq!(9, setup.endpoint_id);
         assert_eq!(
-            Some("127.0.0.1:40125".parse().expect("an address")),
+            Some("127.0.0.1:10125".parse().expect("an address")),
             setup.control_address,
             "the ask goes to the control address, and so does the entry that keeps asking"
         );
@@ -2645,7 +2645,7 @@ mod tests {
         let (mut endpoint, sent) =
             endpoint_that_records_with_tag(Some(17), &mut counters, &regions);
 
-        let control = "127.0.0.1:40456".parse().expect("an address");
+        let control = "127.0.0.1:10456".parse().expect("an address");
         endpoint
             .send_sm(
                 only_destination(&endpoint),
@@ -2681,7 +2681,7 @@ mod tests {
         let (mut counters, regions) = fixture.open();
         let (mut endpoint, sent) = endpoint_that_records(&mut counters, &regions);
 
-        let control = "127.0.0.1:40456".parse().expect("an address");
+        let control = "127.0.0.1:10456".parse().expect("an address");
         endpoint
             .send_sm(
                 only_destination(&endpoint),
@@ -2720,7 +2720,7 @@ mod tests {
         endpoint
             .send_error_frame(
                 only_destination(&endpoint),
-                "127.0.0.1:40456".parse().expect("an address"),
+                "127.0.0.1:10456".parse().expect("an address"),
                 1_001,
                 42,
                 deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
@@ -2744,7 +2744,7 @@ mod tests {
         endpoint
             .send_error_frame(
                 only_destination(&endpoint),
-                "127.0.0.1:40456".parse().expect("an address"),
+                "127.0.0.1:10456".parse().expect("an address"),
                 1_001,
                 42,
                 deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
@@ -2774,7 +2774,7 @@ mod tests {
         let length = endpoint
             .send_error_frame(
                 only_destination(&endpoint),
-                "127.0.0.1:40456".parse().expect("an address"),
+                "127.0.0.1:10456".parse().expect("an address"),
                 1001,
                 42,
                 deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
@@ -2827,7 +2827,7 @@ mod tests {
         endpoint
             .send_error_frame(
                 only_destination(&endpoint),
-                "127.0.0.1:40456".parse().expect("an address"),
+                "127.0.0.1:10456".parse().expect("an address"),
                 1001,
                 42,
                 deepmsg_cnc::command::ERROR_CODE_IMAGE_REJECTED,
@@ -2867,10 +2867,10 @@ mod tests {
         // The kernel's media publishes no 76, so a destination on it has none —
         // and counting into the null id is nothing rather than a failure.
         let kernel = ReceiveDestination::attach(
-            channel("aeron:udp?endpoint=127.0.0.1:40123"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123"),
             0,
             &TransportBindings::Default,
-            stub(40123),
+            stub(10123),
             &mut counters,
             &regions,
             7,
@@ -2897,14 +2897,14 @@ mod tests {
         let bindings = TransportBindings::Userspace(std::sync::Arc::clone(&stack));
         let transport = UserspaceTransport::open(
             std::sync::Arc::clone(&stack),
-            SocketAddr::from((Ipv4Addr::new(10, 10, 0, 1), 40456)),
+            SocketAddr::from((Ipv4Addr::new(10, 10, 0, 1), 10456)),
             None,
             Affinity::Receiver,
         )
         .expect("a transport");
 
         let destination = ReceiveDestination::attach(
-            channel("aeron:udp?endpoint=10.10.0.1:40456"),
+            channel("aeron:udp?endpoint=10.10.0.1:10456"),
             0,
             &bindings,
             Box::new(transport),
@@ -2934,7 +2934,7 @@ mod tests {
 
         assert_eq!(1, transport_counters.len(), "one per transport");
         assert_eq!(
-            "dpdk transport: 10.10.0.1:40456 -> *", transport_counters[0].label,
+            "dpdk transport: 10.10.0.1:10456 -> *", transport_counters[0].label,
             "a destination never connects, so it hears from anyone"
         );
 
@@ -2981,10 +2981,10 @@ mod tests {
         let (mut counters, regions) = fixture.open();
 
         let mut endpoint = ReceiveChannelEndpoint::with_transport(
-            channel("aeron:udp?endpoint=127.0.0.1:40123|control-mode=manual"),
+            channel("aeron:udp?endpoint=127.0.0.1:10123|control-mode=manual"),
             None,
             &crate::media::TransportBindings::Default,
-            stub(40123),
+            stub(10123),
             1,
             16,
             &mut counters,
@@ -2996,11 +2996,11 @@ mod tests {
         )
         .expect("an endpoint");
 
-        let uri = "aeron:udp?endpoint=127.0.0.1:40124";
+        let uri = "aeron:udp?endpoint=127.0.0.1:10124";
         let id = endpoint.add_destination(
             ReceiveDestination::attach(
                 channel(uri),
-                40310,
+                10310,
                 &crate::media::TransportBindings::Default,
                 Box::new(Sent::default()),
                 &mut counters,
@@ -3019,13 +3019,13 @@ mod tests {
             .expect("the destination it was given");
 
         assert_eq!(id, removed_id);
-        assert_eq!(40310, destination.managed_port());
+        assert_eq!(10310, destination.managed_port());
 
         // And a destination the manager held nothing for says zero, which is
         // not a port: the caller gives back nothing.
         let kernel_chosen = endpoint.add_destination(
             ReceiveDestination::attach(
-                channel("aeron:udp?endpoint=127.0.0.1:40125"),
+                channel("aeron:udp?endpoint=127.0.0.1:10125"),
                 0,
                 &crate::media::TransportBindings::Default,
                 Box::new(Sent::default()),
@@ -3041,7 +3041,7 @@ mod tests {
         );
 
         let (removed_id, destination) = endpoint
-            .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:40125"))
+            .remove_destination(&channel("aeron:udp?endpoint=127.0.0.1:10125"))
             .expect("the destination it was given");
 
         assert_eq!(kernel_chosen, removed_id);

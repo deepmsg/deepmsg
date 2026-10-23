@@ -549,7 +549,7 @@ mod tests {
                 MDC_NUM_DESTINATIONS_NAME,
                 channel_type_id::MDC_NUM_DESTINATIONS,
                 7,
-                b"aeron:udp?endpoint=127.0.0.1:40123",
+                b"aeron:udp?endpoint=127.0.0.1:10123",
                 0,
             )
             .expect("a counter");
@@ -632,8 +632,8 @@ mod tests {
             &counters,
             &regions,
             NOW,
-            channel(40124),
-            Some(address(40124)),
+            channel(10124),
+            Some(address(10124)),
             42,
         ));
         assert_eq!(Some(1), counters.value(&regions, counter_id));
@@ -642,8 +642,8 @@ mod tests {
             &counters,
             &regions,
             NOW,
-            channel(40125),
-            Some(address(40125)),
+            channel(10125),
+            Some(address(10125)),
             43,
         );
         assert_eq!(Some(2), counters.value(&regions, counter_id));
@@ -653,7 +653,7 @@ mod tests {
 
         assert!(
             tracker
-                .remove(&counters, &regions, &address(40125))
+                .remove(&counters, &regions, &address(10125))
                 .is_some()
         );
         assert_eq!(Some(0), counters.value(&regions, counter_id));
@@ -677,12 +677,12 @@ mod tests {
             &counters,
             &regions,
             NOW,
-            channel(40124),
-            Some(address(40124)),
+            channel(10124),
+            Some(address(10124)),
             42,
         );
 
-        let removed = tracker.remove(&counters, &regions, &address(40124));
+        let removed = tracker.remove(&counters, &regions, &address(10124));
         assert!(removed.is_some(), "the destination was there");
         assert!(tracker.is_empty());
     }
@@ -696,13 +696,13 @@ mod tests {
         let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(false, DESTINATION_TIMEOUT_NS, counter_id);
 
-        let known = tracker.on_status_message(&counters, &regions, -1234, &address(40124), NOW);
+        let known = tracker.on_status_message(&counters, &regions, -1234, &address(10124), NOW);
         assert!(!known, "nothing was there to match");
         assert_eq!(1, tracker.len(), "and it is a destination now");
         assert_eq!(NULL_VALUE, tracker.destinations()[0].registration_id);
 
         assert!(
-            tracker.on_status_message(&counters, &regions, -1234, &address(40124), NOW + 1),
+            tracker.on_status_message(&counters, &regions, -1234, &address(10124), NOW + 1),
             "the same receiver again is matched, not added twice"
         );
         assert_eq!(1, tracker.len());
@@ -717,7 +717,7 @@ mod tests {
         let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
 
-        assert!(!tracker.on_status_message(&counters, &regions, -1234, &address(40124), NOW));
+        assert!(!tracker.on_status_message(&counters, &regions, -1234, &address(10124), NOW));
         assert!(
             tracker.is_empty(),
             "manual destinations are named, not learned"
@@ -736,9 +736,9 @@ mod tests {
         let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(false, DESTINATION_TIMEOUT_NS, counter_id);
 
-        tracker.on_status_message(&counters, &regions, -1234, &address(40124), NOW);
+        tracker.on_status_message(&counters, &regions, -1234, &address(10124), NOW);
 
-        let from_elsewhere = SocketAddr::from(([10, 0, 0, 9], 40124));
+        let from_elsewhere = SocketAddr::from(([10, 0, 0, 9], 10124));
         assert!(
             tracker.on_status_message(&counters, &regions, -1234, &from_elsewhere, NOW + 1),
             "the id and the port are what matched"
@@ -746,7 +746,7 @@ mod tests {
         assert_eq!(1, tracker.len(), "not a second destination");
 
         // A different port is a different destination, whatever the id says.
-        let other_port = SocketAddr::from(([10, 0, 0, 9], 40125));
+        let other_port = SocketAddr::from(([10, 0, 0, 9], 10125));
         assert!(!tracker.on_status_message(&counters, &regions, -1234, &other_port, NOW + 2));
         assert_eq!(2, tracker.len(), "a second destination, learned from it");
     }
@@ -767,15 +767,15 @@ mod tests {
                 &counters,
                 &regions,
                 NOW,
-                channel(40124),
-                Some(address(40124)),
+                channel(10124),
+                Some(address(10124)),
                 42,
             );
 
             // A manual channel has to be given it: `manual_add` is a no-op on a
             // dynamic one, so that side is fed by a status message instead.
             if !is_manual {
-                tracker.on_status_message(&counters, &regions, -1, &address(40124), NOW);
+                tracker.on_status_message(&counters, &regions, -1, &address(10124), NOW);
             }
             assert_eq!(1, tracker.len());
 
@@ -819,8 +819,8 @@ mod tests {
         let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
 
-        tracker.manual_add(&counters, &regions, NOW, channel(40124), None, 42);
-        tracker.manual_add(&counters, &regions, NOW, channel(40125), None, 43);
+        tracker.manual_add(&counters, &regions, NOW, channel(10124), None, 42);
+        tracker.manual_add(&counters, &regions, NOW, channel(10125), None, 43);
 
         let quiet_at = NOW + DESTINATION_TIMEOUT_NS + 1;
 
@@ -834,7 +834,7 @@ mod tests {
         let due = tracker.destinations_to_re_resolve(quiet_at, DESTINATION_TIMEOUT_NS);
         assert_eq!(2, due.len(), "both are quiet");
         assert_eq!(
-            Some("127.0.0.1:40124"),
+            Some("127.0.0.1:10124"),
             tracker.destination_name(due[0].0),
             "and a destination is asked about by the name its channel wrote"
         );
@@ -856,8 +856,8 @@ mod tests {
 
         // The answer moves the destinations whose channel named that endpoint,
         // and only those.
-        let moved: SocketAddr = "127.0.0.2:40124".parse().expect("an address");
-        tracker.on_resolution_change("127.0.0.1:40124", moved);
+        let moved: SocketAddr = "127.0.0.2:10124".parse().expect("an address");
+        tracker.on_resolution_change("127.0.0.1:10124", moved);
 
         assert_eq!(Some(moved), tracker.destination_addr(due[0].0));
         assert_eq!(
@@ -875,7 +875,7 @@ mod tests {
         let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(false, DESTINATION_TIMEOUT_NS, counter_id);
 
-        tracker.on_status_message(&counters, &regions, 1, &address(40124), NOW);
+        tracker.on_status_message(&counters, &regions, 1, &address(10124), NOW);
 
         assert!(!tracker.is_empty(), "a dynamic channel did learn one");
         assert!(
@@ -901,8 +901,8 @@ mod tests {
             &counters,
             &regions,
             NOW,
-            channel(40124),
-            Some(address(40124)),
+            channel(10124),
+            Some(address(10124)),
             42,
         ));
         assert!(tracker.is_empty());
@@ -919,19 +919,19 @@ mod tests {
         let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
         let mut transport = Recorder::default();
 
-        tracker.manual_add(&counters, &regions, NOW, channel(40124), None, 42);
+        tracker.manual_add(&counters, &regions, NOW, channel(10124), None, 42);
         tracker.manual_add(
             &counters,
             &regions,
             NOW,
-            channel(40125),
-            Some(address(40125)),
+            channel(10125),
+            Some(address(10125)),
             43,
         );
 
         let sent = tracker.send(&mut transport, &[b"payload"], &counters, &regions, NOW);
 
-        assert_eq!(vec![address(40125)], transport.sent_to);
+        assert_eq!(vec![address(10125)], transport.sent_to);
         assert_eq!(1, sent, "the batch went out");
         assert_eq!(2, tracker.len(), "and both destinations are still there");
     }
@@ -945,11 +945,11 @@ mod tests {
         let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
         let mut transport = Recorder {
-            refuse: vec![address(40124)],
+            refuse: vec![address(10124)],
             ..Recorder::default()
         };
 
-        for port in [40124u16, 40125] {
+        for port in [10124u16, 10125] {
             tracker.manual_add(
                 &counters,
                 &regions,
@@ -964,7 +964,7 @@ mod tests {
 
         assert_eq!(0, sent, "a partial send is reported as none of it");
         assert_eq!(
-            vec![address(40124), address(40125)],
+            vec![address(10124), address(10125)],
             transport.sent_to,
             "and the destinations after the one that refused were still tried"
         );
@@ -978,7 +978,7 @@ mod tests {
         let (counters, regions, counter_id) = fixture.open();
         let mut tracker = DestinationTracker::new(true, DESTINATION_TIMEOUT_NS, counter_id);
 
-        for port in [40124u16, 40125, 40126] {
+        for port in [10124u16, 10125, 10126] {
             tracker.manual_add(
                 &counters,
                 &regions,
@@ -1000,7 +1000,7 @@ mod tests {
         }
 
         assert_eq!(
-            vec![address(40124), address(40125), address(40126)],
+            vec![address(10124), address(10125), address(10126)],
             first_of_each_pass,
             "each pass starts one further along"
         );
@@ -1019,15 +1019,15 @@ mod tests {
             &counters,
             &regions,
             NOW,
-            channel(40124),
-            Some(address(40124)),
+            channel(10124),
+            Some(address(10124)),
             42_i64,
         );
 
-        assert_eq!(42, tracker.find_registration_id(-1, &address(40124)));
+        assert_eq!(42, tracker.find_registration_id(-1, &address(10124)));
         assert_eq!(
             NULL_VALUE,
-            tracker.find_registration_id(-1, &address(40999)),
+            tracker.find_registration_id(-1, &address(10999)),
             "an address no destination has"
         );
     }

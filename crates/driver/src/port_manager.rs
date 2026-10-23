@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(20700, port_of("[::1]:20700".parse().expect("an address")));
         assert_eq!(20700, port_of(wildcard(20700)));
         assert_eq!(0, port_of(wildcard(0)));
-        assert!(is_unspecified("0.0.0.0:40456".parse().expect("an address")));
-        assert!(!is_unspecified(wildcard(40456)));
+        assert!(is_unspecified("0.0.0.0:10456".parse().expect("an address")));
+        assert!(!is_unspecified(wildcard(10456)));
     }
 }

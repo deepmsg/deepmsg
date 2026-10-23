@@ -5100,7 +5100,7 @@ mod tests {
             client_id: 7,
             correlation_id: 9,
             registration_id: 4242,
-            channel: "aeron:udp?endpoint=127.0.0.1:40456",
+            channel: "aeron:udp?endpoint=127.0.0.1:10456",
         };
         let mut payload = vec![0u8; command.encoded_length()];
         assert!(command.encode_into(&mut payload));
@@ -5149,10 +5149,10 @@ mod tests {
             ("aeron:ipc", "unknown subscription"),
             // And so does a spy (`:6053-6062`).
             (
-                "aeron-spy:aeron:udp?endpoint=127.0.0.1:40456",
+                "aeron-spy:aeron:udp?endpoint=127.0.0.1:10456",
                 "unknown subscription",
             ),
-            ("aeron:udp?endpoint=127.0.0.1:40456", "unknown subscription"),
+            ("aeron:udp?endpoint=127.0.0.1:10456", "unknown subscription"),
         ];
 
         for (channel, expected) in channels {
@@ -6858,7 +6858,7 @@ mod tests {
                 7,
                 10,
                 1001,
-                "aeron:udp?endpoint=127.0.0.1:40123|media-rcv-ts-offset=0",
+                "aeron:udp?endpoint=127.0.0.1:10123|media-rcv-ts-offset=0",
             ),
         );
         let payload = await_event(
@@ -6921,7 +6921,7 @@ mod tests {
         send(
             &conductor,
             ADD_SUBSCRIPTION_TYPE_ID,
-            &add_subscription_payload(7, 12, 1001, "aeron:udp?endpoint=224.0.1.1:40456"),
+            &add_subscription_payload(7, 12, 1001, "aeron:udp?endpoint=224.0.1.1:10456"),
         );
         let payload = await_event(
             &mut conductor,
@@ -6981,7 +6981,7 @@ mod tests {
         send(
             &conductor,
             ADD_PUBLICATION_TYPE_ID,
-            &add_publication_payload(7, 13, 1001, "aeron:udp?endpoint=10.10.0.2:40500"),
+            &add_publication_payload(7, 13, 1001, "aeron:udp?endpoint=10.10.0.2:10500"),
         );
         let _ = await_event(
             &mut conductor,
@@ -6996,7 +6996,7 @@ mod tests {
 
         let label = &transports[0].label;
         assert!(
-            label.starts_with("dpdk transport: 0.0.0.0:") && label.ends_with("-> 10.10.0.2:40500"),
+            label.starts_with("dpdk transport: 0.0.0.0:") && label.ends_with("-> 10.10.0.2:10500"),
             "the label names where the endpoint is bound and who it was \
              connected to: {label}"
         );
@@ -7015,7 +7015,7 @@ mod tests {
         send(
             &conductor,
             ADD_PUBLICATION_TYPE_ID,
-            &add_publication_payload(7, 13, 1001, "aeron:udp?endpoint=localhost:40500"),
+            &add_publication_payload(7, 13, 1001, "aeron:udp?endpoint=localhost:10500"),
         );
 
         for _ in 0..8 {
@@ -7073,7 +7073,7 @@ mod tests {
         send(
             &conductor,
             ADD_PUBLICATION_TYPE_ID,
-            &add_publication_payload(7, 13, 1001, "aeron:udp?endpoint=10.10.0.2:40500"),
+            &add_publication_payload(7, 13, 1001, "aeron:udp?endpoint=10.10.0.2:10500"),
         );
         let payload = await_event(
             &mut conductor,
@@ -7104,7 +7104,7 @@ mod tests {
         send(
             &conductor,
             ADD_PUBLICATION_TYPE_ID,
-            &add_publication_payload(7, 14, 1001, "aeron:udp?endpoint=192.0.2.5:40456"),
+            &add_publication_payload(7, 14, 1001, "aeron:udp?endpoint=192.0.2.5:10456"),
         );
         let payload = await_event(
             &mut conductor,

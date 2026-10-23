@@ -23,7 +23,7 @@
 //! ```text
 //! aeron:ipc
 //! aeron:ipc?session-id=1001|term-length=64k
-//! aeron:udp?endpoint=localhost:40123|mtu=1408
+//! aeron:udp?endpoint=localhost:10123|mtu=1408
 //! ```
 //!
 //! # Faithful where it matters, strict where it does not
@@ -757,7 +757,7 @@ mod tests {
         assert_eq!(Transport::Ipc, parse("aeron:ipc?").transport());
         assert_eq!(
             Transport::Udp,
-            parse("aeron:udp?endpoint=localhost:40123").transport()
+            parse("aeron:udp?endpoint=localhost:10123").transport()
         );
 
         // A channel with no parameters is the common case and has to be free

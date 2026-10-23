@@ -1087,7 +1087,7 @@ mod tests {
                     destination,
                     identification: 1,
                 },
-                source_port: 40000,
+                source_port: 10000,
                 destination_port: to,
                 payload_length: payload.len(),
             },
@@ -1180,9 +1180,9 @@ mod tests {
     fn a_frame_reaches_the_transport_bound_to_its_destination() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let (binding, ring) = bind(&stack, 40456);
+        let (binding, ring) = bind(&stack, 10456);
 
-        send_udp(&mut far_end(&wire), OWN, 40456, b"hello");
+        send_udp(&mut far_end(&wire), OWN, 10456, b"hello");
 
         assert_eq!(1, stack.pump());
         assert_eq!(1, ring.len(), "and it is waiting for its transport");
@@ -1194,7 +1194,7 @@ mod tests {
             panic!("a UDP frame");
         };
         assert_eq!(b"hello", datagram.payload);
-        assert_eq!(40456, binding.port);
+        assert_eq!(10456, binding.port);
         assert!(ring.pop().is_none());
     }
 
@@ -1206,27 +1206,27 @@ mod tests {
         let wire = Wire::new();
         let stack = stack(&wire);
         let far = &mut far_end(&wire);
-        let (_, unclaimed) = bind(&stack, 40457);
+        let (_, unclaimed) = bind(&stack, 10457);
 
-        send_udp(far, OWN, 40458, b"not for you");
+        send_udp(far, OWN, 10458, b"not for you");
         assert_eq!(1, stack.pump());
         assert!(unclaimed.is_empty());
 
         let (_, connected) = stack
             .bind(
                 Some(OWN),
-                40459,
-                Some(SocketAddr::from((PEER, 40000))),
-                SocketAddr::from((OWN, 40459)),
+                10459,
+                Some(SocketAddr::from((PEER, 10000))),
+                SocketAddr::from((OWN, 10459)),
             )
             .expect("a bind");
-        send_udp(far, OWN, 40459, b"from somebody else");
-        // The far end's source port is 40000 and its address is PEER, so this
+        send_udp(far, OWN, 10459, b"from somebody else");
+        // The far end's source port is 10000 and its address is PEER, so this
         // one is the peer's; the next is not.
         assert_eq!(1, stack.pump());
         assert_eq!(1, connected.len());
 
-        send_udp(far, OWN, 40459, b"still the peer");
+        send_udp(far, OWN, 10459, b"still the peer");
         assert_eq!(1, stack.pump());
         assert_eq!(2, connected.len());
     }
@@ -1303,9 +1303,9 @@ mod tests {
     fn a_released_ring_stops_accepting_its_old_binding() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let (binding, ring) = bind(&stack, 40460);
+        let (binding, ring) = bind(&stack, 10460);
 
-        send_udp(&mut far_end(&wire), OWN, 40460, b"waiting");
+        send_udp(&mut far_end(&wire), OWN, 10460, b"waiting");
         assert_eq!(1, stack.pump());
         assert_eq!(1, ring.len());
 
@@ -1320,7 +1320,7 @@ mod tests {
             "a frame routed under the old binding is refused"
         );
 
-        let (next, ring) = bind(&stack, 40460);
+        let (next, ring) = bind(&stack, 10460);
         assert!(next.generation > binding.generation);
         assert!(
             ring.is_empty(),
@@ -1334,7 +1334,7 @@ mod tests {
     fn a_full_ring_drops_and_counts() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let (_, ring) = bind(&stack, 40461);
+        let (_, ring) = bind(&stack, 10461);
 
         for _ in 0..ring.capacity() {
             assert_eq!(
@@ -1368,11 +1368,11 @@ mod tests {
                 ..params()
             };
             let stack = Stack::over_a_fake_wire(&wire, Side::A, params, Clock::Monotonic);
-            let (_, ring) = bind(&stack, 40462);
+            let (_, ring) = bind(&stack, 10462);
 
             let far = &mut far_end(&wire);
             for _ in 0..8 {
-                send_udp(far, OWN, 40462, b"one of eight");
+                send_udp(far, OWN, 10462, b"one of eight");
             }
 
             let handed = stack.pump();
@@ -1401,12 +1401,12 @@ mod tests {
     fn a_window_of_frames_survives_a_burst() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let (_, ring) = bind(&stack, 40462);
+        let (_, ring) = bind(&stack, 10462);
         let far = &mut far_end(&wire);
 
         let window = stack.params().receive_window / stack.params().mtu;
         for _ in 0..=window {
-            send_udp(far, OWN, 40462, b"one window's worth");
+            send_udp(far, OWN, 10462, b"one window's worth");
         }
 
         while wire.queued(Side::B) > 0 {
@@ -1424,15 +1424,15 @@ mod tests {
         let wire = Wire::new();
         let stack = stack(&wire);
         let (_, ring) = stack
-            .bind(None, 40463, None, SocketAddr::from((OWN, 40463)))
+            .bind(None, 10463, None, SocketAddr::from((OWN, 10463)))
             .expect("a bind");
         let far = &mut far_end(&wire);
 
-        send_udp(far, OWN, 40463, b"to the wildcard");
+        send_udp(far, OWN, 10463, b"to the wildcard");
         stack.pump();
         assert_eq!(1, ring.len());
 
-        send_udp(far, PEER, 40463, b"to somebody else");
+        send_udp(far, PEER, 10463, b"to somebody else");
         stack.pump();
         assert_eq!(1, ring.len(), "and only that address");
     }
@@ -1444,7 +1444,7 @@ mod tests {
     fn a_frame_addressed_elsewhere_is_dropped() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let (_, ring) = bind(&stack, 40464);
+        let (_, ring) = bind(&stack, 10464);
 
         let mut bytes = vec![0u8; frame::IPV4_UDP_HEADER_LENGTH];
         let written = frame::write_ipv4_udp_here(
@@ -1457,8 +1457,8 @@ mod tests {
                     destination: OWN,
                     identification: 1,
                 },
-                source_port: 40000,
-                destination_port: 40464,
+                source_port: 10000,
+                destination_port: 10464,
                 payload_length: 0,
             },
         )
@@ -1479,7 +1479,7 @@ mod tests {
     fn a_corrupted_frame_never_reaches_a_transport() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let (_, ring) = bind(&stack, 40465);
+        let (_, ring) = bind(&stack, 10465);
 
         wire.set_injection(
             Side::B,
@@ -1488,7 +1488,7 @@ mod tests {
                 ..Injection::default()
             },
         );
-        send_udp(&mut far_end(&wire), OWN, 40465, b"damaged");
+        send_udp(&mut far_end(&wire), OWN, 10465, b"damaged");
 
         stack.pump();
         assert!(ring.is_empty());
@@ -1501,9 +1501,9 @@ mod tests {
     fn only_the_receivers_thread_pumps() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let (_, ring) = bind(&stack, 40467);
+        let (_, ring) = bind(&stack, 10467);
 
-        send_udp(&mut far_end(&wire), OWN, 40467, b"one frame");
+        send_udp(&mut far_end(&wire), OWN, 10467, b"one frame");
 
         let sender = ThreadQueues::new(Arc::clone(&stack), Affinity::Sender);
         assert_eq!(0, sender.pump());
@@ -1526,7 +1526,7 @@ mod tests {
     fn a_bound_port_with_nothing_sent_receives_nothing() {
         let wire = Wire::new();
         let stack = stack(&wire);
-        let (_, ring) = bind(&stack, 40466);
+        let (_, ring) = bind(&stack, 10466);
 
         assert_eq!(0, stack.pump());
         assert_eq!(0, wire.queued(Side::B));
