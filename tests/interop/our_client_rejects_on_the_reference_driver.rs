@@ -108,13 +108,16 @@ fn the_reference_driver_reads_our_rejection_and_answers_with_an_error_frame() {
         .expect("the image")
         .position();
 
-    // The command under test. Its bytes are this build's; whether the reference
-    // believes them is what the acknowledgement says — a record it called
-    // malformed would be recorded and answered with **silence**, and this would
-    // be a timeout instead.
+    // The command under test. Its bytes are this build's, and **nothing is
+    // waited for** — that is the C client's shape
+    // (`aeron_client_conductor_reject_image`, `aeron_client_conductor.c:3627-3651`).
+    // Whether the reference believed the record is what the *publication error*
+    // below says: a record it called malformed is recorded and answered with
+    // **silence**, so the publisher would never hear, and the wait after this
+    // is what fails.
     client
-        .reject_image(publication, position, REASON, DEFAULT_TIMEOUT)
-        .expect("the reference driver acts on the rejection");
+        .reject_image(publication, position, REASON)
+        .expect("the rejection is written into the ring");
 
     let mut errors = Vec::new();
     assert!(
