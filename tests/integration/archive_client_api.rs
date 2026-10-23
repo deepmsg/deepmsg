@@ -3227,55 +3227,27 @@ fn a_live_replication_merges_into_the_stream_it_is_copying() {
     media_driver.stop().expect("the driver stops");
 }
 
-/// Every `RecordingPos` counter naming `recording_id`, as `(session, value)`.
+/// **An extend whose image does not join where the recording stopped is
+/// refused, by name** — `validateImageForExtendRecording`
+/// (`ArchiveConductor.java:2155-2194`: the image's join position, initial term,
+/// term length and MTU must be the recording's, or the bytes would be appended
+/// at a position the segments do not describe).
 ///
-/// The counters are walked the way `find_counter_id_by_recording` walks them —
-/// allocated, type 100, and the key agreeing — but both halves are kept,
-/// because the question here is *which session* owns the counter.
-fn recording_positions(client: &Client, recording_id: i64) -> Vec<(i32, i64)> {
-    use deepmsg_archive::server::recording_pos::parse_key;
-
-    let Some(counters) = client.counters_reader() else {
-        return Vec::new();
-    };
-
-    let mut ids = Vec::new();
-    counters.for_each(|descriptor| {
-        // 100 is `ARCHIVE_RECORDING_POSITION_TYPE_ID`, the archive's own
-        // recording position counter.
-        if descriptor.type_id == 100 {
-            ids.push(descriptor.counter_id);
-        }
-    });
-
-    let mut found = Vec::new();
-    for id in ids {
-        let Some(identity) = counters.key(id).and_then(|key| parse_key(&key)) else {
-            continue;
-        };
-        if identity.recording_id == recording_id {
-            found.push((identity.session_id, counters.value(id).unwrap_or(-1)));
-        }
-    }
-    found
-}
-
-/// **A stopped recording that is extended gets a position counter for the new
-/// session, promptly** — the archive half of a cluster member's rejoin.
-///
-/// `start_log_recording` (`agent/mod.rs:1933`) extends the last term's
-/// recording when there is one, and `try_create_append_position` then waits for
-/// the archive's `RecordingPos` counter for that subscription's session. A
-/// member that re-enters a term loops in `join_log_as_follower` until the
-/// counter exists; the F3 rows that stall do exactly that
-/// (`records/P3-6c.md` §16).
-///
-/// The bound is the point: ten seconds is what a join can afford, and the
-/// counter existing *eventually* is not the property the member needs.
+/// This is the archive half of P3-6c's stalled F3 rows, and it is the reading
+/// that explains them: a member that rejoins a term **extends** the last
+/// term's recording (`ConsensusModuleAgent.startLogRecording`), and the
+/// publication it extends with is only at the recording's stop when the
+/// recovery plan still knows the log. When the plan has lost it, the
+/// publication is created at position 0, the image joins there, and the archive
+/// refuses with `cannot extend recording N image.joinPosition=0 !=
+/// rec.stopPosition=M` — no recording, no `RecordingPos` counter, and the
+/// member loops in `join_log_as_follower`.
 #[test]
-#[ignore = "F3 reading: the archive accepts the extend and its subscription stays `Awaiting` (images=0) forever, so no RecordingPos counter appears — records/P3-6c.md §16"]
-fn a_stopped_recording_that_is_extended_gets_a_new_position_counter() {
-    let Some((media_driver, _archive_dir, mut client)) = rig("archive-client-api-extend") else {
+fn an_extend_that_does_not_join_where_the_recording_stopped_is_refused() {
+    use deepmsg_archive::client::archive::RecordingEvent;
+    use deepmsg_archive::server::conductor::INVALID_EXTENSION;
+
+    let Some((_media_driver, _archive_dir, mut client)) = rig("archive-client-api-extend") else {
         return;
     };
 
@@ -3306,30 +3278,25 @@ fn a_stopped_recording_that_is_extended_gets_a_new_position_counter() {
         .expect("a publication on the recording channel");
 
     // The recording begins when the archive's image sees this publication.
-    let (recording_id, first_session) = until_map(
-        &mut client,
-        "the first recording position counter",
-        |client| {
-            // Keep the archive's image fed, or the recording never begins.
-            let _ = client.offer_exclusive(publication, b"one");
-            let counters = client.counters_reader()?;
-            let mut ids = Vec::new();
-            counters.for_each(|descriptor| {
-                if descriptor.type_id == 100 {
-                    ids.push(descriptor.counter_id);
-                }
-            });
-            for id in ids {
-                if let Some(identity) = counters
-                    .key(id)
-                    .and_then(|key| deepmsg_archive::server::recording_pos::parse_key(&key))
-                {
-                    return Some((identity.recording_id, identity.session_id));
-                }
+    let recording_id = until_map(&mut client, "the recording position counter", |client| {
+        let _ = client.offer_exclusive(publication, b"one");
+        let counters = client.counters_reader()?;
+        let mut ids = Vec::new();
+        counters.for_each(|descriptor| {
+            if descriptor.type_id == 100 {
+                ids.push(descriptor.counter_id);
             }
-            None
-        },
-    );
+        });
+        for id in ids {
+            if let Some(identity) = counters
+                .key(id)
+                .and_then(|key| deepmsg_archive::server::recording_pos::parse_key(&key))
+            {
+                return Some(identity.recording_id);
+            }
+        }
+        None
+    });
 
     archive
         .stop_recording_channel_and_stream(&mut client, RECORDING_CHANNEL, RECORDING_STREAM_ID)
@@ -3342,6 +3309,8 @@ fn a_stopped_recording_that_is_extended_gets_a_new_position_counter() {
             .unwrap_or(false)
     });
 
+    // The publication is still where it started, so the image the extend draws
+    // joins at 0 and not at the recording's stop.
     archive
         .extend_recording(
             &mut client,
@@ -3351,54 +3320,30 @@ fn a_stopped_recording_that_is_extended_gets_a_new_position_counter() {
             true,
             false,
         )
-        .expect("the archive extends the recording");
+        .expect("the extend's request is accepted");
 
-    // Is the recording itself alive again? `get_recording_position` reads the
-    // session's counter, so a `-1` here and no counter below are the same fact
-    // said twice — but it is worth saying twice, because "the extend was
-    // accepted" and "the recording runs" are different claims.
-    let alive = std::time::Instant::now();
-    let mut position_after_extend = -1;
-    while alive.elapsed() < std::time::Duration::from_secs(5) {
-        let _ = client.offer_exclusive(publication, b"probe");
-        position_after_extend = archive
-            .get_recording_position(&mut client, recording_id)
-            .expect("the archive answers");
-        if position_after_extend >= 0 {
-            break;
-        }
-        client.poll();
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    eprintln!("after extend: get_recording_position = {position_after_extend}");
-
-    let started = std::time::Instant::now();
-    let bound = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let extended = loop {
+    let refusal = until_map(&mut client, "the extend's refusal", |client| {
+        // The image has to exist before the archive can judge it.
         let _ = client.offer_exclusive(publication, b"two");
-        if let Some(found) = recording_positions(&client, recording_id)
-            .into_iter()
-            .find(|(session, _)| *session != first_session)
-        {
-            break found;
+        match archive.poll_recording_event(client) {
+            Ok(Some(RecordingEvent::Refusal(refusal))) => Some(refusal),
+            _ => None,
         }
-        if std::time::Instant::now() >= bound {
-            eprintln!("--- archive log ---\n{}", media_driver.log_tail(40));
-            panic!("the extended recording's position counter never happened");
-        }
-        client.poll();
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    };
-    let elapsed = started.elapsed();
-    let (new_session, position) = extended;
+    });
 
-    assert_ne!(
-        first_session, new_session,
-        "the extend brings a session of its own"
+    assert_eq!(
+        INVALID_EXTENSION, refusal.error_code,
+        "the refusal is the extension's own: {:?}",
+        refusal.message
     );
     assert!(
-        position >= 0,
-        "the new session's counter has a position: {position}"
+        refusal.message.contains("cannot extend recording"),
+        "and it says which recording and why: {:?}",
+        refusal.message
     );
-    eprintln!("the extended recording's counter came in {elapsed:?}");
+    assert!(
+        refusal.message.contains("image.joinPosition="),
+        "the image's join position is the half it refuses on: {:?}",
+        refusal.message
+    );
 }
