@@ -133,8 +133,14 @@ impl Cluster {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let logs = self
+            .nodes
+            .iter()
+            .map(|node| format!("--- node {} ---\n{}", node.id(), node.driver_log_tail(25)))
+            .collect::<Vec<_>>()
+            .join("\n");
         panic!(
-            "every member's election to close: election={:?} role={:?} term={:?} append={:?} commit={:?} faults={:?}",
+            "every member's election to close: election={:?} role={:?} term={:?} append={:?} commit={:?} faults={:?}\n{logs}",
             self.counters
                 .iter()
                 .map(NodeCounters::election_state)

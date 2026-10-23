@@ -1360,9 +1360,7 @@ impl ConsensusModuleAgent {
         if self.config.service_count > 0 {
             self.send_service_termination_position_at(0, true);
         }
-        if let Err(error) = self.try_stop_log_recording() {
-            self.report_counted_error(Some(&error));
-        }
+        self.try_stop_log_recording();
         self.set_state(ModuleState::Closed, reason);
         ClusterError::AgentTermination(reason.to_owned())
     }
@@ -1370,14 +1368,10 @@ impl ConsensusModuleAgent {
     /// `closeAndTerminate` (`:3290-3295`): stop the recording, mark the state,
     /// and hand the duty cycle the one error that ends it.
     ///
-    /// The reference's `tryStopLogRecording` catches its own archive errors and
-    /// reports them (`:3346-3370`); this one returns them, so the failure is
-    /// counted and the close continues — a node being told to stop must still
-    /// stop.
+    /// The stop reports its own archive errors (`:3346-3370`) and the close
+    /// continues — a node being told to stop must still stop.
     fn close_and_terminate(&mut self) -> ClusterError {
-        if let Err(error) = self.try_stop_log_recording() {
-            self.report_counted_error(Some(&error));
-        }
+        self.try_stop_log_recording();
 
         self.set_state(ModuleState::Closed, "expected termination");
         ClusterError::AgentTermination("expected termination".to_owned())
@@ -1720,7 +1714,7 @@ impl ConsensusModuleAgent {
         }
         self.closed = true;
 
-        let stop_result = self.try_stop_log_recording();
+        self.try_stop_log_recording();
         self.stop_log_replication_session();
 
         // `logPublisher.disconnect(errorHandler)` (`:300`), before the log
@@ -1790,7 +1784,6 @@ impl ConsensusModuleAgent {
         self.set_state(ModuleState::Closed, "closed");
         self.mark_file.signal_terminated().map_err(cluster)?;
 
-        stop_result?;
         match remove_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -1995,21 +1988,33 @@ impl ConsensusModuleAgent {
 
     /// `tryStopLogRecording` (`:3346-3378`), keeping the id like the reference
     /// does (the recovery plan still needs it).
-    fn try_stop_log_recording(&mut self) -> Result<(), ClusterError> {
+    ///
+    /// **What the archive says about a stop that finds nothing is a warning,
+    /// not a failure.** The reference catches every exception there and reports
+    /// a `ClusterEvent` (`:3369-3372`): the subscription the agent named is
+    /// already gone, which is the state the caller wanted. Returning it instead
+    /// is what put a rejoining member into a loop — a new term's
+    /// `prepareForNewLeadership` stops the recording on its way in, and an error
+    /// there goes to the election, which starts the whole term over.
+    fn try_stop_log_recording(&mut self) {
         self.append_position = None;
 
         if self.log_subscription_id != NULL_VALUE {
             let subscription_id = mem::replace(&mut self.log_subscription_id, NULL_VALUE);
-            self.archive
+            if let Err(error) = self
+                .archive
                 .try_stop_recording_subscription(&mut self.client, subscription_id)
-                .map_err(cluster)?;
+            {
+                self.report_cluster_error(&ClusterError::ClusterEvent(error.to_string()));
+            }
         } else if self.log_recording_id != NULL_VALUE {
-            self.archive
+            if let Err(error) = self
+                .archive
                 .try_stop_recording_by_identity(&mut self.client, self.log_recording_id)
-                .map_err(cluster)?;
+            {
+                self.report_cluster_error(&ClusterError::ClusterEvent(error.to_string()));
+            }
         }
-
-        Ok(())
     }
 
     // -- waiting -----------------------------------------------------------
@@ -3601,7 +3606,7 @@ impl ElectionHost for ConsensusModuleAgent {
 
         let had_recording = self.log_recording_id != NULL_VALUE;
         let last_append_position = self.append_position_value();
-        self.try_stop_log_recording()?;
+        self.try_stop_log_recording();
 
         if had_recording {
             self.recovery_plan = create_recovery_plan(
