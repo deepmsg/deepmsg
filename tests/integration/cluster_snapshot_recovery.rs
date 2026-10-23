@@ -1074,7 +1074,7 @@ fn a_snapshot_invalidated_between_two_elections() {
 /// per-member counters are the reference's own: the member that was away for a
 /// snapshot replays its action and is one behind.
 #[test]
-#[ignore = "F3-c reading: gets past its invalidation and its restart (`records/P3-6c.md` §21, §22) and now stalls on one `ack out of sequence` — the container takes a second snapshot at 1664 (snapshot 7) and acks it while the module is `Active`, so the ack is queued and never consumed and every later ack is shifted by one (`has_reached` at the next join: expected [ackId=2, logPosition=2144] vs received [ackId=2, logPosition=1664])"]
+#[ignore = "F3-c reading: gets past its invalidation (`records/P3-6c.md` §21) and then stalls with one member's log publication made at position **0** — `followerLogAwait - joinPosition=0 less than logPosition=2144`, an election that never closes. §22 measured the cause (`prepareForNewLeadership` reading the driver counter after the recording stopped) and its fix traded this for a port flake on `a_follower_comes_back_to_a_snapshot_taken_while_it_was_down`, so it was reverted: the reading stands and the fix needs a different shape"]
 fn the_last_two_snapshots_are_invalidated_after_an_election() {
     let _serial = serial();
     let ports = CasePorts::new(12);
