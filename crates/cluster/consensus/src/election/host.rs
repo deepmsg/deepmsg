@@ -225,6 +225,21 @@ pub trait ElectionHost {
     /// `:1946`-`2059`.
     fn catchup_poll(&mut self, limit_position: i64, now_ns: i64) -> Result<usize, ClusterError>;
 
+    /// A `NewLeadershipTerm` the catchup has just **replayed**, if any.
+    ///
+    /// The reference's `catchupPoll` delivers it straight into
+    /// `election.onReplayNewLeadershipTermEvent` (`ConsensusModuleAgent:1513` →
+    /// `Election.java:590-608`), because its election is a field the agent can
+    /// call re-entrantly. Here the election is out of the agent for the length
+    /// of its own turn, so the record's handler posts the event here and the
+    /// election takes it back the moment `catchup_poll` returns.
+    ///
+    /// The default is `None`: a host that never replays a term into an election
+    /// — every test host — has nothing to hand over.
+    fn take_replayed_new_leadership_term(&mut self) -> Option<(i64, i64, i64, i64)> {
+        None
+    }
+
     /// Is the catchup close enough to switch to live?
     /// `isCatchupNearLive(long)` at `:1946`-`2059`.
     fn is_catchup_near_live(&mut self, position: i64) -> bool;

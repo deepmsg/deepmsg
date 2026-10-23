@@ -889,6 +889,7 @@ impl Election {
                 }
                 let start = self.log_position;
                 let stop = self.append_position.min(self.notified_commit_position);
+
                 self.log_replay = Some(host.new_log_replay(start, stop)?);
                 work += 1;
             } else {
@@ -1027,6 +1028,22 @@ impl Election {
     ) -> Result<usize, ClusterError> {
         let _ = sender;
         let mut work = host.catchup_poll(self.notified_commit_position, now_ns)?;
+
+        // `ConsensusModuleAgent.catchupPoll` hands the election a
+        // `NewLeadershipTerm` it replayed (`:1513`); the host could not, because
+        // this election is out of it for the length of its turn.
+        if let Some((term, log_position, timestamp, term_base)) =
+            host.take_replayed_new_leadership_term()
+        {
+            self.on_replay_new_leadership_term_event(
+                host,
+                term,
+                log_position,
+                timestamp,
+                term_base,
+            )?;
+            work += 1;
+        }
 
         let near_live_position = self
             .catchup_join_position

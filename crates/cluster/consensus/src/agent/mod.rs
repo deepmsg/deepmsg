@@ -250,6 +250,11 @@ pub struct ConsensusModuleAgent {
     node_state: NodeStateFile,
     mark_file: ClusterMarkFile,
     recovery_plan: RecoveryPlan,
+    /// A `NewLeadershipTerm` replayed while the election was out of this agent
+    /// for its own turn; the election takes it back after `catchup_poll`.
+    pending_replayed_new_leadership_term: Option<(i64, i64, i64, i64)>,
+    /// Whether the election is out of this agent for its own turn right now.
+    election_in_turn: bool,
     counters: ClusterCounters,
     duty_cycle: DutyCycle,
 
@@ -602,6 +607,8 @@ impl ConsensusModuleAgent {
             node_state,
             mark_file,
             recovery_plan,
+            pending_replayed_new_leadership_term: None,
+            election_in_turn: false,
             counters,
             duty_cycle: DutyCycle {
                 max_cycle_time,
@@ -747,7 +754,9 @@ impl ConsensusModuleAgent {
         };
         self.publisher.refresh_position_limits(&self.client);
         let mut publisher = self.publisher.clone();
+        self.election_in_turn = true;
         let result = election.do_work(self, &mut publisher);
+        self.election_in_turn = false;
         self.publisher = publisher;
 
         let result = match result {
@@ -3684,6 +3693,10 @@ impl ElectionHost for ConsensusModuleAgent {
         Ok(())
     }
 
+    fn take_replayed_new_leadership_term(&mut self) -> Option<(i64, i64, i64, i64)> {
+        self.pending_replayed_new_leadership_term.take()
+    }
+
     fn catchup_poll(&mut self, limit_position: i64, now_ns: i64) -> Result<usize, ClusterError> {
         let mut work = 0;
 
@@ -6475,7 +6488,9 @@ struct AgentLogReplayHandler<'a> {
     leadership_term_id: i64,
     service_count: i32,
     state_change: Option<ModuleState>,
-    new_leadership_term_id: Option<i64>,
+    /// `(leadershipTermId, logPosition, timestamp, termBaseLogPosition)` of the
+    /// last `NewLeadershipTerm` replayed (`Election.java:590-608`).
+    new_leadership_term: Option<(i64, i64, i64, i64)>,
     deferred_snapshot: Option<(i64, i64)>,
     /// A `SNAPSHOT` action with default flags was replayed:
     /// `totalSnapshotDurationTracker.onSnapshotBegin` (`:1584`).
@@ -6582,13 +6597,18 @@ impl LogReplayHandler for AgentLogReplayHandler<'_> {
     fn on_replay_new_leadership_term_event(
         &mut self,
         leadership_term_id: i64,
-        _log_position: i64,
-        _timestamp: i64,
-        _term_base_log_position: i64,
+        log_position: i64,
+        timestamp: i64,
+        term_base_log_position: i64,
         _time_unit: i32,
         _app_version: i32,
     ) -> Result<(), ClusterError> {
-        self.new_leadership_term_id = Some(leadership_term_id);
+        self.new_leadership_term = Some((
+            leadership_term_id,
+            log_position,
+            timestamp,
+            term_base_log_position,
+        ));
         Ok(())
     }
 
@@ -6672,7 +6692,7 @@ impl ConsensusModuleAgent {
     /// position — the reference's "unexpected image close".
     fn poll_log_replay(&mut self) -> Result<usize, ClusterError> {
         let state_change;
-        let new_leadership_term_id;
+        let new_leadership_term;
         let deferred_snapshot;
         let snapshot_began;
         let work;
@@ -6764,7 +6784,7 @@ impl ConsensusModuleAgent {
                 leadership_term_id: *leadership_term_id,
                 service_count: config.service_count,
                 state_change: None,
-                new_leadership_term_id: None,
+                new_leadership_term: None,
                 deferred_snapshot: None,
                 snapshot_began: false,
             };
@@ -6777,7 +6797,7 @@ impl ConsensusModuleAgent {
                 config.log_fragment_limit,
             )?;
             state_change = handler.state_change;
-            new_leadership_term_id = handler.new_leadership_term_id;
+            new_leadership_term = handler.new_leadership_term;
             deferred_snapshot = handler.deferred_snapshot;
             snapshot_began = handler.snapshot_began;
 
@@ -6820,11 +6840,8 @@ impl ConsensusModuleAgent {
         if let Some(state) = state_change {
             self.set_state(state, "replayed cluster action");
         }
-        if let Some(term) = new_leadership_term_id {
-            self.leadership_term_id = term;
-            for tracker in self.trackers.iter_mut() {
-                tracker.set_leadership_term_id(term);
-            }
+        if let Some(term) = new_leadership_term {
+            self.apply_replayed_new_leadership_term(term)?;
         }
         if snapshot_began {
             // `onReplayClusterAction` (`:1584`): the replayed action starts the
@@ -6848,7 +6865,7 @@ impl ConsensusModuleAgent {
 struct LogApplyOutcome {
     count: usize,
     state_change: Option<ModuleState>,
-    new_leadership_term_id: Option<i64>,
+    new_leadership_term: Option<(i64, i64, i64, i64)>,
     deferred_snapshot: Option<(i64, i64)>,
     snapshot_began: bool,
 }
@@ -6885,7 +6902,7 @@ impl ConsensusModuleAgent {
             leadership_term_id: *leadership_term_id,
             service_count: config.service_count,
             state_change: None,
-            new_leadership_term_id: None,
+            new_leadership_term: None,
             deferred_snapshot: None,
             snapshot_began: false,
         };
@@ -6903,10 +6920,65 @@ impl ConsensusModuleAgent {
         Ok(LogApplyOutcome {
             count,
             state_change: handler.state_change,
-            new_leadership_term_id: handler.new_leadership_term_id,
+            new_leadership_term: handler.new_leadership_term,
             deferred_snapshot: handler.deferred_snapshot,
             snapshot_began: handler.snapshot_began,
         })
+    }
+
+    /// A `NewLeadershipTerm` replayed out of the log — the agent's half of
+    /// `onReplayNewLeadershipTermEvent` (`ConsensusModuleAgent.java:1593-1637`).
+    ///
+    /// The **agent** takes the term (`leadershipTermId(leadershipTermId)`,
+    /// `:1626`, which also carries it to the trackers); the **election** is
+    /// told (`:1628-1631`), because the recording log's coherence and the
+    /// replayed term's applied position are its (`Election.java:590-608`).
+    ///
+    /// Three ways in, because the election is only reachable when it is not in
+    /// its own turn:
+    ///
+    /// * between turns — it sits in `self.election`, and is asked;
+    /// * from the election's own turn (the catchup's replay) — it is **out**, so
+    ///   the event is posted for it (`take_replayed_new_leadership_term`) and it
+    ///   takes the event back as soon as `catchup_poll` returns;
+    /// * with no election at all — a live log being applied after one closed —
+    ///   where the reference also does nothing beyond the term above.
+    ///
+    /// # Errors
+    ///
+    /// The recording log's, from the election's coherence check.
+    fn apply_replayed_new_leadership_term(
+        &mut self,
+        (leadership_term_id, log_position, timestamp, term_base_log_position): (i64, i64, i64, i64),
+    ) -> Result<(), ClusterError> {
+        self.leadership_term_id = leadership_term_id;
+        for tracker in self.trackers.iter_mut() {
+            tracker.set_leadership_term_id(leadership_term_id);
+        }
+
+        if let Some(mut election) = self.election.take() {
+            let result = election.on_replay_new_leadership_term_event(
+                self,
+                leadership_term_id,
+                log_position,
+                timestamp,
+                term_base_log_position,
+            );
+            if election.state() != ElectionState::Closed {
+                self.election = Some(election);
+            }
+            return result;
+        }
+
+        if self.election_in_turn {
+            self.pending_replayed_new_leadership_term = Some((
+                leadership_term_id,
+                log_position,
+                timestamp,
+                term_base_log_position,
+            ));
+        }
+        Ok(())
     }
 
     /// Apply what [`Self::poll_log_adapter`]'s handler decided — the agent-side
@@ -6920,11 +6992,8 @@ impl ConsensusModuleAgent {
         if let Some(state) = outcome.state_change {
             self.set_state(state, "replayed cluster action");
         }
-        if let Some(term) = outcome.new_leadership_term_id {
-            self.leadership_term_id = term;
-            for tracker in self.trackers.iter_mut() {
-                tracker.set_leadership_term_id(term);
-            }
+        if let Some(term) = outcome.new_leadership_term {
+            self.apply_replayed_new_leadership_term(term)?;
         }
         if outcome.snapshot_began {
             self.snapshot_duration
