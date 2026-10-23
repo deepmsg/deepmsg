@@ -47,6 +47,7 @@ use deepmsg_archive::client::archive::{Archive, RecordingEvent};
 use deepmsg_archive::client::async_connect::NoCredentials;
 use deepmsg_archive::client::descriptor_poller::RecordingDescriptor;
 use deepmsg_archive::server::conductor::UNKNOWN_REPLAY;
+use deepmsg_archive::server::counters::ARCHIVE_RECORDING_POSITION_TYPE_ID;
 use deepmsg_archive::server::recording_pos::ANY_ARCHIVE_ID;
 use deepmsg_archive::server::recording_pos::{
     find_counter_id_by_recording, find_counter_id_by_session, parse_key,
@@ -175,6 +176,11 @@ struct ClusterCounters {
 #[derive(Clone, Copy, Debug)]
 struct AppendPosition {
     counter_id: i32,
+    /// The counter's **registration id** at the moment it was taken, which is
+    /// what [`CountersReader::is_active`] compares to tell "our counter" from
+    /// "a counter the driver has since handed to somebody else"
+    /// (`RecordingPos.isActive`, `:292-298`).
+    registration_id: i64,
 }
 
 /// A cluster's duty-cycle tracker (`DutyCycleStallTracker`).
@@ -1821,13 +1827,36 @@ impl ConsensusModuleAgent {
         read_counter(&self.client, self.counters.commit_position).unwrap_or(0)
     }
 
+    /// The log's append position, **as far as the counter can be believed**.
+    ///
+    /// The counter a log recording was found through is not ours for ever: when
+    /// the recording stops the driver frees the slot and can hand it to another
+    /// recording, and a value read from it then is that recording's — `0`, for
+    /// a recording that has not written yet. The reference asks
+    /// `RecordingPos.isActive(counters, counterId, registrationId)` before it
+    /// believes a position (`:292-298`), and so does this.
+    ///
+    /// A stale counter falls back to the highest append position this member
+    /// last published — the last thing it knew to be true — rather than to a
+    /// zero that would make the next term's log publication start at 0.
     fn append_position_value(&self) -> i64 {
         let Some(position) = self.append_position else {
             return self.log_recording_stop_position;
         };
-        self.client
-            .counters_reader()
-            .and_then(|counters| counters.value(position.counter_id))
+        let Some(counters) = self.client.counters_reader() else {
+            return self.log_recording_stop_position;
+        };
+        if !counters.is_active(
+            position.counter_id,
+            ARCHIVE_RECORDING_POSITION_TYPE_ID,
+            position.registration_id,
+        ) {
+            return self
+                .last_append_position
+                .max(self.log_recording_stop_position);
+        }
+        counters
+            .value(position.counter_id)
             .unwrap_or(self.log_recording_stop_position)
     }
 
@@ -1991,7 +2020,10 @@ impl ConsensusModuleAgent {
         }
 
         self.log_recording_id = identity.recording_id;
-        self.append_position = Some(AppendPosition { counter_id });
+        self.append_position = Some(AppendPosition {
+            counter_id,
+            registration_id: descriptor.registration_id,
+        });
         Ok(true)
     }
 
