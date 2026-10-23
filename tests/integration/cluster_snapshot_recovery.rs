@@ -1074,7 +1074,7 @@ fn a_snapshot_invalidated_between_two_elections() {
 /// per-member counters are the reference's own: the member that was away for a
 /// snapshot replays its action and is one behind.
 #[test]
-#[ignore = "F3-c reading: gets past its invalidation now (`records/P3-6c.md` §21) and fails at the restart after it — `ack out of sequence: expected [ackId=2, logPosition=1952] vs received [ackId=2, logPosition=1664]`, `log replication failed to stop`, `followerLogAwait - joinPosition=0 less than logPosition=1952`, every member `append=0`"]
+#[ignore = "F3-c reading: gets past its invalidation and its restart (`records/P3-6c.md` §21, §22) and now fails on one `ack out of sequence`: expected [ackId=2, logPosition=2144] vs received [ackId=2, logPosition=1664, relevantId=7] — a snapshot ack at the head of the service-ack queue carrying the ack id the join is waiting for"]
 fn the_last_two_snapshots_are_invalidated_after_an_election() {
     let _serial = serial();
     let ports = CasePorts::new(12);

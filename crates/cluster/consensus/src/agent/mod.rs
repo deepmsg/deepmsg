@@ -1821,6 +1821,36 @@ impl ConsensusModuleAgent {
         read_counter(&self.client, self.counters.commit_position).unwrap_or(0)
     }
 
+    /// `getLastAppendedPosition` (`ConsensusModuleAgent.java:3372-3384`): the
+    /// **archive's** stop position for the log recording, spun on until the
+    /// archive answers.
+    ///
+    /// The driver's recording-position counter is not the same question. Once
+    /// the recording has stopped, its counter is closed and its slot can be
+    /// handed to another recording — a read of it then answers `0`, and a
+    /// member that lost a term has just stopped its own recording
+    /// (`prepareForNewLeadership` stops it *after* this line, so the read lands
+    /// on a counter in exactly that state). What followed was measured: the
+    /// member started the next term with `append=0`, published its log at
+    /// position 0, and every follower refused to join it
+    /// (`followerLogAwait - joinPosition=0 less than logPosition=2144`) — an
+    /// election that never closes.
+    ///
+    /// # Errors
+    ///
+    /// The archive's refusal or the request's failure.
+    fn get_last_appended_position(&mut self) -> Result<i64, ClusterError> {
+        loop {
+            let position = self
+                .archive
+                .get_stop_position(&mut self.client, self.log_recording_id)?;
+            if position != NULL_POSITION {
+                return Ok(position);
+            }
+            self.idle()?;
+        }
+    }
+
     fn append_position_value(&self) -> i64 {
         let Some(position) = self.append_position else {
             return self.log_recording_stop_position;
@@ -3614,7 +3644,16 @@ impl ElectionHost for ConsensusModuleAgent {
         ClusterControlToggle::deactivate(&self.client, self.counters.control_toggle);
 
         let had_recording = self.log_recording_id != NULL_VALUE;
-        let last_append_position = self.append_position_value();
+        // `Election.java:1388`: `lastAppendPosition = getLastAppendedPosition()`,
+        // which is the **archive's** stop position for the log recording — not
+        // the driver's recording-position counter. See
+        // [`Self::get_last_appended_position`] for why the difference is the
+        // whole of a defect: a counter whose recording has stopped reads `0`,
+        // and the next term then starts its log publication at 0.
+        if had_recording {
+            self.last_append_position = self.get_last_appended_position()?;
+        }
+        let last_append_position = self.last_append_position;
         self.try_stop_log_recording();
 
         if had_recording {
