@@ -130,24 +130,59 @@ fn three_nodes_elect_commit_and_keep_committing_when_a_follower_dies() {
             .is_some_and(|position| position > target)
     });
 
+    // `P3-6b` gives each follower a log adapter, so its **commit** counter —
+    // not just its recording — reaches what the leader committed: the same
+    // position on all three (`ConsensusModuleAgent.java:2526-2532`).
+    //
+    // Two things this wait does that the first version of it did not:
+    //
+    // * the leader's value is read **inside** the loop. A value taken once and
+    //   then compared with `==` is a snapshot the leader can move past, and a
+    //   position nobody is at any more never becomes true again — a hang, not a
+    //   slow follower;
+    // * the failure carries every member's counters. This wait went red in CI
+    //   on 2026-10-23 with the bare `timed out waiting for …`, and there was no
+    //   way to tell a follower that never applied from one that was a record
+    //   behind.
+    let deadline = std::time::Instant::now() + deepmsg_tests::cluster_harness::DEADLINE;
+    let mut agreed = false;
+    while std::time::Instant::now() < deadline {
+        faults.check();
+        client.poll_events();
+        let leader_now = counters[leader_id as usize].commit_position();
+        if leader_now.is_some_and(|position| {
+            position > target
+                && counters
+                    .iter()
+                    .all(|node| node.commit_position() == Some(position))
+        }) {
+            agreed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        agreed,
+        "every member's commit counter to reach the leader's: roles={:?} terms={:?} \
+         append={:?} commit={:?} (the leader was {leader_id}, target {target})",
+        counters.iter().map(NodeCounters::role).collect::<Vec<_>>(),
+        counters
+            .iter()
+            .map(NodeCounters::leadership_term_id)
+            .collect::<Vec<_>>(),
+        counters
+            .iter()
+            .map(NodeCounters::append_position)
+            .collect::<Vec<_>>(),
+        counters
+            .iter()
+            .map(NodeCounters::commit_position)
+            .collect::<Vec<_>>(),
+    );
     let leader_commit = counters[leader_id as usize]
         .commit_position()
         .expect("the leader's commit position");
     assert!(leader_commit > target);
-
-    // `P3-6b` gives each follower a log adapter, so its **commit** counter —
-    // not just its recording — reaches what the leader committed: the same 203
-    // on all three (`ConsensusModuleAgent.java:2526-2532`).
-    wait_until(
-        "every member's commit counter to reach the leader's",
-        &faults,
-        || {
-            client.poll_events();
-            counters
-                .iter()
-                .all(|node| node.commit_position() == Some(leader_commit))
-        },
-    );
 
     // ---- C6: kill a follower; the leader keeps committing -----------------
     let victim = (0..MEMBER_COUNT)
