@@ -384,6 +384,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
                 sessions,
                 cm_proxy,
                 context,
+                config,
                 service,
                 cluster_time,
                 time_unit,
@@ -397,6 +398,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
                 sessions,
                 cm_proxy,
                 context,
+                config,
                 ClusterTime {
                     time: *cluster_time,
                     unit: *time_unit,
@@ -1089,6 +1091,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
                 sessions,
                 cm_proxy,
                 context,
+                config,
                 service,
                 cluster_time,
                 time_unit,
@@ -1102,6 +1105,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
                 sessions,
                 cm_proxy,
                 context,
+                config,
                 ClusterTime {
                     time: *cluster_time,
                     unit: *time_unit,
@@ -1183,6 +1187,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
                     sessions,
                     cm_proxy,
                     context,
+                    config,
                     service,
                     cluster_time,
                     time_unit,
@@ -1196,6 +1201,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
                     sessions,
                     cm_proxy,
                     context,
+                    config,
                     ClusterTime {
                         time: *cluster_time,
                         unit: *time_unit,
@@ -1297,6 +1303,7 @@ impl<S: ClusteredService> LogHandler for EventHandler<'_, S> {
                     &mut *self.sessions,
                     &mut *self.cm_proxy,
                     &mut *self.context,
+                    self.config,
                     ClusterTime {
                         time: self.cluster_time,
                         unit: self.time_unit,
@@ -1323,6 +1330,7 @@ impl<S: ClusteredService> LogHandler for EventHandler<'_, S> {
                     &mut *self.sessions,
                     &mut *self.cm_proxy,
                     &mut *self.context,
+                    self.config,
                     ClusterTime {
                         time: self.cluster_time,
                         unit: self.time_unit,
@@ -1371,6 +1379,7 @@ impl<S: ClusteredService> LogHandler for EventHandler<'_, S> {
                     &mut *self.sessions,
                     &mut *self.cm_proxy,
                     &mut *self.context,
+                    self.config,
                     ClusterTime {
                         time: self.cluster_time,
                         unit: self.time_unit,
@@ -1410,6 +1419,7 @@ impl<S: ClusteredService> LogHandler for EventHandler<'_, S> {
                     &mut *self.sessions,
                     &mut *self.cm_proxy,
                     &mut *self.context,
+                    self.config,
                     ClusterTime {
                         time: self.cluster_time,
                         unit: self.time_unit,
@@ -1483,6 +1493,7 @@ impl<S: ClusteredService> LogHandler for EventHandler<'_, S> {
                     &mut *self.sessions,
                     &mut *self.cm_proxy,
                     &mut *self.context,
+                    self.config,
                     ClusterTime {
                         time: self.cluster_time,
                         unit: self.time_unit,

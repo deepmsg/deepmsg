@@ -31,6 +31,7 @@ use deepmsg_cluster_common::mark::ClusterMarkFile;
 use deepmsg_core::logbuffer::frame::DATA_HEADER_LENGTH;
 use deepmsg_driver::idle::Strategy;
 
+use crate::config::ServiceContainerConfig;
 use crate::error::ContainerError;
 use crate::proxy::{
     Claimed, ConsensusModuleProxy, MOCKED_OFFER, OFFER_NOT_CONNECTED, SESSION_HEADER_LENGTH,
@@ -278,6 +279,11 @@ pub struct Cluster<'a> {
     sessions: &'a mut SessionTable,
     cm_proxy: &'a mut ConsensusModuleProxy,
     context: &'a mut AgentContext,
+    /// What `Cluster.context()` hands a business. The third borrow of the
+    /// container's own state, and the only **shared** one: nothing writes a
+    /// `ServiceContainerConfig` after launch, so it cannot conflict with the
+    /// three above (`lib.rs`'s field table records the reason, P3-12).
+    config: &'a ServiceContainerConfig,
     time: ClusterTime,
     log_position: i64,
     role: Role,
@@ -292,6 +298,7 @@ impl<'a> Cluster<'a> {
         sessions: &'a mut SessionTable,
         cm_proxy: &'a mut ConsensusModuleProxy,
         context: &'a mut AgentContext,
+        config: &'a ServiceContainerConfig,
         time: ClusterTime,
         log_position: i64,
         role: Role,
@@ -302,6 +309,7 @@ impl<'a> Cluster<'a> {
             sessions,
             cm_proxy,
             context,
+            config,
             time,
             log_position,
             role,
@@ -359,13 +367,16 @@ impl<'a> Cluster<'a> {
             ..
         } = self;
 
-        sessions.get(id.0).map(|session| ClientSession {
+        let lifecycle = context.lifecycle();
+
+        sessions.get_mut(id.0).map(|session| ClientSession {
             session,
             client,
             cm_proxy,
+            context,
             time: *time,
             role: *role,
-            lifecycle: context.lifecycle(),
+            lifecycle,
         })
     }
 
@@ -385,6 +396,69 @@ impl<'a> Cluster<'a> {
         })
     }
 
+    /// `forEachClientSession(Consumer)` (`Cluster.java:183`): every session as a
+    /// view that can offer, one at a time.
+    ///
+    /// The write-side counterpart of [`Self::sessions`], and the reason that one
+    /// can stay read-only: a fan-out walks the table directly instead of
+    /// collecting ids first, so it costs no allocation and each view is the
+    /// session it names.
+    pub fn for_each_client_session<F>(&mut self, mut action: F)
+    where
+        F: FnMut(&mut ClientSession<'_>),
+    {
+        let Self {
+            client,
+            sessions,
+            cm_proxy,
+            context,
+            time,
+            role,
+            ..
+        } = self;
+        let lifecycle = context.lifecycle();
+
+        for session in sessions.iter_mut() {
+            action(&mut ClientSession {
+                session,
+                client,
+                cm_proxy,
+                context,
+                time: *time,
+                role: *role,
+                lifecycle,
+            });
+        }
+    }
+
+    /// `aeron()` (`Cluster.java:151`): the client the container runs on.
+    ///
+    /// The reference returns the `Aeron` it owns; this build has no owner
+    /// object — the client is the one the agent threads through every call — so
+    /// the corresponding thing is a borrow of it. `&mut` because what a
+    /// business does with it is `addPublication` / `addExclusivePublication`
+    /// (`crates/client/src/client.rs:1499`, `:1525`), and both need it.
+    ///
+    /// A publication taken from here is addressed by **registration id** and
+    /// must be looked up again with `client.publication(id)` after the callback
+    /// returns: the handle borrows the client, and the client is borrowed for
+    /// one callback at a time.
+    pub fn aeron(&mut self) -> &mut Client {
+        self.client
+    }
+
+    /// `context()` (`Cluster.java:158`): the container's own configuration.
+    ///
+    /// The reference returns `ClusteredServiceContainer.Context`; this build's
+    /// counterpart is [`ServiceContainerConfig`], which is the same facts and
+    /// the only place they live. What the reference's Context has and this
+    /// does not — `errorHandler`, `threadFactory`, `epochClock`,
+    /// `ownsAeronClient`, `clusteredService` — is listed in `docs/compat.md`
+    /// with why each has no counterpart.
+    pub fn context(&self) -> &ServiceContainerConfig {
+        self.config
+    }
+
     /// `closeClientSession(id)` (`Cluster.java:192-230`): three send attempts,
     /// `idle()` between them.
     ///
@@ -395,33 +469,17 @@ impl<'a> Cluster<'a> {
     pub fn close_client_session(&mut self, id: SessionId) -> Result<bool, ContainerError> {
         self.check_for_valid_invocation()?;
 
-        let closing = {
-            let Some(session) = self.sessions.get(id.0) else {
-                return Err(ContainerError::Cluster(format!(
-                    "unknown clusterSessionId: {}",
-                    id.0
-                )));
-            };
-            session.is_closing()
+        let Some(session) = self.sessions.get_mut(id.0) else {
+            return Err(ContainerError::Cluster(format!(
+                "unknown clusterSessionId: {}",
+                id.0
+            )));
         };
-        if closing {
+        if session.is_closing() {
             return Ok(true);
         }
 
-        let mut attempts = 3;
-        loop {
-            if self.cm_proxy.close_session(self.client, id.0)? {
-                if let Some(session) = self.sessions.get_mut(id.0) {
-                    session.mark_closing();
-                }
-                return Ok(true);
-            }
-            self.context.idle(self.client, 0)?;
-            attempts -= 1;
-            if attempts == 0 {
-                return Ok(false);
-            }
-        }
+        close_session(self.cm_proxy, self.client, self.context, session)
     }
 
     /// `scheduleTimer(correlationId, deadline)` (`Cluster.java:246-275`).
@@ -545,6 +603,36 @@ impl<'a> Cluster<'a> {
                 "sending messages or scheduling timers is not allowed from {}",
                 lifecycle.name()
             )))
+        }
+    }
+}
+
+/// `ClusteredServiceAgent.closeClientSession` (`CSA:323-351`): three send
+/// attempts with `idle()` between them, and the session marked closing when one
+/// lands.
+///
+/// Shared by [`Cluster::close_client_session`] and [`ClientSession::close`],
+/// which the reference routes through the **same** method
+/// (`ContainerClientSession.java:73-79`) — so there is one loop here, and one
+/// place where it can be wrong.
+fn close_session(
+    cm_proxy: &mut ConsensusModuleProxy,
+    client: &mut Client,
+    context: &mut AgentContext,
+    session: &mut ContainerClientSession,
+) -> Result<bool, ContainerError> {
+    let id = session.id();
+
+    let mut attempts = 3;
+    loop {
+        if cm_proxy.close_session(client, id)? {
+            session.mark_closing();
+            return Ok(true);
+        }
+        context.idle(client, 0)?;
+        attempts -= 1;
+        if attempts == 0 {
+            return Ok(false);
         }
     }
 }
@@ -678,9 +766,10 @@ pub struct SessionInfo<'a> {
 
 /// `ClientSession` (`ClientSession.java:30-134`), for one callback.
 pub struct ClientSession<'a> {
-    session: &'a ContainerClientSession,
-    client: &'a Client,
+    session: &'a mut ContainerClientSession,
+    client: &'a mut Client,
     cm_proxy: &'a mut ConsensusModuleProxy,
+    context: &'a mut AgentContext,
     time: ClusterTime,
     role: Role,
     lifecycle: LifecycleCallback,
@@ -714,6 +803,29 @@ impl ClientSession<'_> {
 
     /// `offer(buffer, offset, length)` (`ClientSession.java:78-91`).
     ///
+    /// `close()` (`ClientSession.java:67`): the same close
+    /// `Cluster::close_client_session` asks for, from a session that already
+    /// holds itself.
+    ///
+    /// The reference delegates to `ClusteredServiceAgent.closeClientSession`
+    /// (`ContainerClientSession.java:73-79`), which is the method
+    /// `Cluster.closeClientSession` also calls — so the two are one path here
+    /// too, three send attempts with `idle()` between them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Cluster::close_client_session`], minus the unknown session: a view
+    /// cannot exist for one.
+    pub fn close(&mut self) -> Result<bool, ContainerError> {
+        self.check_for_valid_invocation()?;
+
+        if self.session.is_closing() {
+            return Ok(true);
+        }
+
+        close_session(self.cm_proxy, self.client, self.context, self.session)
+    }
+
     /// Returns the reference's codes: a positive position, [`MOCKED_OFFER`] on
     /// a follower, [`OFFER_NOT_CONNECTED`] with no publication, or one of the
     /// negative `Publication` codes.
