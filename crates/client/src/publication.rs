@@ -170,6 +170,34 @@ impl Publication {
         )
     }
 
+    /// Append a message made of **any number of slices** — `first` at the front
+    /// of the payload, then each of `rest` — as one message.
+    ///
+    /// The reference's `Publication.offer(DirectBufferVector[])`, which the
+    /// service container's two doors use (`Cluster.offer` and
+    /// `ClientSession.offer`, `aeron-cluster/.../service/Cluster.java:332`,
+    /// `ClientSession.java:96`). The leading slice is separate from `rest`
+    /// because the container's session header is resident: joining it to the
+    /// caller's parts would be exactly the copy this avoids.
+    ///
+    /// # Errors
+    ///
+    /// See [`Appended`], and [`Publication::offer`] for what each one means —
+    /// this is the same append.
+    pub fn offer_slices(&self, position_limit: i64, first: &[u8], rest: &[&[u8]]) -> Appended {
+        let Some(appender) = self.appender() else {
+            return Appended::Malformed;
+        };
+
+        appender.append_slices(
+            self.session_id,
+            self.stream_id,
+            position_limit,
+            first,
+            rest,
+        )
+    }
+
     /// Claim `length` **payload** bytes and write into them without copying.
     ///
     /// The one thing a publication with more than one producer could not do:
