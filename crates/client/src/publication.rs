@@ -28,6 +28,7 @@ use std::path::Path;
 use deepmsg_core::buffer::{AtomicBuffer, ReadOnly, ReadWrite};
 use deepmsg_core::logbuffer::append::PayloadRegion;
 use deepmsg_core::logbuffer::append::{AppendShape, Appended, Appender};
+use deepmsg_core::logbuffer::frame::DATA_HEADER_LENGTH;
 use deepmsg_core::logbuffer::frame::Frame;
 use deepmsg_core::logbuffer::position::Position;
 use deepmsg_core::logbuffer::{descriptor, position};
@@ -189,13 +190,7 @@ impl Publication {
             return Appended::Malformed;
         };
 
-        appender.append_slices(
-            self.session_id,
-            self.stream_id,
-            position_limit,
-            first,
-            rest,
-        )
+        appender.append_slices(self.session_id, self.stream_id, position_limit, first, rest)
     }
 
     /// Claim `length` **payload** bytes and write into them without copying.
@@ -221,7 +216,7 @@ impl Publication {
     pub fn try_claim(&self, position_limit: i64, length: usize) -> Result<Claim<'_>, Appended> {
         // Scoped so the appender's borrow of the log ends before the window's
         // begins — they are the same mapping, taken mutably.
-        let offset = {
+        let (offset, position) = {
             let Some(appender) = self.appender() else {
                 return Err(Appended::Malformed);
             };
@@ -237,7 +232,11 @@ impl Publication {
             return Err(Appended::Malformed);
         };
 
-        Ok(Claim { term, offset })
+        Ok(Claim {
+            term,
+            offset,
+            position: position.raw(),
+        })
     }
 
     /// The largest payload one frame can carry on this log.
@@ -740,7 +739,7 @@ impl ExclusivePublication {
         // answers with where it **ends**, which is what moves the cache.
         let offset = usize::try_from(self.term_offset.get()).unwrap_or(0);
 
-        {
+        let position = {
             let Some(appender) = self.appender() else {
                 return Err(Appended::Malformed);
             };
@@ -753,7 +752,10 @@ impl ExclusivePublication {
                 self.term_offset.get(),
                 length,
             ) {
-                Ok(position) => self.advance_to(position),
+                Ok(position) => {
+                    self.advance_to(position);
+                    position
+                }
                 Err(error) => {
                     // Both of the "try again" answers mean this publication's
                     // cached term is not the log's current one, and the cache is
@@ -773,7 +775,7 @@ impl ExclusivePublication {
                     return Err(error);
                 }
             }
-        }
+        };
 
         // A **second** view of the same term, because the frame outlives the
         // call and the appender's view does not. The reference has two here as
@@ -783,7 +785,11 @@ impl ExclusivePublication {
             return Err(Appended::Malformed);
         };
 
-        Ok(Claim { term, offset })
+        Ok(Claim {
+            term,
+            offset,
+            position: position.raw(),
+        })
     }
 
     /// Append a padding frame of `length` **payload** bytes.
@@ -987,6 +993,7 @@ impl std::fmt::Debug for ExclusivePublication {
 pub struct Claim<'a> {
     term: AtomicBuffer<'a, ReadWrite>,
     offset: usize,
+    position: i64,
 }
 
 impl Claim<'_> {
@@ -1002,5 +1009,38 @@ impl Claim<'_> {
     /// Where in the term the claimed frame starts.
     pub const fn offset(&self) -> usize {
         self.offset
+    }
+
+    /// Where the claimed frame **ends**: the position just past it, which is
+    /// what `Publication.tryClaim` answers with.
+    pub const fn position(&self) -> i64 {
+        self.position
+    }
+
+    /// The claimed frame's payload as a **writable** window of `len` bytes
+    /// starting `offset` bytes into it.
+    ///
+    /// The producer's half of a claim: it writes its message where the message
+    /// will lie (`aeron_buffer_claim_t`'s payload pointer,
+    /// `aeron-client/src/main/c/aeron_publication.h:36-41`). The offset is into
+    /// the payload, which is how a caller that keeps a header at the front of a
+    /// claimed message writes the header at 0 and hands the rest out from
+    /// session-header length on. Nothing is published by
+    /// writing here — [`Claim::frame`]`().publish(length)` is what makes the
+    /// bytes visible.
+    ///
+    /// Takes `&mut self` because the window is exclusive: while it lives, the
+    /// claim's [`Frame`] cannot be asked for. The claim owns its term view (it
+    /// was made for it by `try_claim`), so it is the only view of these bytes.
+    ///
+    /// # Errors
+    ///
+    /// `None` if the range runs past the claim.
+    pub fn payload_mut(&mut self, offset: usize, len: usize) -> Option<&mut [u8]> {
+        let at = self
+            .offset
+            .checked_add(DATA_HEADER_LENGTH)?
+            .checked_add(offset)?;
+        self.term.window_mut(at, len)
     }
 }

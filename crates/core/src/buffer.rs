@@ -504,6 +504,40 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
         Some(())
     }
 
+    /// Hand out a **writable** window onto part of this one, or `None` if the
+    /// range is out of bounds.
+    ///
+    /// What a claimed frame needs: a claim reserves a span in the term and the
+    /// producer writes its message where the message will lie, instead of
+    /// assembling it elsewhere and copying it in. That is the whole of
+    /// `aeron_buffer_claim_t` (`aeron-client/src/main/c/aeron_publication.h:36-41`)
+    /// — a header pointer, a payload pointer and a length.
+    ///
+    /// This is the only accessor that returns `&mut`, and it takes `&mut self`
+    /// for that reason: while the window lives, no other accessor of **this**
+    /// buffer can be called. The caller's side of the bargain is that no other
+    /// view of these bytes exists — which a claim's owner can keep, because
+    /// `try_claim` builds the term's view for the claim and hands it over.
+    ///
+    /// Nothing is published by writing here: a producer's release on the
+    /// frame's length is what a reader synchronises with.
+    pub fn window_mut(&mut self, offset: usize, len: usize) -> Option<&mut [u8]> {
+        if offset.checked_add(len)? > self.len {
+            return None;
+        }
+
+        // SAFETY: the range was just proven to be inside the window, whose base
+        // `build` proved non-null and 8-byte aligned (a `u8` window needs no
+        // more than 1); `&mut self` means no other accessor of this buffer is
+        // live, and the caller guarantees it is the only view of these bytes.
+        unsafe {
+            Some(std::slice::from_raw_parts_mut(
+                self.base.add(offset).cast_mut(),
+                len,
+            ))
+        }
+    }
+
     /// Copy bytes into the window **out of another window**, or `None` if either
     /// range is out of bounds or the two overlap.
     ///
@@ -698,6 +732,38 @@ mod tests {
         let view = AtomicBuffer::from_slice(&bytes.0).expect("aligned slice");
         assert_eq!(64, view.len());
         assert!(!view.is_empty());
+    }
+
+    /// A writable window is a window: what is written through it is what the
+    /// window's own accessors read back, and it refuses a range that runs past
+    /// the end.
+    ///
+    /// This is the pinned frame's accessor (`Claim::payload_mut`), and the only
+    /// one on this type that hands out `&mut`.
+    #[test]
+    fn a_writable_window_writes_where_it_says_it_does() {
+        let mut bytes = Aligned([0u8; 64]);
+        let mut view = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned slice");
+
+        {
+            let window = view.window_mut(8, 16).expect("inside the window");
+            assert_eq!(16, window.len());
+            window[0] = 0xAA;
+            window[15] = 0xBB;
+        }
+
+        assert_eq!(Some(0xAA), view.load_u8(8));
+        assert_eq!(Some(0xBB), view.load_u8(23));
+        assert_eq!(Some(0), view.load_u8(7), "nothing before the window moved");
+
+        assert!(
+            view.window_mut(56, 16).is_none(),
+            "a range that ends past the window is refused"
+        );
+        assert!(
+            view.window_mut(usize::MAX, 1).is_none(),
+            "an offset that wraps is refused"
+        );
     }
 
     #[test]

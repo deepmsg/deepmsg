@@ -1199,8 +1199,10 @@ impl<'a> Appender<'a> {
     ///   exclusive one is a plain store.
     ///
     /// Returns the **term offset the claim starts at** — the one number the
-    /// caller could not have known. The frame header is written here, so that
-    /// offset is all that is needed to build a window over the claim.
+    /// caller could not have known — and the position just past the frame,
+    /// which is what a publication's `tryClaim` answers with. The frame header
+    /// is written here, so that offset is all that is needed to build a window
+    /// over the claim.
     ///
     /// # Errors
     ///
@@ -1212,7 +1214,7 @@ impl<'a> Appender<'a> {
         stream_id: i32,
         position_limit: i64,
         length: usize,
-    ) -> Result<usize, Appended> {
+    ) -> Result<(usize, Position), Appended> {
         // The entry, in the reference's order and for its reason: the count
         // first, then the tail that count names, and only then a position. The
         // pair is checked against itself because another producer may be
@@ -1299,7 +1301,16 @@ impl<'a> Appender<'a> {
             return Err(Appended::Malformed);
         }
 
-        usize::try_from(claimed_offset).map_err(|_| Appended::Malformed)
+        let offset = usize::try_from(claimed_offset).map_err(|_| Appended::Malformed)?;
+        Ok((
+            offset,
+            Position::new(
+                claimed_term_id,
+                resulting_offset,
+                self.bits_to_shift,
+                self.initial_term_id,
+            ),
+        ))
     }
 
     /// Append a padding frame of `length` **payload** bytes at the caller's
@@ -1960,10 +1971,12 @@ mod tests {
             (
                 appender
                     .try_claim_shared(11, 22, i64::MAX, first.len())
-                    .expect("the first claim"),
+                    .expect("the first claim")
+                    .0,
                 appender
                     .try_claim_shared(11, 22, i64::MAX, second.len())
-                    .expect("the second claim"),
+                    .expect("the second claim")
+                    .0,
             )
         };
 
