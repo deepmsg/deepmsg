@@ -457,6 +457,23 @@ impl<'a> Cluster<'a> {
         self.cm_proxy.offer_service_message(self.client, payload)
     }
 
+    /// The same service message, made of parts that must land as one message
+    /// (`Cluster.offer(DirectBufferVector[])`, `Cluster.java:332`).
+    ///
+    /// The parts are joined by the term, not by a buffer of ours: the sticky
+    /// header goes out as the leading slice and `parts` follow it. The
+    /// reference does the same, by putting its header vector at the front of
+    /// the caller's array (`CSA:382-397`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::offer`].
+    pub fn offer_vectored(&mut self, parts: &[&[u8]]) -> Result<i64, ContainerError> {
+        self.check_for_valid_invocation()?;
+        self.cm_proxy
+            .offer_service_message_vectored(self.client, parts)
+    }
+
     /// The cluster-members query (`ConsensusModuleProxy.clusterMembersQuery`).
     ///
     /// # Errors
@@ -572,6 +589,34 @@ impl ClientSession<'_> {
             self.session.id(),
             self.time.time,
             payload,
+        ))
+    }
+
+    /// The same egress message, made of parts that must land as one message
+    /// (`ClientSession.offer(DirectBufferVector[])`, `ClientSession.java:96`).
+    ///
+    /// Returns the reference's codes, as [`Self::offer`] does; the sticky
+    /// header goes out as the leading slice.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::offer`].
+    pub fn offer_vectored(&mut self, parts: &[&[u8]]) -> Result<i64, ContainerError> {
+        self.check_for_valid_invocation()?;
+
+        if self.role != Role::Leader {
+            return Ok(MOCKED_OFFER);
+        }
+        let Some(publication_registration_id) = self.session.publication_registration_id() else {
+            return Ok(OFFER_NOT_CONNECTED);
+        };
+
+        Ok(self.cm_proxy.offer_session_message_vectored(
+            self.client,
+            publication_registration_id,
+            self.session.id(),
+            self.time.time,
+            parts,
         ))
     }
 

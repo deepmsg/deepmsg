@@ -269,6 +269,29 @@ impl ConsensusModuleProxy {
         self.offer(client, payload)
     }
 
+    /// The same service message, made of parts that must land as one message
+    /// (`Cluster.offer(DirectBufferVector[])`, `Cluster.java:332`).
+    ///
+    /// The sticky header is offered as the leading slice, exactly as the
+    /// reference puts its header vector at the front of the caller's array
+    /// (`CSA:382-397`), and the parts follow it with no buffer joining them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::offer_service_message`].
+    pub fn offer_service_message_vectored(
+        &mut self,
+        client: &Client,
+        parts: &[&[u8]],
+    ) -> Result<i64, ContainerError> {
+        self.header.cluster_session_id = i64::from(self.service_id);
+        let position = self.offer_vectored(client, parts);
+        if position < 0 {
+            check_result(client, self.publication_registration_id, position)?;
+        }
+        Ok(position)
+    }
+
     /// An **egress message**: `clusterSessionId` is the session and `timestamp`
     /// is the container's log time (`CSA:694-706`).
     ///
@@ -294,6 +317,31 @@ impl ConsensusModuleProxy {
         };
 
         self.offer_on(client, publication, length)
+    }
+
+    /// The same egress message, made of parts that must land as one message
+    /// (`ClientSession.offer(DirectBufferVector[])`, `ClientSession.java:96`).
+    ///
+    /// The sticky header goes out as the leading slice, as it does in the
+    /// single-buffer path — `encode_header` writes it into the resident buffer,
+    /// which is what makes this an offer of parts rather than a join.
+    pub fn offer_session_message_vectored(
+        &mut self,
+        client: &Client,
+        egress_publication_registration_id: i64,
+        cluster_session_id: i64,
+        timestamp: i64,
+        parts: &[&[u8]],
+    ) -> i64 {
+        self.header.cluster_session_id = cluster_session_id;
+        self.header.timestamp = timestamp;
+        self.encode_header();
+
+        let Some(publication) = client.publication(egress_publication_registration_id) else {
+            return OFFER_NOT_CONNECTED;
+        };
+
+        self.offer_slices_on(client, publication, parts)
     }
 
     /// Encode the sticky header into `buffer[..SESSION_HEADER_LENGTH]`.
@@ -340,11 +388,44 @@ impl ConsensusModuleProxy {
         self.offer_on(client, publication, length)
     }
 
+    /// The sticky header, then `parts`, offered on the consensus module's
+    /// publication as one message.
+    ///
+    /// Nothing is encoded past the header: the parts are the caller's, and the
+    /// term receives them back to back with it (`Publication.offer_slices`).
+    fn offer_vectored(&mut self, client: &Client, parts: &[&[u8]]) -> i64 {
+        self.encode_header();
+
+        let Some(publication) = self.publication(client) else {
+            return OFFER_NOT_CONNECTED;
+        };
+
+        self.offer_slices_on(client, publication, parts)
+    }
+
     /// Offer the first `length` bytes of the buffer on `publication`, retried
     /// [`SEND_ATTEMPTS`] times, and answer with the reference's code.
     fn offer_on(&self, client: &Client, publication: &Publication, length: usize) -> i64 {
+        self.offer_with(client, publication, |limit| {
+            publication.offer(limit, &self.buffer[..length])
+        })
+    }
+
+    /// The same, with the message made of the sticky header and `parts`.
+    fn offer_slices_on(&self, client: &Client, publication: &Publication, parts: &[&[u8]]) -> i64 {
+        self.offer_with(client, publication, |limit| {
+            publication.offer_slices(limit, &self.buffer[..SESSION_HEADER_LENGTH], parts)
+        })
+    }
+
+    /// The retry the three offers share: the limit is read fresh on every
+    /// attempt, and the answer is the reference's code.
+    fn offer_with<F>(&self, client: &Client, publication: &Publication, append: F) -> i64
+    where
+        F: Fn(i64) -> Appended,
+    {
         for _ in 0..SEND_ATTEMPTS {
-            match publication.offer(position_limit(client, publication), &self.buffer[..length]) {
+            match append(position_limit(client, publication)) {
                 Appended::Ok { position, .. } => return position.raw(),
                 Appended::EndOfLog | Appended::MidRotation | Appended::BackPressured => {}
                 Appended::NotConnected => return OFFER_NOT_CONNECTED,
@@ -458,6 +539,29 @@ mod tests {
 
     fn u16_at(bytes: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("two bytes"))
+    }
+
+    /// The vectored path writes the same sticky header as the single-buffer
+    /// one, and **copies none of the parts**: the header is offered as the
+    /// leading slice (`CSA:382-397`), which is what makes this an offer of
+    /// parts rather than a join.
+    #[test]
+    fn the_vectored_offer_prepares_the_header_and_copies_no_part() {
+        let mut proxy = ConsensusModuleProxy::new(4);
+        proxy.set_leadership_term_id(9);
+        proxy.header.cluster_session_id = 21;
+        proxy.header.timestamp = 5_000;
+
+        proxy.encode_header();
+
+        assert_eq!(
+            SESSION_HEADER_LENGTH,
+            proxy.buffer.len(),
+            "the parts are offered from the caller's slices, not copied in"
+        );
+        assert_eq!(i64_at(&proxy.buffer, 8), 9, "leadershipTermId");
+        assert_eq!(i64_at(&proxy.buffer, 16), 21, "clusterSessionId");
+        assert_eq!(i64_at(&proxy.buffer, 24), 5_000, "timestamp");
     }
 
     /// The sticky header's bytes: one schema-111 message header and the three
