@@ -439,7 +439,8 @@ impl ElectionHost for TestHost {
         _stop_position: i64,
         _now_ns: i64,
     ) -> Result<RecordingReplication, ClusterError> {
-        Ok(RecordingReplication::new(leader_recording_id, 1))
+        let _ = leader_recording_id;
+        Ok(RecordingReplication::new(1))
     }
     fn truncate_log_entry(
         &mut self,
@@ -1280,7 +1281,7 @@ fn a_replication_that_ended_without_stopping_is_a_failure() {
     {
         let replication = election.log_replication().expect("a replication");
         replication.observe_position(100);
-        replication.on_signal(1, 100, RecordingSignal::ReplicateEnd);
+        replication.on_signal(1, -1, 100, RecordingSignal::ReplicateEnd);
     }
 
     let mut failure = None;
@@ -1380,8 +1381,8 @@ fn follower_log_replication_completes_and_returns_to_canvass() {
     assert_eq!(election.state(), ElectionState::FollowerLogReplication);
     {
         let replication = election.log_replication().expect("a replication");
-        replication.on_signal(1, 120, RecordingSignal::Stop);
-        replication.on_signal(1, 120, RecordingSignal::ReplicateEnd);
+        replication.on_signal(1, -1, 120, RecordingSignal::Stop);
+        replication.on_signal(1, -1, 120, RecordingSignal::ReplicateEnd);
     }
     election.on_commit_position(&mut host, 0, 120, 0).unwrap();
 
@@ -1425,7 +1426,7 @@ fn on_recording_signal_moves_the_replication_forward() {
 
     // No replication yet: the signal is ignored without a panic.
     election
-        .on_recording_signal(&mut host, 1, 5, RecordingSignal::ReplicateEnd)
+        .on_recording_signal(&mut host, 1, -1, 5, RecordingSignal::ReplicateEnd)
         .unwrap();
 }
 

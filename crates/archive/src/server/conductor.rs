@@ -7756,7 +7756,18 @@ impl ArchiveConductor {
             };
 
             let reason = ended.abort_reason.as_deref().unwrap_or(SESSION_CLOSED_MSG);
-            let _ = client.reject_image(image.correlation_id(), position, reason, *command_timeout);
+
+            // **Not waited for.** The rejection is a command into the driver's
+            // ring, and under `deepmsg-archiving-media-driver` the driver is
+            // driven by *this* thread — a wait here stops the whole process for
+            // the length of the command timeout, which every client of it reads
+            // as a dead driver. That is the hazard
+            // `server::replay_session::revoke_publication` already removed once;
+            // it is **not** the cause of the replication `connect timeout` the
+            // cluster suite sees (`records/P3-6c.md` §25.10 falsified that), and
+            // the answer is not wanted either way: the driver's own receiver
+            // sends the `ERR` frame, and what this archive owed was the command.
+            let _ = client.reject_image(image.correlation_id(), position, reason);
         }
 
         for warning in sessions.take_warnings() {

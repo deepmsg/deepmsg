@@ -131,9 +131,13 @@ fn a_rejected_image_tells_the_publisher_and_nobody_else() {
         .expect("the image")
         .position();
 
+    // **The command and nothing else**: it does not wait for the driver
+    // (`aeron_client_conductor_reject_image`, `aeron_client_conductor.c:3627-3651`),
+    // so everything the rest of this test asserts is downstream of a command
+    // whose answer nobody read.
     subscriber_client
-        .reject_image(image_registration_id, position, REASON, DEFAULT_TIMEOUT)
-        .expect("the driver acts on the rejection");
+        .reject_image(image_registration_id, position, REASON)
+        .expect("the rejection is written into the ring");
 
     // The subscriber is told nothing: the error frame is the publisher's.
     assert!(
@@ -153,6 +157,24 @@ fn a_rejected_image_tells_the_publisher_and_nobody_else() {
     assert!(told, "the publisher's client hears about it");
 
     assert_eq!(1, errors.len());
+
+    // ★ **Nobody was waiting for the driver's answer**, and that is not a
+    // detail: this command is issued from the archive's conductor, whose thread
+    // *is* the media driver's under `deepmsg-archiving-media-driver`, so a
+    // variant that waited for it would stop that whole process for the length
+    // of the command timeout — a heartbeat every client reads as a dead driver
+    // (`records/P3-6c.md` §25). A client with no pending entry for the answer
+    // counts it as unsolicited, which is the reading that says nobody waited:
+    // the waiting variant consumed it here and left this zero.
+    let unsolicited = await_until(Duration::from_secs(10), || {
+        subscriber_client.poll();
+        subscriber_client.unknown_responses() > 0
+    });
+    assert!(
+        unsolicited,
+        "the driver's acknowledgement arrives addressed to nobody"
+    );
+
     let error = &errors[0];
 
     assert_eq!(publication, error.registration_id);

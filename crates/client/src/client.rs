@@ -3052,8 +3052,27 @@ impl Client {
         Ok(correlation_id)
     }
 
-    /// Reject an image this client is reading, and wait for the driver to
-    /// acknowledge the command.
+    /// Reject an image this client is reading — the command, **and nothing
+    /// waited for**.
+    ///
+    /// `aeron_client_conductor_reject_image`
+    /// (`aeron-client/src/main/c/aeron_client_conductor.c:3627-3651`): the
+    /// command goes into the ring, the ring is committed, and the client is
+    /// done. Nothing in that function waits, and the answer the driver does
+    /// send — `ON_OPERATION_SUCCEEDED` on the command's correlation id —
+    /// arrives to nobody, which is the C client's own shape.
+    ///
+    /// **The Java client waits** and can afford to
+    /// (`aeron-client/src/main/java/io/aeron/ClientConductor.java:1689-1704`:
+    /// `driverProxy.rejectImage(…)`, then `awaitResponse`): its conductor and
+    /// the media driver are threads of their own. This build has one caller in
+    /// the product — the archive's control plane — and under
+    /// `deepmsg-archiving-media-driver` the driver **is** the thread that would
+    /// wait — so a wait here is not slow, it is unanswerable: it runs to its
+    /// deadline, the driver's heartbeat stops for that whole time, and every
+    /// client of that process reads a dead driver (`records/P3-6c.md` §25). The
+    /// same lesson is written at `server::replay_session::revoke_publication`,
+    /// which is where the waiting variant of a replay's close was removed.
     ///
     /// `image_registration_id` is the **publication's** registration id, which
     /// is what [`crate::image::Image`] carries and what an `ON_AVAILABLE_IMAGE`
@@ -3064,22 +3083,20 @@ impl Client {
     /// the image, its receiver sends an `ERR` frame to the publisher, and the
     /// **publisher's** client is handed an
     /// [`PublicationErrorEvent`](crate::publication_error::PublicationErrorEvent)
-    /// with code 13. The acknowledgement this waits for says only that the
-    /// driver acted on the command — the reference's own clients do not wait at
-    /// all, which is why a caller that wants the outcome wants the other
-    /// client's queue.
+    /// with code 13. That is why a caller that wants the outcome wants the other
+    /// client's queue, and why the ack is not worth waiting for in the first
+    /// place: it says only that the driver acted on the command.
     ///
     /// # Errors
     ///
-    /// [`CommandError`] if the command could not be sent, the driver refused it
-    /// — an id that names no image and no IPC publication is answered with
-    /// `GENERIC_ERROR` — or no reply arrived within `timeout`.
+    /// [`CommandError`] if the command could not be written, or if the ring it
+    /// is written into cannot be claimed. A driver that will not answer is no
+    /// longer an error, because nothing is asked of it.
     pub fn reject_image(
         &mut self,
         image_registration_id: i64,
         position: i64,
         reason: &str,
-        timeout: Duration,
     ) -> Result<(), CommandError> {
         let correlation_id = self.next_correlation_id()?;
 
@@ -3091,13 +3108,11 @@ impl Client {
             reason.as_bytes(),
         );
 
-        self.send(REJECT_IMAGE_TYPE_ID, &payload, correlation_id, timeout)?;
-
-        let Ready::OperationSucceeded = self.wait(correlation_id)? else {
-            return Err(CommandError::Encoding);
-        };
-
-        Ok(())
+        // `write_command` and not `send`: an entry in the pending list is a
+        // command somebody will wait for, and this is not one — the answer is
+        // dropped by `Client::complete` as unsolicited, exactly as the C
+        // client's would be.
+        self.write_command(REJECT_IMAGE_TYPE_ID, &payload)
     }
 
     /// Offer a payload on a publication.
@@ -3605,9 +3620,11 @@ impl Client {
 
     /// Write a command and wait for nothing.
     ///
-    /// Three commands are sent this way: the ones that are answered by nobody
-    /// (`CLIENT_CLOSE`, `TERMINATE_DRIVER`), and a removal sent to give up on an
-    /// add, whose answer the caller did not ask for. An answer to one of these
+    /// Four commands are sent this way: the ones that are answered by nobody
+    /// (`CLIENT_CLOSE`, `TERMINATE_DRIVER`), a removal sent to give up on an
+    /// add, and an image rejection — whose answer exists but which the C
+    /// client does not wait for and neither does anything here
+    /// ([`Client::reject_image`]). The answer to one of these
     /// arrives with no pending entry to match it, which the client already
     /// treats as an unsolicited response (`Client::complete`).
     fn write_command(&self, type_id: i32, payload: &[u8]) -> Result<(), CommandError> {

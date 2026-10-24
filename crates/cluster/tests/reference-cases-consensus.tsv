@@ -123,12 +123,12 @@ system	ClusterNetworkTopologyTest	shouldMatchPatternSplitAcrossBufferBoundary	A	
 system	ClusterTest	shouldStopFollowerAndRestartFollower	A	P3-6c	counter,cm-object			a_stopped_follower_catches_up_through_the_leaders_archive (weakened: counters and commit position, not the service's message count)
 system	ClusterTest	shouldStopFollowerAndRestartFollowerGracefully	A	P3-6c	counter,cm-object,client			a_follower_stopped_and_restarted_is_invisible_to_the_client (weakened: no service to await termination of)
 system	ClusterTest	shouldNotifyClientOfNewLeader	A	P3-6c	counter,cm-object,client			the_surviving_members_elect_a_new_leader_and_keep_committing (weakened: the counters, not the client's leadership event)
-system	ClusterTest	shouldStopLeaderAndFollowersThenRestartAllWithSnapshot	A	P3-6c	counter,client			(deferred: F3 - every member restarts off its own snapshot)
+system	ClusterTest	shouldStopLeaderAndFollowersThenRestartAllWithSnapshot	A	P3-6c	stub-service,counter,client			every_member_restarts_on_the_snapshot_it_took (weakened: three messages before the snapshot, so the loaded business has a count to restore and not only the loaded flag)
 system	ClusterTest	shouldConnectAndDisconnectClient	A	P3-6c	counter,client			a_client_connects_opens_a_session_sends_a_message_and_closes (weakened: one member, no service)
 system	ClusterTest	shouldNotSnapshotOnPrimaryClusterWhenStandbySnapshotIsRequested	A	P3-6c	counter,client		n/a:premium	n/a:premium
 system	ClusterTest	shouldStartClusterWithExtension	A	P3-6c	java-injection,counter		hook:cm-extension	(hook: cm-extension - the seam is in the binary; no implementation is in P3's scope)
 system	ClusterTest	shouldStopClusteredServicesOnAppropriateMessage	A	P3-6c	counter,client			(deferred: F4 - a client's termination request ends every service)
-system	ClusterTest	shouldShutdownClusterAndRestartWithSnapshots	A	P3-6c	stub-service,counter,cm-object			shutdown_snapshots_and_then_ends_the_duty_cycle (weakened: one member, no restart; the restart half is F3)
+system	ClusterTest	shouldShutdownClusterAndRestartWithSnapshots	A	P3-6c	stub-service,counter,cm-object			shutdown_snapshots_and_then_ends_the_duty_cycle + a_graceful_shutdown_snapshots_every_member_and_the_cluster_comes_back
 system	ClusterTest	shouldAbortClusterAndRestart	A	P3-6c	stub-service,counter			abort_ends_the_duty_cycle_without_a_snapshot (weakened: one member, no restart)
 system	ClusterTest	shouldAbortClusterOnTerminationTimeout	A	P3-6c	counter,client			abort_ends_the_duty_cycle_without_a_snapshot (weakened: one member; the termination round's timeout is F4)
 system	ClusterTest	shouldEchoMessages	A	P3-6c	stub-service,counter,client			a_java_client_echoes_through_our_three_node_cluster
@@ -142,7 +142,7 @@ system	ClusterTest	shouldStopLeaderAndRestartAsFollower	A	P3-6c	counter			a_stop
 system	ClusterTest	shouldStopLeaderAndRestartAsFollowerWithSendingAfter	A	P3-6c	counter,client			a_stopped_leader_comes_back_as_a_follower_and_the_client_keeps_sending
 system	ClusterTest	shouldStopLeaderAndRestartAsFollowerWithSendingAfterThenStopLeader	A	P3-6c	counter,client			a_stopped_leader_comes_back_as_a_follower_then_the_new_leader_stops
 system	ClusterTest	shouldAcceptMessagesAfterSingleNodeCleanRestart	A	P3-6c	stub-service,counter,client			a_follower_restarted_on_an_empty_directory_catches_up (weakened: no service to count messages, so the commit positions carry it)
-system	ClusterTest	shouldReplaySnapshotTakenWhileDown	A	P3-6c	stub-service,counter,client			(deferred: F3 - a follower replays the snapshot taken while it was down)
+system	ClusterTest	shouldReplaySnapshotTakenWhileDown	A	P3-6c	stub-service,counter,client			(deferred: F3 - the returning member stalls in FollowerCatchupAwait with 9 of 10 applied, its append stuck at 256; the shape is in cluster_snapshot_recovery.rs, ignored; records/P3-6c.md §15)
 system	ClusterTest	shouldTolerateMultipleLeaderFailures	A	P3-6c	counter,client			the_surviving_members_elect_a_new_leader_and_keep_committing (weakened: one leader failure)
 system	ClusterTest	shouldRecoverAfterTwoLeaderNodesFailAndComeBackUpAtSameTime	A	P3-6c	counter,client			(deferred: F1 - two leaders fail and return together)
 system	ClusterTest	shouldAcceptMessagesAfterTwoNodeCleanRestart	A	P3-6c	stub-service,counter,client			two_followers_restarted_on_empty_directories_catch_up (weakened: same)
@@ -159,9 +159,9 @@ system	ClusterTest	shouldCloseClientOnTimeout	A	P3-6c	counter,cm-object,client		
 system	ClusterTest	shouldCloseClientAfterClusterBecomesUnavailable	A	P3-6c	counter,client			(deferred: F4 - the client's own new-leader timeout)
 system	ClusterTest	shouldRecoverWhileMessagesContinue	A	P3-6c	stub-service,counter,client			messages_continue_across_a_follower_restart (weakened: offered from the test's thread between steps, not a publisher thread)
 system	ClusterTest	shouldCatchupFromEmptyLog	A	P3-6c	stub-service,counter,client			a_member_with_an_empty_log_catches_up (weakened: the commit position, and the member is one of three)
-system	ClusterTest	shouldCatchupFromEmptyLogThenSnapshotAfterShutdownAndFollowerCleanStart	A	P3-6c	stub-service,counter,client			(deferred: F3 - an empty log, a shutdown snapshot and a clean start)
+system	ClusterTest	shouldCatchupFromEmptyLogThenSnapshotAfterShutdownAndFollowerCleanStart	A	P3-6c	stub-service,counter,client			(deferred: F3 - a clean-start member has its archive refuse `unknown recording id: -1` and never applies; records/P3-6c.md §15)
 system	ClusterTest	shouldCatchUpTwoFreshNodesAfterRestart	A	P3-6c	stub-service,counter,client			(deferred: needs five members - with three, two away is no quorum at all, and a client cannot even open a session)
-system	ClusterTest	shouldReplayMultipleSnapshotsWithEmptyFollowerLog	A	P3-6c	stub-service,counter,client			(deferred: F3 - two snapshots replayed into an empty follower log)
+system	ClusterTest	shouldReplayMultipleSnapshotsWithEmptyFollowerLog	A	P3-6c	stub-service,counter,client			(deferred: F3 - the same `unknown recording id: -1` refusal; records/P3-6c.md §15)
 system	ClusterTest	shouldRecoverQuicklyAfterKillingFollowersThenRestartingOne	A	P3-6c	counter,client			(deferred: F2 - quorum lost by killing both followers)
 system	ClusterTest	shouldRecoverWhenLeaderHasAppendedMoreThanFollower	A	P3-6c	counter,client			a_leader_and_a_follower_come_back_after_both_stopped (weakened: three members, and no service to count messages)
 system	ClusterTest	shouldRecoverWhenFollowerIsMultipleTermsBehind	A	P3-6c	stub-service,counter,client			a_member_that_missed_a_term_is_caught_up_by_replication
@@ -169,11 +169,11 @@ system	ClusterTest	shouldRecoverWhenFollowerIsMultipleTermsBehindFromEmptyLog	A	
 system	ClusterTest	shouldRecoverWhenFollowerWithInitialSnapshotAndArchivePurgeThenIsMultipleTermsBehind	A	P3-6c	stub-service,counter,client			(deferred: F3 - a snapshot, a purged archive, then a term behind)
 system	ClusterTest	shouldRecoverWhenFollowerArrivesPartWayThroughTerm	A	P3-6c	stub-service,counter,client			a_follower_back_part_way_through_a_term_catches_up (weakened: ten commits, the commit position)
 system	ClusterTest	shouldRecoverWhenFollowerArrivePartWayThroughTermAfterMissingElection	A	P3-6c	stub-service,counter,client			a_follower_back_after_missing_an_election_catches_up (weakened: the leader's commit position at each step, and the returning member's commit against the last of them, instead of the stub service's message count)
-system	ClusterTest	shouldRecoverWhenLastSnapshotIsMarkedInvalid	A	P3-6c	stub-service,counter,client			(deferred: F3 - an invalidated latest snapshot is replayed)
+system	ClusterTest	shouldRecoverWhenLastSnapshotIsMarkedInvalid	A	P3-6c	stub-service,counter,client			(deferred: F3 - the same-term fallback is ours (the_snapshot_before_the_invalidated_one_is_what_the_cluster_comes_back_on); the reference's cross-term half stalls a restarted member in FollowerReplay with no log recording; records/P3-6c.md §16)
 system	ClusterTest	shouldRecoverWhenLastSnapshotForShutdownIsMarkedInvalid	A	P3-4f	stub-service,counter,client			
 system	ClusterTest	shouldHandleMultipleElections	A	P3-6c	counter,client			(deferred: F2 - two leader failures in a row, the leadership events counted)
-system	ClusterTest	shouldRecoverWhenLastSnapshotIsInvalidBetweenTwoElections	A	P3-6c	stub-service,counter,client			(deferred: F3 - an invalidation between two elections)
-system	ClusterTest	shouldRecoverWhenLastTwosSnapshotsAreInvalidAfterElection	A	P3-6c	stub-service,counter,client			(deferred: F3 - the last two snapshots invalid)
+system	ClusterTest	shouldRecoverWhenLastSnapshotIsInvalidBetweenTwoElections	A	P3-6c	stub-service,counter,client			(deferred: F3 - cross-term invalidation: a restarted member stalls in FollowerReplay with append=None; records/P3-6c.md §16)
+system	ClusterTest	shouldRecoverWhenLastTwosSnapshotsAreInvalidAfterElection	A	P3-6c	stub-service,counter,client			(deferred: F3 - the returning member has no term entry, so the invalidation itself answers `unknown leadershipTermId=1`; records/P3-6c.md §16)
 system	ClusterTest	shouldCatchUpAfterFollowerMissesOneMessage	A	P3-6c	client			a_follower_that_missed_one_message_catches_up (weakened: the commit position, not a service's message count)
 system	ClusterTest	shouldCatchUpAfterFollowerMissesTimerRegistration	A	P3-6c	client			(deferred: the family runs with no container, so nothing registers a timer)
 system	ClusterTest	shouldAllowChangingTermBufferLengthAndMtuAfterRecordingLogIsTruncatedToTheLatestSnapshot	A	P3-6c	java-injection,stub-service,counter,client		hook:service-supplier	a_restarted_cluster_takes_a_new_term_length_and_mtu_after_a_snapshot_seed (weakened: no checksum service)
@@ -217,7 +217,7 @@ system	InitiateShutdownThenImmediatelyCloseLeaderTest	shouldNotSendTerminationAc
 system	MultiModuleSharedDriverTest	shouldSupportTwoSingleNodeClusters	A	P3-6c	java-injection		hook:service-supplier	(deferred: two clusters on one driver; the plan's section 8 question)
 system	MultiModuleSharedDriverTest	shouldSupportTwoMultiNodeClusters	A	P3-6c	java-injection		hook:service-supplier	(deferred: two clusters on separate drivers, a redirecting name resolver)
 system	MultiNodeTest	shouldElectAppointedLeaderWithThreeNodesWithNoReplayNoSnapshot	A	P3-6c	counter			an_appointed_leader_is_the_one_that_serves
-system	MultiNodeTest	shouldReplayWithAppointedLeaderWithThreeNodesWithNoSnapshot	A	P3-6c	stub-service,counter,client			(deferred: F3 - an appointed leader and a replay after every node restarts)
+system	MultiNodeTest	shouldReplayWithAppointedLeaderWithThreeNodesWithNoSnapshot	A	P3-6c	stub-service,counter,client			an_appointed_leader_serves_again_after_every_member_restarts (strengthened: the appointed member still leads after the restart, which the reference does not assert)
 system	MultiNodeTest	shouldCatchUpWithAppointedLeaderWithThreeNodesWithNoSnapshot	A	P3-6c	stub-service,counter,client			(deferred: F1 - an appointed leader and a stopgapped node)
 system	MultiNodeTest	shouldConnectClientOverIpc	A	P3-6c	counter,client			three_nodes_elect_commit_and_keep_committing_when_a_follower_dies (weakened: our client over IPC commits, no echo service)
 system	MultiNodeTest	shouldConnectClientUsingResolvedResponsePort	A	P3-6c	client			(deferred: F4 - the response port resolved from a host name, including port 0)

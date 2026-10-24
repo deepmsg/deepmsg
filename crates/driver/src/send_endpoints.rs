@@ -43,7 +43,7 @@
 
 use std::net::SocketAddr;
 
-use deepmsg_cnc::{CounterManager, CounterRegions};
+use deepmsg_cnc::{CounterManager, CounterRegions, layout};
 
 use crate::channel_validation;
 use crate::media::loss_generator::SendDataLoss;
@@ -108,6 +108,24 @@ pub struct SendChannelEndpointEntry {
     /// the two buffer lengths are: the endpoint is on the sender's thread by
     /// the time the port has to go back.
     pub managed_port: u16,
+    /// The `snd-local-sockaddr` counter (type 14) this endpoint published, or
+    /// [`layout::NULL_COUNTER_ID`] when it published none.
+    ///
+    /// On the entry because it is one of the **three** counters the reference
+    /// frees when the endpoint is deleted
+    /// (`aeron_send_channel_endpoint.c:250-269`), and the conductor — the side
+    /// that owns the region — is what frees them here. Leaving it behind is not
+    /// cosmetic: the counter's key carries the endpoint's channel status id, so
+    /// once that id is recycled by a subscription, the subscription's own
+    /// `resolvedEndpoint` (`Subscription.java:579-586`, which takes the **first**
+    /// type 14 counter naming its channel status id) can answer with this dead
+    /// socket's address. See `records/P3-6c.md` §28.
+    pub local_sockaddr_counter_id: i32,
+    /// The `mdc-num-dest` counter of a multi-destination channel, freed with
+    /// the other two (`aeron_send_channel_endpoint.c:265-268`);
+    /// [`layout::NULL_COUNTER_ID`] for a unicast endpoint, which has no
+    /// tracker.
+    pub num_destinations_counter_id: i32,
 }
 
 /// What `get_or_add` did.
@@ -550,6 +568,16 @@ impl SendChannelEndpoints {
         let socket_rcvbuf = endpoint.socket_rcvbuf;
         let socket_sndbuf = endpoint.socket_sndbuf;
 
+        // And the two counters `aeron_send_channel_endpoint_delete` frees beside
+        // the channel status, read off the endpoint for the same reason: after
+        // the sender takes it, nothing on this thread can reach them.
+        let local_sockaddr_counter_id = endpoint.local_sockaddr_counter_id();
+        let num_destinations_counter_id = endpoint
+            .destination_tracker()
+            .map_or(layout::NULL_COUNTER_ID, |tracker| {
+                tracker.num_destinations_counter_id()
+            });
+
         self.entries.push(SendChannelEndpointEntry {
             id,
             channel: endpoint.channel.clone(),
@@ -562,6 +590,8 @@ impl SendChannelEndpoints {
             socket_rcvbuf,
             socket_sndbuf,
             managed_port: endpoint.managed_port(),
+            local_sockaddr_counter_id,
+            num_destinations_counter_id,
         });
 
         Ok(EndpointOutcome::Created {
@@ -1611,6 +1641,8 @@ mod tests {
             socket_rcvbuf: 0,
             socket_sndbuf: 0,
             managed_port: 0,
+            local_sockaddr_counter_id: deepmsg_cnc::layout::NULL_COUNTER_ID,
+            num_destinations_counter_id: deepmsg_cnc::layout::NULL_COUNTER_ID,
         };
 
         assert!(!SendChannelEndpoints::is_collectable(&entry, 2_000, 500));

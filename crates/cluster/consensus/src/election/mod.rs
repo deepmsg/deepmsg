@@ -406,7 +406,33 @@ impl Election {
         host: &mut dyn ElectionHost,
         now_ns: i64,
     ) -> Result<(), ClusterError> {
-        self.log_position = host.prepare_for_new_leadership(self.log_position, now_ns)?;
+        // `Election.java:1587-1594`: the agent's answer is the log's **last
+        // appended position**, and the reference puts it in `appendPosition`,
+        // not in `logPosition`:
+        //
+        // ```text
+        // final long lastAppendPosition = consensusModuleAgent.prepareForNewLeadership(logPosition, nowNs);
+        // if (NULL_POSITION != lastAppendPosition)
+        // {
+        //     appendPosition = lastAppendPosition;
+        // }
+        // ```
+        //
+        // `logPosition` is what the **services** have applied (the commit
+        // counter); the appended position is how much log there is. They differ
+        // exactly when a member holds log it has not applied — and writing the
+        // append position into `logPosition` makes the member claim to have
+        // applied it. The next `FollowerReplay` then starts at a position the
+        // service container has not reached, the container refuses to join
+        // there (`Cluster log must be contiguous for active log event`), never
+        // acks, and the module waits in `awaitServicesReady` for ever. That is
+        // the measured shape of F3's stall: `log_pos=640` became `1024` on the
+        // way into `Canvass`, and the replay then asked the services to join at
+        // 1024 while they stood at 640.
+        let last_append_position = host.prepare_for_new_leadership(self.log_position, now_ns)?;
+        if last_append_position != member::NULL_POSITION {
+            self.append_position = last_append_position;
+        }
         Ok(())
     }
 
@@ -863,6 +889,7 @@ impl Election {
                 }
                 let start = self.log_position;
                 let stop = self.append_position.min(self.notified_commit_position);
+
                 self.log_replay = Some(host.new_log_replay(start, stop)?);
                 work += 1;
             } else {
@@ -1001,6 +1028,22 @@ impl Election {
     ) -> Result<usize, ClusterError> {
         let _ = sender;
         let mut work = host.catchup_poll(self.notified_commit_position, now_ns)?;
+
+        // `ConsensusModuleAgent.catchupPoll` hands the election a
+        // `NewLeadershipTerm` it replayed (`:1513`); the host could not, because
+        // this election is out of it for the length of its turn.
+        if let Some((term, log_position, timestamp, term_base)) =
+            host.take_replayed_new_leadership_term()
+        {
+            self.on_replay_new_leadership_term_event(
+                host,
+                term,
+                log_position,
+                timestamp,
+                term_base,
+            )?;
+            work += 1;
+        }
 
         let near_live_position = self
             .catchup_join_position
@@ -1456,6 +1499,7 @@ impl Election {
         &mut self,
         host: &mut dyn ElectionHost,
         correlation_id: i64,
+        recording_id: i64,
         position: i64,
         signal: RecordingSignal,
     ) -> Result<(), ClusterError> {
@@ -1464,7 +1508,13 @@ impl Election {
         }
 
         if let Some(replication) = &self.log_replication {
-            replication.on_signal(correlation_id, position, signal);
+            replication.on_signal(correlation_id, recording_id, position, signal);
+            // `logRecordingId(logReplication.recordingId())` (`:281`): the
+            // recording the copy is being made **into**, which the handle took
+            // from the signal a line above. This is the only place a member
+            // whose copy made a recording of its own — a clean start, where the
+            // destination id was `NULL` when it asked — ever learns that id, and
+            // every replay, truncation and extend it makes afterwards names it.
             let recording_id = replication.recording_id();
             host.set_log_recording_id(recording_id);
         }

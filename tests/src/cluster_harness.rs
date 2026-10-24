@@ -49,8 +49,8 @@ use deepmsg_cluster_common::config::Properties;
 use deepmsg_cluster_common::counters::{
     CLUSTER_BACKUP_ERROR_COUNT_TYPE_ID, CLUSTER_BACKUP_LIVE_LOG_POSITION_TYPE_ID,
     CLUSTER_BACKUP_QUERY_DEADLINE_TYPE_ID, CLUSTER_BACKUP_SNAPSHOT_RETRIEVE_COUNT_TYPE_ID,
-    CLUSTER_BACKUP_STATE_TYPE_ID, CLUSTER_COMMIT_POSITION_TYPE_ID, CLUSTER_ELECTION_STATE_TYPE_ID,
-    CLUSTER_LEADERSHIP_TERM_ID_TYPE_ID, CLUSTER_NODE_ROLE_TYPE_ID,
+    CLUSTER_BACKUP_STATE_TYPE_ID, CLUSTER_COMMIT_POSITION_TYPE_ID, CLUSTER_CONTROL_TOGGLE_TYPE_ID,
+    CLUSTER_ELECTION_STATE_TYPE_ID, CLUSTER_LEADERSHIP_TERM_ID_TYPE_ID, CLUSTER_NODE_ROLE_TYPE_ID,
     CLUSTER_SNAPSHOT_COUNTER_TYPE_ID, find_cluster_counter,
 };
 use deepmsg_cluster_service::agent::ClusteredServiceAgent;
@@ -62,6 +62,9 @@ use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH as MESSAGE_HEADER_LENGTH;
 use deepmsg_codec_cluster::session_connect_request_codec::SessionConnectRequestEncoder;
 use deepmsg_codec_cluster::session_event_codec::SessionEventDecoder;
+use deepmsg_codec_cluster::session_keep_alive_codec::{
+    SBE_BLOCK_LENGTH as SESSION_KEEP_ALIVE_BLOCK_LENGTH, SessionKeepAliveEncoder,
+};
 use deepmsg_codec_cluster::session_message_header_codec::SessionMessageHeaderEncoder;
 use deepmsg_codec_cluster::{ReadBuf, WriteBuf};
 use deepmsg_driver::idle::Strategy;
@@ -2401,6 +2404,28 @@ impl ClientSide {
     }
 
     /// Offer one session message on the open session.
+    /// `AeronCluster.sendKeepAlive` (`AeronCluster.java:437-460`): the session
+    /// message the cluster counts as liveness, not as traffic.
+    ///
+    /// The reference's client sends one every `keepAliveIntervalNs` (one
+    /// second), so its ingress publication is never idle. This test client
+    /// sends only what a case asks for — and a member's driver drops an idle
+    /// publication's image after its ten-second liveness timeout, so a wait
+    /// longer than that (stopping a member takes about thirty) has to send
+    /// these itself. `diag_idle_publication` is the reading that found it.
+    pub fn send_keep_alive(&self, session: &SessionEvent, faults: &Faults) {
+        let length = MESSAGE_HEADER_LENGTH + usize::from(SESSION_KEEP_ALIVE_BLOCK_LENGTH);
+        let mut buffer = vec![0_u8; length];
+        let encoder = SessionKeepAliveEncoder::default()
+            .wrap(WriteBuf::new(&mut buffer), MESSAGE_HEADER_LENGTH);
+        let mut header = encoder.header(0);
+        let mut keep_alive = header.parent().expect("the encoder the header wrapped");
+        keep_alive
+            .leadership_term_id(session.leadership_term_id)
+            .cluster_session_id(session.cluster_session_id);
+        offer_message(self, faults, &buffer[..length]);
+    }
+
     pub fn send(&self, session: &SessionEvent, payload: &[u8], faults: &Faults) {
         let message = ingress_message(
             session.leadership_term_id,
@@ -2700,6 +2725,74 @@ pub fn offer_message(client: &ClientSide, faults: &Faults, message: &[u8]) {
         faults.check();
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+// ---- snapshots (P3-6c's F3) ----------------------------------------------
+//
+// The reference's `TestCluster` helpers, one for one. A snapshot is the
+// cluster-wide `SNAPSHOT` toggle (`TestCluster.takeSnapshot`,
+// `TestCluster.java:1502`): every live member takes one at the same log
+// position, which is why the waits below are "every member's".
+
+/// `TestCluster.takeSnapshot` (`TestCluster.java:1502`): put `SNAPSHOT` on the
+/// **leader's** cluster-control toggle. The leader proposes it and every member
+/// snapshots at that position (`ConsensusModuleAgent.java:3221-3253`).
+pub fn take_snapshot(counters: &NodeCounters) {
+    counters.set(
+        CLUSTER_CONTROL_TOGGLE_TYPE_ID,
+        i64::from(deepmsg_cluster::control::cluster_control::ToggleState::Snapshot.code()),
+    );
+}
+
+/// `TestCluster.awaitSnapshotCount(node, value)` (`:1549`).
+pub fn await_snapshot_count(counters: &NodeCounters, faults: &Faults, count: i64) {
+    wait_until("a member's snapshot count", faults, || {
+        counters.snapshot_count() == Some(count)
+    });
+}
+
+/// `TestCluster.awaitSnapshotCount(value)` (`:1538`): every member.
+pub fn await_every_snapshot_count(counters: &[NodeCounters], faults: &Faults, count: i64) {
+    wait_until("every member's snapshot count", faults, || {
+        counters
+            .iter()
+            .all(|node| node.snapshot_count() == Some(count))
+    });
+}
+
+/// `TestCluster.awaitSnapshotsLoaded` (`:1789`): every member's business was
+/// handed a snapshot on start.
+///
+/// The reference asks the service (`TestNode.allSnapshotsLoaded`,
+/// `TestNode.java:440-451`) because "loaded" is the business's own claim about
+/// what it was given; a counter cannot say it.
+pub fn await_snapshots_loaded(nodes: &[Node], faults: &Faults) {
+    wait_until("every member's snapshot to load", faults, || {
+        nodes.iter().all(|node| {
+            node.service_state()
+                .is_some_and(|state| state.was_snapshot_loaded())
+        })
+    });
+}
+
+/// `TestCluster.invalidateLatestSnapshot` (`TestCluster.java:2229-2240`): mark
+/// the member's newest valid snapshot invalid, in its own recording log.
+///
+/// The module must be stopped — it holds the file, and the whole point is what
+/// the **next** start reads. The write is at the entry's own offset
+/// (`RecordingLog::set_valid`), so the fault survives a crash as the reference's
+/// does; `force` is what puts it on the disk rather than in the page cache.
+pub fn invalidate_latest_snapshot(node: &Node) -> Result<usize, String> {
+    use deepmsg_cluster::persist::recording_log::{self, RecordingLog};
+
+    let path = node.cluster_dir().join(recording_log::FILENAME);
+    let mut log = RecordingLog::open(&path).map_err(|error| error.to_string())?;
+    let index = log
+        .invalidate_latest_snapshot()
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "no valid snapshot to invalidate".to_owned())?;
+    log.force(1).map_err(|error| error.to_string())?;
+    Ok(index)
 }
 
 /// Announce a skip when the archiving driver is not available.

@@ -277,6 +277,25 @@ fn until(client: &mut Client, what: &str, mut done: impl FnMut(&mut Client) -> b
     }
 }
 
+/// [`until`], for a wait whose answer is a value rather than a predicate.
+fn until_map<T>(
+    client: &mut Client,
+    what: &str,
+    mut probe: impl FnMut(&mut Client) -> Option<T>,
+) -> T {
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    loop {
+        if let Some(value) = probe(client) {
+            return value;
+        }
+
+        assert!(Instant::now() < deadline, "{what} never happened");
+        client.poll();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// The `EXTEND` an archive sent about `recording_id`, waited for by its signal.
 ///
 /// **The signal is what a client can see of an extend; the subscription it makes
@@ -3206,4 +3225,125 @@ fn a_live_replication_merges_into_the_stream_it_is_copying() {
 
     archive.close(&client);
     media_driver.stop().expect("the driver stops");
+}
+
+/// **An extend whose image does not join where the recording stopped is
+/// refused, by name** — `validateImageForExtendRecording`
+/// (`ArchiveConductor.java:2155-2194`: the image's join position, initial term,
+/// term length and MTU must be the recording's, or the bytes would be appended
+/// at a position the segments do not describe).
+///
+/// This is the archive half of P3-6c's stalled F3 rows, and it is the reading
+/// that explains them: a member that rejoins a term **extends** the last
+/// term's recording (`ConsensusModuleAgent.startLogRecording`), and the
+/// publication it extends with is only at the recording's stop when the
+/// recovery plan still knows the log. When the plan has lost it, the
+/// publication is created at position 0, the image joins there, and the archive
+/// refuses with `cannot extend recording N image.joinPosition=0 !=
+/// rec.stopPosition=M` — no recording, no `RecordingPos` counter, and the
+/// member loops in `join_log_as_follower`.
+#[test]
+fn an_extend_that_does_not_join_where_the_recording_stopped_is_refused() {
+    use deepmsg_archive::client::archive::RecordingEvent;
+    use deepmsg_archive::server::conductor::INVALID_EXTENSION;
+
+    let Some((_media_driver, _archive_dir, mut client)) = rig("archive-client-api-extend") else {
+        return;
+    };
+
+    let mut archive = Archive::connect(
+        &context(),
+        &mut client,
+        &mut NoCredentials,
+        Handlers::default(),
+    )
+    .expect("the archive is connected");
+
+    archive
+        .start_recording(
+            &mut client,
+            RECORDING_CHANNEL,
+            RECORDING_STREAM_ID,
+            true,
+            false,
+        )
+        .expect("the archive starts recording");
+
+    let publication = client
+        .add_exclusive_publication(
+            RECORDING_CHANNEL,
+            RECORDING_STREAM_ID,
+            archive::COMMAND_TIMEOUT,
+        )
+        .expect("a publication on the recording channel");
+
+    // The recording begins when the archive's image sees this publication.
+    let recording_id = until_map(&mut client, "the recording position counter", |client| {
+        let _ = client.offer_exclusive(publication, b"one");
+        let counters = client.counters_reader()?;
+        let mut ids = Vec::new();
+        counters.for_each(|descriptor| {
+            if descriptor.type_id == 100 {
+                ids.push(descriptor.counter_id);
+            }
+        });
+        for id in ids {
+            if let Some(identity) = counters
+                .key(id)
+                .and_then(|key| deepmsg_archive::server::recording_pos::parse_key(&key))
+            {
+                return Some(identity.recording_id);
+            }
+        }
+        None
+    });
+
+    archive
+        .stop_recording_channel_and_stream(&mut client, RECORDING_CHANNEL, RECORDING_STREAM_ID)
+        .expect("the archive stops recording");
+
+    until(&mut client, "the recording to stop", |client| {
+        archive
+            .get_recording_position(client, recording_id)
+            .map(|position| position == -1)
+            .unwrap_or(false)
+    });
+
+    // The publication is still where it started, so the image the extend draws
+    // joins at 0 and not at the recording's stop.
+    archive
+        .extend_recording(
+            &mut client,
+            recording_id,
+            RECORDING_CHANNEL,
+            RECORDING_STREAM_ID,
+            true,
+            false,
+        )
+        .expect("the extend's request is accepted");
+
+    let refusal = until_map(&mut client, "the extend's refusal", |client| {
+        // The image has to exist before the archive can judge it.
+        let _ = client.offer_exclusive(publication, b"two");
+        match archive.poll_recording_event(client) {
+            Ok(Some(RecordingEvent::Refusal(refusal))) => Some(refusal),
+            _ => None,
+        }
+    });
+
+    assert_eq!(
+        INVALID_EXTENSION, refusal.error_code,
+        "the refusal is the extension's own: {:?}",
+        refusal.message
+    );
+    assert!(
+        refusal.message.contains("cannot extend recording"),
+        "and it says which recording and why: {:?}",
+        refusal.message
+    );
+    assert!(
+        refusal.message.contains("image.joinPosition="),
+        "the image's join position is the half it refuses on: {:?}",
+        refusal.message
+    );
 }

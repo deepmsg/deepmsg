@@ -47,6 +47,7 @@ use deepmsg_archive::client::archive::{Archive, RecordingEvent};
 use deepmsg_archive::client::async_connect::NoCredentials;
 use deepmsg_archive::client::descriptor_poller::RecordingDescriptor;
 use deepmsg_archive::server::conductor::UNKNOWN_REPLAY;
+use deepmsg_archive::server::counters::ARCHIVE_RECORDING_POSITION_TYPE_ID;
 use deepmsg_archive::server::recording_pos::ANY_ARCHIVE_ID;
 use deepmsg_archive::server::recording_pos::{
     find_counter_id_by_recording, find_counter_id_by_session, parse_key,
@@ -175,6 +176,11 @@ struct ClusterCounters {
 #[derive(Clone, Copy, Debug)]
 struct AppendPosition {
     counter_id: i32,
+    /// The counter's **registration id** at the moment it was taken, which is
+    /// what [`CountersReader::is_active`] compares to tell "our counter" from
+    /// "a counter the driver has since handed to somebody else"
+    /// (`RecordingPos.isActive`, `:292-298`).
+    registration_id: i64,
 }
 
 /// A cluster's duty-cycle tracker (`DutyCycleStallTracker`).
@@ -250,6 +256,11 @@ pub struct ConsensusModuleAgent {
     node_state: NodeStateFile,
     mark_file: ClusterMarkFile,
     recovery_plan: RecoveryPlan,
+    /// A `NewLeadershipTerm` replayed while the election was out of this agent
+    /// for its own turn; the election takes it back after `catchup_poll`.
+    pending_replayed_new_leadership_term: Option<(i64, i64, i64, i64)>,
+    /// Whether the election is out of this agent for its own turn right now.
+    election_in_turn: bool,
     counters: ClusterCounters,
     duty_cycle: DutyCycle,
 
@@ -602,6 +613,8 @@ impl ConsensusModuleAgent {
             node_state,
             mark_file,
             recovery_plan,
+            pending_replayed_new_leadership_term: None,
+            election_in_turn: false,
             counters,
             duty_cycle: DutyCycle {
                 max_cycle_time,
@@ -747,7 +760,9 @@ impl ConsensusModuleAgent {
         };
         self.publisher.refresh_position_limits(&self.client);
         let mut publisher = self.publisher.clone();
+        self.election_in_turn = true;
         let result = election.do_work(self, &mut publisher);
+        self.election_in_turn = false;
         self.publisher = publisher;
 
         let result = match result {
@@ -1360,9 +1375,7 @@ impl ConsensusModuleAgent {
         if self.config.service_count > 0 {
             self.send_service_termination_position_at(0, true);
         }
-        if let Err(error) = self.try_stop_log_recording() {
-            self.report_counted_error(Some(&error));
-        }
+        self.try_stop_log_recording();
         self.set_state(ModuleState::Closed, reason);
         ClusterError::AgentTermination(reason.to_owned())
     }
@@ -1370,14 +1383,10 @@ impl ConsensusModuleAgent {
     /// `closeAndTerminate` (`:3290-3295`): stop the recording, mark the state,
     /// and hand the duty cycle the one error that ends it.
     ///
-    /// The reference's `tryStopLogRecording` catches its own archive errors and
-    /// reports them (`:3346-3370`); this one returns them, so the failure is
-    /// counted and the close continues — a node being told to stop must still
-    /// stop.
+    /// The stop reports its own archive errors (`:3346-3370`) and the close
+    /// continues — a node being told to stop must still stop.
     fn close_and_terminate(&mut self) -> ClusterError {
-        if let Err(error) = self.try_stop_log_recording() {
-            self.report_counted_error(Some(&error));
-        }
+        self.try_stop_log_recording();
 
         self.set_state(ModuleState::Closed, "expected termination");
         ClusterError::AgentTermination("expected termination".to_owned())
@@ -1720,7 +1729,7 @@ impl ConsensusModuleAgent {
         }
         self.closed = true;
 
-        let stop_result = self.try_stop_log_recording();
+        self.try_stop_log_recording();
         self.stop_log_replication_session();
 
         // `logPublisher.disconnect(errorHandler)` (`:300`), before the log
@@ -1790,7 +1799,6 @@ impl ConsensusModuleAgent {
         self.set_state(ModuleState::Closed, "closed");
         self.mark_file.signal_terminated().map_err(cluster)?;
 
-        stop_result?;
         match remove_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -1819,13 +1827,36 @@ impl ConsensusModuleAgent {
         read_counter(&self.client, self.counters.commit_position).unwrap_or(0)
     }
 
+    /// The log's append position, **as far as the counter can be believed**.
+    ///
+    /// The counter a log recording was found through is not ours for ever: when
+    /// the recording stops the driver frees the slot and can hand it to another
+    /// recording, and a value read from it then is that recording's — `0`, for
+    /// a recording that has not written yet. The reference asks
+    /// `RecordingPos.isActive(counters, counterId, registrationId)` before it
+    /// believes a position (`:292-298`), and so does this.
+    ///
+    /// A stale counter falls back to the highest append position this member
+    /// last published — the last thing it knew to be true — rather than to a
+    /// zero that would make the next term's log publication start at 0.
     fn append_position_value(&self) -> i64 {
         let Some(position) = self.append_position else {
             return self.log_recording_stop_position;
         };
-        self.client
-            .counters_reader()
-            .and_then(|counters| counters.value(position.counter_id))
+        let Some(counters) = self.client.counters_reader() else {
+            return self.log_recording_stop_position;
+        };
+        if !counters.is_active(
+            position.counter_id,
+            ARCHIVE_RECORDING_POSITION_TYPE_ID,
+            position.registration_id,
+        ) {
+            return self
+                .last_append_position
+                .max(self.log_recording_stop_position);
+        }
+        counters
+            .value(position.counter_id)
             .unwrap_or(self.log_recording_stop_position)
     }
 
@@ -1989,27 +2020,42 @@ impl ConsensusModuleAgent {
         }
 
         self.log_recording_id = identity.recording_id;
-        self.append_position = Some(AppendPosition { counter_id });
+        self.append_position = Some(AppendPosition {
+            counter_id,
+            registration_id: descriptor.registration_id,
+        });
         Ok(true)
     }
 
     /// `tryStopLogRecording` (`:3346-3378`), keeping the id like the reference
     /// does (the recovery plan still needs it).
-    fn try_stop_log_recording(&mut self) -> Result<(), ClusterError> {
+    ///
+    /// **What the archive says about a stop that finds nothing is a warning,
+    /// not a failure.** The reference catches every exception there and reports
+    /// a `ClusterEvent` (`:3369-3372`): the subscription the agent named is
+    /// already gone, which is the state the caller wanted. Returning it instead
+    /// is what put a rejoining member into a loop — a new term's
+    /// `prepareForNewLeadership` stops the recording on its way in, and an error
+    /// there goes to the election, which starts the whole term over.
+    fn try_stop_log_recording(&mut self) {
         self.append_position = None;
 
         if self.log_subscription_id != NULL_VALUE {
             let subscription_id = mem::replace(&mut self.log_subscription_id, NULL_VALUE);
-            self.archive
+            if let Err(error) = self
+                .archive
                 .try_stop_recording_subscription(&mut self.client, subscription_id)
-                .map_err(cluster)?;
+            {
+                self.report_cluster_error(&ClusterError::ClusterEvent(error.to_string()));
+            }
         } else if self.log_recording_id != NULL_VALUE {
-            self.archive
+            if let Err(error) = self
+                .archive
                 .try_stop_recording_by_identity(&mut self.client, self.log_recording_id)
-                .map_err(cluster)?;
+            {
+                self.report_cluster_error(&ClusterError::ClusterEvent(error.to_string()));
+            }
         }
-
-        Ok(())
     }
 
     // -- waiting -----------------------------------------------------------
@@ -3469,7 +3515,7 @@ impl ElectionHost for ConsensusModuleAgent {
             &params,
         )?;
 
-        let handle = RecordingReplication::new(leader_recording_id, replication_id);
+        let handle = RecordingReplication::new(replication_id);
         self.log_replication = Some(AgentLogReplication::new(
             handle.clone(),
             leader_recording_id,
@@ -3601,7 +3647,7 @@ impl ElectionHost for ConsensusModuleAgent {
 
         let had_recording = self.log_recording_id != NULL_VALUE;
         let last_append_position = self.append_position_value();
-        self.try_stop_log_recording()?;
+        self.try_stop_log_recording();
 
         if had_recording {
             self.recovery_plan = create_recovery_plan(
@@ -3677,6 +3723,10 @@ impl ElectionHost for ConsensusModuleAgent {
         self.time_of_last_append_position_update_ns = now_ns;
         self.time_of_last_append_position_send_ns = now_ns;
         Ok(())
+    }
+
+    fn take_replayed_new_leadership_term(&mut self) -> Option<(i64, i64, i64, i64)> {
+        self.pending_replayed_new_leadership_term.take()
     }
 
     fn catchup_poll(&mut self, limit_position: i64, now_ns: i64) -> Result<usize, ClusterError> {
@@ -4910,6 +4960,12 @@ impl ConsensusModuleAgent {
             CodecSignal::START => crate::handles::RecordingSignal::Start,
             CodecSignal::STOP => crate::handles::RecordingSignal::Stop,
             CodecSignal::EXTEND => crate::handles::RecordingSignal::Extend,
+            // `REPLICATE` is the destination archive's "the copy has a
+            // recording descriptor" — the **only** signal that names the
+            // destination recording when the copy made a new one. Dropping it
+            // (this did) leaves a clean-start member with no recording id.
+            CodecSignal::REPLICATE => crate::handles::RecordingSignal::Replicate,
+            CodecSignal::MERGE => crate::handles::RecordingSignal::Merge,
             CodecSignal::SYNC => crate::handles::RecordingSignal::Sync,
             CodecSignal::REPLICATE_END => crate::handles::RecordingSignal::ReplicateEnd,
             CodecSignal::DELETE => {
@@ -4934,7 +4990,46 @@ impl ConsensusModuleAgent {
             signal.position
         };
 
-        handle.on_signal(signal.correlation_id, position, mapped);
+        // `CMA:2117-2120`: the signal goes to the **election**, which is both
+        // the state machine that reads it and the only thing that can write the
+        // destination recording's id back (`Election.onRecordingSignal`,
+        // `Election.java:269-282` → `logRecordingId(logReplication.recordingId())`).
+        //
+        // Applying it to the handle here instead — which this did — left a
+        // member that asked for a copy with **no** destination recording (a
+        // clean start, `destinationRecordingId=NULL`) naming `-1` for ever: the
+        // archive minted the recording, the signal carried its id, and the
+        // handle threw it away. The next `FollowerReplay` then asked the archive
+        // to replay `-1`, was refused (`unknown recording id: -1`), the refusal
+        // became an election error and the member went round
+        // `Canvass → FollowerReplay → Init` without ever applying a message.
+        //
+        // **Two ways in, and only one of them can name the election.** A signal
+        // read by `slowTickWork`'s poll arrives between the election's turns,
+        // when it sits in `self.election` — that is the reference's path, and
+        // the election is asked. A signal read by this call from
+        // `FollowerLogReplication` (`Election.java:924` → `pollArchiveEvents`)
+        // arrives while the election is **out of** `self.election`, running its
+        // own turn; its handler is already on the stack, so what it would have
+        // done is done here.
+        if let Some(mut election) = self.election.take() {
+            let result = election.on_recording_signal(
+                self,
+                signal.correlation_id,
+                signal.recording_id,
+                position,
+                mapped,
+            );
+            if election.state() != ElectionState::Closed {
+                self.election = Some(election);
+            }
+            if let Err(error) = result {
+                self.report_counted_error(Some(&error));
+            }
+        } else {
+            handle.on_signal(signal.correlation_id, signal.recording_id, position, mapped);
+            self.set_log_recording_id(handle.recording_id());
+        }
 
         if handle.has_replication_ended() && handle.has_stopped() {
             // `REPLICATE_END` and the destination's `STOP` have both arrived:
@@ -6423,9 +6518,23 @@ struct AgentLogReplayHandler<'a> {
     trackers: &'a mut [PendingServiceMessageTracker],
     expired_timer_count: &'a mut deepmsg_cluster_common::collections::HashMap<i64, i64>,
     leadership_term_id: i64,
+    /// The agent's own `leadership_term_id`, written **inside the poll**.
+    ///
+    /// The reference applies a replayed `NewLeadershipTerm` where it meets it
+    /// (`ConsensusModuleAgent.java:1626`), and that matters beyond bookkeeping:
+    /// the records **after it in the same poll** are cluster actions whose
+    /// `onReplayClusterAction` decides by comparing the record's term with this
+    /// one (`:1580`). Deferring the write to the end of the poll — which this
+    /// did — makes every action that shares a poll with its own term record be
+    /// judged against the *previous* term and dropped, while the service
+    /// container executes it anyway and acks: the orphaned acks of
+    /// `records/P3-6c.md` §23.
+    agent_term: &'a mut i64,
     service_count: i32,
     state_change: Option<ModuleState>,
-    new_leadership_term_id: Option<i64>,
+    /// `(leadershipTermId, logPosition, timestamp, termBaseLogPosition)` of the
+    /// last `NewLeadershipTerm` replayed (`Election.java:590-608`).
+    new_leadership_term: Option<(i64, i64, i64, i64)>,
     deferred_snapshot: Option<(i64, i64)>,
     /// A `SNAPSHOT` action with default flags was replayed:
     /// `totalSnapshotDurationTracker.onSnapshotBegin` (`:1584`).
@@ -6532,13 +6641,27 @@ impl LogReplayHandler for AgentLogReplayHandler<'_> {
     fn on_replay_new_leadership_term_event(
         &mut self,
         leadership_term_id: i64,
-        _log_position: i64,
-        _timestamp: i64,
-        _term_base_log_position: i64,
+        log_position: i64,
+        timestamp: i64,
+        term_base_log_position: i64,
         _time_unit: i32,
         _app_version: i32,
     ) -> Result<(), ClusterError> {
-        self.new_leadership_term_id = Some(leadership_term_id);
+        // Applied **here**, not after the poll: the reference's
+        // `leadershipTermId(leadershipTermId)` is synchronous
+        // (`ConsensusModuleAgent.java:1626`) for exactly that reason.
+        *self.agent_term = leadership_term_id;
+        self.leadership_term_id = leadership_term_id;
+        for tracker in self.trackers.iter_mut() {
+            tracker.set_leadership_term_id(leadership_term_id);
+        }
+
+        self.new_leadership_term = Some((
+            leadership_term_id,
+            log_position,
+            timestamp,
+            term_base_log_position,
+        ));
         Ok(())
     }
 
@@ -6622,7 +6745,7 @@ impl ConsensusModuleAgent {
     /// position — the reference's "unexpected image close".
     fn poll_log_replay(&mut self) -> Result<usize, ClusterError> {
         let state_change;
-        let new_leadership_term_id;
+        let new_leadership_term;
         let deferred_snapshot;
         let snapshot_began;
         let work;
@@ -6712,9 +6835,10 @@ impl ConsensusModuleAgent {
                 trackers,
                 expired_timer_count,
                 leadership_term_id: *leadership_term_id,
+                agent_term: leadership_term_id,
                 service_count: config.service_count,
                 state_change: None,
-                new_leadership_term_id: None,
+                new_leadership_term: None,
                 deferred_snapshot: None,
                 snapshot_began: false,
             };
@@ -6727,7 +6851,7 @@ impl ConsensusModuleAgent {
                 config.log_fragment_limit,
             )?;
             state_change = handler.state_change;
-            new_leadership_term_id = handler.new_leadership_term_id;
+            new_leadership_term = handler.new_leadership_term;
             deferred_snapshot = handler.deferred_snapshot;
             snapshot_began = handler.snapshot_began;
 
@@ -6770,11 +6894,8 @@ impl ConsensusModuleAgent {
         if let Some(state) = state_change {
             self.set_state(state, "replayed cluster action");
         }
-        if let Some(term) = new_leadership_term_id {
-            self.leadership_term_id = term;
-            for tracker in self.trackers.iter_mut() {
-                tracker.set_leadership_term_id(term);
-            }
+        if let Some(term) = new_leadership_term {
+            self.apply_replayed_new_leadership_term(term)?;
         }
         if snapshot_began {
             // `onReplayClusterAction` (`:1584`): the replayed action starts the
@@ -6798,7 +6919,7 @@ impl ConsensusModuleAgent {
 struct LogApplyOutcome {
     count: usize,
     state_change: Option<ModuleState>,
-    new_leadership_term_id: Option<i64>,
+    new_leadership_term: Option<(i64, i64, i64, i64)>,
     deferred_snapshot: Option<(i64, i64)>,
     snapshot_began: bool,
 }
@@ -6833,9 +6954,10 @@ impl ConsensusModuleAgent {
             trackers,
             expired_timer_count,
             leadership_term_id: *leadership_term_id,
+            agent_term: leadership_term_id,
             service_count: config.service_count,
             state_change: None,
-            new_leadership_term_id: None,
+            new_leadership_term: None,
             deferred_snapshot: None,
             snapshot_began: false,
         };
@@ -6853,10 +6975,65 @@ impl ConsensusModuleAgent {
         Ok(LogApplyOutcome {
             count,
             state_change: handler.state_change,
-            new_leadership_term_id: handler.new_leadership_term_id,
+            new_leadership_term: handler.new_leadership_term,
             deferred_snapshot: handler.deferred_snapshot,
             snapshot_began: handler.snapshot_began,
         })
+    }
+
+    /// A `NewLeadershipTerm` replayed out of the log — the agent's half of
+    /// `onReplayNewLeadershipTermEvent` (`ConsensusModuleAgent.java:1593-1637`).
+    ///
+    /// The **agent** takes the term (`leadershipTermId(leadershipTermId)`,
+    /// `:1626`, which also carries it to the trackers); the **election** is
+    /// told (`:1628-1631`), because the recording log's coherence and the
+    /// replayed term's applied position are its (`Election.java:590-608`).
+    ///
+    /// Three ways in, because the election is only reachable when it is not in
+    /// its own turn:
+    ///
+    /// * between turns — it sits in `self.election`, and is asked;
+    /// * from the election's own turn (the catchup's replay) — it is **out**, so
+    ///   the event is posted for it (`take_replayed_new_leadership_term`) and it
+    ///   takes the event back as soon as `catchup_poll` returns;
+    /// * with no election at all — a live log being applied after one closed —
+    ///   where the reference also does nothing beyond the term above.
+    ///
+    /// # Errors
+    ///
+    /// The recording log's, from the election's coherence check.
+    fn apply_replayed_new_leadership_term(
+        &mut self,
+        (leadership_term_id, log_position, timestamp, term_base_log_position): (i64, i64, i64, i64),
+    ) -> Result<(), ClusterError> {
+        self.leadership_term_id = leadership_term_id;
+        for tracker in self.trackers.iter_mut() {
+            tracker.set_leadership_term_id(leadership_term_id);
+        }
+
+        if let Some(mut election) = self.election.take() {
+            let result = election.on_replay_new_leadership_term_event(
+                self,
+                leadership_term_id,
+                log_position,
+                timestamp,
+                term_base_log_position,
+            );
+            if election.state() != ElectionState::Closed {
+                self.election = Some(election);
+            }
+            return result;
+        }
+
+        if self.election_in_turn {
+            self.pending_replayed_new_leadership_term = Some((
+                leadership_term_id,
+                log_position,
+                timestamp,
+                term_base_log_position,
+            ));
+        }
+        Ok(())
     }
 
     /// Apply what [`Self::poll_log_adapter`]'s handler decided — the agent-side
@@ -6870,11 +7047,8 @@ impl ConsensusModuleAgent {
         if let Some(state) = outcome.state_change {
             self.set_state(state, "replayed cluster action");
         }
-        if let Some(term) = outcome.new_leadership_term_id {
-            self.leadership_term_id = term;
-            for tracker in self.trackers.iter_mut() {
-                tracker.set_leadership_term_id(term);
-            }
+        if let Some(term) = outcome.new_leadership_term {
+            self.apply_replayed_new_leadership_term(term)?;
         }
         if outcome.snapshot_began {
             self.snapshot_duration
