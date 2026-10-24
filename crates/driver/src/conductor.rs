@@ -1898,15 +1898,22 @@ impl Conductor {
     }
 
     /// Give back what a send endpoint held, once the sender has let it go
-    /// (`aeron_send_channel_endpoint_delete`, `:250-266`, which is where the
+    /// (`aeron_send_channel_endpoint_delete`, `:250-269`, which is where the
     /// counters go back in the reference — the sender owns the endpoint, the
     /// conductor owns the region).
     ///
-    /// The two counters the endpoint's *destinations* hold
-    /// (`local_sockaddr_indicator` and `tracker_num_destinations`) are not here
-    /// yet: they live in the sender's copy, and getting at them needs the same
-    /// thing the receive side needed — the numbers travelling back with the
-    /// confirmation.
+    /// **All three**, in the reference's order: the channel status, the
+    /// `snd-local-sockaddr` indicator and the destination tracker's count.
+    /// Until this build gave back the second, a released endpoint left a
+    /// **type 14** counter behind whose key names the endpoint's channel status
+    /// id — and type 14 is the same family `rcv-local-sockaddr` is, which is
+    /// what a subscription reads to answer "which port did I bind". Once that
+    /// id was recycled by a subscription, the client's
+    /// `Subscription.resolvedEndpoint` took the **first** matching counter
+    /// (`Subscription.java:579-586`, the reference's own `break`) and could
+    /// answer with the dead socket's address. That is the cluster's
+    /// `Replication connection failed=connect timeout`: a replica dialled a
+    /// port nobody held. `records/P3-6c.md` §28.
     fn release_send_endpoint(&mut self, id: u64) -> usize {
         let Some(entry) = self.send_endpoints.remove(id) else {
             return 0;
@@ -1916,6 +1923,18 @@ impl Conductor {
             let _ = self
                 .counters
                 .free(&region, entry.channel_status_counter_id, self.now_ms);
+
+            if entry.local_sockaddr_counter_id != layout::NULL_COUNTER_ID {
+                let _ = self
+                    .counters
+                    .free(&region, entry.local_sockaddr_counter_id, self.now_ms);
+            }
+
+            if entry.num_destinations_counter_id != layout::NULL_COUNTER_ID {
+                let _ = self
+                    .counters
+                    .free(&region, entry.num_destinations_counter_id, self.now_ms);
+            }
         }
 
         1
@@ -6570,9 +6589,9 @@ mod tests {
         socket.local_address().expect("an address").port()
     }
 
-    /// Removing a UDP publication stops the sender and gives its six counters
-    /// back — the half of the removal path that was missing, and whose absence
-    /// would have been silent: the client is answered, and the sender keeps
+    /// Removing a UDP publication stops the sender and gives its counters back
+    /// — the half of the removal path that was missing, and whose absence would
+    /// have been silent: the client is answered, and the sender keeps
     /// sending.
     #[test]
     fn removing_a_udp_publication_stops_the_sender_and_frees_its_counters() {
@@ -6623,8 +6642,14 @@ mod tests {
         );
 
         // Six counters of its own, freed in the pass that answered the client,
-        // and the endpoint's `snd-channel` — which was the last one holding
-        // that port — once the sender has confirmed it let the endpoint go.
+        // and **two** of the endpoint's once the sender has confirmed it let
+        // the endpoint go: the `snd-channel` status — the last one holding that
+        // port — and the `snd-local-sockaddr` indicator. The second is the one
+        // `aeron_send_channel_endpoint_delete` frees beside the first
+        // (`aeron_send_channel_endpoint.c:255-268`) and this build used to
+        // leave behind, which is how a subscription could end up reporting a
+        // dead socket's port (`records/P3-6c.md` §28; its own case is
+        // `receive_endpoint_lifecycle::a_released_send_endpoint_leaves_no_address_behind`).
         //
         // The release waits for the publication to **linger out**, because the
         // endpoint goes with it and a client may be about to publish on that
@@ -6632,9 +6657,9 @@ mod tests {
         // `:1329-1341` for the window). That is the reference's own five
         // seconds, so this test waits them.
         assert_eq!(
-            counters_before + 7,
-            await_counter_frees(&mut conductor, counters_before, 7),
-            "all seven came back"
+            counters_before + 8,
+            await_counter_frees(&mut conductor, counters_before, 8),
+            "all eight came back"
         );
 
         assert!(

@@ -566,14 +566,21 @@ impl SendChannelEndpoint {
         )
     }
 
-    /// Hand this endpoint's counters back, when the endpoint is gone
+    /// Hand **all** of this endpoint's counters back, in the reference's order
     /// (`aeron_send_channel_endpoint_delete`,
     /// `aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:250-269`,
     /// which frees the channel status, the local sockaddr and the destination
-    /// count, in that order). The answer is the channel status's, which is the
-    /// one callers act on. The transport counter this media added goes back
-    /// beside them, for the same reason: a counter left behind is one nobody
-    /// owns.
+    /// count). The answer is the channel status's, which is the one callers act
+    /// on. The transport counter this media added goes back beside them, for the
+    /// same reason: a counter left behind is one nobody owns.
+    ///
+    /// **Not the production path.** The endpoint has been moved to the sender
+    /// by the time it is released, and the region belongs to the conductor, so
+    /// the release itself is `Conductor::release_send_endpoint`'s (the numbers
+    /// travel on [`crate::send_endpoints::SendChannelEndpointEntry`]). This
+    /// stays for the tests that own an endpoint on their own thread, and it is
+    /// the same three — a second copy that frees fewer is how the leak this
+    /// exists to prevent got in (`records/P3-6c.md` §28).
     pub fn free_counter(
         &self,
         counters: &mut CounterManager,
@@ -582,6 +589,10 @@ impl SendChannelEndpoint {
     ) -> bool {
         let channel_status = counters.free(regions, self.channel_status_counter_id, now_ms);
         counters.free(regions, self.local_sockaddr_counter_id, now_ms);
+
+        if let Some(tracker) = self.destination_tracker() {
+            counters.free(regions, tracker.num_destinations_counter_id(), now_ms);
+        }
 
         if self.transport_counter_id != layout::NULL_COUNTER_ID {
             counters.free(regions, self.transport_counter_id, now_ms);
