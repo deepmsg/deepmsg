@@ -71,7 +71,7 @@ use deepmsg_driver::idle::Strategy;
 
 use crate::archive;
 use crate::archiving_driver::{self, OwnArchivingMediaDriver};
-use crate::cluster::{TestServiceState, in_process_test_service};
+use crate::cluster::{TestServiceState, in_process_api_service, in_process_test_service};
 use crate::driver::OwnDriver;
 use crate::temp::TempDir;
 
@@ -528,6 +528,8 @@ pub struct Node {
     /// it: a case reads it **after** the node has been stopped, which is when
     /// a clean shutdown's snapshots are the thing being asserted.
     service_state: Option<Arc<TestServiceState>>,
+    /// The API business's observables, when the node runs `api-service`.
+    api_state: Option<Arc<crate::cluster::ApiState>>,
     /// The test business's name, kept so a restart starts the same one.
     service_name: Option<&'static str>,
     /// The member's authenticator, when a case supplies one — the equivalent
@@ -825,6 +827,7 @@ impl Node {
             archive_dir,
             service: None,
             service_state: None,
+            api_state: None,
             service_name: service,
             authenticator,
             driver: Some(driver),
@@ -941,7 +944,13 @@ impl Node {
             .expect("the container's properties parse");
         let config = ServiceContainerConfig::from_properties(&properties)
             .expect("the container's configuration settles");
-        let (service, state) = in_process_test_service(name);
+        let (service, state, api_state) = if "api-service" == name {
+            let (service, api) = in_process_api_service();
+            (service, None, Some(api))
+        } else {
+            let (service, echo) = in_process_test_service(name);
+            (service, Some(echo), None)
+        };
         let (started_tx, started_rx) =
             mpsc::channel::<Result<deepmsg_cluster_service::ShutdownHandle, String>>();
         let id = self.id;
@@ -984,7 +993,8 @@ impl Node {
         // clearer report.
         match started_rx.recv_timeout(DEADLINE) {
             Ok(Ok(shutdown)) => {
-                self.service_state = Some(Arc::clone(&state));
+                self.service_state = state;
+                self.api_state = api_state;
                 self.service = Some(InProcessService { shutdown, thread });
             }
             Ok(Err(error)) => {
@@ -1005,6 +1015,16 @@ impl Node {
     #[must_use]
     pub fn service_state(&self) -> Option<Arc<TestServiceState>> {
         self.service_state.clone()
+    }
+
+    /// The API business's observables, when this node runs `api-service`.
+    ///
+    /// Separate from [`Self::service_state`] because the two businesses observe
+    /// different things: one is the reference's echo-plus-snapshot test
+    /// business, the other drives the container's API and records what it saw.
+    #[must_use]
+    pub fn api_state(&self) -> Option<Arc<crate::cluster::ApiState>> {
+        self.api_state.clone()
     }
 
     /// The archive directory this node owns.
@@ -2339,6 +2359,44 @@ impl ClientSide {
             });
 
         (events, challenges, messages)
+    }
+
+    /// Every egress payload that is neither a `SessionEvent` nor a `Challenge`
+    /// — the service's replies, verbatim, with their sticky headers.
+    pub fn poll_egress_messages(&mut self) -> Vec<Vec<u8>> {
+        self.client.poll();
+
+        let mut messages = Vec::new();
+        self.client
+            .poll_subscription(self.egress_subscription_id, 10, |message| {
+                if decode_session_event(message.payload).is_none()
+                    && decode_challenge(message.payload).is_none()
+                {
+                    messages.push(message.payload.to_vec());
+                }
+            });
+        messages
+    }
+
+    /// A subscription this client makes for itself — the seam a case uses to
+    /// read a publication the **container** made, rather than the cluster's
+    /// own egress.
+    pub fn add_subscription(&mut self, channel: &str, stream_id: i32) -> i64 {
+        self.client
+            .add_subscription(channel, stream_id, DEADLINE)
+            .expect("the case's own subscription")
+    }
+
+    /// One poll, and every payload that subscription delivered.
+    pub fn poll_payloads(&mut self, registration_id: i64) -> Vec<Vec<u8>> {
+        self.client.poll();
+
+        let mut payloads = Vec::new();
+        self.client
+            .poll_subscription(registration_id, 10, |message| {
+                payloads.push(message.payload.to_vec());
+            });
+        payloads
     }
 
     /// Open a session and wait for the `OK` event — the reference's

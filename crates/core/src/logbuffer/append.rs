@@ -135,6 +135,24 @@ enum PayloadSource<'a, 'b> {
     /// Fragmentation splits the **joined** bytes, not each part: a message
     /// longer than one frame may straddle the boundary between the two.
     TwoSlices(&'a [u8], &'a [u8]),
+    /// The same, for any number of parts: `first` at the front of the payload,
+    /// then each of `rest` in turn, as **one** message.
+    ///
+    /// The cluster service container's two doors need it — `Cluster.offer` and
+    /// `ClientSession.offer` take `DirectBufferVector[]`
+    /// (`aeron-cluster/.../service/Cluster.java:332`,
+    /// `ClientSession.java:96`), and the container puts its own session header
+    /// at the front of that array (`ClusteredServiceAgent.java:390-397`). The
+    /// leading slice is separate from `rest` so a caller whose header is
+    /// resident never has to build an array of it and the payload's parts.
+    ///
+    /// A frame's piece may cover **more than two** parts (three one-byte parts
+    /// and a frame that carries four bytes), which is why this is a loop and
+    /// not a second special case.
+    Slices {
+        first: &'a [u8],
+        rest: &'a [&'a [u8]],
+    },
 }
 
 /// A message that lies in a window rather than in a slice: the window, and where
@@ -170,11 +188,14 @@ impl<'a, 'b> PayloadRegion<'a, 'b> {
 }
 
 impl PayloadSource<'_, '_> {
-    const fn len(&self) -> usize {
+    fn len(&self) -> usize {
         match self {
             Self::Slice(bytes) => bytes.len(),
             Self::Region(region) => region.length,
             Self::TwoSlices(first, second) => first.len() + second.len(),
+            Self::Slices { first, rest } => {
+                rest.iter().map(|part| part.len()).sum::<usize>() + first.len()
+            }
         }
     }
 
@@ -216,6 +237,32 @@ impl PayloadSource<'_, '_> {
                     }
                 }
                 Some(())
+            }
+            Self::Slices { first, rest } => {
+                // `at` is the piece's position in the **joined** message and
+                // `written` is how much of it has reached the frame; the two
+                // differ by the parts the piece has already left behind. More
+                // than two parts can meet in one frame, so this walks them all.
+                let mut at = offset;
+                let mut written = 0;
+
+                for part in core::iter::once(*first).chain(rest.iter().copied()) {
+                    if at >= part.len() {
+                        at -= part.len();
+                        continue;
+                    }
+
+                    let take = (part.len() - at).min(len - written);
+                    frame.write_payload_slice_from(written, part.get(at..at + take)?)?;
+                    written += take;
+                    at = 0;
+
+                    if written == len {
+                        return Some(());
+                    }
+                }
+
+                None
             }
         }
     }
@@ -462,6 +509,37 @@ impl<'a> Appender<'a> {
             stream_id,
             position_limit,
             &PayloadSource::TwoSlices(first, second),
+        )
+    }
+
+    /// The same append, with the message in **any number of slices** that must
+    /// land as one message: `first` at the front of the payload, then each of
+    /// `rest` after it.
+    ///
+    /// The door the service container needs (`Cluster.offer` and
+    /// `ClientSession.offer` take `DirectBufferVector[]`,
+    /// `aeron-cluster/.../service/Cluster.java:332`, `ClientSession.java:96`).
+    /// `first` is separate from `rest` for the same reason
+    /// [`Appender::append_two_slices`] exists: the container's header is
+    /// resident, and joining it to the caller's parts would be the copy this
+    /// avoids.
+    ///
+    /// # Errors
+    ///
+    /// As [`Appender::append`].
+    pub fn append_slices(
+        &self,
+        session_id: i32,
+        stream_id: i32,
+        position_limit: i64,
+        first: &[u8],
+        rest: &[&[u8]],
+    ) -> Appended {
+        self.append_source(
+            session_id,
+            stream_id,
+            position_limit,
+            &PayloadSource::Slices { first, rest },
         )
     }
 
@@ -1121,8 +1199,10 @@ impl<'a> Appender<'a> {
     ///   exclusive one is a plain store.
     ///
     /// Returns the **term offset the claim starts at** — the one number the
-    /// caller could not have known. The frame header is written here, so that
-    /// offset is all that is needed to build a window over the claim.
+    /// caller could not have known — and the position just past the frame,
+    /// which is what a publication's `tryClaim` answers with. The frame header
+    /// is written here, so that offset is all that is needed to build a window
+    /// over the claim.
     ///
     /// # Errors
     ///
@@ -1134,7 +1214,7 @@ impl<'a> Appender<'a> {
         stream_id: i32,
         position_limit: i64,
         length: usize,
-    ) -> Result<usize, Appended> {
+    ) -> Result<(usize, Position), Appended> {
         // The entry, in the reference's order and for its reason: the count
         // first, then the tail that count names, and only then a position. The
         // pair is checked against itself because another producer may be
@@ -1221,7 +1301,16 @@ impl<'a> Appender<'a> {
             return Err(Appended::Malformed);
         }
 
-        usize::try_from(claimed_offset).map_err(|_| Appended::Malformed)
+        let offset = usize::try_from(claimed_offset).map_err(|_| Appended::Malformed)?;
+        Ok((
+            offset,
+            Position::new(
+                claimed_term_id,
+                resulting_offset,
+                self.bits_to_shift,
+                self.initial_term_id,
+            ),
+        ))
     }
 
     /// Append a padding frame of `length` **payload** bytes at the caller's
@@ -1882,10 +1971,12 @@ mod tests {
             (
                 appender
                     .try_claim_shared(11, 22, i64::MAX, first.len())
-                    .expect("the first claim"),
+                    .expect("the first claim")
+                    .0,
                 appender
                     .try_claim_shared(11, 22, i64::MAX, second.len())
-                    .expect("the second claim"),
+                    .expect("the second claim")
+                    .0,
             )
         };
 
@@ -2945,7 +3036,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod two_part_tests {
+mod multi_part_tests {
     use super::*;
 
     use crate::logbuffer::frame::Frame;
@@ -3002,6 +3093,14 @@ mod two_part_tests {
             let appender = Appender::new(metadata, term).expect("a usable log");
 
             appender.append_two_slices(1, 2, i64::MAX, first, second)
+        }
+
+        fn append_many(&mut self, first: &[u8], rest: &[&[u8]]) -> Appended {
+            let metadata = AtomicBuffer::from_slice_mut(&mut self.metadata.0).expect("aligned");
+            let term = AtomicBuffer::from_slice_mut(&mut self.term.0).expect("aligned");
+            let appender = Appender::new(metadata, term).expect("a usable log");
+
+            appender.append_slices(1, 2, i64::MAX, first, rest)
         }
 
         /// The payloads of the frames in the term, in order.
@@ -3073,6 +3172,72 @@ mod two_part_tests {
         assert!(
             payloads[0].len() > first.len(),
             "the first frame carries the end of the first slice and the start of the second"
+        );
+    }
+
+    /// A message in **many** slices lands as one message, in order — the
+    /// `DirectBufferVector[]` door (`Cluster.java:332`).
+    #[test]
+    fn many_slices_become_one_message() {
+        let mut log = Log::new();
+        let header = [7u8; 32];
+        let parts: Vec<Vec<u8>> = vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()];
+        let rest: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+
+        let appended = log.append_many(&header, &rest);
+        assert!(matches!(appended, Appended::Ok { .. }), "{appended:?}");
+
+        let payloads = log.payloads();
+        assert_eq!(1, payloads.len(), "one message, not four");
+
+        let joined: Vec<u8> = payloads.concat();
+        let mut expected = header.to_vec();
+        expected.extend_from_slice(b"onetwothree");
+        assert_eq!(expected, joined, "the parts follow one another, in order");
+    }
+
+    /// Fragmented, and with parts small enough that one frame carries **more
+    /// than two** of them: the piece's cursor has to walk past every part it
+    /// has already left, not just the first.
+    #[test]
+    fn many_slices_fragment_across_more_than_two_boundaries() {
+        let mut log = Log::new();
+        let header = vec![0xAAu8; 32];
+        let parts: Vec<Vec<u8>> = vec![
+            vec![0x01u8; 3],
+            vec![0x02u8; 5],
+            vec![0x03u8; 700],
+            vec![0x04u8; 900],
+        ];
+        let rest: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+
+        let appended = log.append_many(&header, &rest);
+        assert!(matches!(appended, Appended::Ok { .. }), "{appended:?}");
+
+        let payloads = log.payloads();
+        assert!(payloads.len() > 1, "the message took more than one frame");
+
+        let joined: Vec<u8> = payloads.concat();
+        let mut expected = header.clone();
+        for part in &parts {
+            expected.extend_from_slice(part);
+        }
+        assert_eq!(expected, joined);
+
+        // The first frame alone covers the header and the first three parts,
+        // and runs on into the fourth: four part boundaries in one piece. A
+        // `copy_into` that handled only two would have lost the tail of this
+        // span or written it at the wrong place.
+        let first_frame_covers = payloads[0].len();
+        let through_third = 32 + 3 + 5 + 700;
+        assert!(
+            first_frame_covers > through_third,
+            "the first frame reaches into the fourth part, and it carried \
+             {first_frame_covers} bytes"
+        );
+        assert!(
+            first_frame_covers < expected.len(),
+            "the message is longer than one frame, so the fourth part is split"
         );
     }
 }

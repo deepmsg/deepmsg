@@ -339,19 +339,39 @@ impl SessionManager {
             return Ok(());
         }
 
-        self.sessions[index].closing(CloseReason::CLIENT_ACTION);
-        self.sessions[index].disconnect(ctx.client);
+        // `onServiceCloseSession` (`SessionManager.java:454-476`): the reason is
+        // **SERVICE_ACTION**, not the client's own, and the client is told —
+        // `egressPublisher.sendEvent(..., EventCode.CLOSED, SERVICE_ACTION)`
+        // (`:469`). Without that event a business that closes a session has no
+        // way to know it happened, which is what `ClientSession.close` is for.
+        self.sessions[index].closing(CloseReason::SERVICE_ACTION);
 
         let timestamp = ctx.clock.time();
-        let session = &mut self.sessions[index];
-        if ctx.log_publisher.append_session_close(
-            &*ctx.client,
-            ctx.member_id,
-            session,
-            leadership_term_id,
-            timestamp,
-        )? {
-            session.set_closed_log_position(ctx.log_publisher.position());
+        let appended = {
+            let session = &mut self.sessions[index];
+            let appended = ctx.log_publisher.append_session_close(
+                &*ctx.client,
+                ctx.member_id,
+                session,
+                leadership_term_id,
+                timestamp,
+            )?;
+
+            if appended {
+                let detail = close_reason_name(session.close_reason());
+                egress_session_event(ctx, session, EventCode::CLOSED, &detail)?;
+                session.set_closed_log_position(ctx.log_publisher.position());
+            }
+
+            appended
+        };
+
+        if appended {
+            // After the event, not before: `disconnect` closes the session's own
+            // egress publication, and a publication that is gone cannot tell the
+            // client anything. The reference closes the session after it sends
+            // (`SessionManager.java:469` then `closeSession`, `:472`).
+            self.sessions[index].disconnect(ctx.client);
             let closed = self.sessions.remove(index);
             self.uncommitted_closed_sessions.push_back(closed);
         }

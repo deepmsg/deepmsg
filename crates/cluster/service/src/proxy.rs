@@ -32,7 +32,7 @@
 //! caller. That split survives here as `Err` versus `Ok(false)`.
 
 use deepmsg_client::client::Client;
-use deepmsg_client::publication::Publication;
+use deepmsg_client::publication::{Claim, Publication};
 use deepmsg_codec_cluster::WriteBuf;
 use deepmsg_codec_cluster::cancel_timer_codec::{
     CancelTimerEncoder, SBE_BLOCK_LENGTH as CANCEL_TIMER_BLOCK_LENGTH,
@@ -54,6 +54,8 @@ use deepmsg_codec_cluster::session_message_header_codec::{
     SBE_BLOCK_LENGTH as SESSION_MESSAGE_HEADER_BLOCK_LENGTH, SessionMessageHeaderEncoder,
 };
 use deepmsg_core::logbuffer::append::Appended;
+use deepmsg_core::logbuffer::frame::DATA_HEADER_LENGTH;
+use deepmsg_driver::publication_params::MAX_UDP_PAYLOAD_LENGTH;
 
 use crate::error::ContainerError;
 
@@ -65,6 +67,13 @@ pub const SEND_ATTEMPTS: usize = 5;
 /// `SessionMessageHeader`'s block.
 pub const SESSION_HEADER_LENGTH: usize =
     MESSAGE_HEADER_LENGTH + SESSION_MESSAGE_HEADER_BLOCK_LENGTH as usize;
+
+/// What a follower's mocked claim may hold
+/// (`ConsensusModuleProxy` has no such bound; the agent's) — the reference's
+/// `headerBuffer.capacity() - SESSION_HEADER_LENGTH`, where that buffer is the
+/// message buffer less one frame header (`CSA:152-154`).
+const MAX_CLAIMED_PAYLOAD: usize =
+    MAX_UDP_PAYLOAD_LENGTH as usize - DATA_HEADER_LENGTH - SESSION_HEADER_LENGTH;
 
 /// The bytes of a `SessionMessageHeader`, and the values still to be written.
 ///
@@ -79,6 +88,32 @@ pub struct SessionHeader {
     pub cluster_session_id: i64,
     /// `SessionMessageHeader.timestamp`.
     pub timestamp: i64,
+}
+
+/// A claimed message, as the proxy hands it over.
+///
+/// The sticky header is already written into it; what follows is the caller's.
+pub enum Claimed<'a> {
+    /// A claim in the term. [`Claimed::Term`] is published by the caller's
+    /// `Frame::publish`, and until then a reader stops at its negative length.
+    Term(Claim<'a>),
+    /// A follower's scratch window (`CSA:713-731`): the caller writes it and
+    /// **nothing is sent**. The reference's mocked claim, whose position is
+    /// `ClientSession.MOCKED_OFFER` (`ClientSession.java:32`).
+    Mocked(&'a mut [u8]),
+}
+
+impl core::fmt::Debug for Claimed<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Term(claim) => f
+                .debug_struct("Term")
+                .field("offset", &claim.offset())
+                .field("position", &claim.position())
+                .finish(),
+            Self::Mocked(bytes) => f.debug_tuple("Mocked").field(&bytes.len()).finish(),
+        }
+    }
 }
 
 /// `ConsensusModuleProxy` (`ConsensusModuleProxy.java`), on a non-exclusive
@@ -269,6 +304,29 @@ impl ConsensusModuleProxy {
         self.offer(client, payload)
     }
 
+    /// The same service message, made of parts that must land as one message
+    /// (`Cluster.offer(DirectBufferVector[])`, `Cluster.java:332`).
+    ///
+    /// The sticky header is offered as the leading slice, exactly as the
+    /// reference puts its header vector at the front of the caller's array
+    /// (`CSA:382-397`), and the parts follow it with no buffer joining them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::offer_service_message`].
+    pub fn offer_service_message_vectored(
+        &mut self,
+        client: &Client,
+        parts: &[&[u8]],
+    ) -> Result<i64, ContainerError> {
+        self.header.cluster_session_id = i64::from(self.service_id);
+        let position = self.offer_vectored(client, parts);
+        if position < 0 {
+            check_result(client, self.publication_registration_id, position)?;
+        }
+        Ok(position)
+    }
+
     /// An **egress message**: `clusterSessionId` is the session and `timestamp`
     /// is the container's log time (`CSA:694-706`).
     ///
@@ -296,18 +354,139 @@ impl ConsensusModuleProxy {
         self.offer_on(client, publication, length)
     }
 
+    /// The same egress message, made of parts that must land as one message
+    /// (`ClientSession.offer(DirectBufferVector[])`, `ClientSession.java:96`).
+    ///
+    /// The sticky header goes out as the leading slice, as it does in the
+    /// single-buffer path — `encode_header` writes it into the resident buffer,
+    /// which is what makes this an offer of parts rather than a join.
+    pub fn offer_session_message_vectored(
+        &mut self,
+        client: &Client,
+        egress_publication_registration_id: i64,
+        cluster_session_id: i64,
+        timestamp: i64,
+        parts: &[&[u8]],
+    ) -> i64 {
+        self.header.cluster_session_id = cluster_session_id;
+        self.header.timestamp = timestamp;
+        self.encode_header();
+
+        let Some(publication) = client.publication(egress_publication_registration_id) else {
+            return OFFER_NOT_CONNECTED;
+        };
+
+        self.offer_slices_on(client, publication, parts)
+    }
+
+    /// Claim a **service message** of `length` payload bytes
+    /// (`Cluster.tryClaim`, `Cluster.java:379`).
+    ///
+    /// The claim is `length + SESSION_HEADER_LENGTH`, and the sticky header is
+    /// written into its front — the reference's
+    /// `tryClaim(length + SESSION_HEADER_LENGTH, claim, header)`
+    /// (`ConsensusModuleProxy.java:132-146`).
+    ///
+    /// # Errors
+    ///
+    /// One of the negative `Publication` codes, exactly as the reference's
+    /// `tryClaim` answers. A "try again" answer is not retried here: the
+    /// reference does not retry a caller's claim either.
+    pub fn claim_service_message<'c>(
+        &'c mut self,
+        client: &'c Client,
+        length: usize,
+    ) -> Result<Claimed<'c>, i64> {
+        self.header.cluster_session_id = i64::from(self.service_id);
+        self.claim_on(client, length)
+    }
+
+    /// Claim an **egress message** of `length` payload bytes on the session's
+    /// own publication (`CSA:708-736`, `ClientSession.java:133`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::claim_service_message`], plus [`OFFER_NOT_CONNECTED`] for a
+    /// session whose publication is not there yet.
+    pub fn claim_session_message<'c>(
+        &'c mut self,
+        client: &'c Client,
+        egress_publication_registration_id: i64,
+        cluster_session_id: i64,
+        timestamp: i64,
+        length: usize,
+    ) -> Result<Claimed<'c>, i64> {
+        self.header.cluster_session_id = cluster_session_id;
+        self.header.timestamp = timestamp;
+
+        let Some(publication) = client.publication(egress_publication_registration_id) else {
+            return Err(OFFER_NOT_CONNECTED);
+        };
+
+        self.claim_on_publication(client, publication, length)
+    }
+
+    /// A follower's claim: a window over the resident buffer, and nothing sent
+    /// (`CSA:713-731`).
+    ///
+    /// # Errors
+    ///
+    /// [`ContainerError::Cluster`] for a claim longer than the reference's
+    /// buffer allows — its `IllegalArgumentException`, with its words.
+    pub fn mock_session_message(
+        &mut self,
+        cluster_session_id: i64,
+        timestamp: i64,
+        length: usize,
+    ) -> Result<Claimed<'_>, ContainerError> {
+        if length > MAX_CLAIMED_PAYLOAD {
+            return Err(ContainerError::Cluster(format!(
+                "claim exceeds maxPayloadLength={MAX_CLAIMED_PAYLOAD}, length={length}"
+            )));
+        }
+
+        self.header.cluster_session_id = cluster_session_id;
+        self.header.timestamp = timestamp;
+        self.resize(SESSION_HEADER_LENGTH + length);
+        self.encode_header();
+
+        let start = SESSION_HEADER_LENGTH;
+        Ok(Claimed::Mocked(&mut self.buffer[start..start + length]))
+    }
+
+    fn claim_on<'c>(&'c mut self, client: &'c Client, length: usize) -> Result<Claimed<'c>, i64> {
+        let Some(publication) = self.publication(client) else {
+            return Err(OFFER_NOT_CONNECTED);
+        };
+
+        self.claim_on_publication(client, publication, length)
+    }
+
+    fn claim_on_publication<'c>(
+        &'c mut self,
+        client: &'c Client,
+        publication: &'c Publication,
+        length: usize,
+    ) -> Result<Claimed<'c>, i64> {
+        let Some(total) = SESSION_HEADER_LENGTH.checked_add(length) else {
+            return Err(OFFER_MAX_POSITION_EXCEEDED);
+        };
+
+        let mut claim = match publication.try_claim(position_limit(client, publication), total) {
+            Ok(claim) => claim,
+            Err(appended) => return Err(claim_refusal(appended)),
+        };
+
+        if let Some(slot) = claim.payload_mut(0, SESSION_HEADER_LENGTH) {
+            encode_session_header(self.header, slot);
+        }
+
+        Ok(Claimed::Term(claim))
+    }
+
     /// Encode the sticky header into `buffer[..SESSION_HEADER_LENGTH]`.
     fn encode_header(&mut self) {
-        let encoder = SessionMessageHeaderEncoder::default().wrap(
-            WriteBuf::new(&mut self.buffer[..SESSION_HEADER_LENGTH]),
-            MESSAGE_HEADER_LENGTH,
-        );
-        let mut header = encoder.header(0);
-        let mut message = header.parent().expect("the encoder just wrapped");
-        message
-            .leadership_term_id(self.header.leadership_term_id)
-            .cluster_session_id(self.header.cluster_session_id)
-            .timestamp(self.header.timestamp);
+        encode_session_header(self.header, &mut self.buffer[..SESSION_HEADER_LENGTH]);
     }
 
     fn offer(&mut self, client: &Client, payload: &[u8]) -> Result<i64, ContainerError> {
@@ -340,11 +519,44 @@ impl ConsensusModuleProxy {
         self.offer_on(client, publication, length)
     }
 
+    /// The sticky header, then `parts`, offered on the consensus module's
+    /// publication as one message.
+    ///
+    /// Nothing is encoded past the header: the parts are the caller's, and the
+    /// term receives them back to back with it (`Publication.offer_slices`).
+    fn offer_vectored(&mut self, client: &Client, parts: &[&[u8]]) -> i64 {
+        self.encode_header();
+
+        let Some(publication) = self.publication(client) else {
+            return OFFER_NOT_CONNECTED;
+        };
+
+        self.offer_slices_on(client, publication, parts)
+    }
+
     /// Offer the first `length` bytes of the buffer on `publication`, retried
     /// [`SEND_ATTEMPTS`] times, and answer with the reference's code.
     fn offer_on(&self, client: &Client, publication: &Publication, length: usize) -> i64 {
+        self.offer_with(client, publication, |limit| {
+            publication.offer(limit, &self.buffer[..length])
+        })
+    }
+
+    /// The same, with the message made of the sticky header and `parts`.
+    fn offer_slices_on(&self, client: &Client, publication: &Publication, parts: &[&[u8]]) -> i64 {
+        self.offer_with(client, publication, |limit| {
+            publication.offer_slices(limit, &self.buffer[..SESSION_HEADER_LENGTH], parts)
+        })
+    }
+
+    /// The retry the three offers share: the limit is read fresh on every
+    /// attempt, and the answer is the reference's code.
+    fn offer_with<F>(&self, client: &Client, publication: &Publication, append: F) -> i64
+    where
+        F: Fn(i64) -> Appended,
+    {
         for _ in 0..SEND_ATTEMPTS {
-            match publication.offer(position_limit(client, publication), &self.buffer[..length]) {
+            match append(position_limit(client, publication)) {
                 Appended::Ok { position, .. } => return position.raw(),
                 Appended::EndOfLog | Appended::MidRotation | Appended::BackPressured => {}
                 Appended::NotConnected => return OFFER_NOT_CONNECTED,
@@ -412,6 +624,35 @@ pub fn position_limit(client: &Client, publication: &Publication) -> i64 {
         .unwrap_or(0)
 }
 
+/// Write the sticky header into `slot`, which must be exactly
+/// [`SESSION_HEADER_LENGTH`] bytes.
+///
+/// Free of the proxy so a **claimed** message can carry the same header the
+/// offered one does: the claim hands back term memory, and the header goes into
+/// it where the message will lie rather than through the resident buffer.
+fn encode_session_header(header: SessionHeader, slot: &mut [u8]) {
+    let encoder =
+        SessionMessageHeaderEncoder::default().wrap(WriteBuf::new(slot), MESSAGE_HEADER_LENGTH);
+    let mut encoder_header = encoder.header(0);
+    let mut message = encoder_header.parent().expect("the encoder just wrapped");
+    message
+        .leadership_term_id(header.leadership_term_id)
+        .cluster_session_id(header.cluster_session_id)
+        .timestamp(header.timestamp);
+}
+
+/// What a refused claim answers: the reference's `Publication.tryClaim` codes.
+fn claim_refusal(appended: Appended) -> i64 {
+    match appended {
+        Appended::NotConnected => OFFER_NOT_CONNECTED,
+        Appended::Malformed | Appended::MessageTooLarge | Appended::MaxPositionExceeded => {
+            OFFER_MAX_POSITION_EXCEEDED
+        }
+        Appended::EndOfLog | Appended::MidRotation => OFFER_ADMIN_ACTION,
+        Appended::BackPressured | Appended::Ok { .. } => OFFER_BACK_PRESSURED,
+    }
+}
+
 /// The reference's `checkResult` (`:227-235`): the three states that throw.
 fn check_result(
     client: &Client,
@@ -432,6 +673,23 @@ fn check_result(
             )))
         }
         _ => Ok(()),
+    }
+}
+
+/// The two `Publication.tryClaim` answers the reference **returns** rather
+/// than throws (`ConsensusModuleProxy.java:227-235`): no window right now, and
+/// another producer is mid-rotation. Both mean "try again".
+pub(crate) const fn is_retryable_claim(code: i64) -> bool {
+    code == OFFER_BACK_PRESSURED || code == OFFER_ADMIN_ACTION
+}
+
+/// The same three states as a value, for the caller that has already
+/// classified the other two as retries — a claim's `BACK_PRESSURED` and
+/// `ADMIN_ACTION` (`ConsensusModuleProxy.java:227-235`).
+pub(crate) fn check_result_code(client: &Client, code: i64) -> ContainerError {
+    match check_result(client, None, code) {
+        Err(error) => error,
+        Ok(()) => ContainerError::Cluster(format!("publication refused the claim: {code}")),
     }
 }
 
@@ -458,6 +716,80 @@ mod tests {
 
     fn u16_at(bytes: &[u8], offset: usize) -> u16 {
         u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("two bytes"))
+    }
+
+    /// The vectored path writes the same sticky header as the single-buffer
+    /// one, and **copies none of the parts**: the header is offered as the
+    /// leading slice (`CSA:382-397`), which is what makes this an offer of
+    /// parts rather than a join.
+    #[test]
+    fn the_vectored_offer_prepares_the_header_and_copies_no_part() {
+        let mut proxy = ConsensusModuleProxy::new(4);
+        proxy.set_leadership_term_id(9);
+        proxy.header.cluster_session_id = 21;
+        proxy.header.timestamp = 5_000;
+
+        proxy.encode_header();
+
+        assert_eq!(
+            SESSION_HEADER_LENGTH,
+            proxy.buffer.len(),
+            "the parts are offered from the caller's slices, not copied in"
+        );
+        assert_eq!(i64_at(&proxy.buffer, 8), 9, "leadershipTermId");
+        assert_eq!(i64_at(&proxy.buffer, 16), 21, "clusterSessionId");
+        assert_eq!(i64_at(&proxy.buffer, 24), 5_000, "timestamp");
+    }
+
+    /// A follower's claim is a window over the resident buffer: the sticky
+    /// header is in front of it, the caller's bytes follow, and nothing was
+    /// offered (`CSA:713-731`).
+    #[test]
+    fn a_follower_claim_writes_into_the_resident_buffer() {
+        let mut proxy = ConsensusModuleProxy::new(4);
+        proxy.set_leadership_term_id(9);
+
+        let mut claimed = proxy
+            .mock_session_message(21, 5_000, 6)
+            .expect("six bytes fit the resident buffer");
+
+        {
+            let Claimed::Mocked(window) = &mut claimed else {
+                panic!("a follower's claim is never in the log");
+            };
+            assert_eq!(6, window.len());
+            window.copy_from_slice(b"abcdef");
+        }
+
+        assert_eq!(i64_at(&proxy.buffer, 8), 9, "leadershipTermId");
+        assert_eq!(i64_at(&proxy.buffer, 16), 21, "clusterSessionId");
+        assert_eq!(i64_at(&proxy.buffer, 24), 5_000, "timestamp");
+        assert_eq!(
+            b"abcdef",
+            &proxy.buffer[SESSION_HEADER_LENGTH..SESSION_HEADER_LENGTH + 6],
+            "the payload lies just past the header"
+        );
+    }
+
+    /// Past what the reference's resident buffer can hold, its words.
+    #[test]
+    fn a_follower_claim_past_the_buffer_is_refused_with_the_references_words() {
+        let mut proxy = ConsensusModuleProxy::new(4);
+
+        let error = proxy
+            .mock_session_message(21, 5_000, MAX_CLAIMED_PAYLOAD + 1)
+            .expect_err("one byte too many");
+
+        let ContainerError::Cluster(message) = error else {
+            panic!("a claim past the buffer is the reference's ClusterException");
+        };
+        assert_eq!(
+            format!(
+                "claim exceeds maxPayloadLength={MAX_CLAIMED_PAYLOAD}, length={}",
+                MAX_CLAIMED_PAYLOAD + 1
+            ),
+            message
+        );
     }
 
     /// The sticky header's bytes: one schema-111 message header and the three
