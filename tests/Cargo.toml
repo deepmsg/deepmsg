@@ -80,6 +80,10 @@ name = "cluster_snapshot_recovery"
 path = "integration/cluster_snapshot_recovery.rs"
 
 [[test]]
+name = "cluster_service_api"
+path = "integration/cluster_service_api.rs"
+
+[[test]]
 name = "cluster_backup_query"
 path = "integration/cluster_backup_query.rs"
 

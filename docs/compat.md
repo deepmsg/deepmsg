@@ -1368,6 +1368,68 @@ channel above and runs one business.
 | `echo`'s messages | a client message is echoed to its session; the 27-byte `Echo as Service IPC ingress` is offered back **into the cluster** (`cluster.offer`), and the service message that returns (`session == null`) is echoed to **every** session | `TestNode.java:669-690`, `StubClusteredService.java:82-104`, `ClusterTests.java:40` | `cluster_lc4a_service_messages.rs` (all three arms: the round trip, exactly once) |
 | `echo`'s timer commands | a 16-byte message: `cmd: i32 @0` (1 = schedule, 2 = cancel), `correlationId: i64 @4`, `delayMillis: i32 @12`; a fired timer echoes its 8-byte correlation id to the session that scheduled it. **This shape is this build's** — the reference drives timers through its test harness, not through a business. | — | `cluster_lc4a_smoke.rs` (the timer scenario, all three arms) |
 
+## The service container's API (P3-12)
+
+`Cluster` and `ClientSession` are the whole of what a business may do
+(`aeron-cluster/.../service/Cluster.java:130-387`,
+`ClientSession.java:39-133`). Every method of both interfaces is below, in the
+order the reference declares them — the rows are the interface, not a selection
+from it. `Cluster.role` and `Cluster.timeUnit` answer the same values their
+`Role`/`TimeUnit` do, which is one `enum` each on both sides.
+
+`Cluster`:
+
+| Java method | This build | Reference source | Pinned by |
+|---|---|---|---|
+| `int memberId()` | `member_id()` | `Cluster.java:130` | `cluster_harness.rs` (every case reads the role counter) |
+| `Role role()` | `role()` | `Cluster.java:137` | `cluster_lc4a_failover.rs` |
+| `long logPosition()` | `log_position()` | `Cluster.java:144` | `cluster_snapshot_recovery.rs` |
+| `Aeron aeron()` | `aeron() -> &mut Client` — a borrow, not an owned handle: this build has no `Aeron` owner, the client is threaded through each callback. A publication taken here is addressed by registration id | `Cluster.java:151` | `cluster_service_api.rs::every_door_of_the_containers_api_answers` (a publication the container makes, a subscriber in the client's own driver) |
+| `ClusteredServiceContainer.Context context()` | `context() -> &ServiceContainerConfig` | `Cluster.java:158` | `cluster_service_api.rs::the_business_reads_its_containers_configuration` |
+| `ClientSession getClientSession(long)` | `session(id) -> Option<ClientSession>` | `Cluster.java:166` | `cluster_service_api.rs` (both offer doors) |
+| `Collection<ClientSession> clientSessions()` | `sessions()` yields read-only `SessionInfo`; the writable form is `for_each_client_session` | `Cluster.java:176` | `cluster_service_api.rs::every_door_of_the_containers_api_answers` |
+| `void forEachClientSession(Consumer)` | `for_each_client_session(&mut self, FnMut(&mut ClientSession))`, walking the table with no allocation | `Cluster.java:183` | same case (one session visited, one offer taken) |
+| `boolean closeClientSession(long)` | `close_client_session(id)` | `Cluster.java:192` | `cluster_service.rs` (the session leaves the table) |
+| `long time()` | `time()`, plus `time_micros()`/`time_nanos()` | `Cluster.java:199` | `cluster_lc4a_smoke.rs` (the timer scenario) |
+| `TimeUnit timeUnit()` | `time_unit()` | `Cluster.java:206` | `cluster_snapshot_recovery.rs` |
+| `boolean scheduleTimer(long, long)` | `schedule_timer(correlation_id, deadline)` | `Cluster.java:246` | `cluster_lc4a_smoke.rs` |
+| `boolean cancelTimer(long)` | `cancel_timer(correlation_id)` | `Cluster.java:277` | `cluster_lc4a_smoke.rs` |
+| `long offer(DirectBuffer, int, int)` | `offer(&[u8])`; the sticky header is written by the container | `Cluster.java:316` | `cluster_lc4a_service_messages.rs` |
+| `long offer(DirectBufferVector[])` | `offer_vectored(&[&[u8]])`; the header is the leading slice, as the reference's header vector is | `Cluster.java:332` | `cluster_service_api.rs::the_log_hands_back_the_parted_and_claimed_service_messages` |
+| `long tryClaim(int, BufferClaim)` | `try_claim(len) -> TryClaim`; `ClaimedMessage::payload_mut` is the writable window, `commit` publishes | `Cluster.java:379` | same case |
+| `IdleStrategy idleStrategy()` | `idle(work)` and `reset_idle()` on `Cluster` itself — the reference returns the agent **as** an `IdleStrategy`, so a caller had `cluster.idleStrategy().idle()`; here it is `cluster.idle(0)`, the same call without the object | `Cluster.java:387` | `cluster_lc4a_*` (every business idles on back-pressure through these two) |
+
+`ClientSession`:
+
+| Java method | This build | Reference source | Pinned by |
+|---|---|---|---|
+| `long id()` | `id()` | `ClientSession.java:39` | `cluster_service_api.rs` |
+| `int responseStreamId()` | `response_stream_id()` | `ClientSession.java:46` | `cluster_lc4a_sessions.rs` |
+| `String responseChannel()` | `response_channel()` | `ClientSession.java:53` | `cluster_service_api.rs` (it is the channel the market publication is made on) |
+| `byte[] encodedPrincipal()` | `encoded_principal()` | `ClientSession.java:60` | `cluster_lc4a_sessions.rs` |
+| `void close()` | `close()`, the same three-attempt path `Cluster::close_client_session` takes | `ClientSession.java:67` | `cluster_service_api.rs::every_door_of_the_containers_api_answers` (the client is told `CLOSED`) |
+| `boolean isClosing()` | `is_closing()` | `ClientSession.java:74` | `cluster_service_api.rs` |
+| `long offer(DirectBuffer, int, int)` | `offer(&[u8])` | `ClientSession.java:85` | `cluster_lc4a_service_messages.rs` |
+| `long offer(DirectBufferVector[])` | `offer_vectored(&[&[u8]])` | `ClientSession.java:96` | `cluster_service_api.rs::every_door_of_the_containers_api_answers` (it is byte-identical to the single-buffer offer) |
+| `long tryClaim(int, BufferClaim)` | `try_claim(len) -> TryClaim` | `ClientSession.java:133` | same case, and `a_claimed_egress_message_carries_the_session_id_not_the_service_id` for the header |
+
+Four deviations worth naming, because none of them is the interface's shape:
+
+* **`aeron()` is a borrow.** The reference returns the `Aeron` it owns; here the
+  client outlives the callback and is borrowed for it. A publication is
+  therefore addressed by registration id, and looked up again with
+  `Client::publication(id)`.
+* **`context()` is the config, not a Context object.** `ServiceContainerConfig`
+  is the same facts; what the reference's Context carries and this does not is
+  listed in `crates/cluster/service/src/lib.rs`, with the reason for each.
+* **`clientSessions()` is read-only.** A view that can offer needs the client
+  and the proxy mutably, so enumeration yields `SessionInfo` and the write side
+  is `for_each_client_session`. Recorded as deviation 2 in `lib.rs`.
+* **A vectored offer takes `&[&[u8]]`.** The reference rewrites `vectors[0]`
+  with its header vector, which obliges a caller to leave a slot free at the
+  front of its array; here the header is a separate leading argument.
+
+
 ## A consensus module's snapshot, and its log replay (P3-4d)
 
 | Contract | Value | Reference source | Pinned by |

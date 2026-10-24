@@ -93,7 +93,7 @@ pub mod session;
 pub mod snapshot;
 
 pub use agent::{ClusteredServiceAgent, ShutdownHandle};
-pub use cluster::{ClientSession, Cluster, SessionInfo};
+pub use cluster::{ClaimedMessage, ClientSession, Cluster, SessionInfo, TryClaim};
 pub use config::ServiceContainerConfig;
 pub use error::ContainerError;
 pub use role::{Role, TimeUnit};

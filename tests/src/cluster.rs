@@ -52,7 +52,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1623,6 +1623,375 @@ pub fn in_process_test_service(
         "sequence-service" => TestService::new(Arc::clone(&state), true),
         other => panic!("no test business named {other}"),
     };
+    (Box::new(service), state)
+}
+
+/// The stream the API business's own market publication uses — a stream no
+/// client of the cluster asks for, so the case can tell its messages from the
+/// cluster's.
+pub const API_MARKET_STREAM_ID: i32 = 4001;
+
+/// What the API-facing test business observed, for the case that reads it.
+///
+/// A business cannot panic its way out of a failure — a panic takes the
+/// container down — so every unexpected answer is recorded here in words.
+#[derive(Default)]
+pub struct ApiState {
+    /// `Cluster.context()`, as the business read it.
+    pub service_id: AtomicI64,
+    pub cluster_id: AtomicI64,
+    pub aeron_dir: Mutex<String>,
+    /// The registration id `aeron().add_publication(..)` answered with, and how
+    /// many of its offers landed.
+    pub market_publication: AtomicI64,
+    pub market_offers: AtomicUsize,
+    /// The positions `try_claim` answered with (service and egress), and how
+    /// many claimed frames were committed.
+    pub claimed: AtomicUsize,
+    /// `for_each_client_session`: views visited, and offers accepted.
+    pub visits: AtomicUsize,
+    pub fanned_out: AtomicUsize,
+    /// `ClientSession::close` answers.
+    pub closes: AtomicUsize,
+    /// The service messages the business offered and later read back, in the
+    /// order they came: `(what it offered, what the log delivered)`.
+    pub service_messages: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+    pub fault: Mutex<Option<String>>,
+}
+
+impl ApiState {
+    fn fault(&self, message: String) {
+        let mut slot = self.fault.lock().expect("the fault lock");
+        if slot.is_none() {
+            *slot = Some(message);
+        }
+    }
+
+    /// Every failure recorded, so a case can name them all at once.
+    #[must_use]
+    pub fn faults(&self) -> Vec<String> {
+        self.fault
+            .lock()
+            .expect("the fault lock")
+            .clone()
+            .into_iter()
+            .collect()
+    }
+}
+
+/// The business the API cases drive: one message per door of the container's
+/// public surface, chosen by the first payload byte.
+struct ApiService {
+    state: Arc<ApiState>,
+}
+
+impl ApiService {
+    fn new(state: Arc<ApiState>) -> Self {
+        Self { state }
+    }
+
+    /// What the business offered as a **service message**, held until the log
+    /// hands it back, so the read-back can be compared with the offer.
+    fn record_offered(&self, offered: &[u8]) {
+        self.state
+            .service_messages
+            .lock()
+            .expect("the service-message lock")
+            .push((offered.to_vec(), Vec::new()));
+    }
+
+    /// A service message came back: pair it with the oldest offer.
+    fn record_delivered(&self, delivered: &[u8]) {
+        let mut pending = self
+            .state
+            .service_messages
+            .lock()
+            .expect("the service-message lock");
+
+        // The **first** offer still unanswered, not the newest: the log may
+        // hand two service messages back after both were offered, and pairing
+        // them with the latest would leave the first unanswered for ever.
+        let Some(open) = pending
+            .iter_mut()
+            .find(|(_, delivered)| delivered.is_empty())
+        else {
+            self.state.fault(format!(
+                "a service message arrived with nothing offered: {delivered:?}"
+            ));
+            return;
+        };
+        open.1 = delivered.to_vec();
+    }
+}
+
+impl ClusteredService for ApiService {
+    fn on_start(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        snapshot: Option<&mut SnapshotReader<'_>>,
+    ) -> Result<(), ContainerError> {
+        if let Some(reader) = snapshot {
+            // Nothing to restore: this business keeps no state across a
+            // restart, and draining the image is what keeps the loader happy.
+            while !reader.is_end_of_stream() {
+                reader.poll(10, |_| {});
+            }
+        }
+
+        let context = cluster.context();
+        self.state
+            .service_id
+            .store(i64::from(context.service_id), Ordering::Release);
+        self.state
+            .cluster_id
+            .store(i64::from(context.cluster_id), Ordering::Release);
+        *self.state.aeron_dir.lock().expect("the directory lock") =
+            context.aeron_dir.display().to_string();
+        Ok(())
+    }
+
+    fn on_session_open(
+        &mut self,
+        _cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        _session: SessionId,
+        _timestamp: i64,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    fn on_session_close(
+        &mut self,
+        _cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        _session: SessionId,
+        _timestamp: i64,
+        _reason: CloseReason,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    fn on_session_message(
+        &mut self,
+        cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        session: Option<SessionId>,
+        _timestamp: i64,
+        payload: &[u8],
+        _header: &LogHeader,
+    ) -> Result<(), ContainerError> {
+        let Some(session_id) = session else {
+            self.record_delivered(payload);
+            return Ok(());
+        };
+
+        match payload.first().copied() {
+            Some(b'v') => self.vectored(cluster, session_id),
+            Some(b'k') => self.claim(cluster, session_id),
+            Some(b'f') => self.fan_out(cluster),
+            Some(b'x') => self.close_one(cluster, session_id),
+            Some(b'm') => self.market(cluster, session_id),
+            other => self.state.fault(format!(
+                "unknown command {other:?} from session {session_id:?}"
+            )),
+        }
+
+        Ok(())
+    }
+
+    fn on_timer_event(
+        &mut self,
+        _cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+        _correlation_id: i64,
+        _timestamp: i64,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    fn on_take_snapshot(&mut self, _writer: &mut SnapshotWriter<'_>) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    fn on_role_change(&mut self, _new_role: Role) -> Result<(), ContainerError> {
+        Ok(())
+    }
+
+    fn on_terminate(
+        &mut self,
+        _cluster: &mut deepmsg_cluster_service::Cluster<'_>,
+    ) -> Result<(), ContainerError> {
+        Ok(())
+    }
+}
+
+impl ApiService {
+    /// `v`: an egress message in parts, and a **service** message in parts.
+    ///
+    /// The egress one the client compares against a single-buffer offer of the
+    /// same bytes; the service message the business reads back out of the log.
+    fn vectored(&self, cluster: &mut deepmsg_cluster_service::Cluster<'_>, session: SessionId) {
+        let parts: [&[u8]; 2] = [b"vec-one", b"vec-two"];
+        let joined = b"vec-onevec-two";
+
+        if let Some(mut view) = cluster.session(session) {
+            if let Err(error) = view.offer_vectored(&parts) {
+                self.state.fault(format!("egress offer_vectored: {error}"));
+            }
+            if let Err(error) = view.offer(joined) {
+                self.state.fault(format!("egress offer: {error}"));
+            }
+        } else {
+            self.state
+                .fault(format!("no session {session:?} to offer on"));
+        }
+
+        match cluster.offer_vectored(&parts) {
+            Ok(_) => self.record_offered(joined),
+            Err(error) => self.state.fault(format!("service offer_vectored: {error}")),
+        }
+    }
+
+    /// `k`: a claimed egress message, and a claimed service message.
+    fn claim(&self, cluster: &mut deepmsg_cluster_service::Cluster<'_>, session: SessionId) {
+        let payload = b"claim";
+
+        if let Some(mut view) = cluster.session(session) {
+            match view.try_claim(payload.len()) {
+                Ok(deepmsg_cluster_service::TryClaim::Claimed(mut claimed)) => {
+                    let Some(window) = claimed.payload_mut() else {
+                        self.state
+                            .fault("an egress claim with no window".to_owned());
+                        return;
+                    };
+                    window.copy_from_slice(payload);
+                    match claimed.commit() {
+                        Ok(_) => {
+                            self.state.claimed.fetch_add(1, Ordering::AcqRel);
+                        }
+                        Err(error) => self.state.fault(format!("egress commit: {error}")),
+                    }
+                }
+                Ok(deepmsg_cluster_service::TryClaim::NotClaimed(code)) => self
+                    .state
+                    .fault(format!("the egress claim was refused with {code}")),
+                Err(error) => self.state.fault(format!("egress try_claim: {error}")),
+            }
+        }
+
+        match cluster.try_claim(payload.len()) {
+            Ok(deepmsg_cluster_service::TryClaim::Claimed(mut claimed)) => {
+                let Some(window) = claimed.payload_mut() else {
+                    self.state
+                        .fault("a service claim with no window".to_owned());
+                    return;
+                };
+                window.copy_from_slice(payload);
+                if let Err(error) = claimed.commit() {
+                    self.state.fault(format!("service commit: {error}"));
+                    return;
+                }
+                self.state.claimed.fetch_add(1, Ordering::AcqRel);
+                self.record_offered(payload);
+            }
+            Ok(deepmsg_cluster_service::cluster::TryClaim::NotClaimed(code)) => self
+                .state
+                .fault(format!("the service claim was refused with {code}")),
+            Err(error) => self.state.fault(format!("service try_claim: {error}")),
+        }
+    }
+
+    /// `f`: every session, visited once and offered once.
+    fn fan_out(&self, cluster: &mut deepmsg_cluster_service::Cluster<'_>) {
+        let state = Arc::clone(&self.state);
+        let mut visits = 0;
+        let mut offered = 0;
+
+        cluster.for_each_client_session(|view| {
+            visits += 1;
+            if view.offer(b"fan").is_ok() {
+                offered += 1;
+            }
+        });
+
+        state.visits.fetch_add(visits, Ordering::AcqRel);
+        state.fanned_out.fetch_add(offered, Ordering::AcqRel);
+    }
+
+    /// `x`: close the session through the session's own door.
+    fn close_one(&self, cluster: &mut deepmsg_cluster_service::Cluster<'_>, session: SessionId) {
+        match cluster.session(session) {
+            Some(mut view) => match view.close() {
+                Ok(closed) => {
+                    if closed {
+                        self.state.closes.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+                Err(error) => self.state.fault(format!("session close: {error}")),
+            },
+            None => self.state.fault(format!("no session {session:?} to close")),
+        }
+    }
+
+    /// `m`: a market-data publication made through `Cluster.aeron()`.
+    ///
+    /// The channel is the one the client is already listening on — its own
+    /// egress channel, which is what `responseChannel()` names — so the
+    /// publication is in the container's driver and the subscriber in the
+    /// client's, which is the only arrangement that proves the client is real.
+    fn market(&self, cluster: &mut deepmsg_cluster_service::Cluster<'_>, session: SessionId) {
+        let channel = cluster
+            .sessions()
+            .map(|info| info.response_channel.to_owned())
+            .next();
+
+        let Some(channel) = channel else {
+            self.state.fault("no session to name a channel".to_owned());
+            return;
+        };
+
+        let client = cluster.aeron();
+        let existing = self
+            .state
+            .market_publication
+            .load(std::sync::atomic::Ordering::Acquire);
+        let registration_id = if existing > 0 {
+            existing
+        } else {
+            match client.add_publication(&channel, API_MARKET_STREAM_ID, Duration::from_secs(1)) {
+                Ok(id) => {
+                    self.state.market_publication.store(id, Ordering::Release);
+                    id
+                }
+                Err(error) => {
+                    self.state
+                        .fault(format!("add_publication on {channel}: {error}"));
+                    return;
+                }
+            }
+        };
+
+        let Some(publication) = client.publication(registration_id) else {
+            self.state
+                .fault("the market publication is not in the client".to_owned());
+            return;
+        };
+        let limit = deepmsg_cluster_service::proxy::position_limit(client, publication);
+        if matches!(
+            publication.offer(limit, b"market"),
+            deepmsg_core::logbuffer::append::Appended::Ok { .. }
+        ) {
+            self.state.market_offers.fetch_add(1, Ordering::AcqRel);
+        }
+
+        if let Some(mut view) = cluster.session(session) {
+            if let Err(error) = view.offer(b"market-ack") {
+                self.state.fault(format!("market ack: {error}"));
+            }
+        }
+    }
+}
+
+/// The API business, with its observables.
+pub fn in_process_api_service() -> (Box<dyn ClusteredService + Send>, Arc<ApiState>) {
+    let state = Arc::new(ApiState::default());
+    let service = ApiService::new(Arc::clone(&state));
     (Box::new(service), state)
 }
 
