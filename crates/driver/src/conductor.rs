@@ -2026,7 +2026,13 @@ impl Conductor {
             return 0;
         };
 
-        let _ = self.receiver.remove_image(registration_id);
+        // `aeron_driver_receiver_proxy_on_remove_publication_image` (`:1354`):
+        // the dispatcher forgets the image and leaves `IMAGE_COOL_DOWN` behind
+        // (`aeron_data_packet_dispatcher.c:323-355`). **Detach**, not remove:
+        // this build's image state machine runs in the receiver, so an image
+        // taken out of that list here would never reach `DONE` and never be
+        // released (`ReceiverCommand::DetachImage`).
+        let _ = self.receiver.detach_image(registration_id);
         let rejoin = self
             .subscriptions
             .readers_of(registration_id)
@@ -2107,6 +2113,11 @@ impl Conductor {
         {
             let _ = self.transition_image_to_linger(registration_id);
         }
+
+        // The image itself goes back now, wherever the transition happened: the
+        // receiver unmaps and unlinks the log buffer and stops running the state
+        // machine that has just said it is `DONE`.
+        let _ = self.receiver.remove_image(registration_id);
 
         // `aeron_publication_image_entry_delete` (`:1604-1618`): the links let
         // go of the image's subscribable, and only then are the counters and the

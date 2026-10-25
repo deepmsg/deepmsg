@@ -182,6 +182,21 @@ pub enum ReceiverCommand {
         /// Which one.
         registration_id: i64,
     },
+    /// Take an image out of the endpoint dispatchers — leaving the cool-down it
+    /// leaves behind — **without** releasing the image itself.
+    ///
+    /// `aeron_driver_receiver_proxy_on_remove_publication_image`
+    /// (`aeron_driver_receiver.c:585-610`) is the reference's own, called as the
+    /// image leaves `DRAINING` (`aeron_publication_image.c:1354`), and there the
+    /// object outlives the call: the reference's image state machine runs on the
+    /// **conductor**. This build's runs here, over this command loop's own
+    /// `images`, so an image removed from that list now would never reach
+    /// `DONE` — no `ImageDone`, no release, a counter block and an endpoint
+    /// reference leaked for the life of the driver.
+    DetachImage {
+        /// Which one.
+        registration_id: i64,
+    },
     /// Forget the cool-down an image left behind, so a `SETUP` or a frame from
     /// that session can ask for another one
     /// (`aeron_driver_receiver_proxy_on_remove_cool_down`,
@@ -643,6 +658,19 @@ impl ReceiverProxy {
     pub fn remove_image(&self, registration_id: i64) -> io::Result<()> {
         self.commands
             .send(ReceiverCommand::RemoveImage { registration_id })
+            .map_err(|_| stopped())
+    }
+
+    /// Take an image out of the endpoint dispatchers without releasing it: the
+    /// cool-down is left behind, and the image itself carries on to `DONE` in
+    /// this thread's own state machine ([`ReceiverCommand::DetachImage`]).
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] when the thread is gone.
+    pub fn detach_image(&self, registration_id: i64) -> io::Result<()> {
+        self.commands
+            .send(ReceiverCommand::DetachImage { registration_id })
             .map_err(|_| stopped())
     }
 
@@ -1276,6 +1304,27 @@ impl ReceiverThread {
                         self.pending_setups
                             .retain(|pending| pending.session_id != registration_id as i32);
 
+                        for (_, endpoint) in &mut self.endpoints {
+                            let images = endpoint.dispatcher().images();
+                            for (stream_id, session_id, image_id) in images {
+                                if image_id == registration_id {
+                                    endpoint.dispatcher_mut().remove_image(
+                                        stream_id,
+                                        session_id,
+                                        registration_id,
+                                        false,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    ReceiverCommand::DetachImage { registration_id } => {
+                        // The dispatcher forgets the image and keeps
+                        // `IMAGE_COOL_DOWN` for its session
+                        // (`aeron_data_packet_dispatcher.c:323-355`). The image
+                        // itself stays in this thread's list — it still has to
+                        // reach `DONE` and send `ImageDone`, or the conductor
+                        // never releases it.
                         for (_, endpoint) in &mut self.endpoints {
                             let images = endpoint.dispatcher().images();
                             for (stream_id, session_id, image_id) in images {
