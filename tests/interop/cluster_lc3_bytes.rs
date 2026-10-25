@@ -295,6 +295,22 @@ fn the_three_rulers(name: &str, members: &[MemberSpec], appointed: i32) {
             "{name}: roles {:?} (LEADER=2), the appointed member is {appointed}",
             cluster_mixed::roles(&cluster)
         );
+        // The authoritative decode: this build's own tool, on each member's
+        // directory, prints the session fields the snapshot adapter reads.
+        for member in 0..MEMBERS {
+            let output = std::process::Command::new("../target/debug/deepmsg-cluster-tool")
+                .arg(cluster.cluster_dir(member))
+                .arg("describe-latest-cm-snapshot")
+                .output();
+            if let Ok(output) = output {
+                let text = String::from_utf8_lossy(&output.stdout);
+                for line in text.lines() {
+                    if line.contains("openedLogPosition") || line.contains("clusterSessionId") {
+                        eprintln!("{name}: member {member} tool: {line}");
+                    }
+                }
+            }
+        }
         for (member, found) in found.iter().enumerate() {
             eprintln!("{name}: member {member} recordings: {found:?}");
         }
