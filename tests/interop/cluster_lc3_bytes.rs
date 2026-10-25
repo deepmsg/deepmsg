@@ -292,10 +292,8 @@ fn the_three_rulers(name: &str, members: &[MemberSpec], appointed: i32) {
     );
     if std::env::var("LC3_DUMP").is_ok() {
         eprintln!(
-            "{name}: client events {:?}, new leaders {:?}, messages {}",
-            session.received.borrow().events,
-            session.received.borrow().new_leaders,
-            session.messages().len()
+            "{name}: roles {:?} (LEADER=2), the appointed member is {appointed}",
+            cluster_mixed::roles(&cluster)
         );
         for (member, found) in found.iter().enumerate() {
             eprintln!("{name}: member {member} recordings: {found:?}");

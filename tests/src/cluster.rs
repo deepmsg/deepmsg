@@ -750,6 +750,13 @@ impl TestCluster {
         self.node(member).aeron.path()
     }
 
+    /// A node's archive directory (`aeron.archive.dir`) — where the recordings
+    /// this member made live, as segments of the term buffers.
+    #[must_use]
+    pub fn archive_dir(&self, member: i32) -> &Path {
+        self.node(member).archive.path()
+    }
+
     /// A node's cluster directory (`aeron.cluster.dir`).
     #[must_use]
     pub fn cluster_dir(&self, member: i32) -> &Path {
