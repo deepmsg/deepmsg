@@ -469,6 +469,10 @@ struct Node {
     driver: Option<OwnArchivingMediaDriver>,
     /// Our node's consensus module.
     module: Option<ModuleHandle>,
+    /// Where our external module writes — kept after the process is stopped,
+    /// because a case that watches a member stop needs to read what it said on
+    /// the way out.
+    module_log: Option<PathBuf>,
     /// What our consensus module reported. Its thread has no log file, so a
     /// failure message reads this instead.
     faults: Arc<Mutex<Vec<String>>>,
@@ -695,6 +699,7 @@ impl TestCluster {
                 process: None,
                 driver: None,
                 module: None,
+                module_log: None,
                 faults: Arc::new(Mutex::new(Vec::new())),
             });
         }
@@ -1017,6 +1022,96 @@ impl TestCluster {
         }
     }
 
+    /// Replace a **stopped** member's implementation and start it again over the
+    /// directories it already had — LC-5's rolling replacement (`3J → 3R → 3J`
+    /// in a live cluster, plan §3.6).
+    ///
+    /// What `spec` may change is who runs the node and the container; what it
+    /// may not change is which member it is ([`Self::start_inner`]'s one
+    /// implementation per node id still holds). The **state** directories —
+    /// `aeron.cluster.dir` (`recording.log`, `node-state.dat`, the mark file)
+    /// and `aeron.archive.dir` (the recordings) — are the fixture's own and are
+    /// not recreated here: they are the thing under test. Only the driver's
+    /// directory is thrown away, and [`Self::start_node`] does that on every
+    /// restart already.
+    ///
+    /// # Panics
+    ///
+    /// When the member is still running, still has a container, is not in the
+    /// table, or when the table's other containers on this member disagree with
+    /// `spec` about who runs their node.
+    pub fn replace_member(&mut self, spec: MemberSpec) {
+        let slots: Vec<usize> = self
+            .containers
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.spec.id == spec.id)
+            .map(|(index, _)| index)
+            .collect();
+        assert!(
+            !slots.is_empty(),
+            "member {} is not in the table, so there is nothing to replace",
+            spec.id
+        );
+        assert!(
+            !self.node(spec.id).is_running(),
+            "member {} is still running: a replacement starts over the directories the old \
+             implementation left, and a live one is still writing them",
+            spec.id
+        );
+        for index in &slots {
+            assert!(
+                self.containers[*index].container.is_none(),
+                "member {} service {}'s container is still running: stop it before replacing \
+                 the member",
+                spec.id,
+                self.containers[*index].spec.service_id
+            );
+        }
+
+        let replacement: Vec<usize> = slots
+            .into_iter()
+            .filter(|index| self.containers[*index].spec.service_id == spec.service_id)
+            .collect();
+        assert!(
+            !replacement.is_empty(),
+            "member {} has no service {} to replace",
+            spec.id,
+            spec.service_id
+        );
+        // The services that are *not* being replaced stay on the member, and a
+        // node has one module: they have to agree with the one that arrives.
+        for (index, slot) in self.containers.iter().enumerate() {
+            if slot.spec.id == spec.id && !replacement.contains(&index) {
+                assert!(
+                    slot.spec.node == spec.node && slot.spec.driver == spec.driver,
+                    "member {} asked to be replaced by {:?}/{:?}, but its service {} stays on \
+                     {:?}/{:?}: a node has one module and one driver",
+                    spec.id,
+                    spec.node,
+                    spec.driver,
+                    slot.spec.service_id,
+                    slot.spec.node,
+                    slot.spec.driver
+                );
+            }
+        }
+        for index in replacement {
+            self.containers[index].spec = spec;
+        }
+
+        self.start_node_by_id(spec.id);
+        let service_ids: Vec<i32> = self
+            .containers
+            .iter()
+            .filter(|slot| slot.spec.id == spec.id)
+            .map(|slot| slot.spec.service_id)
+            .collect();
+        for service_id in service_ids {
+            self.start_container(spec.id, service_id);
+        }
+    }
+
     /// Stop one member's node. Its containers are the caller's to stop first:
     /// a container outliving its node ends by itself, and a test that wants to
     /// see the end should watch it.
@@ -1077,6 +1172,14 @@ impl TestCluster {
             .map_or_else(String::new, |process| process.log_tail(80));
         if let Some(driver) = &node.driver {
             text.push_str(&driver.log_tail(40));
+        }
+        if let Some(path) = &node.module_log {
+            let module = std::fs::read_to_string(path).unwrap_or_default();
+            let lines: Vec<&str> = module.lines().collect();
+            if !lines.is_empty() {
+                text.push_str("\nconsensus module log:\n");
+                text.push_str(&lines[lines.len().saturating_sub(40)..].join("\n"));
+            }
         }
         let faults = node.fault_lines();
         if !faults.is_empty() {
@@ -1274,8 +1377,13 @@ impl TestCluster {
 
         let arguments = self.rust_module_arguments(index);
         let module = match self.member_mode(index) {
-            ProcessMode::InProcess => self.launch_rust_module(index, arguments),
+            ProcessMode::InProcess => {
+                self.nodes[index].module_log = None;
+                self.launch_rust_module(index, arguments)
+            }
             ProcessMode::External => {
+                self.nodes[index].module_log =
+                    Some(self.nodes[index].cluster.path().join("cluster-node.log"));
                 ModuleHandle::External(self.spawn_cluster_node(index, &arguments))
             }
         };
@@ -1421,12 +1529,45 @@ impl TestCluster {
                 ModuleHandle::InProcess { stop, thread } => {
                     stop.store(true, Ordering::Release);
                     // The duty cycle polls the flag, so this returns once it
-                    // has taken one more turn. **It assumes the module got as
-                    // far as its duty cycle**: `launch` blocks until the
-                    // election closes, so stopping a member that is still
-                    // launching waits for that launch — which is the same wait
-                    // a start would have made, not a new one.
-                    let _ = thread.join();
+                    // has taken one more turn — **but a thread inside
+                    // `do_work` is not in that turn**: the election's
+                    // `await_services_ready` polls its acks in a loop with no
+                    // deadline (the reference's does the same,
+                    // `ConsensusModuleAgent.java:1820-1836`), and a member
+                    // that is joining a term while this fixture takes its
+                    // service containers away never leaves it.
+                    //
+                    // An unbounded join here cost the interop suite **100
+                    // minutes** once: every other binary had finished, this
+                    // thread sat in `await_services_ready`, and the harness
+                    // reported nothing because a hung test never fails. Bound
+                    // the wait so the next one is a failure that names the
+                    // state.
+                    let (finished_tx, finished_rx) = mpsc::channel();
+                    let joiner = std::thread::spawn(move || {
+                        let _ = thread.join();
+                        let _ = finished_tx.send(());
+                    });
+                    if finished_rx.recv_timeout(DEADLINE).is_err() {
+                        // The module thread cannot be killed, and it holds a
+                        // client onto this node's driver: stop the driver so
+                        // the rest of the fixture does not wait on it too, then
+                        // fail with what is known.
+                        if let Some(mut driver) = self.nodes[index].driver.take() {
+                            let _ = driver.stop();
+                        }
+                        panic!(
+                            "member {id}'s consensus module thread is still inside its duty \
+                             cycle {DEADLINE:?} after being told to stop. The stop flag is read \
+                             between duty cycles, so this is a module blocked inside one — the \
+                             election's `await_services_ready` is the unbounded wait that does \
+                             it, and a shutdown that stops the containers first leaves it \
+                             waiting for acks that can never come. This is a hang made into a \
+                             failure; the case still needs a shorter scenario or a different \
+                             stop order."
+                        );
+                    }
+                    drop(joiner);
                 }
                 ModuleHandle::External(mut process) => {
                     let status = process.stop().expect("our node stops");

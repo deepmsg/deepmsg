@@ -44,14 +44,12 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Instant;
 
 use deepmsg_tests::cluster::{Options, ProcessMode, TestCluster};
-use deepmsg_tests::cluster_client::Session;
 use deepmsg_tests::cluster_mixed::{
-    self, DEADLINE, Leader, LeaderImpl, MEMBERS, Topology, assert_one_leader, await_caught_up,
-    await_everyone_at_the_leaders_position, commit_position, connect, echo, leadership_term,
-    node_logs, options, start_member, stop_member,
+    self, Leader, LeaderImpl, MEMBERS, Topology, assert_one_leader, await_caught_up,
+    await_everyone_at_the_leaders_position, commit_position, connect, echo, follow_a_new_leader,
+    leadership_term, node_logs, options, start_member, stop_member,
 };
 
 /// The whole matrix runs one cell at a time.
@@ -190,30 +188,6 @@ fn a_follower(topology: Topology, leader: i32, other_implementation: bool) -> i3
             !other_implementation || topology.rust_members().contains(member) != leader_is_ours
         })
         .unwrap_or(if leader == 0 { 1 } else { 0 })
-}
-
-/// Wait until the session follows a leader that is not `dead`, and answer it.
-///
-/// **The wait drives the session**, the way LC-1's failover case does: a client
-/// that is not polled through a whole election is a client its own driver
-/// reaps, and the failure that produces looks like a cluster that never
-/// elected.
-fn follow_a_new_leader(cluster: &TestCluster, session: &mut Session, dead: i32) -> i32 {
-    let deadline = Instant::now() + DEADLINE;
-    let mut new_leader = None;
-    let followed = session.poll_until(deadline, |session| {
-        if new_leader.is_none() {
-            new_leader = cluster.leader_other_than(dead);
-        }
-        new_leader.is_some_and(|leader| leader == session.session.leader_member_id())
-    });
-    assert!(
-        followed,
-        "the session never followed a new leader {new_leader:?}: it says member {} leads\n{}",
-        session.session.leader_member_id(),
-        node_logs(cluster)
-    );
-    new_leader.expect("a leader the session followed")
 }
 
 /// Ten messages through the leader, and every member at the leader's position.

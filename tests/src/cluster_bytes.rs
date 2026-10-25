@@ -43,6 +43,10 @@ pub struct Recording {
     pub log_position: i64,
     /// The leadership term it was taken in.
     pub leadership_term_id: i64,
+    /// The log position the leadership term starts at. A term's log recording
+    /// begins at this position, so the bytes to replay for a log position `p`
+    /// are `p - term_base_log_position`.
+    pub term_base_log_position: i64,
 }
 
 /// The three recordings one member's `recording.log` names.
@@ -81,6 +85,7 @@ pub fn recordings_of(cluster_dir: &Path, service_id: i32) -> MemberRecordings {
                 id: entry.recording_id,
                 log_position: entry.log_position,
                 leadership_term_id: entry.leadership_term_id,
+                term_base_log_position: entry.term_base_log_position,
             })
     };
 
@@ -88,6 +93,7 @@ pub fn recordings_of(cluster_dir: &Path, service_id: i32) -> MemberRecordings {
         id: term.recording_id,
         log_position: term.log_position,
         leadership_term_id: term.leadership_term_id,
+        term_base_log_position: term.term_base_log_position,
     });
 
     MemberRecordings {
