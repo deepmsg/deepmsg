@@ -13,14 +13,23 @@
 //! MemberSpec { id, service_id, node, service, driver, backup, mode, responder }
 //! ```
 //!
-//! * `node` — who runs the consensus module. Only [`NodeImpl::Java`] is here
-//!   today; ours is P3-6a's `cluster_harness`.
+//! * `node` — who runs the consensus module: [`NodeImpl::Java`] is the
+//!   reference's `ClusteredMediaDriver` (driver, archive and module in one
+//!   JVM); [`NodeImpl::Rust`] is this build's — a
+//!   `deepmsg-archiving-media-driver` process with the module either on a
+//!   thread of this process (`ProcessMode::InProcess`) or as the
+//!   `deepmsg-cluster-node` binary (`External`). A mixed cluster is a member
+//!   table that names both, which is LC-3 (P3-7).
 //! * `service` — who runs the container: [`ServiceImpl::Rust`] names a business
 //!   from `deepmsg_cluster_service::services`, [`ServiceImpl::Test`] one of the
 //!   fixture's own (with the reference's test-business observables, in process
 //!   only), [`ServiceImpl::Java`] a Java class the reference's container loads.
-//! * `driver` — the media driver. Only [`DriverImpl::Java`] is here today: the
-//!   reference's `ClusteredMediaDriver` starts its own.
+//! * `driver` — the media driver. [`DriverImpl::Java`] is the reference's,
+//!   started inside `ClusteredMediaDriver` and therefore only with
+//!   [`NodeImpl::Java`]; [`DriverImpl::Deepmsg`] is this build's and only with
+//!   [`NodeImpl::Rust`]. The other two crosses are refused on purpose: a
+//!   reference module on this driver is LC-0's question, and this build's
+//!   module on the reference's driver is not a deployment this build targets.
 //! * `backup` — a backup member. **Carried from the first version and refused
 //!   now**: `ClusterBackup` is P3-9, and the point of carrying it is that P3-9
 //!   must not have to change this table (plan §7.2 revision).
@@ -58,6 +67,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use deepmsg_client::client::Client;
+use deepmsg_cluster::{ConsensusModuleAgent, ConsensusModuleConfig, LaunchComponents};
+use deepmsg_cluster_common::config::Properties;
 use deepmsg_cluster_common::counters::{
     self, CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID, CLUSTER_NODE_ROLE_TYPE_ID,
 };
@@ -74,8 +85,10 @@ use deepmsg_cluster_service::{
 use deepmsg_codec_cluster::close_reason::CloseReason;
 use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
 use deepmsg_core::clock::epoch_millis;
+use deepmsg_driver::idle::Strategy;
 
 use crate::aeron_tests;
+use crate::archiving_driver::OwnArchivingMediaDriver;
 use crate::driver::{self, AGRONA_JVM_ARGS};
 use crate::java;
 use crate::temp::TempDir;
@@ -87,11 +100,17 @@ pub const DEADLINE: Duration = Duration::from_secs(120);
 pub const CONTAINER_ENV: &str = "DEEPMSG_CONTAINER_BIN";
 /// Where the binary is when the variable is unset and the workspace is built.
 pub const DEFAULT_CONTAINER: &str = "../target/debug/deepmsg-clustered-service-container";
+/// Environment variable naming our consensus module binary to run.
+pub const CLUSTER_NODE_ENV: &str = "DEEPMSG_CLUSTER_NODE_BIN";
+/// Where our consensus module binary is when the variable is unset and the
+/// workspace is built.
+pub const DEFAULT_CLUSTER_NODE: &str = "../target/debug/deepmsg-cluster-node";
 
 /// Who runs a member's consensus module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeImpl {
-    /// Ours — P3-6a's `cluster_harness`, not this fixture.
+    /// Ours: a `deepmsg-archiving-media-driver` process and this build's
+    /// consensus module.
     Rust,
     /// The reference's `ClusteredMediaDriver`.
     Java,
@@ -116,18 +135,21 @@ pub enum ServiceImpl {
 /// Which media driver a member uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriverImpl {
-    /// Ours — P3-7's mixed matrix, not this fixture.
+    /// Ours. Only with [`NodeImpl::Rust`]: this build's consensus module
+    /// attaches to a driver somebody else runs.
     Deepmsg,
     /// The reference's, started inside `ClusteredMediaDriver`.
     Java,
 }
 
-/// How a member's container is started.
+/// How a member's container — and, when the node is ours, its consensus module
+/// — is started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessMode {
-    /// On a thread of this process.
+    /// On a thread of this process (the module as well, for [`NodeImpl::Rust`]).
     InProcess,
-    /// As the `deepmsg-clustered-service-container` binary.
+    /// As the `deepmsg-clustered-service-container` binary — and the
+    /// `deepmsg-cluster-node` binary for a [`NodeImpl::Rust`] node.
     External,
 }
 
@@ -200,6 +222,26 @@ impl MemberSpec {
             driver: DriverImpl::Java,
             backup: false,
             mode: ProcessMode::InProcess,
+            responder: true,
+        }
+    }
+
+    /// Our consensus module on our driver, running our container in `mode`.
+    ///
+    /// The mixed matrix's other half (LC-3, P3-7): the module and the driver are
+    /// this build's, and the container is this build's too — a Java container
+    /// beside a Rust module is LC-4b's shape, and it stays expressible by
+    /// flipping this spec's `service`.
+    #[must_use]
+    pub const fn rust_node(id: i32, service: &'static str, mode: ProcessMode) -> Self {
+        Self {
+            id,
+            service_id: 0,
+            node: NodeImpl::Rust,
+            service: ServiceImpl::Rust(service),
+            driver: DriverImpl::Deepmsg,
+            backup: false,
+            mode,
             responder: true,
         }
     }
@@ -386,14 +428,61 @@ pub struct TestCluster {
     classes: TempDir,
 }
 
-/// One node: its directories, its process, and how many containers it expects.
+/// One node: its directories, its process(es), and how many containers it
+/// expects.
 struct Node {
     id: i32,
     aeron: TempDir,
     cluster: TempDir,
     archive: TempDir,
     service_count: i32,
+    /// A Java node: one JVM that is driver, archive and consensus module.
     process: Option<Process>,
+    /// Our node's driver and archive — a process of its own, because our
+    /// consensus module attaches to a driver somebody runs.
+    driver: Option<OwnArchivingMediaDriver>,
+    /// Our node's consensus module.
+    module: Option<ModuleHandle>,
+    /// What our consensus module reported. Its thread has no log file, so a
+    /// failure message reads this instead.
+    faults: Arc<Mutex<Vec<String>>>,
+}
+
+/// Our consensus module, in whichever shape its mode asked for.
+enum ModuleHandle {
+    /// A thread of this process, driven the way `cluster_harness` drives one.
+    InProcess {
+        stop: Arc<AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    },
+    /// The `deepmsg-cluster-node` binary.
+    External(Process),
+}
+
+impl Node {
+    /// What this node's module reported, one line each.
+    fn fault_lines(&self) -> Vec<String> {
+        self.faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether anything that runs this node is still there.
+    ///
+    /// Two things can be: a Java node's one JVM, and our node's module (its
+    /// driver outlives nothing — a stopped member has neither).
+    fn is_running(&self) -> bool {
+        self.process.is_some() || self.module.is_some()
+    }
+}
+
+/// Record a line from a module thread, which has no log file of its own.
+fn record_fault(faults: &Arc<Mutex<Vec<String>>>, line: String) {
+    faults
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(line);
 }
 
 /// One container of the table, attached to a node.
@@ -477,16 +566,24 @@ impl TestCluster {
                 member.id
             );
             assert_eq!(
-                member.node,
-                NodeImpl::Java,
-                "member {} asks for our consensus module: that is P3-6a's `cluster_harness`",
-                member.id
-            );
-            assert_eq!(
                 member.driver,
-                DriverImpl::Java,
-                "member {} asks for our driver: that is P3-7's mixed matrix",
-                member.id
+                match member.node {
+                    NodeImpl::Java => DriverImpl::Java,
+                    NodeImpl::Rust => DriverImpl::Deepmsg,
+                },
+                "member {} asks for {}'s driver beside {}'s consensus module: a reference module \
+                 starts its own driver (`ClusteredMediaDriver`) and ours attaches to one somebody \
+                 runs, so the two crosses are two other cards — the reference module on our driver \
+                 is LC-0's, ours on the reference's is not a deployment this build targets",
+                member.id,
+                match member.driver {
+                    DriverImpl::Java => "the reference",
+                    DriverImpl::Deepmsg => "our",
+                },
+                match member.node {
+                    NodeImpl::Java => "the reference",
+                    NodeImpl::Rust => "our",
+                }
             );
             assert!(
                 !(matches!(member.service, ServiceImpl::Java(_))
@@ -503,6 +600,42 @@ impl TestCluster {
                  teaching the product to fail on demand",
                 member.id
             );
+        }
+
+        // A node is one set of directories and one implementation of the
+        // module: a second service on the same member id may vary its container,
+        // not who runs the node under it.
+        for (index, member) in members.iter().enumerate() {
+            for other in &members[index + 1..] {
+                assert!(
+                    other.id != member.id
+                        || (other.node == member.node && other.driver == member.driver),
+                    "member {} carries two services that disagree about who runs its node \
+                     ({:?}/{:?} and {:?}/{:?})",
+                    member.id,
+                    member.node,
+                    member.driver,
+                    other.node,
+                    other.driver
+                );
+            }
+        }
+
+        // A member whose node is ours needs two binaries of this build, and the
+        // suite's way of saying "not built" is a skip, not a panic halfway into
+        // a start: the first member would already have a driver running.
+        if members.iter().any(|member| member.node == NodeImpl::Rust) {
+            let needs_binaries = crate::archiving_driver::locate_own_archiving_media_driver()
+                .is_some()
+                && members.iter().all(|member| {
+                    member.node != NodeImpl::Rust
+                        || member.mode != ProcessMode::External
+                        || driver::locate_tool(CLUSTER_NODE_ENV, DEFAULT_CLUSTER_NODE).is_some()
+                });
+            if !needs_binaries {
+                crate::archiving_driver::announce_skip();
+                return None;
+            }
         }
 
         let jar = driver::locate_aeron_all()?;
@@ -534,6 +667,9 @@ impl TestCluster {
                 )
                 .expect("a node's service count fits an i32"),
                 process: None,
+                driver: None,
+                module: None,
+                faults: Arc::new(Mutex::new(Vec::new())),
             });
         }
         assert!(
@@ -690,7 +826,7 @@ impl TestCluster {
         let deadline = Instant::now() + DEADLINE;
         while Instant::now() < deadline {
             for node in &self.nodes {
-                if node.process.is_none() {
+                if !node.is_running() {
                     continue;
                 }
                 if self.counter_on(node.id, CLUSTER_NODE_ROLE_TYPE_ID) == Some(ROLE_LEADER) {
@@ -853,14 +989,7 @@ impl TestCluster {
     /// see the end should watch it.
     pub fn stop_node(&mut self, member: i32) {
         let index = self.node_index(member);
-        if let Some(mut process) = self.nodes[index].process.take() {
-            let status = process.stop().expect("the Java node stops");
-            assert!(
-                status.success() || status.code() == Some(143),
-                "member {member}'s Java node exited with {status}\nnode log:\n{}",
-                process.log_tail(80)
-            );
-        }
+        self.stop_node_processes(index);
     }
 
     /// The half of [`Self::restart_node`] that stops the containers and the
@@ -885,14 +1014,7 @@ impl TestCluster {
         }
 
         let node_index = self.node_index(member);
-        if let Some(mut process) = self.nodes[node_index].process.take() {
-            let status = process.stop().expect("the Java node stops");
-            assert!(
-                status.success() || status.code() == Some(143),
-                "member {member}'s Java node exited with {status}\nnode log:\n{}",
-                process.log_tail(80)
-            );
-        }
+        self.stop_node_processes(node_index);
         self.start_node(node_index);
     }
 
@@ -907,26 +1029,28 @@ impl TestCluster {
             self.stop_container(member, service_id);
         }
 
-        for node in &mut self.nodes {
-            if let Some(mut process) = node.process.take() {
-                let status = process.stop().expect("the Java node stops");
-                assert!(
-                    status.success() || status.code() == Some(143),
-                    "member {}'s Java node exited with {status}\nnode log:\n{}",
-                    node.id,
-                    process.log_tail(80)
-                );
-            }
+        for index in 0..self.nodes.len() {
+            self.stop_node_processes(index);
         }
     }
 
     /// The last lines of a node's output.
     #[must_use]
     pub fn node_log(&self, member: i32) -> String {
-        self.node(member)
+        let node = self.node(member);
+        let mut text = node
             .process
             .as_ref()
-            .map_or_else(String::new, |process| process.log_tail(80))
+            .map_or_else(String::new, |process| process.log_tail(80));
+        if let Some(driver) = &node.driver {
+            text.push_str(&driver.log_tail(40));
+        }
+        let faults = node.fault_lines();
+        if !faults.is_empty() {
+            text.push_str("\nconsensus module:\n");
+            text.push_str(&faults.join("\n"));
+        }
+        text
     }
 
     /// The last lines of every container's output, for a failure message.
@@ -1052,9 +1176,238 @@ impl TestCluster {
         // thing a restart is free to throw away.
         let _ = std::fs::remove_dir_all(self.nodes[index].aeron.path());
 
-        let process = self.spawn_java_node(index);
-        self.nodes[index].process = Some(process);
-        self.await_driver_ready(index);
+        match self.node_impl(index) {
+            NodeImpl::Java => {
+                let process = self.spawn_java_node(index);
+                self.nodes[index].process = Some(process);
+                self.await_driver_ready(index);
+            }
+            NodeImpl::Rust => self.start_rust_node(index),
+        }
+    }
+
+    /// Who runs this node. Every spec that names it agrees — [`Self::start_inner`]
+    /// refuses a table where they do not.
+    fn node_impl(&self, index: usize) -> NodeImpl {
+        let id = self.nodes[index].id;
+        self.containers
+            .iter()
+            .find(|slot| slot.spec.id == id)
+            .map_or(NodeImpl::Java, |slot| slot.spec.node)
+    }
+
+    /// How this member's containers — and, when the node is ours, its module —
+    /// are started.
+    fn member_mode(&self, index: usize) -> ProcessMode {
+        let id = self.nodes[index].id;
+        self.containers
+            .iter()
+            .find(|slot| slot.spec.id == id)
+            .map_or(ProcessMode::External, |slot| slot.spec.mode)
+    }
+
+    /// Start our node: a driver-and-archive process, then the module.
+    fn start_rust_node(&mut self, index: usize) {
+        let id = self.nodes[index].id;
+        let archive_channel = self.archive_control_channel(id);
+        let properties = [
+            // The archiving media driver runs the driver and the archive on
+            // one thread and refuses anything but SHARED or INVOKER.
+            "-Daeron.threading.mode=SHARED".to_owned(),
+            "-Daeron.archive.threading.mode=SHARED".to_owned(),
+            format!("-Daeron.archive.control.channel={archive_channel}"),
+            "-Daeron.archive.replication.channel=aeron:udp?endpoint=localhost:0".to_owned(),
+        ];
+        let property_refs: Vec<&str> = properties.iter().map(String::as_str).collect();
+
+        let mut driver = {
+            let node = &self.nodes[index];
+            OwnArchivingMediaDriver::start_in(
+                node.aeron.path(),
+                node.archive.path(),
+                &property_refs,
+            )
+        }
+        .unwrap_or_else(|| {
+            panic!(
+                "member {id} asks for our node, and there is no \
+                 `deepmsg-archiving-media-driver` binary: `start` skips a table that asks for one \
+                 before it gets here, so this build changed under the fixture"
+            )
+        });
+        driver.await_ready(DEADLINE).unwrap_or_else(|error| {
+            panic!("member {id}'s driver and archive never became ready: {error}")
+        });
+
+        let arguments = self.rust_module_arguments(index);
+        let module = match self.member_mode(index) {
+            ProcessMode::InProcess => self.launch_rust_module(index, arguments),
+            ProcessMode::External => {
+                ModuleHandle::External(self.spawn_cluster_node(index, &arguments))
+            }
+        };
+
+        self.nodes[index].driver = Some(driver);
+        self.nodes[index].module = Some(module);
+    }
+
+    /// The module properties a [`NodeImpl::Rust`] member is given — the same
+    /// names and the same values its Java sibling gets from
+    /// `ClusteredMediaDriver`, so that a difference between the two is a
+    /// difference in the implementations and not in what they were told.
+    fn rust_module_arguments(&self, index: usize) -> Vec<String> {
+        let node = &self.nodes[index];
+        let mut arguments = vec![
+            format!("-Daeron.dir={}", node.aeron.path().display()),
+            format!("-Daeron.cluster.dir={}", node.cluster.path().display()),
+            format!("-Daeron.cluster.id={}", self.options.cluster_id),
+            format!("-Daeron.cluster.member.id={}", node.id),
+            format!("-Daeron.cluster.members={}", self.options.members_string()),
+            format!(
+                "-Daeron.cluster.ingress.channel={}",
+                self.options.ingress_channel
+            ),
+            format!(
+                "-Daeron.cluster.consensus.channel={}",
+                self.options.consensus_channel
+            ),
+            format!("-Daeron.cluster.log.channel={}", self.options.log_channel),
+            format!(
+                "-Daeron.cluster.control.channel={}",
+                self.options.control_channel
+            ),
+            "-Daeron.cluster.replication.channel=aeron:udp?endpoint=localhost:0".to_owned(),
+            format!("-Daeron.cluster.service.count={}", node.service_count),
+        ];
+        for (name, value) in &self.options.node_properties {
+            arguments.push(format!("-D{name}={value}"));
+        }
+        arguments
+    }
+
+    /// Our consensus module on a thread of this process, as `cluster_harness`
+    /// runs one.
+    fn launch_rust_module(&self, index: usize, arguments: Vec<String>) -> ModuleHandle {
+        let node = &self.nodes[index];
+        let id = node.id;
+        let mut properties = Properties::new();
+        properties
+            .apply_args(arguments)
+            .unwrap_or_else(|error| panic!("member {id}'s module properties: {error}"));
+        let config = ConsensusModuleConfig::from_properties(&properties)
+            .unwrap_or_else(|error| panic!("member {id}'s module is refused: {error}"));
+        let idle_strategy = config.idle_strategy.clone();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let faults = Arc::clone(&node.faults);
+
+        let thread = std::thread::spawn(move || {
+            let Some(mut idle) = Strategy::by_agrona_name(&idle_strategy) else {
+                record_fault(
+                    &faults,
+                    format!("member {id}: unknown idle strategy {idle_strategy}"),
+                );
+                return;
+            };
+            let handler = Arc::clone(&faults);
+            let mut agent = match ConsensusModuleAgent::launch_with_components(
+                config,
+                LaunchComponents {
+                    // The reference's `ClusterTests.errorHandler`
+                    // (`ClusterTest.java:565`): a WARN is printed by the agent
+                    // and goes no further, an ERROR is a failure — and here a
+                    // failure is what a case's waits panic with.
+                    error_handler: Some(Box::new(move |error: &deepmsg_cluster::ClusterError| {
+                        if !error.is_warning() {
+                            record_fault(&handler, format!("member {id}: {error}"));
+                        }
+                    })),
+                    ..LaunchComponents::default()
+                },
+            ) {
+                Ok(agent) => agent,
+                Err(error) => {
+                    record_fault(&faults, format!("member {id}: launch: {error}"));
+                    return;
+                }
+            };
+
+            while !flag.load(Ordering::Relaxed) {
+                match agent.do_work() {
+                    Ok(work) => idle.idle(work),
+                    Err(error) if error.is_termination() => break,
+                    Err(error) => {
+                        record_fault(&faults, format!("member {id}: the duty cycle: {error}"));
+                        break;
+                    }
+                }
+            }
+
+            if let Err(error) = agent.close() {
+                record_fault(&faults, format!("member {id}: close: {error}"));
+            }
+        });
+
+        ModuleHandle::InProcess { stop, thread }
+    }
+
+    /// Our consensus module as the `deepmsg-cluster-node` binary.
+    fn spawn_cluster_node(&self, index: usize, arguments: &[String]) -> Process {
+        let node = &self.nodes[index];
+        let binary =
+            driver::locate_tool(CLUSTER_NODE_ENV, DEFAULT_CLUSTER_NODE).unwrap_or_else(|| {
+                panic!(
+                    "no {DEFAULT_CLUSTER_NODE}; build it with `cargo build --workspace --bins` \
+                     or set {CLUSTER_NODE_ENV}"
+                )
+            });
+        let log = node.cluster.path().join("cluster-node.log");
+        Process::spawn(&binary, &log, arguments, &[]).unwrap_or_else(|error| {
+            panic!(
+                "member {}'s consensus module did not start: {error}",
+                node.id
+            )
+        })
+    }
+
+    /// Stop whatever runs this node: the reference's one JVM, or our module and
+    /// its driver.
+    fn stop_node_processes(&mut self, index: usize) {
+        let id = self.nodes[index].id;
+        if let Some(mut process) = self.nodes[index].process.take() {
+            let status = process.stop().expect("the Java node stops");
+            assert!(
+                status.success() || status.code() == Some(143),
+                "member {id}'s Java node exited with {status}\nnode log:\n{}",
+                process.log_tail(80)
+            );
+        }
+        if let Some(module) = self.nodes[index].module.take() {
+            match module {
+                ModuleHandle::InProcess { stop, thread } => {
+                    stop.store(true, Ordering::Release);
+                    // The duty cycle polls the flag, so this returns once it
+                    // has taken one more turn. **It assumes the module got as
+                    // far as its duty cycle**: `launch` blocks until the
+                    // election closes, so stopping a member that is still
+                    // launching waits for that launch — which is the same wait
+                    // a start would have made, not a new one.
+                    let _ = thread.join();
+                }
+                ModuleHandle::External(mut process) => {
+                    let status = process.stop().expect("our node stops");
+                    assert!(
+                        status.success() || status.code() == Some(143),
+                        "member {id}'s node exited with {status}\nnode log:\n{}",
+                        process.log_tail(80)
+                    );
+                }
+            }
+        }
+        if let Some(mut driver) = self.nodes[index].driver.take() {
+            let _ = driver.stop();
+        }
     }
 
     /// Wait until the restarted node's driver has published a CnC file a client

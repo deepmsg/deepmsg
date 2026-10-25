@@ -139,6 +139,42 @@ impl OwnArchivingMediaDriver {
         })
     }
 
+    /// [`Self::start`] with the **aeron** directory supplied by the caller
+    /// rather than derived from `test_name`.
+    ///
+    /// A cluster member's directories are the fixture's, not the driver's: the
+    /// consensus module, the containers and the driver all have to name the
+    /// same `aeron.dir`, and a directory the driver picked from a test name is
+    /// one the others cannot name. The other three properties are the ones
+    /// [`ReferenceDriver::start_with_env`] writes, kept identical so that a
+    /// node started this way behaves like a driver started the other way.
+    pub fn start_in(
+        aeron_dir: &Path,
+        archive_dir: &Path,
+        extra_properties: &[&str],
+    ) -> Option<Self> {
+        let binary = locate_own_archiving_media_driver()?;
+
+        let mut properties: Vec<String> = vec![
+            format!("-Daeron.dir={}", aeron_dir.display()),
+            "-Daeron.dir.delete.on.start=true".to_owned(),
+            "-Daeron.dir.delete.on.shutdown=true".to_owned(),
+            "-Daeron.print.configuration=false".to_owned(),
+            format!("-Daeron.archive.dir={}", archive_dir.display()),
+        ];
+        properties.extend(
+            extra_properties
+                .iter()
+                .map(|property| (*property).to_owned()),
+        );
+        let driver = ReferenceDriver::spawn_with_args(&binary, aeron_dir, &properties, &[]).ok()?;
+
+        Some(Self {
+            driver,
+            archive_dir: archive_dir.to_path_buf(),
+        })
+    }
+
     /// The aeron directory this process owns — where its CnC file lives.
     pub fn aeron_dir(&self) -> &Path {
         self.driver.aeron_dir()
