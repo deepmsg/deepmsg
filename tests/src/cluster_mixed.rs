@@ -42,6 +42,8 @@ use deepmsg_cluster_common::counters::{
     CLUSTER_COMMIT_POSITION_TYPE_ID, CLUSTER_LEADERSHIP_TERM_ID_TYPE_ID, CLUSTER_NODE_ROLE_TYPE_ID,
     CLUSTER_SNAPSHOT_COUNTER_TYPE_ID,
 };
+use deepmsg_codec_cluster::admin_request_type::AdminRequestType;
+use deepmsg_codec_cluster::admin_response_code::AdminResponseCode;
 
 use crate::cluster::{ClusterPorts, MemberSpec, Options, ProcessMode, TestCluster};
 use crate::cluster_client::{Session, base_context, send_and_await_echo};
@@ -375,6 +377,56 @@ pub fn leadership_term(cluster: &TestCluster, member: i32) -> Option<i64> {
 #[must_use]
 pub fn snapshots_taken(cluster: &TestCluster, member: i32) -> Option<i64> {
     cluster.counter_on(member, CLUSTER_SNAPSHOT_COUNTER_TYPE_ID)
+}
+
+/// Ask the cluster for a snapshot and wait until every member in `expected`
+/// has taken one.
+///
+/// `expected` is not always every member: a case that takes a snapshot while a
+/// member is away has one whose counter can never move.
+pub fn take_a_snapshot(cluster: &TestCluster, session: &mut Session, expected: &[i32]) {
+    assert!(
+        session
+            .session
+            .send_admin_request_to_take_a_snapshot(&mut session.client, 42),
+        "the session has an ingress publication to send the request on"
+    );
+
+    let deadline = Instant::now() + DEADLINE;
+    assert!(
+        session.poll_until(deadline, |session| {
+            !session.received.borrow().admin_responses.is_empty()
+        }),
+        "the cluster never answered the admin request\n{}",
+        node_logs(cluster)
+    );
+    let responses = session.received.borrow().admin_responses.clone();
+    assert!(
+        responses.iter().any(
+            |response| response.request_type == AdminRequestType::SNAPSHOT
+                && response.response_code == AdminResponseCode::OK
+                && response.message.is_empty()
+        ),
+        "the cluster accepted the snapshot request: {responses:?}"
+    );
+
+    // The toggle is in the log, so every member takes its own snapshot when it
+    // reaches that position — the leader first, the followers on their way
+    // through.
+    let taken = session.poll_until(deadline, |_| {
+        expected
+            .iter()
+            .all(|member| snapshots_taken(cluster, *member).is_some_and(|count| count >= 1))
+    });
+    assert!(
+        taken,
+        "not every member took the snapshot: {:?}\n{}",
+        expected
+            .iter()
+            .map(|member| snapshots_taken(cluster, *member))
+            .collect::<Vec<_>>(),
+        node_logs(cluster)
+    );
 }
 
 /// Wait until every member's commit position is the leader's, and hand it back.

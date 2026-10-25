@@ -738,6 +738,14 @@ name = "cluster_lc3_matrix"
 path = "interop/cluster_lc3_matrix.rs"
 required-features = ["interop"]
 
+# P3-7c's LC-3 byte rulers: each member's log recording, consensus module
+# snapshot and twin-business snapshot, compared as payload bytes — beside an
+# all-reference control that proves the rulers before the mixed cases use them.
+[[test]]
+name = "cluster_lc3_bytes"
+path = "interop/cluster_lc3_bytes.rs"
+required-features = ["interop"]
+
 # P3-3a's LC-1 first step: our cluster client connecting to the reference's
 # single Java node over IPC.
 [[test]]

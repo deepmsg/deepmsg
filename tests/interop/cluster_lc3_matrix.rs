@@ -44,16 +44,14 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use deepmsg_codec_cluster::admin_request_type::AdminRequestType;
-use deepmsg_codec_cluster::admin_response_code::AdminResponseCode;
 use deepmsg_tests::cluster::{Options, ProcessMode, TestCluster};
 use deepmsg_tests::cluster_client::Session;
 use deepmsg_tests::cluster_mixed::{
     self, DEADLINE, Leader, LeaderImpl, MEMBERS, Topology, assert_one_leader, await_caught_up,
     await_everyone_at_the_leaders_position, commit_position, connect, echo, leadership_term,
-    node_logs, options, snapshots_taken, start_member, stop_member,
+    node_logs, options, start_member, stop_member,
 };
 
 /// The whole matrix runs one cell at a time.
@@ -191,7 +189,7 @@ fn a_follower(topology: Topology, leader: i32, other_implementation: bool) -> i3
         .find(|member| {
             !other_implementation || topology.rust_members().contains(member) != leader_is_ours
         })
-        .unwrap_or_else(|| if leader == 0 { 1 } else { 0 })
+        .unwrap_or(if leader == 0 { 1 } else { 0 })
 }
 
 /// Wait until the session follows a leader that is not `dead`, and answer it.
@@ -216,60 +214,6 @@ fn follow_a_new_leader(cluster: &TestCluster, session: &mut Session, dead: i32) 
         node_logs(cluster)
     );
     new_leader.expect("a leader the session followed")
-}
-
-/// Ask the cluster for a snapshot and wait until every member in `expected`
-/// has taken one.
-///
-/// `expected` is not always every member: the catch-up case takes a snapshot
-/// **while a member is away**, and that member's counter can never move.
-fn take_a_snapshot(cluster: &TestCluster, session: &mut Session, expected: &[i32]) {
-    assert!(
-        session
-            .session
-            .send_admin_request_to_take_a_snapshot(&mut session.client, 42),
-        "the session has an ingress publication to send the request on"
-    );
-
-    let deadline = Instant::now() + DEADLINE;
-    assert!(
-        session.poll_until(deadline, |session| {
-            !session.received.borrow().admin_responses.is_empty()
-        }),
-        "the cluster never answered the admin request\n{}",
-        node_logs(cluster)
-    );
-    let responses = session.received.borrow().admin_responses.clone();
-    assert!(
-        responses.iter().any(
-            |response| response.request_type == AdminRequestType::SNAPSHOT
-                && response.response_code == AdminResponseCode::OK
-                && response.message.is_empty()
-        ),
-        "the cluster accepted the snapshot request: {responses:?}"
-    );
-
-    // The toggle is in the log, so every member takes its own snapshot when it
-    // reaches that position — the leader first, the followers on their way
-    // through.
-    loop {
-        let taken: Vec<Option<i64>> = expected
-            .iter()
-            .map(|member| snapshots_taken(cluster, *member))
-            .collect();
-        if taken
-            .iter()
-            .all(|count| count.is_some_and(|count| count >= 1))
-        {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "not every member took the snapshot: {taken:?}\n{}",
-            node_logs(cluster)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 /// Ten messages through the leader, and every member at the leader's position.
@@ -406,7 +350,7 @@ fn the_matrix_takes_a_snapshot() {
                     return;
                 };
                 echo(&mut session, 0, 5);
-                take_a_snapshot(cluster, &mut session, &[0, 1, 2]);
+                cluster_mixed::take_a_snapshot(cluster, &mut session, &[0, 1, 2]);
 
                 let follower = a_follower(cell.topology, leader, false);
                 stop_member(cluster, follower);
@@ -444,7 +388,7 @@ fn the_matrix_catches_a_follower_up_across_a_snapshot() {
                 stop_member(cluster, follower);
 
                 let still_here: Vec<i32> = (0..MEMBERS).filter(|id| *id != follower).collect();
-                take_a_snapshot(cluster, &mut session, &still_here);
+                cluster_mixed::take_a_snapshot(cluster, &mut session, &still_here);
                 echo(&mut session, 5, 10);
 
                 let position = commit_position(cluster, leader)
