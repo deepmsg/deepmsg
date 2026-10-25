@@ -395,17 +395,13 @@ fn the_rulers_hold_with_ours_leading_and_the_references_following() {
 
 /// The reference leads, ours follows.
 ///
-/// **Ignored: this case found a difference and it is not yet explained.** In a
-/// mixed cluster the consensus module snapshots disagree on exactly one field —
-/// `ClusterSession.openedLogPosition` — 96 on one member and 256 on the other
-/// two, where a pure-reference control agrees on 256 in every combination
-/// tried (including the same appointment). 96 and 256 are one log frame apart,
-/// so the two candidates are "the frame's start position versus the position
-/// after it" and "the session was opened twice"; the next step is to decode the
-/// log's frames rather than guess. Recorded in
+/// **This is the case that found the divergence.** Before the fix, the two
+/// implementations wrote different `ClusterSession.openedLogPosition` values —
+/// 96 on our follower, 256 everywhere else — because our replay path handed the
+/// session the frame's own start where the reference hands it the frame after
+/// (`aeron-client/.../logbuffer/Header.java:240-248`). See
 /// `analysis/cluster/deepmsg-p3-7-plan-mixed-membership.md` §12.
 #[test]
-#[ignore = "P3-7c: openedLogPosition differs between members in a mixed cluster; see plan §12"]
 fn the_rulers_hold_with_the_references_leading_and_ours_following() {
     let _serial = serial();
     let mode = ProcessMode::InProcess;
@@ -418,10 +414,9 @@ fn the_rulers_hold_with_the_references_leading_and_ours_following() {
 
 /// Two of ours, one of the reference's, and ours leads.
 ///
-/// Ignored for the same difference as
+/// The second case that found the divergence; see
 /// [`the_rulers_hold_with_the_references_leading_and_ours_following`].
 #[test]
-#[ignore = "P3-7c: openedLogPosition differs between members in a mixed cluster; see plan §12"]
 fn the_rulers_hold_in_two_of_ours_one_of_theirs() {
     let _serial = serial();
     let mode = ProcessMode::InProcess;
