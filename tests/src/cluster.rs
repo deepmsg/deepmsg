@@ -294,10 +294,21 @@ pub struct Options {
     pub members: Option<String>,
     /// The Java probe sources to compile (`java/<name>.java`).
     pub probes: Vec<&'static str>,
-    /// Extra `-D` properties for the Java node — a scenario that needs a
+    /// Extra `-D` properties for every node — a scenario that needs a
     /// different session timeout, say. Applied last, so a file's value is
     /// overridden the way a JVM's `-D` is.
     pub node_properties: Vec<(String, String)>,
+    /// Extra `-D` properties for **one** member, applied after
+    /// [`Self::node_properties`].
+    ///
+    /// A cluster's members are told the same things almost always, and the
+    /// exception is the point: a case that wants one particular member to be
+    /// the leader gives **that member** the appointment and nobody else, so
+    /// that its death leaves an election rather than the reference's
+    /// appointed-leader stall (`Election.java:715-718`: a member appointed to
+    /// somebody else never nominates, so with every member told the same dead
+    /// id the survivors canvass forever).
+    pub member_properties: Vec<(i32, String, String)>,
 }
 
 impl Default for Options {
@@ -319,11 +330,26 @@ impl Default for Options {
             members: None,
             probes: Vec::new(),
             node_properties: Vec::new(),
+            member_properties: Vec::new(),
         }
     }
 }
 
 impl Options {
+    /// Every `-D` property this member is started with: the cluster-wide ones
+    /// first, then the ones that name it.
+    #[must_use]
+    pub fn properties_for(&self, member: i32) -> Vec<(String, String)> {
+        let mut properties = self.node_properties.clone();
+        properties.extend(
+            self.member_properties
+                .iter()
+                .filter(|(id, _, _)| *id == member)
+                .map(|(_, name, value)| (name.clone(), value.clone())),
+        );
+        properties
+    }
+
     /// The members string, defaulting to one member with unused endpoints.
     #[must_use]
     pub fn members_string(&self) -> String {
@@ -1279,7 +1305,7 @@ impl TestCluster {
             "-Daeron.cluster.replication.channel=aeron:udp?endpoint=localhost:0".to_owned(),
             format!("-Daeron.cluster.service.count={}", node.service_count),
         ];
-        for (name, value) in &self.options.node_properties {
+        for (name, value) in &self.options.properties_for(node.id) {
             arguments.push(format!("-D{name}={value}"));
         }
         arguments
@@ -1517,7 +1543,7 @@ impl TestCluster {
         ));
         args.push("-Daeron.threading.mode=SHARED".to_owned());
         args.push("-Daeron.print.configuration=false".to_owned());
-        for (name, value) in &self.options.node_properties {
+        for (name, value) in &self.options.properties_for(node.id) {
             args.push(format!("-D{name}={value}"));
         }
         args.push("-cp".to_owned());

@@ -24,6 +24,7 @@ pub mod archiving_driver;
 pub mod cluster;
 pub mod cluster_client;
 pub mod cluster_harness;
+pub mod cluster_mixed;
 pub mod driver;
 pub mod java;
 pub mod java_archiving_driver;

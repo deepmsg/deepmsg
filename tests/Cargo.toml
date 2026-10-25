@@ -731,6 +731,13 @@ name = "cluster_lc3_smoke"
 path = "interop/cluster_lc3_smoke.rs"
 required-features = ["interop"]
 
+# P3-7b's LC-3 matrix: six scenarios over both topologies, both appointed
+# leadership directions and both startup paths — eight cells each.
+[[test]]
+name = "cluster_lc3_matrix"
+path = "interop/cluster_lc3_matrix.rs"
+required-features = ["interop"]
+
 # P3-3a's LC-1 first step: our cluster client connecting to the reference's
 # single Java node over IPC.
 [[test]]
