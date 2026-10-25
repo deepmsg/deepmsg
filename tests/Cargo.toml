@@ -722,6 +722,30 @@ name = "cluster_lc4b"
 path = "interop/cluster_lc4b.rs"
 required-features = ["interop"]
 
+# P3-7's LC-3 first rung: one member runs this build's consensus module and two
+# run the reference's, in one cluster. Needs the reference jar and a JDK, our
+# archiving media driver, and (for the external arm) our cluster-node binary.
+# No Java probe is compiled: every container in it is this build's.
+[[test]]
+name = "cluster_lc3_smoke"
+path = "interop/cluster_lc3_smoke.rs"
+required-features = ["interop"]
+
+# P3-7b's LC-3 matrix: six scenarios over both topologies, both appointed
+# leadership directions and both startup paths — eight cells each.
+[[test]]
+name = "cluster_lc3_matrix"
+path = "interop/cluster_lc3_matrix.rs"
+required-features = ["interop"]
+
+# P3-7c's LC-3 byte rulers: each member's log recording, consensus module
+# snapshot and twin-business snapshot, compared as payload bytes — beside an
+# all-reference control that proves the rulers before the mixed cases use them.
+[[test]]
+name = "cluster_lc3_bytes"
+path = "interop/cluster_lc3_bytes.rs"
+required-features = ["interop"]
+
 # P3-3a's LC-1 first step: our cluster client connecting to the reference's
 # single Java node over IPC.
 [[test]]

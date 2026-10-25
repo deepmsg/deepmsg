@@ -324,8 +324,30 @@ impl LogAdapter {
                 let response_channel =
                     String::from_utf8_lossy(decoder.response_channel_slice(channel_coords))
                         .into_owned();
+                // The reference's `LogAdapter` hands the session
+                // `header.position()`, whose javadoc is "the offset of the
+                // frame immediately after this one"
+                // (`aeron-client/.../logbuffer/Header.java:94-97`, `:240-248`
+                // — `computePosition(termId(), nextTermOffset(), …)` with
+                // `nextTermOffset = align(termOffset + termOccupancyLength)`).
+                // **Not** the frame's own start: a leader takes its
+                // `openedLogPosition` from `Publication.offer`'s return, which
+                // is the position after the append, and a follower has to land
+                // on the same number or the two write different snapshots
+                // (P3-7c's byte ruler caught exactly that).
+                //
+                // `fragmented_frame_length` is this build's
+                // `termOccupancyLength`: what one frame carrying the whole
+                // payload measures, which is `frame_length` when nothing was
+                // fragmented (`fragment_assembler.rs:440-453`).
+                let occupancy = message.header.fragmented_frame_length;
+                let next_position = message.header.position
+                    + i64::from(deepmsg_core::logbuffer::position::align_up(
+                        occupancy,
+                        deepmsg_core::logbuffer::descriptor::FRAME_ALIGNMENT,
+                    ));
                 handler.on_replay_session_open(
-                    message.header.position,
+                    next_position,
                     correlation_id,
                     cluster_session_id,
                     timestamp,
