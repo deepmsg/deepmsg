@@ -1607,7 +1607,7 @@ impl Conductor {
                         )],
                         now_ns,
                     );
-                    work += self.announce_image_unavailable(registration_id);
+                    work += self.transition_image_to_linger(registration_id);
                 }
                 ReceiverEvent::ReResolveControl {
                     endpoint_id,
@@ -1994,11 +1994,68 @@ impl Conductor {
         1
     }
 
-    /// Tell every subscription reading this image that it is gone, and stop
-    /// calling them its readers
-    /// (`aeron_driver_conductor_image_transition_to_linger`, `:1642-1675`,
-    /// which is the reference's own **one** announcement — it unlinks as it
-    /// tells, so the release a moment later finds nobody left to tell).
+    /// `aeron_driver_conductor_image_transition_to_linger` (`:1642-1675`) and
+    /// the two calls the reference makes in the **same conductor turn** as the
+    /// image leaves `DRAINING` (`aeron_publication_image.c:1351-1358`).
+    ///
+    /// The three things the reference does here, in this order:
+    ///
+    /// 1. the image leaves the receiver's dispatcher
+    ///    (`aeron_driver_receiver_proxy_on_remove_publication_image`, `:1354`),
+    ///    which is where `IMAGE_COOL_DOWN` is left behind for the session
+    ///    (`aeron_data_packet_dispatcher.c:323-355`): a frame from it no longer
+    ///    elicits a `SETUP` (`:410-413`) and a `SETUP` creates nothing
+    ///    (`:503-506`) until the cool-down is cleared;
+    /// 2. `rejoin` is read off the subscriptions that read the image — the
+    ///    **last** linked one wins and `true` is the initial value, exactly as
+    ///    its loop leaves it (`:1649-1664`) — and the cool-down is cleared when
+    ///    it says so (`:1664-1674`);
+    /// 3. the readers are told the image is gone (`on_unavailable_image` inside
+    ///    that same loop).
+    ///
+    /// **The order is load-bearing, and it is why this is not done at release.**
+    /// The reference's announcement is inside the loop that reads `is_rejoin`,
+    /// so a client cannot answer — by dropping the subscription — between the
+    /// two. Fold after announcing and the links are already gone: the empty set
+    /// folds to its `true` initial value and **every** cool-down is cleared, so
+    /// a subscription that says `rejoin=false` re-joins the same node's image
+    /// and its client silently loses every message in between. That is
+    /// `cluster_lc1_reliability`'s R5 and P3-3c's criterion 4.
+    fn transition_image_to_linger(&mut self, registration_id: i64) -> usize {
+        let Some(image) = self.images.find(registration_id).cloned() else {
+            return 0;
+        };
+
+        let _ = self.receiver.remove_image(registration_id);
+        let rejoin = self
+            .subscriptions
+            .readers_of(registration_id)
+            .iter()
+            .fold(true, |_, link| link.is_rejoin);
+
+        if rejoin {
+            let _ = self.receiver.remove_cool_down(
+                image.endpoint_id,
+                image.stream_id,
+                image.session_id,
+            );
+        }
+
+        self.announce_image_unavailable(registration_id);
+
+        1
+    }
+
+    /// Tell every subscription reading this image that it is gone
+    /// (`aeron_driver_conductor_image_transition_to_linger`, `:1642-1675`: the
+    /// `on_unavailable_image` call inside its loop).
+    ///
+    /// The readers stay **linked** afterwards. The reference lets go of an
+    /// image's subscribable at the end of its life
+    /// (`aeron_publication_image_entry_delete`, `:1604-1618`), not at the
+    /// announcement — and it must, because the cool-down decided in the same
+    /// turn as this announcement is read off those links
+    /// ([`Self::transition_image_to_linger`]).
     fn announce_image_unavailable(&mut self, registration_id: i64) -> usize {
         let Some(image) = self.images.find(registration_id).cloned() else {
             return 0;
@@ -2028,8 +2085,6 @@ impl Conductor {
         // scope here so the link list can be taken below.
         let _ = &transmit;
 
-        self.subscriptions.forget_publication(registration_id);
-
         1
     }
 
@@ -2038,37 +2093,28 @@ impl Conductor {
             return 0;
         };
 
-        let _ = self.receiver.remove_image(registration_id);
-
-        // `aeron_driver_conductor_image_transition_to_linger` (`:1642-1675`):
-        // the cool-down the removal above leaves behind is cleared again when
-        // the subscription that read the image rejoins — otherwise no `SETUP`
-        // and no frame from that session can ever make another image
-        // (`aeron_data_packet_dispatcher.c:503-506`, `:410-413`), and a
-        // publisher still sending is never heard from again. Read off the
-        // **last** matching link, as the reference's loop leaves it; a
-        // subscription that says `rejoin=false` — the cluster's own log
-        // subscription (`Election.java:1376`) — keeps its cool-down.
-        let rejoin = self
-            .subscriptions
-            .readers_of(registration_id)
-            .iter()
-            .fold(true, |_, link| link.is_rejoin);
-
-        if rejoin {
-            let _ = self.receiver.remove_cool_down(
-                image.endpoint_id,
-                image.stream_id,
-                image.session_id,
-            );
+        // The ordinary image took the transition as it left `DRAINING`
+        // (`ReceiverEvent::ImageLingering`). A **revoked** one does not: it goes
+        // `LINGER`→`DONE` with no notice to send (`publication_image.rs`, the
+        // `linger_notice` in `ImageState::Draining`), and this build tells its
+        // readers when it is released. So the same three steps happen here for
+        // it, in the same order and for the same reason — a revoked image is
+        // still a network image with a cool-down to decide.
+        if self
+            .images
+            .find(registration_id)
+            .is_some_and(|record| record.state != crate::publication_image::ImageState::Linger)
+        {
+            let _ = self.transition_image_to_linger(registration_id);
         }
 
-        // A reader that has not been told yet is told now: the normal path has
-        // already said so as the image left DRAINING (`:1642-1675`), and a
-        // **revoked** one has not — it goes LINGER→DONE without a linger to
-        // announce on, which is this build's own divergence and the reason this
-        // call is here rather than gone.
-        self.announce_image_unavailable(registration_id);
+        // `aeron_publication_image_entry_delete` (`:1604-1618`): the links let
+        // go of the image's subscribable, and only then are the counters and the
+        // log buffer given back. **Not** at the announcement: the cool-down the
+        // transition decides is read off these links
+        // ([`Self::transition_image_to_linger`]).
+        self.subscriptions.forget_publication(registration_id);
+
         self.receive_endpoints.detach_image(image.endpoint_id);
 
         // An endpoint whose last image has just gone is one to try again on:
@@ -6504,6 +6550,140 @@ mod tests {
                 "{name} is reclaimed"
             );
         }
+    }
+
+    /// **A subscription that does not rejoin keeps the cool-down an image leaves
+    /// behind**, so the same session's `SETUP` makes no second image.
+    ///
+    /// The cool-down is left by the image's removal
+    /// (`aeron_data_packet_dispatcher.c:323-355`) and a `SETUP` in it creates
+    /// nothing (`:503-506`). What clears it is the same conductor turn that
+    /// tells the readers the image is gone, off the links **still linked** at
+    /// that moment (`aeron_driver_conductor.c:1649-1674`) — so a subscription
+    /// that says `rejoin=false` never clears it. That is what stops a cluster
+    /// client's egress subscription from re-joining the image it just lost and
+    /// silently skipping every message in between (P3-3c criterion 4).
+    #[test]
+    fn a_subscription_that_does_not_rejoin_keeps_the_cool_down_an_image_leaves() {
+        assert!(!an_image_comes_back_after_the_linger("|rejoin=false"));
+    }
+
+    /// The other half, and the half #133 added: a subscription that **does**
+    /// rejoin clears the cool-down in the same turn
+    /// (`aeron_driver_conductor.c:1664-1674`), so a publisher still sending is
+    /// heard again. Without it an image a partition killed is never replaced and
+    /// the cluster stays deaf.
+    #[test]
+    fn a_subscription_that_rejoins_clears_the_cool_down_an_image_leaves() {
+        assert!(an_image_comes_back_after_the_linger(""));
+    }
+
+    /// Both halves of one decision, driven the same way: bring an image up over
+    /// `channel_parameters`, linger it, and answer whether the same session's
+    /// next `SETUP` makes another image.
+    fn an_image_comes_back_after_the_linger(channel_parameters: &str) -> bool {
+        use crate::protocol::SetupFrame;
+        use crate::sys::AddressFamily;
+        use crate::sys::socket::DatagramSocket;
+
+        let temp = TempDir::new();
+        let config = publication_config(&temp.0);
+        let cnc = create(&temp.0);
+        let mut conductor = Conductor::new(cnc, &config).expect("conductor");
+        let (cnc, mut receiver) = events_reader(&temp.0);
+        let mut pending = Vec::new();
+
+        let port = {
+            let probe = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+            probe
+                .bind("127.0.0.1:0".parse().expect("an address"))
+                .expect("a bind");
+            probe.local_address().expect("an address").port()
+        };
+
+        let channel = format!("aeron:udp?endpoint=127.0.0.1:{port}{channel_parameters}");
+
+        send(
+            &conductor,
+            ADD_SUBSCRIPTION_TYPE_ID,
+            &add_subscription_payload(7, 11, 1001, &channel),
+        );
+        let _ = await_event(
+            &mut conductor,
+            &cnc,
+            &mut receiver,
+            &mut pending,
+            ON_SUBSCRIPTION_READY_TYPE_ID,
+        );
+
+        // The publisher: a `SETUP` is what makes an image at all.
+        let setup = SetupFrame {
+            term_offset: 0,
+            session_id: 99,
+            stream_id: 1001,
+            initial_term_id: 1_000,
+            active_term_id: 1_000,
+            term_length: 64 * 1024,
+            mtu: 1408,
+            ttl: 0,
+        };
+        let mut frame = [0u8; SetupFrame::LENGTH];
+        assert!(setup.write_with_flags(&mut frame, 0).is_some());
+
+        let publisher = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
+        publisher
+            .bind("127.0.0.1:0".parse().expect("an address"))
+            .expect("a bind");
+        let destination: std::net::SocketAddr =
+            format!("127.0.0.1:{port}").parse().expect("an address");
+
+        let send_setup = || {
+            publisher
+                .send_batch(Some(destination), &[&frame])
+                .expect("a send");
+        };
+
+        send_setup();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && conductor.publication_images().is_empty() {
+            conductor.do_work();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            !conductor.publication_images().is_empty(),
+            "the `SETUP` makes an image"
+        );
+        let registration_id = conductor.publication_images()[0].registration_id;
+
+        // The image lingers. `release_image` is the same
+        // `transition_image_to_linger` the `ImageLingering` event calls, for the
+        // image that never announced on its way in (a revoked one).
+        assert_eq!(1, conductor.release_image(registration_id));
+
+        // The receiver applies the two commands in the order they were sent:
+        // the removal (which leaves the cool-down) and, when the link still says
+        // `rejoin=true`, the removal of that cool-down.
+        for _ in 0..20 {
+            conductor.do_work();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        send_setup();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            conductor.do_work();
+
+            if !conductor.publication_images().is_empty() {
+                return true;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        false
     }
 
     /// A12: the session id a network publication runs under.
