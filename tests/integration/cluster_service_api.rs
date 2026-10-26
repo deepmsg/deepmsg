@@ -24,10 +24,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use deepmsg_codec_cluster::event_code::EventCode;
-use deepmsg_tests::cluster::API_MARKET_STREAM_ID;
+use deepmsg_tests::cluster::{API_MARKET_STREAM_ID, SNAPSHOT_MARKET_MARKER};
 use deepmsg_tests::cluster_harness::{
-    CLUSTER_ID, ClientSide, Faults, Node, Ports, SessionEvent, announce_skip, await_launched,
-    ingress_message, members_of, offer_message, wait_until,
+    CLUSTER_ID, ClientSide, Faults, Node, NodeCounters, Ports, SessionEvent, announce_skip,
+    await_launched, await_snapshot_count, ingress_message, members_of, offer_message,
+    take_snapshot, wait_until,
 };
 
 /// The harness's port blocks are per process and `cargo test` runs threads in
@@ -226,6 +227,152 @@ fn every_door_of_the_containers_api_answers() {
     );
 
     assert!(state.faults().is_empty(), "{:?}", state.faults());
+}
+
+/// **The snapshot callback publishes on the business's own publication**, which
+/// is the door `Cluster::aeron()` cannot give it: that borrow ends with the
+/// callback that took it, and `on_take_snapshot` is handed no `Cluster`.
+///
+/// This is the counterpart of the reference's business holding the `Aeron` it
+/// took out of `onStart` (`Cluster.java:151`); `SnapshotWriter::aeron()` answers
+/// the same client, read-only, so a publication can be offered on from the
+/// snapshot and cannot be created or removed there.
+///
+/// Two judgements, and the second is what makes the first mean something:
+///
+/// 1. the marker reaches the client's subscriber **byte for byte**, once, and
+///    the business's own counter says it was the snapshot callback that
+///    offered it;
+/// 2. the snapshot the same callback wrote **still recovers**, to the state the
+///    business put in it through the writer's own door — a frame that leaked
+///    into the recording, or a recording the extra offer interrupted, fails
+///    here.
+///
+/// The instrument can fail: comment out the `writer.aeron().offer(..)` in the
+/// business and the first judgement is red; stop writing the record and the
+/// second is.
+#[test]
+fn a_snapshot_publishes_on_the_containers_own_publication() {
+    let _serial = serial();
+    let faults = Faults::default();
+    let Some(mut node) = start(&faults) else {
+        announce_skip();
+        return;
+    };
+    let state = node.api_state().expect("the API business is running");
+
+    let ports = ports();
+    let mut client = match ClientSide::start(&ports, 0) {
+        Some(client) => client,
+        None => {
+            announce_skip();
+            return;
+        }
+    };
+    let session = client.connect_session(&faults);
+    assert_eq!(EventCode::OK, session.code, "{session:?}");
+
+    // A subscription of the case's own, before the publication exists: a
+    // publication with no subscriber is not connected and its first offer is
+    // refused.
+    let market = client.add_subscription(&ports.client_egress_channel(), API_MARKET_STREAM_ID);
+
+    // `m`: the publication is made from `Cluster::aeron()` — P3-12's door, in a
+    // callback that does get a `Cluster`. Asked for more than once because a
+    // publication is created before it is connected.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = Vec::new();
+    while Instant::now() < deadline && seen.is_empty() {
+        send(&client, &session, b"m", &faults);
+        seen.extend(poll_payloads_for(
+            &mut client,
+            market,
+            Duration::from_millis(500),
+        ));
+        let _ = client.poll_egress();
+    }
+    assert_eq!(
+        vec![b"market".to_vec()],
+        seen,
+        "the business's own publication reaches the client's driver"
+    );
+    assert!(
+        state
+            .market_publication
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0,
+        "and it answered with the registration id"
+    );
+
+    // The SNAPSHOT toggle: the cluster takes one at this log position, and the
+    // business's `on_take_snapshot` runs inside it.
+    let counters = NodeCounters::open(node.aeron_dir());
+    take_snapshot(&counters);
+    await_snapshot_count(&counters, &faults, 1);
+
+    // (1) The marker crossed, once, byte for byte.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut markers = 0;
+    while Instant::now() < deadline && markers == 0 {
+        faults.check();
+        for payload in client.poll_payloads(market) {
+            if payload == SNAPSHOT_MARKET_MARKER {
+                markers += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        1, markers,
+        "the subscriber received the frame the snapshot callback published on the business's \
+         own publication, exactly once"
+    );
+    assert_eq!(
+        1,
+        state
+            .snapshot_market_offers
+            .load(std::sync::atomic::Ordering::Acquire),
+        "and it was the snapshot callback that offered it"
+    );
+    assert!(state.faults().is_empty(), "{:?}", state.faults());
+
+    // (2) The snapshot recovers, to the state the callback wrote beside the
+    //     marker through the writer's own door.
+    drop(client);
+    let (launched_tx, launched_rx) = mpsc::channel();
+    node.stop();
+    node.restart(&launched_tx);
+    await_launched(&faults, &launched_rx, 1);
+
+    // The harness builds a **new** business for the restarted container, and with
+    // it a new `ApiState`: the handle taken before the restart is not the one
+    // that just started.
+    let reloaded = node.api_state().expect("the API business is running again");
+    wait_until("the business to load its snapshot", &faults, || {
+        reloaded
+            .started_with_snapshot
+            .load(std::sync::atomic::Ordering::Acquire)
+    });
+    assert_eq!(
+        1,
+        reloaded
+            .loaded_state
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the record the snapshot callback wrote through the writer is what `on_start` read \
+         back: the business's own publication and the snapshot's recording are different \
+         streams"
+    );
+    assert_eq!(
+        1,
+        reloaded
+            .snapshot_records
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the snapshot image carried exactly the business's own record: the frame the callback \
+         published went to the business's publication, not into the recording"
+    );
+    assert!(reloaded.faults().is_empty(), "{:?}", reloaded.faults());
+
+    node.stop();
 }
 
 /// The service messages the business offered in parts and by claim, as the log
