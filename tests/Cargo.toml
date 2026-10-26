@@ -753,6 +753,14 @@ name = "cluster_lc5_rolling"
 path = "interop/cluster_lc5_rolling.rs"
 required-features = ["interop"]
 
+# P3-7e's backup row: our `ClusterBackup` beside a cluster whose members are a
+# mix of the two implementations, and the criterion that its copy of the log is
+# the members' bytes.
+[[test]]
+name = "cluster_lc5_backup"
+path = "interop/cluster_lc5_backup.rs"
+required-features = ["interop"]
+
 # P3-3a's LC-1 first step: our cluster client connecting to the reference's
 # single Java node over IPC.
 [[test]]
