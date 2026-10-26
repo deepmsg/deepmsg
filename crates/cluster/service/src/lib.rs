@@ -72,6 +72,11 @@
 //! 5. An unfragmented log message is copied once into the adapter's buffer
 //!    before it is decoded: the SBE decoders read a `&[u8]`, and this build's
 //!    client hands out windows over a term another process is writing.
+//! 6. `on_take_snapshot` reaches the client through the writer it is handed
+//!    ([`SnapshotWriter::aeron`]), not through an `Aeron` the business keeps:
+//!    the reference's business takes one out of `onStart` and holds it, and this
+//!    build's borrow of the client ends with the callback. `on_role_change` is
+//!    the one callback still with no access at all.
 
 #![forbid(unsafe_code)]
 // Performance spec §3: the disallowed-types list lives in clippy.toml; this
@@ -97,5 +102,5 @@ pub use cluster::{ClaimedMessage, ClientSession, Cluster, SessionInfo, TryClaim}
 pub use config::ServiceContainerConfig;
 pub use error::ContainerError;
 pub use role::{Role, TimeUnit};
-pub use service::{ClusteredService, LogHeader, SessionId};
+pub use service::{ClusteredService, LogHeader, SessionId, SnapshotWriter};
 pub use services::{BasicAuction, EchoService, NoopService};

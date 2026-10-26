@@ -127,6 +127,33 @@ impl<'a> SnapshotWriter<'a> {
         self.publication
     }
 
+    /// The client the container runs on, for the business to publish on a
+    /// publication of **its own**.
+    ///
+    /// The counterpart of the `Aeron` a reference business takes out of
+    /// `Cluster.aeron()` in `onStart` and keeps (`Cluster.java:151`). This
+    /// build's [`Cluster::aeron`] is a borrow that ends with its callback, and
+    /// `on_take_snapshot` is handed no `Cluster` — so without this the snapshot
+    /// is the one callback in which a business cannot publish.
+    ///
+    /// It is the **same** client [`Cluster::aeron`] answers: the container's one
+    /// connection, not a second one. A publication is addressed by its
+    /// **registration id**; keep the id rather than a handle, and look it up
+    /// again on the next callback.
+    ///
+    /// # What this is not for
+    ///
+    /// * Cluster ingress and egress: those go through [`Cluster`] and
+    ///   [`crate::cluster::ClientSession`], whose `check_for_valid_invocation`
+    ///   is not on this path.
+    /// * Adding or removing a publication. The `&Client` is deliberate:
+    ///   `add_publication` is a blocking command with a timeout, and this
+    ///   callback runs in the middle of writing the snapshot's recording.
+    ///   Create the publication elsewhere and only offer here.
+    pub fn aeron(&self) -> &Client {
+        &*self.client
+    }
+
     /// The limit a claim or an offer is clamped to.
     fn position_limit(&self) -> i64 {
         position_limit(self.client, self.publication)
