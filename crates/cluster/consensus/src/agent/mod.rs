@@ -1860,6 +1860,26 @@ impl ConsensusModuleAgent {
             .unwrap_or(self.log_recording_stop_position)
     }
 
+    /// [`Self::append_position_value`] for a caller that has to **know** whether
+    /// the answer came from the counter.
+    ///
+    /// `None` is "the counter cannot answer": there is no handle, no counters
+    /// region, or the slot has been handed to another recording. The caller
+    /// decides what stands in for it; a caller that only wants a number uses
+    /// [`Self::append_position_value`], whose fallbacks are unchanged.
+    fn believed_append_position(&self) -> Option<i64> {
+        let position = self.append_position?;
+        let counters = self.client.counters_reader()?;
+        if !counters.is_active(
+            position.counter_id,
+            ARCHIVE_RECORDING_POSITION_TYPE_ID,
+            position.registration_id,
+        ) {
+            return None;
+        }
+        counters.value(position.counter_id)
+    }
+
     fn position_limit(&self, publication: &ExclusivePublication) -> i64 {
         self.client
             .counters_reader()
@@ -3645,8 +3665,25 @@ impl ElectionHost for ConsensusModuleAgent {
         // honoured by a leader, so losing leadership disarms it.
         ClusterControlToggle::deactivate(&self.client, self.counters.control_toggle);
 
+        // `getLastAppendedPosition` (`:3372-3384`) asks the **archive** for the
+        // log's last appended position, not the driver's recording-position
+        // counter: a counter whose recording is stopping is freed and its slot
+        // can be handed to another recording, and a read of it then answers
+        // `0`. That is the `appendPosition=0` a member came back with here —
+        // measured 2026-10-26, member 1 of `cluster_lc5_rolling`: no counter
+        // handle at all, so `append_position_value()` fell back to the cached
+        // stop position, which had never been set, and the term's base (832)
+        // was refused against it for ever.
+        //
+        // The archive's answer is already in hand: `createRecoveryPlan` below
+        // carries `RecoveryLog.stop_position`, which is `listRecording`'s
+        // `stop_position` — the same question `getStopPosition` asks. Using it
+        // costs no extra round trip, which matters: a blocking
+        // `archive.getStopPosition` here was tried and reverted, because it
+        // disturbed the log socket's lifetime and reddened a covered row
+        // (`records/P3-6c.md` §22.3).
         let had_recording = self.log_recording_id != NULL_VALUE;
-        let last_append_position = self.append_position_value();
+        let believed_append_position = self.believed_append_position();
         self.try_stop_log_recording();
 
         if had_recording {
@@ -3708,7 +3745,19 @@ impl ElectionHost for ConsensusModuleAgent {
             self.sessions.disconnect_sessions(&mut self.client);
 
             write_counter(&self.client, self.counters.commit_position, log_position);
-            self.last_append_position = last_append_position;
+            // The counter when it could answer; otherwise the archive's stop
+            // position, which is what the reference's `getLastAppendedPosition`
+            // returns. A plan that does not know (`NULL_POSITION`) leaves the
+            // last position this member published standing — it must not become
+            // the zero the counter could not vouch for.
+            self.last_append_position = match believed_append_position {
+                Some(position) => position,
+                None if self.recovery_plan.appended_log_position != NULL_POSITION => self
+                    .recovery_plan
+                    .appended_log_position
+                    .max(self.log_recording_stop_position),
+                None => self.last_append_position,
+            };
             self.time_of_last_leader_update_ns = now_ns;
         }
 

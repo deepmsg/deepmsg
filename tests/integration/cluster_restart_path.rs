@@ -32,6 +32,11 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use deepmsg_client::client::Client;
+use deepmsg_cluster::agent::publisher::ConsensusPublisher;
+use deepmsg_cluster::config::CONSENSUS_STREAM_ID_DEFAULT;
+use deepmsg_cluster::persist::recording_log::{self, RecordingLog};
+use deepmsg_cluster_common::counters::CLUSTER_CONSENSUS_MODULE_ERROR_COUNT_TYPE_ID;
 use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_tests::cluster_harness::{
     CATCHUP_DEADLINE, ClientSide, ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters, Ports,
@@ -1858,6 +1863,288 @@ fn a_member_three_terms_behind_comes_back_to_a_five_member_cluster() {
             )
         },
     );
+
+    for node in &mut nodes {
+        node.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The append position a member recovers, through its first election reset
+// ---------------------------------------------------------------------------
+
+/// `ElectionState` codes as counter 207 carries them
+/// (`ElectionState.java:30-115`). The harness exports only `CLOSED`.
+const ELECTION_INIT: i64 = 0;
+const ELECTION_CANVASS: i64 = 1;
+
+// The consensus protocol runs on the **module's** stream,
+// `aeron.cluster.consensus.stream.id` (`ConsensusModule.java:614`) — 108, not
+// the container's 105. A publication on 105 finds no subscription and never
+// connects.
+
+/// One `NewLeadershipTerm` from a leader whose term is stable —
+/// `nextLeadershipTermId = -1`, so there is no next term to replicate from and
+/// `Election.onNewLeadershipTerm` has nowhere to send a member that is behind
+/// (`Election.java:472-520`).
+fn send_new_leadership_term(
+    client: &mut Client,
+    publisher: &mut ConsensusPublisher,
+    member: i32,
+    log_leadership_term_id: i64,
+    term_base_log_position: i64,
+    leader_log_position: i64,
+    leader_member_id: i32,
+) {
+    publisher.refresh_position_limits(client);
+    publisher.new_leadership_term(
+        member,
+        log_leadership_term_id,
+        -1, // nextLeadershipTermId: a stable leader has no next term
+        -1, // nextTermBaseLogPosition
+        -1, // nextLogPosition
+        log_leadership_term_id,
+        term_base_log_position,
+        leader_log_position, // logPosition
+        leader_log_position, // commitPosition
+        0,                   // leaderRecordingId
+        0,                   // timestamp
+        leader_member_id,
+        0, // logSessionId
+        0, // appVersion
+        false,
+    );
+}
+
+/// Wait for `member`'s election to go through `INIT` and back to `CANVASS` —
+/// the reset an error causes (`ConsensusModuleAgent::do_work` hands **any**
+/// error to `Election::handle_error` while an election is in progress).
+///
+/// The poll does not sleep. `INIT` lasts one `init()`, and that is an archive
+/// round trip, so a 5 ms sleep would be a coin toss.
+fn await_reset_to_canvass(member: &NodeCounters, faults: &Faults) {
+    let deadline = Instant::now() + CATCHUP_DEADLINE;
+    let mut saw_init = false;
+    while Instant::now() < deadline {
+        faults.check();
+        match member.election_state() {
+            Some(ELECTION_INIT) => saw_init = true,
+            Some(ELECTION_CANVASS) if saw_init => return,
+            _ => {}
+        }
+    }
+    panic!(
+        "member never came back to CANVASS through INIT: election state {:?}, faults {:?}",
+        member.election_state(),
+        faults.snapshot()
+    );
+}
+
+/// **A member keeps the append position it recovered across its first election
+/// reset.**
+///
+/// `Election.onNewLeadershipTerm` refuses a term whose base is above the
+/// member's append position when the message names no next term
+/// (`Election.java:499`), and the member cannot recover from that refusal on
+/// its own: the error puts the election back to `INIT`, and `INIT` asks the
+/// agent for the log's last appended position again.
+///
+/// The reference asks the **archive** (`getLastAppendedPosition`,
+/// `ConsensusModuleAgent.java:3372-3384`). This build asked the driver's
+/// recording-position counter and, with no counter to read, fell back to a
+/// cached stop position that had never been set — zero. Measured 2026-10-26 in
+/// `cluster_lc5_rolling`: `appendPosition=0` against a term base of 832, for
+/// ever, while the recovery plan computed in the same call said 1472.
+#[test]
+fn the_position_a_member_recovers_survives_its_first_election_reset() {
+    let _serial = serial();
+    let ports = Ports::new();
+    let Some((mut nodes, counters, faults)) = start_cluster(&ports) else {
+        return;
+    };
+
+    // ---- a committed message, and a later term to recover -----------------
+    let first_leader = the_leader(&counters);
+    let first_term = counters[first_leader as usize]
+        .leadership_term_id()
+        .expect("the first term");
+    {
+        let Some(mut client) = ClientSide::start(&ports, first_leader) else {
+            announce_skip();
+            return;
+        };
+        let session = open_session(&mut client, &faults);
+        let before = counters[first_leader as usize]
+            .commit_position()
+            .expect("the leader's commit");
+        client.send(&session, b"the term's first message", &faults);
+        wait_until("the first message to commit", &faults, || {
+            client.poll_events();
+            counters[first_leader as usize]
+                .commit_position()
+                .is_some_and(|position| position > before)
+        });
+    }
+
+    nodes[first_leader as usize].stop();
+    let survivors: Vec<i32> = (0..MEMBER_COUNT).filter(|id| *id != first_leader).collect();
+    wait_until("the survivors to elect a later term", &faults, || {
+        survivors.iter().all(|id| {
+            counters[*id as usize].election_state() == Some(ELECTION_CLOSED)
+                && counters[*id as usize]
+                    .leadership_term_id()
+                    .is_some_and(|term| term > first_term)
+        })
+    });
+    let new_leader = the_leader(&counters);
+    let new_term = counters[new_leader as usize]
+        .leadership_term_id()
+        .expect("the new term");
+    let target = survivors
+        .iter()
+        .copied()
+        .find(|id| *id != new_leader)
+        .expect("a surviving follower");
+
+    // ---- only `target` comes back: no quorum, so it stays in CANVASS ------
+    nodes[target as usize].stop();
+    for id in 0..MEMBER_COUNT {
+        if id != target {
+            nodes[id as usize].stop();
+        }
+    }
+
+    // The term it recovered, from its own log. The member is stopped, so
+    // nothing else can be writing it.
+    let log_path = nodes[target as usize]
+        .cluster_dir()
+        .join(recording_log::FILENAME);
+    let recording_log = RecordingLog::open(&log_path).expect("the member's recording log");
+    let last_term = recording_log
+        .find_last_term()
+        .cloned()
+        .expect("the member recorded the term it closed in");
+    assert_eq!(
+        new_term, last_term.leadership_term_id,
+        "the member's log must have a term entry for the term the cluster elected"
+    );
+    assert!(
+        last_term.term_base_log_position > 0,
+        "the recovered term's base must be above zero for this case to mean anything: {last_term:?}"
+    );
+
+    let (relaunch_tx, relaunch_rx) = mpsc::channel();
+    nodes[target as usize].restart(&relaunch_tx);
+    await_launched(&faults, &relaunch_rx, 1);
+
+    let member = NodeCounters::open(nodes[target as usize].aeron_dir());
+    wait_until("the restarted member to canvass", &faults, || {
+        member.election_state() == Some(ELECTION_CANVASS)
+    });
+
+    // ---- a publication to the member's own consensus channel --------------
+    let mut client = Client::connect(nodes[target as usize].aeron_dir())
+        .expect("a client on the member's own driver");
+    let registration_id = client
+        .add_exclusive_publication(
+            &ports.consensus_channel(target),
+            CONSENSUS_STREAM_ID_DEFAULT,
+            Duration::from_secs(5),
+        )
+        .expect("a publication to the member's consensus channel");
+    wait_until("the consensus publication to connect", &faults, || {
+        let _ = client.poll();
+        client
+            .exclusive_publication(registration_id)
+            .and_then(|publication| publication.is_connected())
+            == Some(true)
+    });
+    let publication = client
+        .take_exclusive_publication(registration_id)
+        .expect("the publication the wait just saw");
+    let mut publisher = ConsensusPublisher::new();
+    publisher.add_publication(target, publication);
+
+    // `leaderMemberId` must name another member (`Election.java:432-436`).
+    let leader_of_record = (target + 1) % MEMBER_COUNT;
+
+    // ---- (1) a term base above the member's log: the invariant must fire --
+    //
+    // This is a message the reference refuses too, and it is what resets the
+    // election. `nextTermBaseLogPosition = -1` keeps it out of the truncation
+    // path (`Election.java:448-461`), which would cut the log and hide the
+    // thing this case is about.
+    faults.expect("invalid newLeadershipTerm");
+    let errors_before = member
+        .value(CLUSTER_CONSENSUS_MODULE_ERROR_COUNT_TYPE_ID)
+        .unwrap_or(0);
+    send_new_leadership_term(
+        &mut client,
+        &mut publisher,
+        target,
+        last_term.leadership_term_id,
+        last_term.term_base_log_position + 1_000_000,
+        last_term.term_base_log_position + 1_000_000,
+        leader_of_record,
+    );
+    await_reset_to_canvass(&member, &faults);
+
+    // ---- (2) the term's real base: the member must join it ----------------
+    //
+    // An election error is reported through `report_counted_error`, which
+    // counts and prints but does **not** hand the error to the deployment's
+    // handler (`report_cluster_error` is the one that does both) — so the
+    // module's error counter, not `Faults`, is what says a refusal happened.
+    let errors_after_refusal = member
+        .value(CLUSTER_CONSENSUS_MODULE_ERROR_COUNT_TYPE_ID)
+        .unwrap_or(0);
+    assert!(
+        errors_after_refusal > errors_before,
+        "the deliberately invalid term was never counted: before={errors_before} \
+         after={errors_after_refusal}"
+    );
+
+    // The answer is not `FOLLOWER_REPLAY` itself: with no leader to replay from
+    // the election leaves it again on the same turn (`Election.java:960-976`),
+    // so what is waited for is the step **after** it — the member subscribing
+    // to a log no one is publishing. That state it can sit in, and a member
+    // that lost its position never reaches it.
+    //
+    // The message is one datagram and the member may be between states when it
+    // lands, so it is said again until the election answers — the assertion is
+    // the answer, not the number of datagrams.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut sends = 0u32;
+    loop {
+        let state = member.election_state();
+        if state.is_some_and(|state| state != ELECTION_CANVASS && state != ELECTION_INIT) {
+            break;
+        }
+        let errors = member
+            .value(CLUSTER_CONSENSUS_MODULE_ERROR_COUNT_TYPE_ID)
+            .unwrap_or(0);
+        assert_eq!(
+            errors_after_refusal, errors,
+            "the term the member recovered was refused as well: the append position it \
+             recovered was lost on the way through INIT"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the member never took the term it recovered after {sends} messages; \
+             election state {state:?}"
+        );
+        send_new_leadership_term(
+            &mut client,
+            &mut publisher,
+            target,
+            last_term.leadership_term_id,
+            last_term.term_base_log_position,
+            last_term.term_base_log_position + 1_000_000,
+            leader_of_record,
+        );
+        sends += 1;
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     for node in &mut nodes {
         node.stop();
