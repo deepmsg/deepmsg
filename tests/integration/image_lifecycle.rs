@@ -834,10 +834,19 @@ fn image_join_position(client: &Client, subscription: i64) -> i64 {
         .join_position()
 }
 
-/// A UDP port nothing else in this process's run of this binary uses.
+/// A UDP port nothing else on this machine is likely to hold.
+///
+/// **Above the ephemeral range on purpose** — this binary's block is 61000 to
+/// 61499. Linux hands an outbound socket a port from `ip_local_port_range`
+/// (32768 to 60999 here, the same range this build's `EPHEMERAL_PORTS`
+/// carries), so a test that binds inside it is racing every socket the machine
+/// opens. The `40_000 + pid % 20_000` this file used before was inside it, and
+/// a run whose pid landed on avahi's `0.0.0.0:46004` met `Address already in
+/// use` before the test did anything. `short_datagram` takes 62000 to 64999;
+/// `unreliable_stream` (61500 to 61999) and the cluster binaries own theirs.
 fn free_port() -> u16 {
     #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 40_000 + (std::process::id() as u16 % 20_000);
+    let base = 61_000 + (std::process::id() as u16 % 500);
 
     base
 }
