@@ -1384,7 +1384,7 @@ from it. `Cluster.role` and `Cluster.timeUnit` answer the same values their
 | `int memberId()` | `member_id()` | `Cluster.java:130` | `cluster_harness.rs` (every case reads the role counter) |
 | `Role role()` | `role()` | `Cluster.java:137` | `cluster_lc4a_failover.rs` |
 | `long logPosition()` | `log_position()` | `Cluster.java:144` | `cluster_snapshot_recovery.rs` |
-| `Aeron aeron()` | `aeron() -> &mut Client` — a borrow, not an owned handle: this build has no `Aeron` owner, the client is threaded through each callback. A publication taken here is addressed by registration id | `Cluster.java:151` | `cluster_service_api.rs::every_door_of_the_containers_api_answers` (a publication the container makes, a subscriber in the client's own driver) |
+| `Aeron aeron()` | `client() -> &mut Client` — a borrow, not an owned handle: this build has no `Aeron` owner, the client is threaded through each callback, and the method is named after what it hands out rather than after the reference's `aeron()`. A publication taken here is addressed by registration id | `Cluster.java:151` | `cluster_service_api.rs::every_door_of_the_containers_api_answers` (a publication the container makes, a subscriber in the client's own driver) |
 | `ClusteredServiceContainer.Context context()` | `context() -> &ServiceContainerConfig` | `Cluster.java:158` | `cluster_service_api.rs::the_business_reads_its_containers_configuration` |
 | `ClientSession getClientSession(long)` | `session(id) -> Option<ClientSession>` | `Cluster.java:166` | `cluster_service_api.rs` (both offer doors) |
 | `Collection<ClientSession> clientSessions()` | `sessions()` yields read-only `SessionInfo`; the writable form is `for_each_client_session` | `Cluster.java:176` | `cluster_service_api.rs::every_door_of_the_containers_api_answers` |
@@ -1415,10 +1415,12 @@ from it. `Cluster.role` and `Cluster.timeUnit` answer the same values their
 
 Five deviations worth naming, because none of them is the interface's shape:
 
-* **`aeron()` is a borrow.** The reference returns the `Aeron` it owns; here the
-  client outlives the callback and is borrowed for it. A publication is
-  therefore addressed by registration id, and looked up again with
-  `Client::publication(id)`.
+* **`client()` is a borrow, and the name is this build's.** The reference
+  returns the `Aeron` it owns and calls the method `aeron()`; here the client
+  outlives the callback and is borrowed for it, and the method is named after
+  what it hands out — `Client` — because no `Aeron` object exists here. A
+  publication is therefore addressed by registration id, and looked up again
+  with `Client::publication(id)`.
 * **`context()` is the config, not a Context object.** `ServiceContainerConfig`
   is the same facts; what the reference's Context carries and this does not is
   listed in `crates/cluster/service/src/lib.rs`, with the reason for each.
@@ -1431,7 +1433,7 @@ Five deviations worth naming, because none of them is the interface's shape:
 * **A snapshot publishes through the writer's client.** `onTakeSnapshot` is
   handed a `SnapshotWriter`, never the `Cluster`, and a reference business needs
   neither because it keeps the `Aeron` it took out of `onStart`
-  (`Cluster.java:151`). `SnapshotWriter::aeron()` answers that same client —
+  (`Cluster.java:151`). `SnapshotWriter::client()` answers that same client —
   **read-only**: a business's own publication can be offered on from inside the
   snapshot, and one cannot be added or removed there, because that is a blocking
   command with a timeout and the callback is in the middle of writing the

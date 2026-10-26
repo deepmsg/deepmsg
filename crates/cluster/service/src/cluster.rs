@@ -431,13 +431,17 @@ impl<'a> Cluster<'a> {
         }
     }
 
-    /// `aeron()` (`Cluster.java:151`): the client the container runs on.
+    /// `client()` (the reference's `aeron()`, `Cluster.java:151`): the client
+    /// the container runs on.
     ///
-    /// The reference returns the `Aeron` it owns; this build has no owner
-    /// object — the client is the one the agent threads through every call — so
-    /// the corresponding thing is a borrow of it. `&mut` because what a
-    /// business does with it is `addPublication` / `addExclusivePublication`
-    /// (`crates/client/src/client.rs:1499`, `:1525`), and both need it.
+    /// The reference returns the `Aeron` it owns and names the method after it;
+    /// this build has no owner object — the client is the one the agent threads
+    /// through every call — so the corresponding thing is a borrow of it, named
+    /// after what it hands out.
+    ///
+    /// `&mut` because what a business does with it is `addPublication` /
+    /// `addExclusivePublication` (`crates/client/src/client.rs:1499`, `:1525`),
+    /// and both need it.
     ///
     /// A publication taken from here is addressed by **registration id** and
     /// must be looked up again with `client.publication(id)` after the callback
@@ -445,8 +449,8 @@ impl<'a> Cluster<'a> {
     /// one callback at a time.
     ///
     /// The snapshot callback gets no `Cluster`; its counterpart is
-    /// [`SnapshotWriter::aeron`](crate::service::SnapshotWriter::aeron).
-    pub fn aeron(&mut self) -> &mut Client {
+    /// [`SnapshotWriter::client`](crate::service::SnapshotWriter::client).
+    pub fn client(&mut self) -> &mut Client {
         self.client
     }
 

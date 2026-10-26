@@ -29,7 +29,7 @@
 //!
 //! | Field | Borrowed for |
 //! |---|---|
-//! | `client` | `idle` polls the conductor; publications are read by registration id; `aeron()` hands it out |
+//! | `client` | `idle` polls the conductor; publications are read by registration id; `client()` hands it out |
 //! | `sessions` | `session()` looks one up; `close_client_session` and `for_each_client_session` walk it |
 //! | `cm_proxy` | the five sends to stream 105, the sticky session header, and every claim |
 //! | `context` | idle strategy, clocks, commit counter, mark file, lifecycle gate |
@@ -73,7 +73,7 @@
 //!    before it is decoded: the SBE decoders read a `&[u8]`, and this build's
 //!    client hands out windows over a term another process is writing.
 //! 6. `on_take_snapshot` reaches the client through the writer it is handed
-//!    ([`SnapshotWriter::aeron`]), not through an `Aeron` the business keeps:
+//!    ([`SnapshotWriter::client`]), not through an `Aeron` the business keeps:
 //!    the reference's business takes one out of `onStart` and holds it, and this
 //!    build's borrow of the client ends with the callback. `on_role_change` is
 //!    the one callback still with no access at all.

@@ -132,11 +132,11 @@ impl<'a> SnapshotWriter<'a> {
     ///
     /// The counterpart of the `Aeron` a reference business takes out of
     /// `Cluster.aeron()` in `onStart` and keeps (`Cluster.java:151`). This
-    /// build's [`Cluster::aeron`] is a borrow that ends with its callback, and
+    /// build's [`Cluster::client`] is a borrow that ends with its callback, and
     /// `on_take_snapshot` is handed no `Cluster` — so without this the snapshot
     /// is the one callback in which a business cannot publish.
     ///
-    /// It is the **same** client [`Cluster::aeron`] answers: the container's one
+    /// It is the **same** client [`Cluster::client`] answers: the container's one
     /// connection, not a second one. A publication is addressed by its
     /// **registration id**; keep the id rather than a handle, and look it up
     /// again on the next callback.
@@ -150,7 +150,7 @@ impl<'a> SnapshotWriter<'a> {
     ///   `add_publication` is a blocking command with a timeout, and this
     ///   callback runs in the middle of writing the snapshot's recording.
     ///   Create the publication elsewhere and only offer here.
-    pub fn aeron(&self) -> &Client {
+    pub fn client(&self) -> &Client {
         &*self.client
     }
 
