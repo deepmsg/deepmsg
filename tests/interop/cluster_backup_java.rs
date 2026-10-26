@@ -35,7 +35,8 @@
 //! Every test starts a whole cluster, a backup and (in two of them) a second
 //! Java process over the backup's directories, so [`SERIAL`] holds them apart
 //! and each takes its own block of [`ClusterPorts`]. The backup's own query
-//! publication binds inside that block too, at [`BACKUP_PORT_OFFSET`] — the
+//! publication binds inside that block too, at
+//! [`cluster_backup::BACKUP_PORT_OFFSET`] — the
 //! reference gives it `localhost:<2<cid>22<memberCount>>` for the same reason.
 
 use std::sync::Mutex;
@@ -52,12 +53,13 @@ use deepmsg_tests::cluster::{
     ARCHIVE_CONTROL_PORT_OFFSET, CLIENT_FACING_PORT_OFFSET, ClusterPorts, LOG_PORT_OFFSET,
     MEMBER_FACING_PORT_OFFSET, MemberSpec, Options, TestCluster,
 };
+use deepmsg_tests::cluster_backup;
 use deepmsg_tests::cluster_client::{Session, base_context, send_and_await_echo};
+use deepmsg_tests::cluster_harness::BackupOptions;
 /// The backup fixture reads its counters by the cluster id it was launched
 /// with, and `NodeCounters` is the harness's own (7): the backup and the
 /// cluster have to agree with it, not merely with each other.
 use deepmsg_tests::cluster_harness::CLUSTER_ID;
-use deepmsg_tests::cluster_harness::{BackupNode, BackupOptions, BackupTarget, Faults};
 use deepmsg_tests::temp::TempDir;
 
 /// The tests in this binary each start a whole cluster.
@@ -76,10 +78,6 @@ fn next_port_base() -> u16 {
     static NEXT: AtomicU16 = AtomicU16::new(27_000);
     NEXT.fetch_add(1_000, Ordering::Relaxed)
 }
-
-/// Where the backup's own query publication binds, inside a test's block: the
-/// cluster's members own offsets 1–4 of their own hundreds.
-const BACKUP_PORT_OFFSET: u16 = 900;
 
 const MEMBERS: i32 = 3;
 /// The member the backup writes for and that is started over its directories —
@@ -368,58 +366,6 @@ fn cluster_errors(directory: &std::path::Path) -> String {
         .join("\n")
 }
 
-/// The backup beside the cluster at `base`, with its own driver and archive.
-fn start_backup(base: u16, options: BackupOptions) -> Option<(BackupNode, Faults)> {
-    let ports = ClusterPorts::new(base);
-    let faults = Faults::default();
-    let target = BackupTarget {
-        cluster_id: CLUSTER_ID,
-        member_string: ports.members_string(MEMBERS),
-        consensus_endpoints: (0..MEMBERS)
-            .map(|member| ports.endpoint(member, MEMBER_FACING_PORT_OFFSET))
-            .collect::<Vec<_>>()
-            .join(","),
-        consensus_endpoint: format!("localhost:{}", base + BACKUP_PORT_OFFSET),
-        name: format!("cluster-backup-java-{base}"),
-    };
-
-    let backup = BackupNode::start_with_target(
-        target,
-        &faults,
-        options,
-        TempDir::new(&format!("p3-9-backup-{base}-archive")),
-        TempDir::new(&format!("p3-9-backup-{base}-cluster")),
-    )?;
-
-    Some((backup, faults))
-}
-
-/// The reference's `awaitBackupLiveLogPosition`: `BACKING_UP`, and the live log
-/// position the cluster proposed to it has reached `position`.
-fn await_backup_live(backup: &BackupNode, position: i64) {
-    let deadline = Instant::now() + DEADLINE;
-
-    while Instant::now() < deadline {
-        if backup.state() == Some(BackupState::BackingUp.code())
-            && backup
-                .live_log_position()
-                .is_some_and(|live| live >= position)
-        {
-            return;
-        }
-
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    panic!(
-        "the backup never reached the cluster's position {position}: state {:?}, live {:?}, \
-         errors {:?}",
-        backup.state(),
-        backup.live_log_position(),
-        backup.error_log()
-    );
-}
-
 /// Start a **Java** member over the directories the backup handed over — the
 /// reference's `startStaticNodeFromBackup`, which is a single-member cluster
 /// whose member id is [`RECOVERY_MEMBER`] and whose appointed leader is itself
@@ -499,11 +445,16 @@ fn a_backup_copies_a_java_clusters_log_and_a_member_starts_from_it() {
     );
     let position = log_position(&cluster, leader);
 
-    let Some((backup, faults)) = start_backup(base, BackupOptions::default()) else {
+    let Some((backup, faults)) = cluster_backup::start_beside(
+        base,
+        &format!("cluster-backup-java-{base}"),
+        MEMBERS,
+        BackupOptions::default(),
+    ) else {
         skip();
         return;
     };
-    await_backup_live(&backup, position);
+    cluster_backup::await_live(&backup, position);
     assert_eq!(
         Some(BackupState::BackingUp.code()),
         backup.state(),
@@ -553,11 +504,16 @@ fn a_backup_carries_a_java_clusters_snapshot() {
     await_snapshot_count(&cluster, 1);
     let position = log_position(&cluster, leader);
 
-    let Some((backup, faults)) = start_backup(base, BackupOptions::default()) else {
+    let Some((backup, faults)) = cluster_backup::start_beside(
+        base,
+        &format!("cluster-backup-java-{base}"),
+        MEMBERS,
+        BackupOptions::default(),
+    ) else {
         skip();
         return;
     };
-    await_backup_live(&backup, position);
+    cluster_backup::await_live(&backup, position);
 
     let deadline = Instant::now() + DEADLINE;
     while Instant::now() < deadline && backup.snapshot_retrieve_count() != Some(1) {
@@ -631,11 +587,16 @@ fn the_latest_snapshot_decides_where_a_backups_recording_starts() {
         initial_replay_start: ReplayStart::LatestSnapshot,
         ..BackupOptions::default()
     };
-    let Some((backup, faults)) = start_backup(base, options) else {
+    let Some((backup, faults)) = cluster_backup::start_beside(
+        base,
+        &format!("cluster-backup-java-{base}"),
+        MEMBERS,
+        options,
+    ) else {
         skip();
         return;
     };
-    await_backup_live(&backup, position);
+    cluster_backup::await_live(&backup, position);
 
     assert_eq!(
         Some(snapshot_position),
