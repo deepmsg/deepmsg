@@ -746,6 +746,13 @@ name = "cluster_lc3_bytes"
 path = "interop/cluster_lc3_bytes.rs"
 required-features = ["interop"]
 
+# P3-7d's LC-5 rolling replacement: a stopped member is started again over the
+# cluster and archive directories the other implementation left behind.
+[[test]]
+name = "cluster_lc5_rolling"
+path = "interop/cluster_lc5_rolling.rs"
+required-features = ["interop"]
+
 # P3-3a's LC-1 first step: our cluster client connecting to the reference's
 # single Java node over IPC.
 [[test]]

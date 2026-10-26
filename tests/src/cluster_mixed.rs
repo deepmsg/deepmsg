@@ -384,7 +384,18 @@ pub fn snapshots_taken(cluster: &TestCluster, member: i32) -> Option<i64> {
 ///
 /// `expected` is not always every member: a case that takes a snapshot while a
 /// member is away has one whose counter can never move.
+///
+/// **The wait is for each member's count to go up by one, not for it to reach
+/// any particular number.** The snapshot counter belongs to the module
+/// *process*: a member that was restarted counts from zero again, and a case
+/// that asked for "two" would wait for a number a cluster whose members have
+/// just been replaced can never show.
 pub fn take_a_snapshot(cluster: &TestCluster, session: &mut Session, expected: &[i32]) {
+    let before: Vec<i64> = expected
+        .iter()
+        .map(|member| snapshots_taken(cluster, *member).unwrap_or(0))
+        .collect();
+
     assert!(
         session
             .session
@@ -414,19 +425,43 @@ pub fn take_a_snapshot(cluster: &TestCluster, session: &mut Session, expected: &
     // reaches that position — the leader first, the followers on their way
     // through.
     let taken = session.poll_until(deadline, |_| {
-        expected
-            .iter()
-            .all(|member| snapshots_taken(cluster, *member).is_some_and(|count| count >= 1))
+        expected.iter().zip(before.iter()).all(|(member, before)| {
+            snapshots_taken(cluster, *member).is_some_and(|count| count > *before)
+        })
     });
     assert!(
         taken,
-        "not every member took the snapshot: {:?}\n{}",
+        "not every member took the snapshot: before {before:?}, now {:?}\n{}",
         expected
             .iter()
             .map(|member| snapshots_taken(cluster, *member))
             .collect::<Vec<_>>(),
         node_logs(cluster)
     );
+}
+
+/// Wait until the session follows a leader that is not `dead`, and answer it.
+///
+/// **The wait drives the session**, the way LC-1's failover case learned: a
+/// client that is not polled through a whole election is a client its own driver
+/// reaps, and the failure that produces looks like a cluster that never
+/// elected.
+pub fn follow_a_new_leader(cluster: &TestCluster, session: &mut Session, dead: i32) -> i32 {
+    let deadline = Instant::now() + DEADLINE;
+    let mut new_leader = None;
+    let followed = session.poll_until(deadline, |session| {
+        if new_leader.is_none() {
+            new_leader = cluster.leader_other_than(dead);
+        }
+        new_leader.is_some_and(|leader| leader == session.session.leader_member_id())
+    });
+    assert!(
+        followed,
+        "the session never followed a new leader {new_leader:?}: it says member {} leads\n{}",
+        session.session.leader_member_id(),
+        node_logs(cluster)
+    );
+    new_leader.expect("a leader the session followed")
 }
 
 /// Wait until every member's commit position is the leader's, and hand it back.
