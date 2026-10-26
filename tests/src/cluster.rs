@@ -2176,7 +2176,7 @@ pub struct ApiState {
     pub service_id: AtomicI64,
     pub cluster_id: AtomicI64,
     pub aeron_dir: Mutex<String>,
-    /// The registration id `aeron().add_publication(..)` answered with, and how
+    /// The registration id `client().add_publication(..)` answered with, and how
     /// many of its offers landed.
     pub market_publication: AtomicI64,
     pub market_offers: AtomicUsize,
@@ -2381,7 +2381,7 @@ impl ClusteredService for ApiService {
 
     fn on_take_snapshot(&mut self, writer: &mut SnapshotWriter<'_>) -> Result<(), ContainerError> {
         // (1) The business's own publication, through the client the writer
-        //     holds — the door this case exists for. `Cluster::aeron()`'s borrow
+        //     holds — the door this case exists for. `Cluster::client()`'s borrow
         //     ended with `on_start`, and this callback is handed no `Cluster`.
         let registration_id = self
             .state
@@ -2389,7 +2389,7 @@ impl ClusteredService for ApiService {
             .load(std::sync::atomic::Ordering::Acquire);
         if registration_id > 0 {
             match writer
-                .aeron()
+                .client()
                 .offer(registration_id, SNAPSHOT_MARKET_MARKER)
             {
                 Some(deepmsg_core::logbuffer::append::Appended::Ok { .. }) => {
@@ -2403,7 +2403,7 @@ impl ClusteredService for ApiService {
             }
         }
 
-        // (2) And the writer's own door in the same callback: `aeron()` takes
+        // (2) And the writer's own door in the same callback: `client()` takes
         //     `&self` and so does `offer`, so the two borrows do not stand in
         //     each other's way. The record is what `on_start` reads back.
         let taken = self.state.snapshots_written.fetch_add(1, Ordering::AcqRel) + 1;
@@ -2534,7 +2534,7 @@ impl ApiService {
         }
     }
 
-    /// `m`: a market-data publication made through `Cluster.aeron()`.
+    /// `m`: a market-data publication made through `Cluster.client()`.
     ///
     /// The channel is the one the client is already listening on — its own
     /// egress channel, which is what `responseChannel()` names — so the
@@ -2551,7 +2551,7 @@ impl ApiService {
             return;
         };
 
-        let client = cluster.aeron();
+        let client = cluster.client();
         let existing = self
             .state
             .market_publication

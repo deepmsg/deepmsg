@@ -15,7 +15,7 @@
 //! | `v` | `ClientSession.offer_vectored` and `Cluster.offer_vectored` |
 //! | `k` | `ClientSession.try_claim` and `Cluster.try_claim` |
 //! | `f` | `Cluster.for_each_client_session` |
-//! | `m` | `Cluster.aeron()` — a publication the container makes itself |
+//! | `m` | `Cluster.client()` — a publication the container makes itself |
 //! | `x` | `ClientSession.close()` |
 //!
 //! `Cluster.context()` is read in `on_start`, before any of them.
@@ -167,7 +167,7 @@ fn every_door_of_the_containers_api_answers() {
         "and it took the offer"
     );
 
-    // `m` — a publication the container made through `aeron()`.
+    // `m` — a publication the container made through `client()`.
     //
     // Asked for more than once: a publication is created before it is
     // connected, so the business's first offer can be refused while its SM is
@@ -230,11 +230,11 @@ fn every_door_of_the_containers_api_answers() {
 }
 
 /// **The snapshot callback publishes on the business's own publication**, which
-/// is the door `Cluster::aeron()` cannot give it: that borrow ends with the
+/// is the door `Cluster::client()` cannot give it: that borrow ends with the
 /// callback that took it, and `on_take_snapshot` is handed no `Cluster`.
 ///
 /// This is the counterpart of the reference's business holding the `Aeron` it
-/// took out of `onStart` (`Cluster.java:151`); `SnapshotWriter::aeron()` answers
+/// took out of `onStart` (`Cluster.java:151`); `SnapshotWriter::client()` answers
 /// the same client, read-only, so a publication can be offered on from the
 /// snapshot and cannot be created or removed there.
 ///
@@ -248,7 +248,7 @@ fn every_door_of_the_containers_api_answers() {
 ///    into the recording, or a recording the extra offer interrupted, fails
 ///    here.
 ///
-/// The instrument can fail: comment out the `writer.aeron().offer(..)` in the
+/// The instrument can fail: comment out the `writer.client().offer(..)` in the
 /// business and the first judgement is red; stop writing the record and the
 /// second is.
 #[test]
@@ -277,7 +277,7 @@ fn a_snapshot_publishes_on_the_containers_own_publication() {
     // refused.
     let market = client.add_subscription(&ports.client_egress_channel(), API_MARKET_STREAM_ID);
 
-    // `m`: the publication is made from `Cluster::aeron()` — P3-12's door, in a
+    // `m`: the publication is made from `Cluster::client()` — P3-12's door, in a
     // callback that does get a `Cluster`. Asked for more than once because a
     // publication is created before it is connected.
     let deadline = Instant::now() + Duration::from_secs(30);
