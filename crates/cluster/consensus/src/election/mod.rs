@@ -1794,8 +1794,26 @@ impl Election {
                             self.transition(ElectionState::FollowerLogReplication, now_ns, host)?;
                         }
                     } else {
+                        // `Election.java:499-513`: the reference prints every
+                        // field the message was decided on — fourteen values,
+                        // thirteen fields (`termBaseLogPosition` twice) — so a
+                        // failing cluster says **why** the member's position is
+                        // behind the term's base, not just that it is.
                         return Err(ClusterError::Cluster(format!(
-                            "invalid newLeadershipTerm - this.appendPosition={} < termBaseLogPosition={term_base_log_position} and nextLeadershipTermId={next_leadership_term_id}",
+                            "invalid newLeadershipTerm - this.appendPosition={} \
+                             < termBaseLogPosition={term_base_log_position} \
+                             and nextLeadershipTermId={next_leadership_term_id}\
+                             , logLeadershipTermId={log_leadership_term_id}\
+                             , nextTermBaseLogPosition={next_term_base_log_position}\
+                             , nextLogPosition={next_log_position}\
+                             , leadershipTermId={leadership_term_id}\
+                             , termBaseLogPosition={term_base_log_position}\
+                             , logPosition={log_position}\
+                             , commitPosition={commit_position}\
+                             , leaderRecordingId={leader_recording_id}\
+                             , leaderMemberId={leader_member_id}\
+                             , logSessionId={log_session_id}\
+                             , isStartup={is_startup}",
                             self.append_position
                         )));
                     }
