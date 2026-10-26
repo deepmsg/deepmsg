@@ -2158,6 +2158,14 @@ pub fn in_process_test_service(
 /// cluster's.
 pub const API_MARKET_STREAM_ID: i32 = 4001;
 
+/// What the business offers on its **own** publication from inside
+/// `on_take_snapshot` — the frame the case reads on its subscriber.
+///
+/// A business's own stream is a different publication from the snapshot
+/// recording, which is why this is a marker and not the state record: it must
+/// arrive on the wire and *not* end up in the snapshot's bytes.
+pub const SNAPSHOT_MARKET_MARKER: &[u8] = b"api-market-in-snapshot";
+
 /// What the API-facing test business observed, for the case that reads it.
 ///
 /// A business cannot panic its way out of a failure — a panic takes the
@@ -2178,6 +2186,19 @@ pub struct ApiState {
     /// `for_each_client_session`: views visited, and offers accepted.
     pub visits: AtomicUsize,
     pub fanned_out: AtomicUsize,
+    /// The marker offers the snapshot callback made on the business's own
+    /// publication, and whether `on_start` was handed a snapshot at all.
+    pub snapshot_market_offers: AtomicUsize,
+    pub started_with_snapshot: AtomicBool,
+    /// How many snapshots this business has taken, and the value `on_start`
+    /// read back out of the business's own record (`0` = nothing was loaded).
+    pub snapshots_written: AtomicI64,
+    pub loaded_state: AtomicI64,
+    /// How many records the business's snapshot image carried on load. One is
+    /// correct: the frame the callback published on its **own** publication
+    /// goes to that stream, not into the recording, and a case that read two
+    /// would be looking at a mix-up of the two publications.
+    pub snapshot_records: AtomicUsize,
     /// `ClientSession::close` answers.
     pub closes: AtomicUsize,
     /// The service messages the business offered and later read back, in the
@@ -2257,11 +2278,37 @@ impl ClusteredService for ApiService {
         cluster: &mut deepmsg_cluster_service::Cluster<'_>,
         snapshot: Option<&mut SnapshotReader<'_>>,
     ) -> Result<(), ContainerError> {
+        // A restart is a **new client**: the registration id the previous
+        // process used is not in this one's publication table, so a business
+        // that keeps publications across a restart has to forget them here.
+        self.state
+            .market_publication
+            .store(0, std::sync::atomic::Ordering::Release);
+
         if let Some(reader) = snapshot {
-            // Nothing to restore: this business keeps no state across a
-            // restart, and draining the image is what keeps the loader happy.
+            // The business's own record, written by `on_take_snapshot` through
+            // the writer: reading it back is how a case tells "loaded a
+            // snapshot" from "started".
+            self.state
+                .started_with_snapshot
+                .store(true, std::sync::atomic::Ordering::Release);
+            let mut loaded = None;
+            let mut records = 0;
             while !reader.is_end_of_stream() {
-                reader.poll(10, |_| {});
+                reader.poll(10, |fragment| {
+                    records += 1;
+                    if let Some(value) = fragment.payload_i64_at(0) {
+                        loaded = Some(value);
+                    }
+                });
+            }
+            self.state
+                .snapshot_records
+                .store(records, std::sync::atomic::Ordering::Release);
+            if let Some(value) = loaded {
+                self.state
+                    .loaded_state
+                    .store(value, std::sync::atomic::Ordering::Release);
             }
         }
 
@@ -2332,7 +2379,38 @@ impl ClusteredService for ApiService {
         Ok(())
     }
 
-    fn on_take_snapshot(&mut self, _writer: &mut SnapshotWriter<'_>) -> Result<(), ContainerError> {
+    fn on_take_snapshot(&mut self, writer: &mut SnapshotWriter<'_>) -> Result<(), ContainerError> {
+        // (1) The business's own publication, through the client the writer
+        //     holds — the door this case exists for. `Cluster::aeron()`'s borrow
+        //     ended with `on_start`, and this callback is handed no `Cluster`.
+        let registration_id = self
+            .state
+            .market_publication
+            .load(std::sync::atomic::Ordering::Acquire);
+        if registration_id > 0 {
+            match writer
+                .aeron()
+                .offer(registration_id, SNAPSHOT_MARKET_MARKER)
+            {
+                Some(deepmsg_core::logbuffer::append::Appended::Ok { .. }) => {
+                    self.state
+                        .snapshot_market_offers
+                        .fetch_add(1, Ordering::AcqRel);
+                }
+                other => self.state.fault(format!(
+                    "the market offer in the snapshot answered {other:?}"
+                )),
+            }
+        }
+
+        // (2) And the writer's own door in the same callback: `aeron()` takes
+        //     `&self` and so does `offer`, so the two borrows do not stand in
+        //     each other's way. The record is what `on_start` reads back.
+        let taken = self.state.snapshots_written.fetch_add(1, Ordering::AcqRel) + 1;
+        if writer.offer(&taken.to_le_bytes()) < 0 {
+            self.state
+                .fault("the snapshot writer refused its own record".to_owned());
+        }
         Ok(())
     }
 

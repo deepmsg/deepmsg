@@ -1413,7 +1413,7 @@ from it. `Cluster.role` and `Cluster.timeUnit` answer the same values their
 | `long offer(DirectBufferVector[])` | `offer_vectored(&[&[u8]])` | `ClientSession.java:96` | `cluster_service_api.rs::every_door_of_the_containers_api_answers` (it is byte-identical to the single-buffer offer) |
 | `long tryClaim(int, BufferClaim)` | `try_claim(len) -> TryClaim` | `ClientSession.java:133` | same case, and `a_claimed_egress_message_carries_the_session_id_not_the_service_id` for the header |
 
-Four deviations worth naming, because none of them is the interface's shape:
+Five deviations worth naming, because none of them is the interface's shape:
 
 * **`aeron()` is a borrow.** The reference returns the `Aeron` it owns; here the
   client outlives the callback and is borrowed for it. A publication is
@@ -1428,6 +1428,19 @@ Four deviations worth naming, because none of them is the interface's shape:
 * **A vectored offer takes `&[&[u8]]`.** The reference rewrites `vectors[0]`
   with its header vector, which obliges a caller to leave a slot free at the
   front of its array; here the header is a separate leading argument.
+* **A snapshot publishes through the writer's client.** `onTakeSnapshot` is
+  handed a `SnapshotWriter`, never the `Cluster`, and a reference business needs
+  neither because it keeps the `Aeron` it took out of `onStart`
+  (`Cluster.java:151`). `SnapshotWriter::aeron()` answers that same client —
+  **read-only**: a business's own publication can be offered on from inside the
+  snapshot, and one cannot be added or removed there, because that is a blocking
+  command with a timeout and the callback is in the middle of writing the
+  recording. Pinned by
+  `cluster_service_api.rs::a_snapshot_publishes_on_the_containers_own_publication`.
+  **`onRoleChange` is then the one callback with no access at all**: the
+  reference's business publishes there from the `Aeron` it holds, and this
+  build's borrow cannot be held. That is not another accessor's worth of work —
+  the answer is an owned handle — and it is tracked as its own issue.
 
 
 ## A consensus module's snapshot, and its log replay (P3-4d)

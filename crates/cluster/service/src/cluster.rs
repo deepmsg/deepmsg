@@ -443,6 +443,9 @@ impl<'a> Cluster<'a> {
     /// must be looked up again with `client.publication(id)` after the callback
     /// returns: the handle borrows the client, and the client is borrowed for
     /// one callback at a time.
+    ///
+    /// The snapshot callback gets no `Cluster`; its counterpart is
+    /// [`SnapshotWriter::aeron`](crate::service::SnapshotWriter::aeron).
     pub fn aeron(&mut self) -> &mut Client {
         self.client
     }
