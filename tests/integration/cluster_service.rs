@@ -69,15 +69,25 @@ fn offer(client: &Client, registration_id: i64, bytes: &[u8]) -> bool {
     )
 }
 
-fn wait_for<F: FnMut() -> bool>(what: &str, mut condition: F) {
+/// The module thread's terminal error, if it ever has one.
+///
+/// The thread leaves it behind and stops; every condition below then stays
+/// false forever. A `wait_for` that does not read this reports the timeout and
+/// throws the cause away — which is the one thing the failure has to say.
+type Failure = std::sync::Mutex<Option<String>>;
+
+fn wait_for<F: FnMut() -> bool>(what: &str, failure: &Failure, mut condition: F) {
     let deadline = Instant::now() + DEADLINE;
     while Instant::now() < deadline {
         if condition() {
             return;
         }
+        if let Some(error) = failure.lock().expect("the lock").clone() {
+            panic!("waiting for {what} cannot succeed: the module failed: {error}");
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
-    panic!("timed out waiting for {what}");
+    panic!("timed out waiting for {what}: the module thread has not reported a failure");
 }
 
 #[test]
@@ -109,7 +119,7 @@ fn a_service_joins_and_then_timers_sessions_and_membership_all_work() {
     let session_count = Arc::new(AtomicUsize::new(0));
     let launched = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
-    let failure: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let failure = Arc::new(Failure::new(None));
 
     let (thread_log_position, thread_session_count, thread_launched, thread_stop) = (
         Arc::clone(&log_position),
@@ -200,9 +210,11 @@ fn a_service_joins_and_then_timers_sessions_and_membership_all_work() {
                 .relevant_id(42)
                 .service_id(0);
             let length = MESSAGE_HEADER_LENGTH + ack.encoded_length();
-            wait_for("the service publication to accept the ack", || {
-                offer(&service, service_publication, &buffer[..length])
-            });
+            wait_for(
+                "the service publication to accept the ack",
+                &failure,
+                || offer(&service, service_publication, &buffer[..length]),
+            );
             joined = true;
         }
         std::thread::sleep(Duration::from_millis(1));
@@ -212,7 +224,7 @@ fn a_service_joins_and_then_timers_sessions_and_membership_all_work() {
         "the module never sent JoinLog; failure: {:?}",
         failure.lock().expect("the lock")
     );
-    wait_for("the module to finish launching", || {
+    wait_for("the module to finish launching", &failure, || {
         launched.load(Ordering::SeqCst)
     });
     if let Some(error) = failure.lock().expect("the lock").clone() {
@@ -273,7 +285,7 @@ fn a_service_joins_and_then_timers_sessions_and_membership_all_work() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(open, "the session did not open");
-    wait_for("the module to see the open session", || {
+    wait_for("the module to see the open session", &failure, || {
         session_count.load(Ordering::SeqCst) == 1
     });
 
@@ -288,11 +300,15 @@ fn a_service_joins_and_then_timers_sessions_and_membership_all_work() {
         let length = MESSAGE_HEADER_LENGTH + message.encoded_length();
         close.truncate(length);
     }
-    wait_for("the service publication to accept CloseSession", || {
-        service.poll();
-        offer(&service, service_publication, &close)
-    });
-    wait_for("the session to close", || {
+    wait_for(
+        "the service publication to accept CloseSession",
+        &failure,
+        || {
+            service.poll();
+            offer(&service, service_publication, &close)
+        },
+    );
+    wait_for("the session to close", &failure, || {
         session_count.load(Ordering::SeqCst) == 0
     });
 
@@ -315,11 +331,15 @@ fn a_service_joins_and_then_timers_sessions_and_membership_all_work() {
         let length = MESSAGE_HEADER_LENGTH + message.encoded_length();
         schedule.truncate(length);
     }
-    wait_for("the service publication to accept ScheduleTimer", || {
-        service.poll();
-        offer(&service, service_publication, &schedule)
-    });
-    wait_for("the timer event to be appended", || {
+    wait_for(
+        "the service publication to accept ScheduleTimer",
+        &failure,
+        || {
+            service.poll();
+            offer(&service, service_publication, &schedule)
+        },
+    );
+    wait_for("the timer event to be appended", &failure, || {
         log_position.load(Ordering::SeqCst) > before
     });
 
@@ -338,6 +358,7 @@ fn a_service_joins_and_then_timers_sessions_and_membership_all_work() {
     }
     wait_for(
         "the service publication to accept ClusterMembersQuery",
+        &failure,
         || {
             service.poll();
             offer(&service, service_publication, &query)
