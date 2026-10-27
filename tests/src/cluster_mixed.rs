@@ -335,8 +335,12 @@ pub fn echo(session: &mut Session, from: u64, to: u64) {
 
 /// Stop one member: its containers first, then its node.
 ///
-/// The order matters: a container outliving its node ends by itself, and a case
-/// that wants to see the end watches it.
+/// The order matters. What this models is a member that **dies**, and it dies
+/// the way a service does: the container goes, then the node. `TestCluster::
+/// shutdown` is the one that stops the module first, because teardown can catch
+/// a member in the middle of a join (`TestCluster::stop_module`) — a member
+/// killed mid-case is a running one, and its module closes over its own bounded
+/// 30 s wait, which a case has no time for.
 pub fn stop_member(cluster: &mut TestCluster, member: i32) {
     for service_id in service_ids(cluster, member) {
         cluster.stop_container(member, service_id);

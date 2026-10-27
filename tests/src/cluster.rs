@@ -96,6 +96,22 @@ use crate::temp::TempDir;
 /// How long a start, a stop or a wait may take before the test is a failure.
 pub const DEADLINE: Duration = Duration::from_secs(120);
 
+/// How long a container gets between `SIGTERM` and `SIGKILL`.
+const CONTAINER_STOP_GRACE: Duration = Duration::from_secs(10);
+
+/// How long a consensus module gets between `SIGTERM` and `SIGKILL`.
+///
+/// Longer than a container's on purpose. `TestCluster::stop_module` stops the
+/// module **before** its containers, so the module can close while its cluster
+/// is still up — and then it waits for the driver to let go of the local
+/// sockets of its log subscription, a wait the product bounds at 30 s
+/// (`LOCAL_SOCKETS_CLOSED_TIMEOUT`,
+/// `crates/cluster/consensus/src/agent/mod.rs:135`). A 10 s grace turned that
+/// clean, bounded close into `exited with signal: 9 (SIGKILL)` and reddened
+/// every leader-is-Java cell of the LC-3 matrix. 30 s for the wait, 10 s of
+/// command timeouts around it, and the margin the rest of this fixture uses.
+const MODULE_STOP_GRACE: Duration = Duration::from_secs(45);
+
 /// Environment variable naming the container binary to run.
 pub const CONTAINER_ENV: &str = "DEEPMSG_CONTAINER_BIN";
 /// Where the binary is when the variable is unset and the workspace is built.
@@ -1112,12 +1128,16 @@ impl TestCluster {
         }
     }
 
-    /// Stop one member's node. Its containers are the caller's to stop first:
-    /// a container outliving its node ends by itself, and a test that wants to
-    /// see the end should watch it.
+    /// Stop one member's node — its module, then its driver. Its containers are
+    /// the caller's to stop: one that outlives the node ends by itself, and a
+    /// test that wants to see the end should watch it. A **clean** stop that
+    /// takes both takes the module first ([`Self::shutdown`]); a case that
+    /// models a member dying takes the container first (see
+    /// `cluster_mixed::stop_member`, and [`Self::stop_module`] for why the two
+    /// differ).
     pub fn stop_node(&mut self, member: i32) {
         let index = self.node_index(member);
-        self.stop_node_processes(index);
+        self.stop_node_processes(index, "stop_node");
     }
 
     /// The half of [`Self::restart_node`] that stops the containers and the
@@ -1142,12 +1162,36 @@ impl TestCluster {
         }
 
         let node_index = self.node_index(member);
-        self.stop_node_processes(node_index);
+        // Containers first **on purpose** here: the counter this is for is only
+        // readable while the services are down. That order is the one
+        // [`Self::stop_module`] warns about, so the module is stopped through
+        // the bounded join and the failure names this path if it ever trips.
+        self.stop_node_processes(node_index, "restart_node_without_containers");
         self.start_node(node_index);
     }
 
-    /// Stop every container, then every node.
+    /// Stop every module, then every container, then every driver — except the
+    /// reference's nodes, whose containers go first.
+    ///
+    /// Ours first is the fix for the 120 s hang [`Self::stop_module`] describes:
+    /// a module inside `await_services_ready` is released only by a service ack,
+    /// so its containers have to outlive it. A reference node is not in that
+    /// group: its **JVM owns its media driver** (the fixture's `driver` is
+    /// `None` there, `ClusteredMediaDriver` started it), so stopping the node
+    /// process takes the driver the container on that node is still attached to
+    /// — measured as `member 2 service 0's container failed: cluster error: the
+    /// media driver has been shut down` in the LC-3 matrix. Those nodes therefore
+    /// stop after the containers, as they always did.
     pub fn shutdown(&mut self) {
+        let members: Vec<i32> = self.nodes.iter().map(|node| node.id).collect();
+        let (ours, reference): (Vec<i32>, Vec<i32>) = members
+            .iter()
+            .partition(|member| self.node(**member).process.is_none());
+
+        for member in &ours {
+            self.stop_module(*member, "shutdown");
+        }
+
         let slots: Vec<(i32, i32)> = self
             .containers
             .iter()
@@ -1157,8 +1201,12 @@ impl TestCluster {
             self.stop_container(member, service_id);
         }
 
-        for index in 0..self.nodes.len() {
-            self.stop_node_processes(index);
+        for member in &reference {
+            self.stop_module(*member, "shutdown");
+        }
+
+        for member in &members {
+            self.stop_driver(*member);
         }
     }
 
@@ -1512,15 +1560,35 @@ impl TestCluster {
         })
     }
 
-    /// Stop whatever runs this node: the reference's one JVM, or our module and
-    /// its driver.
-    fn stop_node_processes(&mut self, index: usize) {
-        let id = self.nodes[index].id;
+    /// Stop one member's consensus module, leaving its driver and its containers
+    /// running.
+    ///
+    /// [`Self::shutdown`] takes this **before** the containers go, because
+    /// teardown can catch a member in the middle of a join. A module can be
+    /// inside `await_services_ready` — the follower's join, or a new leader's
+    /// first turn — and that loop leaves only when a service acks it: neither
+    /// this build's nor the reference's has a deadline
+    /// (`ConsensusModuleAgent.java:1820-1836`). A container stopped first
+    /// therefore strands the thread until the bounded join below fails, which is
+    /// the red `cluster_lc3_matrix::the_matrix_survives_a_leader_that_dies`
+    /// used to take.
+    ///
+    /// It is **not** what a case means by "this member dies": that is
+    /// `cluster_mixed::stop_member`, which takes the container first. Stopping
+    /// the module of a member that is just running means a graceful close, and
+    /// a graceful close in a live cluster is bounded by its own 30 s wait
+    /// ([`MODULE_STOP_GRACE`]) — time a case that is still driving a session
+    /// does not have. `why` names the path that asked, so the failure says which
+    /// one it was.
+    pub fn stop_module(&mut self, member: i32, why: &str) {
+        let index = self.node_index(member);
         if let Some(mut process) = self.nodes[index].process.take() {
-            let status = process.stop().expect("the Java node stops");
+            let status = process
+                .stop_within(MODULE_STOP_GRACE)
+                .expect("the Java node stops");
             assert!(
                 status.success() || status.code() == Some(143),
-                "member {id}'s Java node exited with {status}\nnode log:\n{}",
+                "member {member}'s Java node exited with {status}\nnode log:\n{}",
                 process.log_tail(80)
             );
         }
@@ -1549,6 +1617,10 @@ impl TestCluster {
                         let _ = finished_tx.send(());
                     });
                     if finished_rx.recv_timeout(DEADLINE).is_err() {
+                        // Read what the module reported and what its driver last
+                        // wrote **before** the driver goes: taking it below is
+                        // what loses those tails.
+                        let state = self.node_log(member);
                         // The module thread cannot be killed, and it holds a
                         // client onto this node's driver: stop the driver so
                         // the rest of the fixture does not wait on it too, then
@@ -1557,31 +1629,46 @@ impl TestCluster {
                             let _ = driver.stop();
                         }
                         panic!(
-                            "member {id}'s consensus module thread is still inside its duty \
-                             cycle {DEADLINE:?} after being told to stop. The stop flag is read \
-                             between duty cycles, so this is a module blocked inside one — the \
-                             election's `await_services_ready` is the unbounded wait that does \
-                             it, and a shutdown that stops the containers first leaves it \
-                             waiting for acks that can never come. This is a hang made into a \
-                             failure; the case still needs a shorter scenario or a different \
-                             stop order."
+                            "member {member}'s consensus module thread is still inside its \
+                             duty cycle {DEADLINE:?} after being told to stop ({why}). The stop \
+                             flag is read between duty cycles, so this is a module blocked \
+                             inside one — the join's `await_services_ready` waits for a service \
+                             ack that has no deadline (the reference's loop is the same, \
+                             `ConsensusModuleAgent.java:1820-1836`), so a container stopped \
+                             first strands it for ever. This is a hang made into a failure; \
+                             what the module and its driver last said follows.\n{state}"
                         );
                     }
                     drop(joiner);
                 }
                 ModuleHandle::External(mut process) => {
-                    let status = process.stop().expect("our node stops");
+                    let status = process
+                        .stop_within(MODULE_STOP_GRACE)
+                        .expect("our node stops");
                     assert!(
                         status.success() || status.code() == Some(143),
-                        "member {id}'s node exited with {status}\nnode log:\n{}",
+                        "member {member}'s node exited with {status}\nnode log:\n{}",
                         process.log_tail(80)
                     );
                 }
             }
         }
+    }
+
+    /// Stop one member's driver. A container that outlives its module has to be
+    /// stopped before this; the module goes through [`Self::stop_module`].
+    pub fn stop_driver(&mut self, member: i32) {
+        let index = self.node_index(member);
         if let Some(mut driver) = self.nodes[index].driver.take() {
             let _ = driver.stop();
         }
+    }
+
+    /// Stop whatever runs this node — its module, then its driver.
+    fn stop_node_processes(&mut self, index: usize, why: &str) {
+        let member = self.nodes[index].id;
+        self.stop_module(member, why);
+        self.stop_driver(member);
     }
 
     /// Wait until the restarted node's driver has published a CnC file a client
@@ -3042,6 +3129,17 @@ impl Process {
     }
 
     fn stop(&mut self) -> Result<ExitStatus, std::io::Error> {
+        self.stop_within(CONTAINER_STOP_GRACE)
+    }
+
+    /// `SIGTERM`, then `SIGKILL` if the process is still there after `grace`.
+    ///
+    /// Two different waits need two different graces: a container ends on the
+    /// signal, but a consensus module that closes while its cluster is still up
+    /// waits for its log subscription's local sockets, and that wait is bounded
+    /// at 30 s in the product (`LOCAL_SOCKETS_CLOSED_TIMEOUT`,
+    /// `crates/cluster/consensus/src/agent/mod.rs:135`).
+    fn stop_within(&mut self, grace: Duration) -> Result<ExitStatus, std::io::Error> {
         if self.stopped {
             return self.child.wait();
         }
@@ -3050,7 +3148,7 @@ impl Process {
             .arg(self.child.id().to_string())
             .status();
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + grace;
         loop {
             if let Some(status) = self.child.try_wait()? {
                 self.stopped = true;
