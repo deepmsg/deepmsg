@@ -3298,6 +3298,32 @@ fn an_extend_that_does_not_join_where_the_recording_stopped_is_refused() {
         None
     });
 
+    // The counter appears a turn before the archive takes the recording up
+    // (`Sessions::claim_recordings`), and until it has, `getRecordingPosition`
+    // answers -1 for a recording that is **about to start**. A stop issued in
+    // that turn loses the race in the other direction: the -1 the wait after it
+    // reads means "not claimed yet", the session lands a turn later, and the
+    // extend is refused as an active recording. Wait for the session itself.
+    until(&mut client, "the recording to be live", |client| {
+        archive
+            .get_recording_position(client, recording_id)
+            .map(|position| position >= 0)
+            .unwrap_or(false)
+    });
+
+    // And that it recorded the message, so the stop position is above where a
+    // fresh publication will start.
+    until(
+        &mut client,
+        "the recording to record its message",
+        |client| {
+            archive
+                .get_recording_position(client, recording_id)
+                .map(|position| position > 0)
+                .unwrap_or(false)
+        },
+    );
+
     archive
         .stop_recording_channel_and_stream(&mut client, RECORDING_CHANNEL, RECORDING_STREAM_ID)
         .expect("the archive stops recording");
@@ -3309,8 +3335,35 @@ fn an_extend_that_does_not_join_where_the_recording_stopped_is_refused() {
             .unwrap_or(false)
     });
 
-    // The publication is still where it started, so the image the extend draws
-    // joins at 0 and not at the recording's stop.
+    // A **fresh** publication is what makes the mismatch certain: the image an
+    // extend draws joins where its publication is, and the publication that
+    // made the recording is exactly at the recording's stop position — an image
+    // joining there is a continuation, which the archive rightly accepts (that
+    // is the race this case used to lose, and it is also why the message that
+    // started the recording must not be the only thing this channel ever
+    // carried). Giving the old publication back and taking another on the same
+    // channel puts the new one at position 0, so the image joins at 0 and the
+    // recording stopped above it, every run.
+    let stop_position = archive
+        .get_stop_position(&mut client, recording_id)
+        .expect("the recording's stop position");
+    assert!(
+        stop_position > 0,
+        "the recording has to have recorded something before it is stopped, or a \
+         fresh publication would join at the same position and the extend would be a \
+         continuation"
+    );
+    client
+        .remove_publication(publication, archive::COMMAND_TIMEOUT)
+        .expect("the recording's publication goes");
+    let publication = client
+        .add_exclusive_publication(
+            RECORDING_CHANNEL,
+            RECORDING_STREAM_ID,
+            archive::COMMAND_TIMEOUT,
+        )
+        .expect("a publication at the start of the stream");
+
     archive
         .extend_recording(
             &mut client,
