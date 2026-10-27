@@ -545,12 +545,43 @@ impl ClusterSession {
         )?;
         self.counter_registration_id = counter.registration_id();
 
-        if let Ok(registration_id) = client.add_publication(
+        // The reference adds the publication and, when the driver refuses it,
+        // says so and leaves the **retry** to `isResponsePublicationConnected`
+        // (`ClusterSession.java:209-217`, then `:244-267`). Swallowing the
+        // refusal here left the session with no publication and no one to ask
+        // for it again: a leader that is elected twice keeps the same response
+        // endpoint, and the add that follows its own `asyncRemovePublication`
+        // meets `send_channel_endpoint found in CLOSING state, please retry` —
+        // after which its `NEW_LEADER_EVENT` could never be sent at all.
+        match client.add_publication(
             &self.response_channel,
             self.response_stream_id,
             COMMAND_TIMEOUT,
         ) {
-            self.response_publication_id = registration_id;
+            Ok(registration_id) => self.response_publication_id = registration_id,
+            Err(error) => match response_publication_retry(&error) {
+                // Re-ask, and keep the registration id so that the poll in
+                // `is_response_publication_connected` drives it.
+                ResponsePublicationOutcome::Retry => {
+                    let add = client.async_add_publication(
+                        &self.response_channel,
+                        self.response_stream_id,
+                        COMMAND_TIMEOUT,
+                    )?;
+                    self.response_publication_id = add.registration_id();
+                }
+                // A refusal that is nobody's to retry: the session cannot be
+                // answered, so it goes invalid the same way the poll's arms
+                // below make it — never silence.
+                ResponsePublicationOutcome::Invalid => {
+                    self.set_state(ClusterSessionState::Invalid, "responsePublication is null");
+                }
+                ResponsePublicationOutcome::Fatal(message) => {
+                    return Err(ClusterError::Cluster(format!(
+                        "failed to connect session response publication: {message}"
+                    )));
+                }
+            },
         }
 
         Ok(())
@@ -571,9 +602,17 @@ impl ClusterSession {
         now_ns: i64,
     ) -> Result<bool, ClusterError> {
         if self.response_publication_id == NULL_VALUE {
-            return Err(ClusterError::Cluster(
-                "response publication already added".to_owned(),
-            ));
+            // The reference re-issues the add whenever the publication is not
+            // in hand (`ClusterSession.java:244-267`); a session whose `connect`
+            // was refused is in exactly that state, and answering it with an
+            // error left it with no way back.
+            let add = client.async_add_publication(
+                &self.response_channel,
+                self.response_stream_id,
+                COMMAND_TIMEOUT,
+            )?;
+            self.response_publication_id = add.registration_id();
+            return Ok(false);
         }
 
         // The publication, if the driver has answered the async add.

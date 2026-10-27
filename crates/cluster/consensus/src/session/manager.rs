@@ -763,12 +763,31 @@ impl SessionManager {
                     }
                 }
             } else if self.sessions[index].has_open_event_pending() {
+                // Nothing goes out before the client can receive it. The
+                // reference asks this immediately before the send
+                // (`SessionManager.java:611-617`, `:1004`), and the asking is
+                // also where a response publication the driver refused is
+                // re-added (`ClusterSession.java:244-267`); the pending flag
+                // stays set, so the event goes out on the turn it connects.
+                if !self.sessions[index]
+                    .is_response_publication_connected(ctx.client, ctx.now_ns)?
+                {
+                    continue;
+                }
                 let session = &mut self.sessions[index];
                 if egress_session_event(ctx, session, EventCode::OK, "")? {
                     session.clear_open_event_pending();
                     work_count += 1;
                 }
             } else if self.sessions[index].has_new_leader_event_pending() {
+                // And for the event this case found: it was retried every turn
+                // on a session whose response publication had never been
+                // re-added, so it could never be sent.
+                if !self.sessions[index]
+                    .is_response_publication_connected(ctx.client, ctx.now_ns)?
+                {
+                    continue;
+                }
                 let leadership_term_id = ctx.leadership_term_id;
                 let leader_member_id = ctx.leader_member_id;
                 let ingress_endpoints = ctx.ingress_endpoints;
