@@ -716,6 +716,7 @@ impl Query {
 fn answer_query(
     catalog: &Catalog,
     live: &HashMap<i64, RecordingHandle>,
+    pending_start_position: &dyn Fn(i64) -> Option<i64>,
     counters: &CountersReader<'_, ReadWrite>,
     query: &Query,
 ) -> Result<i64, String> {
@@ -762,9 +763,22 @@ fn answer_query(
     // falls back when there is none; the session's answer is its position
     // counter, which is the number a client reads for a live recording and the
     // number `MaxRecordedPosition` means by "recorded so far".
+    // A recording whose counter the driver has handed out but whose session the
+    // archive has not built yet is **in flight** for every question this
+    // answers: its row is in the catalog, the counter names it, and the image
+    // it will read has a start position. The reference has no such state -
+    // `startRecordingSession` allocates the counter and puts the session in
+    // `recordingSessionByIdMap` in one call (`ArchiveConductor.java:2021-2056`)
+    // - so it is this build that has to answer the two questions below the same
+    // way for it, and `-1` ("not in flight") is the one answer that is wrong:
+    // a client polling `getRecordingPosition` at the moment a recording starts
+    // read "there is no recording" for a turn. That is what made extension
+    // racing a start refuse with `cannot extend active recording` on a
+    // recording it had just been told did not exist (2026-10-27).
     let live_position = live
         .get(&recording_id)
-        .and_then(|handle| handle.position.value(counters));
+        .and_then(|handle| handle.position.value(counters))
+        .or_else(|| pending_start_position(recording_id));
 
     Ok(match query {
         Query::StartPosition { .. } => recording.start_position,
@@ -6762,7 +6776,19 @@ impl Sessions {
                         continue;
                     };
 
-                    match answer_query(catalog, &self.recording_session_by_id, counters, &query) {
+                    let pending = &self.pending_recordings;
+                    match answer_query(
+                        catalog,
+                        &self.recording_session_by_id,
+                        &|recording_id| {
+                            pending
+                                .iter()
+                                .find(|pending| pending.recording_id == recording_id)
+                                .map(|pending| pending.start_position)
+                        },
+                        counters,
+                        &query,
+                    ) {
                         Ok(value) => {
                             entry
                                 .control
@@ -8048,6 +8074,7 @@ mod tests {
             answer_query(
                 &catalog,
                 &HashMap::new(),
+                &|_| None,
                 &counters_region(),
                 &Query::StartPosition { recording_id: 0 }
             )
@@ -8057,6 +8084,7 @@ mod tests {
             answer_query(
                 &catalog,
                 &HashMap::new(),
+                &|_| None,
                 &counters_region(),
                 &Query::StopPosition { recording_id: 0 }
             )
@@ -8066,6 +8094,7 @@ mod tests {
             answer_query(
                 &catalog,
                 &HashMap::new(),
+                &|_| None,
                 &counters_region(),
                 &Query::RecordingPosition { recording_id: 0 }
             ),
@@ -8076,10 +8105,72 @@ mod tests {
             answer_query(
                 &catalog,
                 &HashMap::new(),
+                &|_| None,
                 &counters_region(),
                 &Query::MaxRecordedPosition { recording_id: 0 }
             ),
             "which for one that is not active is where it stopped"
+        );
+    }
+
+    /// A recording whose counter the driver has handed out but whose session
+    /// the archive has not built yet is **in flight**, and `-1` is the one
+    /// answer that is wrong for it: the reference allocates the counter and
+    /// the session's map entry in one call (`ArchiveConductor.java:2021-2056`),
+    /// so it has no such turn, and a client polling `getRecordingPosition` at
+    /// the moment a recording starts must not be told "there is no recording"
+    /// (2026-10-27: an extension racing a start refused with `cannot extend
+    /// active recording` on a recording it had just been told did not exist).
+    #[test]
+    fn a_recording_that_is_about_to_start_has_a_position() {
+        let (_dir, catalog) = catalog_with_a_recording();
+        let pending = |recording_id: i64| (recording_id == 0).then_some(4096);
+
+        assert_eq!(
+            Ok(4096),
+            answer_query(
+                &catalog,
+                &HashMap::new(),
+                &pending,
+                &counters_region(),
+                &Query::RecordingPosition { recording_id: 0 }
+            ),
+            "the counter exists, so the recording is in flight"
+        );
+        assert_eq!(
+            Ok(4096),
+            answer_query(
+                &catalog,
+                &HashMap::new(),
+                &pending,
+                &counters_region(),
+                &Query::MaxRecordedPosition { recording_id: 0 }
+            ),
+            "and nothing has been recorded past where it starts"
+        );
+
+        // With nothing pending both keep the answers of a recording that is
+        // not in flight.
+        let none = |_: i64| None;
+        assert_eq!(
+            Ok(NULL_POSITION),
+            answer_query(
+                &catalog,
+                &HashMap::new(),
+                &none,
+                &counters_region(),
+                &Query::RecordingPosition { recording_id: 0 }
+            )
+        );
+        assert_eq!(
+            Ok(8192),
+            answer_query(
+                &catalog,
+                &HashMap::new(),
+                &none,
+                &counters_region(),
+                &Query::MaxRecordedPosition { recording_id: 0 }
+            )
         );
     }
 
@@ -8097,6 +8188,7 @@ mod tests {
             answer_query(
                 &catalog,
                 &HashMap::new(),
+                &|_| None,
                 &counters_region(),
                 &Query::StartPosition {
                     recording_id: 12345
@@ -8111,6 +8203,7 @@ mod tests {
             answer_query(
                 &catalog,
                 &HashMap::new(),
+                &|_| None,
                 &counters_region(),
                 &Query::MaxRecordedPosition {
                     recording_id: i64::MIN
@@ -8134,6 +8227,7 @@ mod tests {
             answer_query(
                 &catalog,
                 &HashMap::new(),
+                &|_| None,
                 &counters_region(),
                 &Query::FindLastMatching {
                     min_recording_id: 0,
@@ -8149,6 +8243,7 @@ mod tests {
             answer_query(
                 &catalog,
                 &HashMap::new(),
+                &|_| None,
                 &counters_region(),
                 &Query::FindLastMatching {
                     min_recording_id: 0,
@@ -8165,6 +8260,7 @@ mod tests {
             answer_query(
                 &catalog,
                 &HashMap::new(),
+                &|_| None,
                 &counters_region(),
                 &Query::FindLastMatching {
                     min_recording_id: 0,
@@ -8182,6 +8278,7 @@ mod tests {
                 answer_query(
                     &catalog,
                     &HashMap::new(),
+                    &|_| None,
                     &counters_region(),
                     &Query::FindLastMatching {
                         min_recording_id: 0,
@@ -8199,6 +8296,7 @@ mod tests {
             answer_query(
                 &catalog,
                 &HashMap::new(),
+                &|_| None,
                 &counters_region(),
                 &Query::FindLastMatching {
                     min_recording_id: 1,
@@ -8222,6 +8320,7 @@ mod tests {
             answer_query(
                 &catalog,
                 &HashMap::new(),
+                &|_| None,
                 &counters_region(),
                 &Query::FindLastMatching {
                     min_recording_id: -1,
