@@ -90,3 +90,97 @@ fn a_second_publication_on_one_channel_is_its_own_handle() {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// A publication that replaces another one on the **same endpoint** connects.
+///
+/// This is what the reference's `AeronCluster` does when a new leadership term
+/// elects the **same** member (`AeronCluster.java:826-836`): it closes its
+/// ingress publication and adds another on the leader's endpoint — the endpoint
+/// the publication it just closed was sending to. The add can meet
+/// `send_channel_endpoint found in CLOSING state, please retry`, which the
+/// reference's own `shouldReResolveUnicastAddressWhenSendChannelEndpointIsReused`
+/// is written around, and its client retries exactly that error
+/// (`AeronCluster.java:762-793`). What this asks is the second half: once the
+/// driver has taken the replacement, does it **connect**?
+#[test]
+fn a_publication_that_replaces_another_on_the_same_endpoint_connects() {
+    const REPLACE_CHANNEL: &str = "aeron:udp?endpoint=127.0.0.1:24327";
+
+    let Some(receiver) = OwnDriver::start("publication-replace-receiver") else {
+        driver::announce_own_skip();
+        return;
+    };
+    let Some(sender) = OwnDriver::start("publication-replace-sender") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let mut receiving = Client::connect(receiver.aeron_dir()).expect("the receiving client");
+    let subscription = receiving
+        .add_subscription(REPLACE_CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a subscription on the endpoint");
+
+    let mut sending = Client::connect(sender.aeron_dir()).expect("the sending client");
+    let first = sending
+        .add_publication(REPLACE_CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication");
+    await_connected(&sending, first);
+
+    // One message really crosses, so the publication is a live one with a
+    // position — the state a cluster session's response publication is in when
+    // a new term gives it back.
+    let deadline = Instant::now() + DEADLINE;
+    let mut received = 0;
+    while received == 0 && Instant::now() < deadline {
+        let _ = sending.offer(first, b"before");
+        receiving.poll();
+        receiving.poll_subscription(subscription, 10, |message| {
+            if message.payload == b"before" {
+                received += 1;
+            }
+        });
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(1, received, "the message crossed before the rebuild");
+
+    // The rebuild, exactly as a session does it: an **async** removal (the
+    // driver keeps the publication while it drains — the endpoint goes with it)
+    // and the add immediately after, from `ClusterSession::disconnect` and
+    // `::connect`. Linking the new registration to the draining publication is
+    // what left a re-elected leader unable to send its `NEW_LEADER_EVENT` at
+    // all: the registration never sent a `SETUP` and never connected.
+    let _ = sending.async_remove_publication(first, DEFAULT_TIMEOUT);
+
+    // A term change takes turns, not microseconds (`prepareForNewLeadership`
+    // to `connectIngress` is an election long), so the removal is **processed**
+    // by the time the add arrives: the publication is draining, and the
+    // endpoint it holds is still the one the add will find.
+    let settle = Instant::now() + Duration::from_millis(200);
+    while Instant::now() < settle {
+        sending.poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let second = sending
+        .add_publication(REPLACE_CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("the replacement is added");
+
+    await_connected(&sending, second);
+}
+
+/// Wait until the driver says the publication has a subscriber.
+fn await_connected(client: &Client, publication: i64) {
+    let deadline = Instant::now() + DEADLINE;
+    while Instant::now() < deadline {
+        if client
+            .publication(publication)
+            .and_then(|publication| publication.is_connected())
+            == Some(true)
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    panic!("the publication never connected");
+}

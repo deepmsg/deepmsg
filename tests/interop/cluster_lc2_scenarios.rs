@@ -156,7 +156,7 @@ fn java_client_echoes_at(ports: &Ports, count: u32, pause_millis: u32) -> String
     let timeout = (30 + count.parse::<u32>().unwrap_or(0) * pause_millis / 1000).to_string();
     let pause = pause_millis.to_string();
 
-    java::run_probe(
+    let (stdout, stderr) = java::run_probe_capturing_stderr(
         &jar,
         classes.path(),
         "ClusterEchoClientProbe",
@@ -170,6 +170,20 @@ fn java_client_echoes_at(ports: &Ports, count: u32, pause_millis: u32) -> String
             &egress,
             &pause,
         ],
+    );
+
+    // What the client's own driver last said, for the failure message: the
+    // probe's reading is a count, and a count that is short says nothing about
+    // why.
+    let driver_log = client_driver.log_tail(60);
+
+    // The probe exits 0 whatever it read, so the reading is the answer and
+    // **stderr is the explanation**: what Aeron said about the ingress
+    // publication, the session and the new-leader events is the only place a
+    // failed connection says anything at all.
+    format!(
+        "{stdout}\n--- client stderr ---\n{}\n--- client driver ---\n{driver_log}",
+        stderr.trim()
     )
 }
 
@@ -325,10 +339,15 @@ fn a_consensus_partition_heals_and_the_cluster_elects_again() {
     // session.
     let reading = java_client_echoes_at(&ports, 2, 40_000);
     faults.check();
+    let driver_logs = nodes
+        .iter()
+        .map(|node| format!("member {} driver:\n{}", node.id(), node.driver_log_tail(40)))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         reading.contains("RECEIVED 2"),
         "the reference's client was answered on both sides of the partition: {reading}; \
-         roles {:?}, terms {:?}, election {:?}",
+         roles {:?}, terms {:?}, election {:?}\n{driver_logs}",
         (0..MEMBER_COUNT)
             .map(|id| counters[id as usize].role())
             .collect::<Vec<_>>(),

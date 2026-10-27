@@ -54,6 +54,35 @@ pub fn run(jar: &Path, class: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// [`run`], handing back what the class printed **and** what it complained
+/// about.
+///
+/// A probe that reports a failure in its reading and exits 0 is the case this
+/// exists for: `ClusterEchoClientProbe` prints `OFFER_FAILED` on stdout and
+/// nothing else, and whatever Aeron said about the connection is on stderr —
+/// which [`run`] throws away on a successful exit.
+pub fn run_capturing_stderr(jar: &Path, class: &str, args: &[&str]) -> (String, String) {
+    let output = Command::new("java")
+        .args(AGRONA_JVM_ARGS)
+        .arg("-cp")
+        .arg(jar)
+        .arg(class)
+        .args(args)
+        .output()
+        .expect("java runs");
+
+    assert!(
+        output.status.success(),
+        "{class} {args:?} failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
 /// Compile one of the reference's **probe** classes, and answer with the
 /// directory to run it from.
 ///
@@ -103,6 +132,18 @@ pub fn run_probe(jar: &Path, classpath: &Path, class: &str, args: &[&str]) -> St
     let joined = std::env::join_paths([jar, classpath]).expect("two paths join");
 
     run(Path::new(&joined), class, args)
+}
+
+/// [`run_probe`], with the class's stderr as well.
+pub fn run_probe_capturing_stderr(
+    jar: &Path,
+    classpath: &Path,
+    class: &str,
+    args: &[&str],
+) -> (String, String) {
+    let joined = std::env::join_paths([jar, classpath]).expect("two paths join");
+
+    run_capturing_stderr(Path::new(&joined), class, args)
 }
 
 /// `ArchiveTool <directory> <command…>`.

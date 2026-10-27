@@ -977,6 +977,18 @@ impl NetworkPublications {
                 && publication.stream_id == stream_id
                 && publication.params.response_correlation_id == response_correlation_id
                 && !publication.is_exclusive
+                // A publication with no client left is **draining**: its row is
+                // still here because the sender owns the linger
+                // (`aeron_network_publication.c:1048-1069`, reached from the
+                // removal's `end_publication`), and the endpoint goes with it —
+                // "which is why a channel can be published on again
+                // immediately". Handing a new client a *link* to it gave it a
+                // registration id that never sent a `SETUP` and never
+                // connected: a leader that was elected twice could not send its
+                // `NEW_LEADER_EVENT` at all, and the reference's client waited
+                // in `AWAIT_NEW_LEADER` until it closed itself (LC-2's partition
+                // case, 2026-10-27).
+                && publication.refcount > 0
         })
     }
 
