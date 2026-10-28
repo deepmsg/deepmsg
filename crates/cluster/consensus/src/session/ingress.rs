@@ -294,11 +294,20 @@ struct Dispatch<'a> {
 
 impl ControlledHandler for Dispatch<'_> {
     fn on_message(&mut self, message: Message<'_>) -> Action {
-        if let Err(error) = self.dispatch(message) {
-            self.error = Some(error);
-            return Action::Abort;
+        match self.dispatch(message) {
+            // The handler's own action is the back-pressure contract
+            // (`ConsensusModuleAgent.onIngressMessage`'s `else { return ABORT; }`,
+            // `:849-852`). An `ABORT` leaves the fragment **unconsumed**, so the
+            // next poll reads it again — which is how a message the leader
+            // cannot append *yet* (a log publication momentarily out of room,
+            // `aeron_network_publication.c:995-1001`) survives instead of being
+            // dropped on the floor. Answering `Continue` here consumed it.
+            Ok(action) => action,
+            Err(error) => {
+                self.error = Some(error);
+                Action::Abort
+            }
         }
-        Action::Continue
     }
 }
 
@@ -442,5 +451,142 @@ pub fn dispatch_message(
             version,
             payload,
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! What the dispatch layer is told to do with a message is what happens to
+    //! that message. The reference's contract, in one line
+    //! (`ConsensusModuleAgent.java:849-852`): a leader that cannot append answers
+    //! `ABORT`, and `ABORT` means the frame is **not** consumed.
+
+    use super::*;
+    use deepmsg_client::fragment_assembler::MessageHeader;
+    use deepmsg_codec_cluster::WriteBuf;
+    use deepmsg_codec_cluster::session_message_header_codec::SessionMessageHeaderEncoder;
+
+    /// A handler that answers every ingress message the same way, and remembers
+    /// what it was told.
+    struct Answers {
+        action: Action,
+        seen: Vec<(i64, i64)>,
+    }
+
+    impl IngressHandler for Answers {
+        fn on_extension_message(&mut self, _: u16, _: u16, _: u16, _: u16, _: &[u8]) -> Action {
+            Action::Continue
+        }
+
+        fn on_ingress_message(
+            &mut self,
+            leadership_term_id: i64,
+            cluster_session_id: i64,
+            _payload: &[u8],
+        ) -> Result<Action, ClusterError> {
+            self.seen.push((leadership_term_id, cluster_session_id));
+            Ok(self.action)
+        }
+
+        fn on_session_connect(&mut self, _: SessionConnectRequest) -> Result<(), ClusterError> {
+            Ok(())
+        }
+
+        fn on_session_close(&mut self, _: i64, _: i64) -> Result<(), ClusterError> {
+            Ok(())
+        }
+
+        fn on_session_keep_alive(&mut self, _: i64, _: i64, _: i32) -> Result<(), ClusterError> {
+            Ok(())
+        }
+
+        fn on_challenge_response(&mut self, _: i64, _: i64, _: &[u8]) -> Result<(), ClusterError> {
+            Ok(())
+        }
+
+        fn on_admin_request(
+            &mut self,
+            _: i64,
+            _: i64,
+            _: i64,
+            _: AdminRequestType,
+            _: &[u8],
+        ) -> Result<(), ClusterError> {
+            Ok(())
+        }
+    }
+
+    /// One whole `SessionMessageHeader` message, header and all — the shape the
+    /// ingress subscription hands the dispatcher.
+    fn a_session_message(leadership_term_id: i64, cluster_session_id: i64) -> Vec<u8> {
+        let payload = b"echo me";
+        let mut buffer = vec![0_u8; SESSION_HEADER_LENGTH + payload.len()];
+        {
+            let encoder = SessionMessageHeaderEncoder::default()
+                .wrap(WriteBuf::new(&mut buffer), MESSAGE_HEADER_LENGTH);
+            let mut header = encoder.header(0);
+            let mut encoder = header.parent().expect("the encoder the header wrapped");
+            encoder
+                .cluster_session_id(cluster_session_id)
+                .leadership_term_id(leadership_term_id)
+                .timestamp(77);
+        }
+        buffer[SESSION_HEADER_LENGTH..].copy_from_slice(payload);
+        buffer
+    }
+
+    /// Dispatch one message through a handler that answers `answer`, and report
+    /// what the dispatcher answered the reader.
+    fn dispatched(answer: Action) -> Action {
+        let mut handler = Answers {
+            action: answer,
+            seen: Vec::new(),
+        };
+        let images = deepmsg_cluster_common::collections::HashMap::default();
+        let message = a_session_message(2, 7);
+
+        let had_error = {
+            let mut dispatch = Dispatch {
+                handler: &mut handler,
+                images: &images,
+                error: None,
+            };
+            let answered = dispatch.on_message(Message {
+                header: MessageHeader {
+                    session_id: 1,
+                    stream_id: 100,
+                    term_offset: 0,
+                    flags: 0,
+                    position: 0,
+                    frame_length: 0,
+                    fragmented_frame_length: 0,
+                    image_registration_id: 1,
+                },
+                payload: &message,
+            });
+            assert!(dispatch.error.is_none(), "an answer is not an error");
+            answered
+        };
+
+        assert_eq!(
+            vec![(2, 7)],
+            handler.seen,
+            "the handler saw the message the message header named"
+        );
+        had_error
+    }
+
+    #[test]
+    fn an_aborted_ingress_message_is_not_consumed() {
+        // The whole of `ABORT`: the reader's position stays where it was, so the
+        // same frame arrives again. Answering `Continue` consumed a message the
+        // leader never appended — that is a lost client message, not back
+        // pressure.
+        assert_eq!(Action::Abort, dispatched(Action::Abort));
+    }
+
+    #[test]
+    fn a_continued_ingress_message_is_consumed() {
+        assert_eq!(Action::Continue, dispatched(Action::Continue));
     }
 }
