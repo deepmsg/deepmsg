@@ -25,9 +25,10 @@
 //! # The ports
 //!
 //! `ClusterPorts` is the reference's own scheme (`ClusterConfig.java:425-445`)
-//! and the base is this binary's block (15xxx): below
-//! `net.ipv4.ip_local_port_range`, because inside it any process may hold a
-//! port mid-run (`records/P3-9.md` §9.2).
+//! and each case takes a block of its own from this binary's band
+//! ([`bands::LC3_SMOKE`]): below `net.ipv4.ip_local_port_range`,
+//! because inside it any process may hold a port mid-run (`records/P3-9.md`
+//! §9.2).
 //!
 //! # One at a time
 //!
@@ -36,9 +37,8 @@
 //! `--test-threads=1`.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, Ordering};
 
-use deepmsg_tests::cluster::{MemberSpec, Options, ProcessMode, TestCluster};
+use deepmsg_tests::cluster::{MemberSpec, Options, ProcessMode, TestCluster, bands};
 use deepmsg_tests::cluster_mixed::{
     self, Leader, LeaderImpl, Topology, assert_one_leader, await_caught_up,
     await_everyone_at_the_leaders_position, commit_position, connect, echo, node_logs, options,
@@ -53,10 +53,9 @@ const OURS: i32 = 0;
 /// A reference member, for the directions the 1R2J table gives us.
 const THEIRS: i32 = 1;
 
-/// The next cluster's port base; this binary owns the 15xxx block.
+/// The next cluster's port base, from this binary's band ([`bands::LC3_SMOKE`]).
 fn next_port_base() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(15_000);
-    NEXT.fetch_add(1_000, Ordering::Relaxed)
+    bands::LC3_SMOKE.next_base()
 }
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {

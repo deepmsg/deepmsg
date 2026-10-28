@@ -23,21 +23,18 @@
 //! leader is.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use deepmsg_cluster_common::counters::CLUSTER_NODE_ROLE_TYPE_ID;
-use deepmsg_tests::cluster::{ClusterPorts, MemberSpec, Options, ProcessMode, TestCluster};
-
+use deepmsg_tests::cluster::{ClusterPorts, MemberSpec, Options, ProcessMode, TestCluster, bands};
 const CLUSTER_ID: i32 = 13;
 const MEMBERS: i32 = 3;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// The next cluster's port base; each test takes a block it will not share.
+/// The next cluster's port base, from this binary's band ([`bands::LC4A_FAILOVER`]).
 fn next_port_base() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(31_000);
-    NEXT.fetch_add(1_000, Ordering::Relaxed)
+    bands::LC4A_FAILOVER.next_base()
 }
 
 fn options(base: u16) -> Options {

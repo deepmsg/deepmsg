@@ -32,18 +32,18 @@
 //!
 //! # Ports
 //!
-//! This binary owns the 23xxx block — below `net.ipv4.ip_local_port_range`
-//! (32768 here), because a member that loses one of its own endpoints mid-run
-//! dies in a way that reads as something else entirely. Each case takes a
-//! thousand: three members at `base + 0..300`, and the backup's own query
-//! publication at `base + 900` (the reference's
-//! `cluster_backup::BACKUP_PORT_OFFSET`).
+//! Each case takes a thousand ports from this binary's band
+//! ([`bands::LC5_BACKUP`]) — below `ip_local_port_range` (32768
+//! here), because a member that loses one of its own endpoints mid-run dies in
+//! a way that reads as something else entirely. Three members sit at
+//! `base + 0..300`, and the backup's own query publication at `base + 900`
+//! (the reference's `cluster_backup::BACKUP_PORT_OFFSET`), which is what the
+//! thousand is for.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
-use deepmsg_tests::cluster::ProcessMode;
+use deepmsg_tests::cluster::{ProcessMode, bands};
 use deepmsg_tests::cluster_backup;
 use deepmsg_tests::cluster_bytes::{assert_same_bytes, read_recording, recordings_of};
 use deepmsg_tests::cluster_harness::{BackupOptions, CLUSTER_ID};
@@ -60,10 +60,9 @@ const AFTER_THE_SNAPSHOT: u64 = 7;
 /// The tests in this binary each start a whole cluster, a backup and a client.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// The next case's port base; this binary owns the 23xxx block.
+/// The next cluster's port base, from this binary's band ([`bands::LC5_BACKUP`]).
 fn next_port_base() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(23_000);
-    NEXT.fetch_add(1_000, Ordering::Relaxed)
+    bands::LC5_BACKUP.next_base()
 }
 
 fn the_backup_rides_beside(topology: Topology) {
