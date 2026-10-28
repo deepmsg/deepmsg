@@ -475,8 +475,10 @@ pub const PORTS_PER_CLUSTER: u16 = PORTS_PER_NODE * (crate::cluster_mixed::MEMBE
 pub const PORTS_PER_CLUSTER_WITH_A_BACKUP: u16 = 1_000;
 
 /// The first port Linux hands out by itself: this machine's
-/// `net.ipv4.ip_local_port_range` is `32768 60999`.
-pub const EPHEMERAL_RANGE_START: u16 = 32_768;
+/// `net.ipv4.ip_local_port_range` is `32768 60999`. The other end of that range
+/// is [`EPHEMERAL_RANGE_END`], which is where the single-driver tests' window
+/// [`ports`](crate::ports) starts; both numbers have one authority there.
+pub use crate::ports::{EPHEMERAL_RANGE_END, EPHEMERAL_RANGE_START};
 
 /// The first port above the privileged ones.
 pub const UNPRIVILEGED_PORTS_START: u16 = 1_024;
@@ -3521,6 +3523,41 @@ mod port_band_tests {
             assert!(
                 u32::from(slots) >= clusters,
                 "{name} starts {clusters} clusters and its band holds {slots}"
+            );
+        }
+    }
+
+    /// The single-driver window is the same arithmetic on the other side of
+    /// `ip_local_port_range`: it starts above the range, it ends inside `u16`,
+    /// and no cluster band reaches into it.
+    ///
+    /// This is the static half of the port-block fix; the other half is
+    /// `ports::port`'s own check that an offset stays inside its slot.
+    #[test]
+    fn the_single_driver_window_sits_above_the_range_and_clear_of_every_band() {
+        let start = u32::from(crate::ports::SINGLE_DRIVER_PORT_BASE);
+        let width = u32::from(crate::ports::SINGLE_DRIVER_SLOT_WIDTH);
+        let slots = u32::from(crate::ports::SINGLE_DRIVER_SLOTS);
+        let stop = start + width * slots;
+
+        assert!(width > 0 && slots > 0, "a slot has to hold something");
+        assert!(
+            start > u32::from(crate::ports::EPHEMERAL_RANGE_END),
+            "the single-driver window starts at {start}, inside ip_local_port_range"
+        );
+        assert!(
+            stop <= 65_536,
+            "the single-driver window ends at {stop}, past the last port"
+        );
+        // Implied today by `band.end <= EPHEMERAL_RANGE_START` in the test
+        // above; stated here so that a band allowed past the range later meets
+        // this window on its own terms rather than through that one's removal.
+        for (name, band, _) in every_band() {
+            assert!(
+                u32::from(band.end) <= start || stop <= u32::from(band.start),
+                "{name}'s band ({}..{}) reaches into the single-driver window ({start}..{stop})",
+                band.start,
+                band.end
             );
         }
     }

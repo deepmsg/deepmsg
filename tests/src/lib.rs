@@ -14,7 +14,9 @@
 //! driver with no archive beside it, which is the one pairing a mixed gate needs.
 //! [`aeron_tests`] is the seventh and is not a process at all: it is where the C
 //! and Java this suite runs are looked for, which is a fork of the reference
-//! rather than anything in this tree.
+//! rather than anything in this tree. [`ports`] is not a process either: it is
+//! the window the single-driver tests take their ports from, above the range
+//! the kernel hands out.
 
 #![forbid(unsafe_code)]
 
@@ -32,6 +34,7 @@ pub mod driver;
 pub mod java;
 pub mod java_archiving_driver;
 pub mod java_driver;
+pub mod ports;
 pub mod samples;
 pub mod standalone_archive;
 pub mod synthetic;
