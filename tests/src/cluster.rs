@@ -1591,6 +1591,29 @@ impl TestCluster {
                 "member {member}'s Java node exited with {status}\nnode log:\n{}",
                 process.log_tail(80)
             );
+
+            // A JVM that exits before its archive conductor reaches `onClose`
+            // leaves the mark file's last proof-of-life behind
+            // (`signalTerminated` is `ArchiveConductor.java:324`), and agrona
+            // calls such a file *active* for `LIVENESS_TIMEOUT_MS` — ten
+            // seconds (`Archive.java:673`). The next start over the same
+            // directory is then refused with `IllegalStateException: active
+            // mark file detected` (`MarkFile.java:693`), the JVM dies inside
+            // `Archive$Context.conclude`, its media driver closes and writes
+            // the null heartbeat, and the container that was starting against
+            // it reports `cluster error: the media driver has been shut down`.
+            //
+            // The process has been reaped, so the archive *is* gone: saying so
+            // is what a clean close would have written, and it is what makes
+            // the restart legal. The directory is left alone — the recordings
+            // in it are what the catch-up and snapshot cases are about.
+            if let Ok(mark) =
+                deepmsg_archive::mark_file::ArchiveMarkFile::open(self.nodes[index].archive.path())
+            {
+                if mark.is_active(epoch_millis()) {
+                    let _ = mark.signal_terminated();
+                }
+            }
         }
         if let Some(module) = self.nodes[index].module.take() {
             match module {
