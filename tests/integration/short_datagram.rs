@@ -68,20 +68,16 @@ fn await_invalid_packets(client: &mut Client, at_least: i64) -> i64 {
     }
 }
 
-/// A UDP port nothing else on this machine is likely to hold.
+/// A UDP port this process owns, above `ip_local_port_range`
+/// ([`deepmsg_tests::ports`]).
 ///
-/// **Above the ephemeral range on purpose.** Linux hands outbound sockets ports
-/// from `ip_local_port_range` — 32768 to 60999 here, the same numbers this
-/// build's own `EPHEMERAL_PORTS` carries — so a test that binds inside it is
-/// racing every socket the machine opens, including the ones the driver under
-/// test opens. The other batches in this tree derive their ports from
-/// `20_000 + pid % 20_000` and `40_000 + pid % 20_000`, which are in that range;
-/// this one starts past its top.
+/// Linux hands outbound sockets ports from `ip_local_port_range` — 32768 to
+/// 60999 here, the same numbers this build's own `EPHEMERAL_PORTS` carries — so
+/// a test that binds inside it is racing every socket the machine opens. This
+/// file was the first to start past its top; the window it started in is now
+/// `tests/src/ports.rs`, shared with every other single-driver test.
 fn free_port() -> u16 {
-    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 62_000 + (std::process::id() as u16 % 3_000);
-
-    base
+    deepmsg_tests::ports::port(0)
 }
 
 #[test]

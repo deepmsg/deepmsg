@@ -214,16 +214,12 @@ fn await_image(client: &mut Client, subscription: i64) {
     panic!("the subscription never saw an image");
 }
 
-/// A UDP port nothing else on this machine is likely to hold.
+/// A UDP port this process owns, above `ip_local_port_range`
+/// ([`deepmsg_tests::ports`]).
 ///
-/// **Above the ephemeral range on purpose** — this binary's block is 61500 to
-/// 61999. The `40_000 + pid % 20_000` this file used before sat inside
-/// `ip_local_port_range` (32768 to 60999), where the kernel hands the port to
-/// any outbound socket that asks first; `image_lifecycle` owns 61000 to 61499
-/// and `short_datagram` 62000 to 64999.
+/// **Above the ephemeral range on purpose.** The `40_000 + pid % 20_000` this
+/// file used before sat inside it (32768 to 60999), where the kernel hands the
+/// port to any outbound socket that asks first.
 fn free_port() -> u16 {
-    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 61_500 + (std::process::id() as u16 % 500);
-
-    base
+    deepmsg_tests::ports::port(0)
 }
