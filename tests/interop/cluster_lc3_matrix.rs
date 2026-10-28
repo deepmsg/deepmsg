@@ -39,13 +39,13 @@
 //!
 //! Every cell starts three members and their drivers, so [`SERIAL`] holds the
 //! whole matrix apart and the binary is meant to run with `--test-threads=1`.
-//! The port base is this binary's own block (17xxx), below
-//! `net.ipv4.ip_local_port_range`.
+//! Each cell takes a block of its own from this binary's band
+//! ([`bands::LC3_MATRIX`]), which is sized for more cells than the six
+//! scenarios use — below `net.ipv4.ip_local_port_range`.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, Ordering};
 
-use deepmsg_tests::cluster::{Options, ProcessMode, TestCluster};
+use deepmsg_tests::cluster::{Options, ProcessMode, TestCluster, bands};
 use deepmsg_tests::cluster_mixed::{
     self, Leader, LeaderImpl, MEMBERS, Topology, assert_one_leader, await_caught_up,
     await_everyone_at_the_leaders_position, commit_position, connect, echo, follow_a_new_leader,
@@ -55,10 +55,9 @@ use deepmsg_tests::cluster_mixed::{
 /// The whole matrix runs one cell at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// The next cluster's port base; this binary owns the 17xxx block.
+/// The next cluster's port base, from this binary's band ([`bands::LC3_MATRIX`]).
 fn next_port_base() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(17_000);
-    NEXT.fetch_add(1_000, Ordering::Relaxed)
+    bands::LC3_MATRIX.next_base()
 }
 
 /// One cell of the matrix.

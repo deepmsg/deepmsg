@@ -40,7 +40,6 @@
 //! reference gives it `localhost:<2<cid>22<memberCount>>` for the same reason.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use deepmsg_cluster::control::cluster_control::ToggleState;
@@ -51,7 +50,7 @@ use deepmsg_cluster_common::counters::{
 };
 use deepmsg_tests::cluster::{
     ARCHIVE_CONTROL_PORT_OFFSET, CLIENT_FACING_PORT_OFFSET, ClusterPorts, LOG_PORT_OFFSET,
-    MEMBER_FACING_PORT_OFFSET, MemberSpec, Options, TestCluster,
+    MEMBER_FACING_PORT_OFFSET, MemberSpec, Options, TestCluster, bands,
 };
 use deepmsg_tests::cluster_backup;
 use deepmsg_tests::cluster_client::{Session, base_context, send_and_await_echo};
@@ -65,18 +64,9 @@ use deepmsg_tests::temp::TempDir;
 /// The tests in this binary each start a whole cluster.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// The next cluster's port base; this binary owns the 27xxx block.
-///
-/// Below `net.ipv4.ip_local_port_range` (32768 on this machine) on purpose:
-/// inside it, any process may hold a port at any moment, and the cluster needs
-/// its member endpoints for the length of a run. An `avahi-daemon` that had
-/// taken 46004 made a member's follower log subscription fail with
-/// `Address already in use` — its own log endpoint (`Election.java:1362`) — and
-/// the member truncated its log and terminated, which the assertions then read
-/// as "the backup never caught up".
+/// The next cluster's port base, from this binary's band ([`bands::BACKUP_JAVA`]).
 fn next_port_base() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(27_000);
-    NEXT.fetch_add(1_000, Ordering::Relaxed)
+    bands::BACKUP_JAVA.next_base()
 }
 
 const MEMBERS: i32 = 3;

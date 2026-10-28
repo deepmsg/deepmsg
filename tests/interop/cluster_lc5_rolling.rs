@@ -77,16 +77,16 @@
 //! # One cluster at a time
 //!
 //! [`SERIAL`] holds the cases apart and the binary runs with
-//! `--test-threads=1`; the port block is this binary's own (21xxx), below
+//! `--test-threads=1`; each case takes a block of its own from this binary's
+//! band ([`bands::LC5_ROLLING`]), below
 //! `net.ipv4.ip_local_port_range`.
 
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Instant;
 
 use deepmsg_cluster::persist::recording_log::{self, RecordingLog};
-use deepmsg_tests::cluster::{MemberSpec, ProcessMode, TestCluster};
+use deepmsg_tests::cluster::{MemberSpec, ProcessMode, TestCluster, bands};
 use deepmsg_tests::cluster_bytes::{
     MemberRecordings, assert_same_bytes, read_recording, recordings_of,
 };
@@ -108,10 +108,9 @@ const RUST_AUCTION: &str = "basic-auction";
 /// The service id every member of these clusters runs.
 const SERVICE_ID: i32 = 0;
 
-/// This binary's port block.
+/// The next cluster's port base, from this binary's band ([`bands::LC5_ROLLING`]).
 fn next_port_base() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(21_000);
-    NEXT.fetch_add(1_000, Ordering::Relaxed)
+    bands::LC5_ROLLING.next_base()
 }
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {

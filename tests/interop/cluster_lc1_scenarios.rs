@@ -21,14 +21,13 @@
 //! ([`ClusterPorts`]).
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use deepmsg_cluster_common::counters::{
     CLUSTER_NODE_ROLE_TYPE_ID, CLUSTER_SNAPSHOT_COUNTER_TYPE_ID,
 };
 use deepmsg_codec_cluster::event_code::EventCode;
-use deepmsg_tests::cluster::{ClusterPorts, MemberSpec, Options, TestCluster};
+use deepmsg_tests::cluster::{ClusterPorts, MemberSpec, Options, TestCluster, bands};
 use deepmsg_tests::cluster_client::{Session, base_context, send_and_await_echo};
 
 /// The tests in this binary each start a whole cluster.
@@ -39,19 +38,9 @@ const CLUSTER_ID: i32 = 21;
 const ROLE_LEADER: i64 = 2;
 const DEADLINE: Duration = Duration::from_secs(30);
 
-/// The next cluster's port base; this binary owns the 13xxx block.
-///
-/// Below `net.ipv4.ip_local_port_range` (32768 here) on purpose: inside it any
-/// process may hold a port mid-run, and a member that cannot bind its own log
-/// endpoint fails its follower log handover, re-canvasses and terminates — a
-/// failure that reads as a cluster member dying for no reason
-/// (`Election.java:1362`; `records/P3-9.md` §9.2 has the case, where
-/// `avahi-daemon` held 46004). The 41xxx block this used to own was inside the
-/// range and overlapped `cluster_lc1_reliability`'s 43xxx, and `cargo test` runs
-/// the two binaries together.
+/// The next cluster's port base, from this binary's band ([`bands::LC1_SCENARIOS`]).
 fn next_port_base() -> u16 {
-    static NEXT: AtomicU16 = AtomicU16::new(13_000);
-    NEXT.fetch_add(1_000, Ordering::Relaxed)
+    bands::LC1_SCENARIOS.next_base()
 }
 
 fn options(base: u16, members: i32, properties: &[(&str, &str)]) -> Options {

@@ -61,7 +61,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -459,6 +459,183 @@ impl ClusterPorts {
             .collect::<Vec<_>>()
             .join(",")
     }
+}
+
+/// The width of one cluster's block: the widest cluster these scenarios start
+/// ([`MEMBERS`](crate::cluster_mixed::MEMBERS) members), each owning a block of
+/// [`PORTS_PER_NODE`]. A fourth member would widen every band, and the
+/// compile-time checks in [`PortBand::new`] would report every one of them that
+/// stops being a whole number of blocks.
+pub const PORTS_PER_CLUSTER: u16 = PORTS_PER_NODE * (crate::cluster_mixed::MEMBERS as u16);
+
+/// The width of one cluster's block in a binary that also starts a **backup**
+/// beside it: the backup's own query publication sits at
+/// [`BACKUP_PORT_OFFSET`](crate::cluster_backup::BACKUP_PORT_OFFSET) (900), so
+/// the block has to be a thousand ports wide rather than three hundred.
+pub const PORTS_PER_CLUSTER_WITH_A_BACKUP: u16 = 1_000;
+
+/// The first port Linux hands out by itself: this machine's
+/// `net.ipv4.ip_local_port_range` is `32768 60999`.
+pub const EPHEMERAL_RANGE_START: u16 = 32_768;
+
+/// The first port above the privileged ones.
+pub const UNPRIVILEGED_PORTS_START: u16 = 1_024;
+
+/// A run of cluster port blocks that one test binary hands out, one per
+/// cluster.
+///
+/// The allocators this replaces were `AtomicU16::fetch_add(1_000)` from a
+/// literal, and nothing kept them inside the safe band [`ClusterPorts`]
+/// documents. A full `cluster_lc3_matrix` run — 44 clusters — walked from
+/// 17000 to 61000, putting 27 blocks inside `ip_local_port_range`, where any
+/// outbound socket may take one of a member's endpoints mid-run. A binary with
+/// 56 clusters walked the `u16` past 65535 instead, and the base came back as
+/// 464: port 465 is privileged, so the archive could not bind and the driver
+/// exited on `Permission denied`. Both are now the band's arithmetic — a base
+/// cannot leave `start..end`, and the counter that indexes them is 32 bits
+/// wide.
+pub struct PortBand {
+    name: &'static str,
+    start: u16,
+    end: u16,
+    width: u16,
+    next: AtomicU32,
+}
+
+impl PortBand {
+    /// A band of `width`-port blocks from `start` up to `end` (exclusive), a
+    /// whole number of blocks long. Every argument is checked at compile time.
+    #[must_use]
+    pub const fn new(name: &'static str, start: u16, end: u16, width: u16) -> Self {
+        assert!(
+            start >= UNPRIVILEGED_PORTS_START,
+            "a port band starts above the privileged ports"
+        );
+        assert!(
+            end <= EPHEMERAL_RANGE_START,
+            "a port band ends below ip_local_port_range"
+        );
+        assert!(
+            width > 0 && (end - start) % width == 0,
+            "a port band is a whole number of blocks long"
+        );
+        Self {
+            name,
+            start,
+            end,
+            width,
+            next: AtomicU32::new(0),
+        }
+    }
+
+    /// The next cluster's base.
+    ///
+    /// # Panics
+    ///
+    /// When the band has handed out every block it holds. Reusing one silently
+    /// would put two clusters on the same endpoints, which reads as a member
+    /// dying for no reason — so the run stops here instead, and says which band
+    /// to widen.
+    #[must_use]
+    pub fn next_base(&self) -> u16 {
+        let slots = u32::from((self.end - self.start) / self.width);
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            index < slots,
+            "the {} port band ({}..{}) holds {} clusters of {} ports and this run asked for \
+             more: widen the band in `tests/src/cluster.rs`, or give the new cases a band \
+             of their own",
+            self.name,
+            self.start,
+            self.end,
+            slots,
+            self.width
+        );
+        self.start + u16::try_from(index).expect("a slot inside the band") * self.width
+    }
+}
+
+/// One band per cluster interop binary.
+///
+/// The bands are disjoint: `cargo test` may have a binary of this suite running
+/// while another one starts, and two overlapping bands would put two clusters on
+/// the same endpoints in a way that only shows up as a member binding somebody
+/// else's log port. They are packed — the safe window is the 31 700 ports
+/// between [`UNPRIVILEGED_PORTS_START`] and [`EPHEMERAL_RANGE_START`], and
+/// `cluster_lc3_matrix` alone hands out 44 clusters — so a band is exactly as
+/// wide as the clusters its binary starts. A binary that grows a case grows its
+/// band, or [`PortBand::next_base`] stops it with the message that says so.
+///
+/// Packed means **full**: the same window also holds the *integration* suite's
+/// [`Ports`](crate::cluster_harness::Ports) block (21 000..25 800, moved with the
+/// process id), and the two suites overlap there. Nothing inside one `cargo test`
+/// can notice — it runs one test binary at a time — but two runs at once (this
+/// repository is developed in several worktrees) can take each other's ports, as
+/// they already could before this change, when `cluster_lc3_matrix` walked its
+/// 1 000-port step through that block for five of its 44 clusters.
+///
+/// Only the offsets [`CLIENT_FACING_PORT_OFFSET`], [`MEMBER_FACING_PORT_OFFSET`],
+/// [`LOG_PORT_OFFSET`], [`ARCHIVE_CONTROL_PORT_OFFSET`] and the backup's
+/// [`BACKUP_PORT_OFFSET`](crate::cluster_backup::BACKUP_PORT_OFFSET) are ever
+/// bound, so a stray listener between two of them (this machine has `avahi`'s
+/// 5353 and a `20241` nobody owns) costs nothing. A listener *on* one of them
+/// does: inside `ip_local_port_range`, `avahi-daemon` held 46004 long enough
+/// for a member's follower log handover to fail and the member to terminate
+/// (`Election.java:1362`; `records/P3-9.md` §9.2).
+///
+/// | binary | band | block | clusters in a full run |
+/// |---|---|---|---|
+/// | `cluster_lc5_backup` | 1_024..3_024 | 1_000 | 2 |
+/// | `cluster_backup_java` | 3_024..6_024 | 1_000 | 3 |
+/// | `cluster_lc1_reliability` | 6_024..7_524 | 300 | 5 |
+/// | `cluster_lc1_scenarios` | 7_524..9_624 | 300 | 7 |
+/// | `cluster_lc3_smoke` | 9_624..11_724 | 300 | 7 |
+/// | `cluster_lc3_bytes` | 11_724..13_224 | 300 | 5 |
+/// | `cluster_lc5_rolling` | 13_224..14_124 | 300 | 3 |
+/// | `cluster_lc4a_failover` | 14_124..17_124 | 300 | 10 |
+/// | `cluster_lc3_matrix` | 17_124..32_724 | 300 | 44 (+8 on the follower-restart probe branch) |
+pub mod bands {
+    use super::{PORTS_PER_CLUSTER, PORTS_PER_CLUSTER_WITH_A_BACKUP, PortBand};
+
+    /// `cluster_lc5_backup`: one cluster and a backup beside it, twice.
+    pub static LC5_BACKUP: PortBand = PortBand::new(
+        "cluster_lc5_backup",
+        1_024,
+        3_024,
+        PORTS_PER_CLUSTER_WITH_A_BACKUP,
+    );
+    /// `cluster_backup_java`: one Java cluster and a backup beside it, three
+    /// times.
+    pub static BACKUP_JAVA: PortBand = PortBand::new(
+        "cluster_backup_java",
+        3_024,
+        6_024,
+        PORTS_PER_CLUSTER_WITH_A_BACKUP,
+    );
+    /// `cluster_lc1_reliability`: five clusters.
+    pub static LC1_RELIABILITY: PortBand =
+        PortBand::new("cluster_lc1_reliability", 6_024, 7_524, PORTS_PER_CLUSTER);
+    /// `cluster_lc1_scenarios`: seven clusters.
+    pub static LC1_SCENARIOS: PortBand =
+        PortBand::new("cluster_lc1_scenarios", 7_524, 9_624, PORTS_PER_CLUSTER);
+    /// `cluster_lc3_smoke`: seven clusters.
+    pub static LC3_SMOKE: PortBand =
+        PortBand::new("cluster_lc3_smoke", 9_624, 11_724, PORTS_PER_CLUSTER);
+    /// `cluster_lc3_bytes`: five clusters.
+    pub static LC3_BYTES: PortBand =
+        PortBand::new("cluster_lc3_bytes", 11_724, 13_224, PORTS_PER_CLUSTER);
+    /// `cluster_lc5_rolling`: three clusters.
+    pub static LC5_ROLLING: PortBand =
+        PortBand::new("cluster_lc5_rolling", 13_224, 14_124, PORTS_PER_CLUSTER);
+    /// `cluster_lc4a_failover`: ten clusters.
+    pub static LC4A_FAILOVER: PortBand =
+        PortBand::new("cluster_lc4a_failover", 14_124, 17_124, PORTS_PER_CLUSTER);
+    /// `cluster_lc3_matrix`: six scenarios on eight cells, and one scenario on
+    /// four — 44 clusters. The follower-restart pressure fixture on
+    /// `wip/lc3-follower-restart-probe` adds one cell to each of eight
+    /// scenarios, which is why the band is 52 slots rather than 44.
+    pub static LC3_MATRIX: PortBand =
+        PortBand::new("cluster_lc3_matrix", 17_124, 32_724, PORTS_PER_CLUSTER);
 }
 
 /// A running cluster of members whose containers this fixture owns.
@@ -3202,4 +3379,123 @@ fn counter_value(client: &Client, type_id: i32, cluster_id: i32) -> Option<i64> 
     let counters = client.counters_reader()?;
     let counter_id = counters::find_cluster_counter(&counters, type_id, cluster_id)?;
     counters.value(counter_id)
+}
+
+#[cfg(test)]
+mod port_band_tests {
+    use super::bands::{
+        BACKUP_JAVA, LC1_RELIABILITY, LC1_SCENARIOS, LC3_BYTES, LC3_MATRIX, LC3_SMOKE,
+        LC4A_FAILOVER, LC5_BACKUP, LC5_ROLLING,
+    };
+    use super::{
+        ARCHIVE_CONTROL_PORT_OFFSET, CLIENT_FACING_PORT_OFFSET, EPHEMERAL_RANGE_START,
+        LOG_PORT_OFFSET, MEMBER_FACING_PORT_OFFSET, PORTS_PER_CLUSTER_WITH_A_BACKUP,
+        PORTS_PER_NODE, PortBand,
+    };
+    use crate::cluster_backup::BACKUP_PORT_OFFSET;
+
+    /// Every band and the number of clusters its binary starts in a full run.
+    /// A binary that grows a case has to grow this row's second number and its
+    /// band together; the test below is what notices when only one of the two
+    /// moved.
+    fn every_band() -> [(&'static str, &'static PortBand, u32); 9] {
+        [
+            ("cluster_lc5_backup", &LC5_BACKUP, 2),
+            ("cluster_backup_java", &BACKUP_JAVA, 3),
+            ("cluster_lc1_reliability", &LC1_RELIABILITY, 5),
+            ("cluster_lc1_scenarios", &LC1_SCENARIOS, 7),
+            ("cluster_lc3_smoke", &LC3_SMOKE, 7),
+            ("cluster_lc3_bytes", &LC3_BYTES, 5),
+            ("cluster_lc5_rolling", &LC5_ROLLING, 3),
+            ("cluster_lc4a_failover", &LC4A_FAILOVER, 10),
+            ("cluster_lc3_matrix", &LC3_MATRIX, 44),
+        ]
+    }
+
+    #[test]
+    fn the_bands_are_disjoint_and_hold_the_clusters_their_binaries_start() {
+        let mut bands = every_band();
+        bands.sort_unstable_by_key(|(_, band, _)| band.start);
+        for pair in bands.windows(2) {
+            let (previous_name, previous, _) = pair[0];
+            let (name, band, _) = pair[1];
+            assert!(
+                previous.end <= band.start,
+                "{name}'s band starts at {}, inside {previous_name}'s, which ends at {}",
+                band.start,
+                previous.end
+            );
+        }
+        for (name, band, clusters) in bands {
+            assert!(
+                band.end <= EPHEMERAL_RANGE_START,
+                "{name} ends at {}, inside ip_local_port_range",
+                band.end
+            );
+            let slots = (band.end - band.start) / band.width;
+            assert!(
+                u32::from(slots) >= clusters,
+                "{name} starts {clusters} clusters and its band holds {slots}"
+            );
+        }
+    }
+
+    /// What a cluster actually binds: each member's four offsets, and the
+    /// backup's own endpoint in the two binaries that start one.
+    #[test]
+    fn no_port_a_cluster_binds_lands_outside_its_block() {
+        const OFFSETS: [u16; 4] = [
+            ARCHIVE_CONTROL_PORT_OFFSET,
+            CLIENT_FACING_PORT_OFFSET,
+            MEMBER_FACING_PORT_OFFSET,
+            LOG_PORT_OFFSET,
+        ];
+        for (name, band, clusters) in every_band() {
+            for cluster in 0..clusters {
+                let base = band.start + u16::try_from(cluster).expect("a cluster") * band.width;
+                let block = base..base + band.width;
+                for member in 0..(crate::cluster_mixed::MEMBERS as u16) {
+                    for offset in OFFSETS {
+                        let port = base + member * PORTS_PER_NODE + offset;
+                        assert!(
+                            block.contains(&port),
+                            "{name}'s cluster {cluster} binds {port} outside {}..{}",
+                            block.start,
+                            block.end
+                        );
+                        assert!(
+                            port < EPHEMERAL_RANGE_START,
+                            "{name}'s cluster {cluster} binds {port}, inside ip_local_port_range"
+                        );
+                    }
+                }
+                // A block this wide only exists because the binary puts a
+                // backup beside the cluster, which binds 900 ports up.
+                if band.width == PORTS_PER_CLUSTER_WITH_A_BACKUP {
+                    assert!(
+                        block.contains(&(base + BACKUP_PORT_OFFSET)),
+                        "{name}'s cluster {cluster} puts its backup at {} outside {}..{}",
+                        base + BACKUP_PORT_OFFSET,
+                        block.start,
+                        block.end
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_band_that_runs_out_says_so_instead_of_reusing_a_block() {
+        let band = PortBand::new("a two-cluster band", 1_024, 1_624, 300);
+        assert_eq!(band.next_base(), 1_024);
+        assert_eq!(band.next_base(), 1_324);
+        let message = std::panic::catch_unwind(|| band.next_base())
+            .expect_err("the third cluster cannot be placed")
+            .downcast::<String>()
+            .expect("the message is a string");
+        assert!(
+            message.contains("holds 2 clusters of 300 ports"),
+            "the message names the band and what it holds: {message}"
+        );
+    }
 }
