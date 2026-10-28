@@ -37,13 +37,10 @@ use deepmsg_tests::samples::{self, Sample};
 /// start-up and the handshake behind them.
 const SAMPLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A port this process may use, off a base that keeps two test binaries running
-/// at once apart.
+/// A port this process may use, from its slot above `ip_local_port_range`
+/// ([`deepmsg_tests::ports`]).
 fn free_udp_port(offset: u16) -> u16 {
-    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 20_000 + (std::process::id() as u16 % 20_000);
-
-    base.saturating_add(offset)
+    deepmsg_tests::ports::port(offset)
 }
 
 #[test]
@@ -82,8 +79,8 @@ fn the_reference_response_samples_finish_the_handshake_on_our_driver() {
     // sharing is the design: it is the `control=`-only form, which is what
     // gives the requester somewhere to elicit and the responder nowhere to
     // send until it is asked.
-    let request = format!("aeron:udp?endpoint=127.0.0.1:{}", free_udp_port(301));
-    let response = format!("aeron:udp?control=127.0.0.1:{}", free_udp_port(302));
+    let request = format!("aeron:udp?endpoint=127.0.0.1:{}", free_udp_port(1));
+    let response = format!("aeron:udp?control=127.0.0.1:{}", free_udp_port(2));
 
     // The server first. Its request subscription has to be up before the client
     // offers, because an offer to a publication with no reader is not

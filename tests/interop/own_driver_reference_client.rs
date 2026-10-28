@@ -97,16 +97,11 @@ fn token(output: &str, marker: &str, key: &str) -> Option<String> {
     Some(rest.split_whitespace().next()?.to_owned())
 }
 
-/// A UDP port nothing else on this machine is likely to hold.
-///
-/// The same arithmetic `tests/interop/udp_transport.rs` uses: high ports, from
-/// a range derived from the process id. Not "bind a socket and read its port" —
-/// that is a race, and this file's two cases run in one process.
+/// A UDP port this process owns, above `ip_local_port_range`
+/// ([`deepmsg_tests::ports`]). Not "bind a socket and read its port" — that is
+/// a race.
 fn free_udp_port() -> u16 {
-    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 20_000 + (std::process::id() as u16 % 20_000);
-
-    base.saturating_add(1)
+    deepmsg_tests::ports::port(1)
 }
 
 #[test]
