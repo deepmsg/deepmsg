@@ -982,30 +982,52 @@ fn the_destination_count_follows_the_destinations_of_a_manual_channel() {
 
     let mut publisher = Client::connect(own.aeron_dir()).expect("connect our client");
 
-    // One reading per step, each after the driver has answered the command
-    // that changed it — the commands are synchronous, so the counter is a
-    // statement about a completed operation rather than about a race.
+    // One reading per step, each **read until the driver has applied it**.
+    //
+    // Reading once, right after the client is told the command is done, is a
+    // race and used to lose it about a third of the time: the conductor
+    // answers a destination command before the sender thread has put it on the
+    // tracker (`Sender::add_destination` only enqueues a `SenderCommand`,
+    // `crates/driver/src/sender.rs:389`), which is what the reference does too
+    // (`conductor.rs:4007`'s note). Waiting for the value does not weaken what
+    // this asserts — a count that never arrives still fails, and one that
+    // overshoots never matches — it only stops the test from reading a step
+    // behind.
+    const SETTLE: Duration = Duration::from_secs(10);
+
     let mut readings: Vec<(&str, Result<i64, String>)> = Vec::new();
 
     let publication_id = publisher
         .add_publication(MANUAL_CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
         .expect("our driver must confirm the manual publication");
-    readings.push(("after the publication", mdc_num_dest(&stat_binary, &dir)));
+    readings.push((
+        "after the publication",
+        await_mdc_num_dest(&stat_binary, &dir, 0, SETTLE),
+    ));
 
     publisher
         .add_destination(publication_id, &channel_one, DEFAULT_TIMEOUT)
         .expect("our driver must confirm the first destination");
-    readings.push(("after one destination", mdc_num_dest(&stat_binary, &dir)));
+    readings.push((
+        "after one destination",
+        await_mdc_num_dest(&stat_binary, &dir, 1, SETTLE),
+    ));
 
     publisher
         .add_destination(publication_id, &channel_two, DEFAULT_TIMEOUT)
         .expect("our driver must confirm the second destination");
-    readings.push(("after two destinations", mdc_num_dest(&stat_binary, &dir)));
+    readings.push((
+        "after two destinations",
+        await_mdc_num_dest(&stat_binary, &dir, 2, SETTLE),
+    ));
 
     publisher
         .remove_destination(publication_id, &channel_one, DEFAULT_TIMEOUT)
         .expect("our driver must confirm the removal");
-    readings.push(("after removing one", mdc_num_dest(&stat_binary, &dir)));
+    readings.push((
+        "after removing one",
+        await_mdc_num_dest(&stat_binary, &dir, 1, SETTLE),
+    ));
 
     // The subscriber behind the remaining destination goes away. On a manual
     // channel that is not a reason to forget it.
@@ -1021,7 +1043,10 @@ fn the_destination_count_follows_the_destinations_of_a_manual_channel() {
     publisher
         .remove_destination(publication_id, &channel_two, DEFAULT_TIMEOUT)
         .expect("our driver must confirm the removal");
-    readings.push(("after removing the last", mdc_num_dest(&stat_binary, &dir)));
+    readings.push((
+        "after removing the last",
+        await_mdc_num_dest(&stat_binary, &dir, 0, SETTLE),
+    ));
 
     let _ = second_sample.driver.stop();
     let log = own.log_tail(60);
