@@ -1188,8 +1188,28 @@ impl TestCluster {
             .iter()
             .partition(|member| self.node(**member).process.is_none());
 
+        // **Signal, then the member's own containers, then the wait.** A
+        // module's close gives back its log endpoint's local sockets only once
+        // the driver has let go of them, and that endpoint's image is also read
+        // by the member's **service container** (`log-sc-<service_id>`): with
+        // the container still up the image cannot leave, so the close waits out
+        // its whole bound — 32.3 s a stop in ten runs out of ten, 12 s inside
+        // [`MODULE_STOP_GRACE`], and with one more command timeout a
+        // `SIGKILL` instead. Stopping the containers between the signal and the
+        // wait is also the order the product has in mind: the module is told to
+        // stop, and what it waits on goes away under it.
         for member in &ours {
-            self.stop_module(*member, "shutdown");
+            self.signal_module_stop(*member);
+            let slots: Vec<i32> = self
+                .containers
+                .iter()
+                .filter(|slot| slot.spec.id == *member)
+                .map(|slot| slot.spec.service_id)
+                .collect();
+            for service_id in slots {
+                self.stop_container(*member, service_id);
+            }
+            self.join_module(*member, "shutdown");
         }
 
         let slots: Vec<(i32, i32)> = self
@@ -1581,6 +1601,26 @@ impl TestCluster {
     /// does not have. `why` names the path that asked, so the failure says which
     /// one it was.
     pub fn stop_module(&mut self, member: i32, why: &str) {
+        self.signal_module_stop(member);
+        self.join_module(member, why);
+    }
+
+    /// Tell a member's module to stop, and do not wait for it.
+    fn signal_module_stop(&mut self, member: i32) {
+        let index = self.node_index(member);
+        if let Some(process) = self.nodes[index].process.as_mut() {
+            process.terminate();
+            return;
+        }
+        match self.nodes[index].module.as_mut() {
+            Some(ModuleHandle::InProcess { stop, .. }) => stop.store(true, Ordering::Release),
+            Some(ModuleHandle::External(process)) => process.terminate(),
+            None => {}
+        }
+    }
+
+    /// Wait for a module that has been told to stop, and judge how it went.
+    fn join_module(&mut self, member: i32, why: &str) {
         let index = self.node_index(member);
         if let Some(mut process) = self.nodes[index].process.take() {
             let status = process
@@ -1617,8 +1657,8 @@ impl TestCluster {
         }
         if let Some(module) = self.nodes[index].module.take() {
             match module {
-                ModuleHandle::InProcess { stop, thread } => {
-                    stop.store(true, Ordering::Release);
+                ModuleHandle::InProcess { stop: _, thread } => {
+                    // [`Self::signal_module_stop`] has already set the flag.
                     // The duty cycle polls the flag, so this returns once it
                     // has taken one more turn — **but a thread inside
                     // `do_work` is not in that turn**: the election's
@@ -3163,13 +3203,35 @@ impl Process {
     /// at 30 s in the product (`LOCAL_SOCKETS_CLOSED_TIMEOUT`,
     /// `crates/cluster/consensus/src/agent/mod.rs:135`).
     fn stop_within(&mut self, grace: Duration) -> Result<ExitStatus, std::io::Error> {
+        self.terminate();
+        self.wait_within(grace)
+    }
+
+    /// `SIGTERM`, and nothing else: what waits for the process is
+    /// [`Self::wait_within`].
+    ///
+    /// The two are apart because a consensus module's close waits on the
+    /// **driver** for its log endpoint's local sockets, and that endpoint is
+    /// also read by the member's own service container — so the container has to
+    /// go *while* the module closes: not before the signal, which strands a
+    /// module inside `await_services_ready`, and not after the wait, which pays
+    /// the module's whole local-socket bound for a reader that is still there.
+    fn terminate(&mut self) {
         if self.stopped {
-            return self.child.wait();
+            return;
         }
         let _ = Command::new("kill")
             .arg("-TERM")
             .arg(self.child.id().to_string())
             .status();
+    }
+
+    /// Wait for a process that has been told to stop, and kill it if `grace`
+    /// runs out.
+    fn wait_within(&mut self, grace: Duration) -> Result<ExitStatus, std::io::Error> {
+        if self.stopped {
+            return self.child.wait();
+        }
 
         let deadline = Instant::now() + grace;
         loop {
