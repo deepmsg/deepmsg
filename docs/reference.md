@@ -119,7 +119,7 @@ environment, `$PATH` included. The mode is one of:
 |---|---|
 | `transparent` | the real java, both. The control: it is what says the shim is invisible |
 | `hybrid` | our driver, the reference's archive. The entry physical exam for the archive track |
-| `deepmsg` | ours for both. The acceptance criterion itself; the archive is not written yet |
+| `deepmsg` | ours for both. The acceptance criterion itself: the reference's C suite's 306 cases, all passing (`docs/roadmap.md`, LA-1) |
 
 `archive-shim --deepmsg-shim-table` prints the classes it knows, which is what
 the runner checks a run against.

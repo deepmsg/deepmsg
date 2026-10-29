@@ -8,7 +8,7 @@ reference tooling, never by prose.
 | P0 | core, cnc, codec, client | deepmsg client against the reference C `aeronmd` 1.53.2: pub/sub roundtrip, counters, clean termination; CnC 0.2.0 negotiation verified | `aeron-client/src/main/c/` |
 | P1 | driver | pure-Rust end-to-end (deepmsg client + deepmsg driver); reference C client against deepmsg driver; latency baseline in bench | `aeron-driver/src/main/c/` |
 | P2 | archive | the reference and this build **swapped for one another**: LA-0…LA-5, below | `aeron-archive/src/main/java/`, `aeron-archive/src/main/c/` |
-| P3 | cluster (placeholder) | out of scope for now; premium (Standby) deferred, seams preserved | `aeron-cluster/src/main/java/` |
+| P3 | cluster: common, consensus, service, client, tool | the interop suite's cluster lanes, including **mixed** clusters — members of both implementations in one cluster, judged by what a client sees and by each member's own counters. The reference's cluster suite is a dependency-injection harness rather than a black box, so it is a ledger instead of a gate: every case it expresses is enumerated in `crates/cluster/tests/reference-cases-*.tsv`, with what this build does about each | `aeron-cluster/src/main/java/` |
 
 P1's latency baseline is measured, not asserted: `docs/benchmarks.md` records
 the three configurations (our client, the reference's own instrument on our
