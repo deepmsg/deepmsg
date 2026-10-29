@@ -2,7 +2,7 @@
  * Read one or more `.hdr` files and print the quantiles a batch's tables are
  * built from, in nanoseconds and nothing else.
  *
- *   java -cp <harness jar> HdrQuantiles.java [--skip N] [LABEL=PATH ...]
+ *   java -cp <harness jar> HdrQuantiles.java [--skip N] [--quantiles Q[,Q...]] [LABEL=PATH ...]
  *
  * The histogram files this reads are written by the reference's
  * `PersistedHistogram` — the same HdrHistogram interval-log format the harness
@@ -24,7 +24,10 @@
  * cell, which is a whole microsecond of mean and nothing of a p50).
  *
  * p20 and p80 are here and p99.9 is not: the gaps these batches look for live
- * in the body of the distribution.
+ * in the body of the distribution. A batch that does look at the far tail asks
+ * for it with `--quantiles`, which **appends** columns after `e_lt_p99` and
+ * changes nothing for a caller that does not: every reader takes its columns by
+ * name from the header, so an extra one is invisible to all the others.
  */
 import org.HdrHistogram.Histogram;
 import org.HdrHistogram.HistogramLogReader;
@@ -77,12 +80,20 @@ public final class HdrQuantiles
     public static void main(final String[] args) throws Exception
     {
         int skip = 0;
+        final List<Double> extra = new ArrayList<>();
         final List<String[]> files = new ArrayList<>();
         for (int i = 0; i < args.length; i++)
         {
             if (args[i].equals("--skip"))
             {
                 skip = Integer.parseInt(args[++i]);
+            }
+            else if (args[i].equals("--quantiles"))
+            {
+                for (final String q : args[++i].split(","))
+                {
+                    extra.add(Double.parseDouble(q.trim()));
+                }
             }
             else
             {
@@ -96,7 +107,12 @@ public final class HdrQuantiles
         {
             System.out.printf(Locale.US, "\tp%d", (int)q);
         }
-        System.out.println("\tmax\tmean\te_lt_p99");
+        System.out.print("\tmax\tmean\te_lt_p99");
+        for (final double q : extra)
+        {
+            System.out.printf(Locale.US, "\tp%s", label(q));
+        }
+        System.out.println();
 
         for (final String[] f : files)
         {
@@ -106,9 +122,20 @@ public final class HdrQuantiles
             {
                 System.out.printf(Locale.US, "\t%d", h.getValueAtPercentile(q));
             }
-            System.out.printf(Locale.US, "\t%d\t%.1f\t%.1f%n",
+            System.out.printf(Locale.US, "\t%d\t%.1f\t%.1f",
                 h.getMaxValue(), h.getMean(), meanBelow(h, h.getValueAtPercentile(99)));
+            for (final double q : extra)
+            {
+                System.out.printf(Locale.US, "\t%d", h.getValueAtPercentile(q));
+            }
+            System.out.println();
         }
+    }
+
+    /** `99` as `p99` and `99.9` as `p99.9` — the header a reader takes by name. */
+    private static String label(final double q)
+    {
+        return q == Math.rint(q) ? Long.toString((long)q) : Double.toString(q);
     }
 
     /** E[X | X < ceiling], over the recorded values. */

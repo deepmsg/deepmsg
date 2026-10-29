@@ -40,6 +40,12 @@ echo "== the driver and the archive (the workspace's release profile) =="
 cargo build --release -p deepmsg-driver -p deepmsg-archive --bins
 
 echo
+echo "== the cluster node and its container (the cluster batch's node side) =="
+echo "   the reference puts archive, consensus module and service in the node's"
+echo "   JVM; these two are the same three roles on processes of their own."
+cargo build --release -p deepmsg-cluster -p deepmsg-cluster-service --bins
+
+echo
 echo "== the counters reader (the archive batch explains a cell with it) =="
 cargo build --release -p deepmsg-tools --bin cnc-dump
 
@@ -62,9 +68,11 @@ echo
 echo "== what a batch will use =="
 ls -l target/release/deepmsg-driver target/release/deepmsg-archive \
     target/release/deepmsg-archiving-media-driver target/release/cnc-dump \
+    target/release/deepmsg-cluster-node target/release/deepmsg-clustered-service-container \
     target/rig/release/loadtest-rig target/rig/release/echo-node target/rig/release/archive-node
 echo
 echo "== digests (these are what the fingerprint records) =="
 sha256sum target/release/deepmsg-driver target/release/deepmsg-archive \
     target/release/deepmsg-archiving-media-driver target/release/cnc-dump \
+    target/release/deepmsg-cluster-node target/release/deepmsg-clustered-service-container \
     target/rig/release/loadtest-rig target/rig/release/echo-node target/rig/release/archive-node

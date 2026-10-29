@@ -81,6 +81,13 @@ BENCH_ARCHIVE="${BENCH_ARCHIVE:-$DEEPMSG_DIR/target/release/deepmsg-archive}"
 BENCH_ARCHIVE_DRIVER="${BENCH_ARCHIVE_DRIVER:-$DEEPMSG_DIR/target/release/deepmsg-archiving-media-driver}"
 BENCH_ARCHIVE_NODE="${BENCH_ARCHIVE_NODE:-$DEEPMSG_DIR/target/rig/release/archive-node}"
 
+# The cluster batch's node side, for the arms where this build owns it: one
+# consensus module and one service container, each a process of its own (the
+# reference puts both in the node's JVM; the batch's own README says why the
+# second shape is still the same number of threads).
+BENCH_CLUSTER_NODE="${BENCH_CLUSTER_NODE:-$DEEPMSG_DIR/target/release/deepmsg-cluster-node}"
+BENCH_CLUSTER_CONTAINER="${BENCH_CLUSTER_CONTAINER:-$DEEPMSG_DIR/target/release/deepmsg-clustered-service-container}"
+
 # The counters a cell is explained with are read straight out of the driver's CnC
 # file, because both archives allocate the same type ids under the same labels —
 # so one reader serves both arms, and a cell whose archive was the reference's is
