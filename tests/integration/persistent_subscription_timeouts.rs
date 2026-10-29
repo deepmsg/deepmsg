@@ -108,10 +108,10 @@ const MESSAGES: usize = 10;
 const ARCHIVE_CONTROL_UDP: &str = "aeron:udp?endpoint=127.0.0.1:18010";
 const RESPONSE_STREAM_ID: i32 = 20;
 
+/// A UDP port this process owns: above `ip_local_port_range`, one slot per
+/// process, `offset` ports in ([`deepmsg_tests::ports`]).
 fn free_port(offset: u16) -> u16 {
-    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 20_000 + (std::process::id() as u16 % 20_000);
-    base.saturating_add(offset)
+    deepmsg_tests::ports::port(offset)
 }
 
 /// A deadline that has always passed by the time it is looked at (`:4161`).

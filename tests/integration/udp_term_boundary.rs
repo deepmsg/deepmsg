@@ -144,14 +144,8 @@ fn await_image(client: &mut Client, subscription: i64) {
     panic!("the subscription never saw an image");
 }
 
-/// A UDP port nothing else on this machine is likely to hold.
-///
-/// The same arithmetic `tests/interop/udp_transport.rs` uses: high ports, from
-/// a range derived from the process id, so two runs collide only if something
-/// else chose exactly this one.
+/// A UDP port this process owns: above `ip_local_port_range`, one slot per
+/// process ([`deepmsg_tests::ports`]).
 fn free_port() -> u16 {
-    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 20_000 + (std::process::id() as u16 % 20_000);
-
-    base
+    deepmsg_tests::ports::port(0)
 }

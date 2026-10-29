@@ -35,13 +35,10 @@ const LENGTH: usize = 1024;
 /// How long the whole exchange may take before the test is a failure.
 const DEADLINE: Duration = Duration::from_secs(30);
 
-/// A UDP port to name in the channel, derived from the process id so that two
-/// tests running at once do not choose the same one.
+/// A UDP port this process owns: above `ip_local_port_range`, one slot per
+/// process, `offset` ports in ([`deepmsg_tests::ports`]).
 fn free_port(offset: u16) -> u16 {
-    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 20_000 + (std::process::id() as u16 % 20_000);
-
-    base.saturating_add(offset)
+    deepmsg_tests::ports::port(offset)
 }
 
 /// The message carrying number `index`, so a message delivered twice or out of

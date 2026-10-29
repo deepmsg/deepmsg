@@ -29,7 +29,7 @@ fn round_trip(term_length: &str, mtu: &str, payload_len: usize, port_offset: u16
         return;
     };
     let mut client = Client::connect(driver.aeron_dir()).expect("a client");
-    let port = 41_000 + (std::process::id() as u16 % 400) * 10 + port_offset;
+    let port = deepmsg_tests::ports::port(port_offset);
     let channel =
         format!("aeron:udp?endpoint=localhost:{port}|term-length={term_length}|mtu={mtu}");
     let subscription = client

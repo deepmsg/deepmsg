@@ -138,15 +138,14 @@ fn counters_of(cnc: &deepmsg_cnc::CncFile) -> String {
 ///
 /// The reference subscriber binds the port when it starts, so the test needs a
 /// number rather than an open socket: a socket held open by the test would be
-/// the thing that received the frames. High ports are picked from a range the
-/// ephemeral allocator rarely touches, and two drivers on one machine collide
-/// only if something else chose exactly this pair — which is why the pair is
-/// derived from the process id rather than fixed.
+/// the thing that received the frames. The number is this process's own, from
+/// the window above `ip_local_port_range` ([`deepmsg_tests::ports`]).
+///
+/// This comment used to say the ports came from "a range the ephemeral
+/// allocator rarely touches"; it was `20_000 + pid % 20_000`, which is inside
+/// `ip_local_port_range` for every process.
 fn free_udp_port(offset: u16) -> u16 {
-    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 20_000 + (std::process::id() as u16 % 20_000);
-
-    base.saturating_add(offset)
+    deepmsg_tests::ports::port(offset)
 }
 
 /// Offer until the driver's window permits it, or give up.

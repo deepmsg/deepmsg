@@ -145,10 +145,8 @@ fn the_references_loss_stat_reads_what_this_driver_wrote() {
     let _ = cnc;
 }
 
-/// A UDP port nothing else on this machine is likely to hold.
+/// A UDP port this process owns: above `ip_local_port_range`, one slot per
+/// process ([`deepmsg_tests::ports`]).
 fn free_port() -> u16 {
-    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 44_000 + (std::process::id() as u16 % 20_000);
-
-    base
+    deepmsg_tests::ports::port(0)
 }

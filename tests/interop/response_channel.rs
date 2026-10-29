@@ -49,13 +49,10 @@ const STREAM_ID: i32 = 1001;
 /// is being asked of it.
 const READER_SESSION: i32 = 7;
 
-/// A UDP port nobody is listening on, derived from the process id so that two
-/// drivers on one machine collide only by choosing the same pair.
+/// A UDP port nobody is listening on, from this process's slot above
+/// `ip_local_port_range` ([`deepmsg_tests::ports`]).
 fn free_udp_port(offset: u16) -> u16 {
-    #[allow(clippy::cast_possible_truncation)] // the low bits of a pid
-    let base = 20_000 + (std::process::id() as u16 % 20_000);
-
-    base.saturating_add(offset)
+    deepmsg_tests::ports::port(offset)
 }
 
 /// What a publisher's `SETUP` said: the session it is running, the flags byte,
@@ -433,7 +430,7 @@ fn a_response_subscription_is_not_a_reader() {
     // The same channel with `control-mode=response`, which is the only
     // difference between the two phases. It is *served* rather than refused,
     // which is what this slice changed.
-    let (asked, responded) = a_response_channel_asked_once(&mut client, 63);
+    let (asked, responded) = a_response_channel_asked_once(&mut client, 1);
 
     let asked = asked.expect("a channel with a control address is asked for a SETUP");
     assert!(
@@ -486,9 +483,10 @@ fn the_reference_asks_a_response_subscription_once_too() {
 
     let mut client = Client::connect(reference.aeron_dir()).expect("connect our client");
 
-    // Ports past every other test's here: this one runs beside them in the
-    // same process, and two of them must not want the same socket.
-    let (asked, responded) = a_response_channel_asked_once(&mut client, 131);
+    // Two apart from the other caller's seed, and inside the slot: this test
+    // runs beside the others in the same process, and no two of them may want
+    // the same socket.
+    let (asked, responded) = a_response_channel_asked_once(&mut client, 11);
 
     assert!(
         asked.is_some_and(|bytes| is_ask_for_setup(&bytes)),
