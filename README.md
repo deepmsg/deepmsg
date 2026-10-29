@@ -2,8 +2,8 @@
 
 A from-scratch Rust implementation of the
 [Aeron](https://github.com/aeron-io/aeron) messaging system — client, media
-driver and archive — built for low-latency trading workloads and byte-level
-compatibility with Aeron **1.53.2**.
+driver, archive and cluster — built for low-latency trading workloads and
+byte-level compatibility with Aeron **1.53.2**.
 
 ## Where it is
 
@@ -16,16 +16,20 @@ compatibility with Aeron **1.53.2**.
   response channels, spies). The acceptance is two-sided and runs against the
   reference in both directions, in the interop suite.
   What is left is the reference's own system-test suite: `.github/workflows/interop.yml`
-  runs its 72 classes against this driver and is **expected to be red** — a red
-  run there is a list of known gaps, class by class, not a broken build, and it
-  is the work queue rather than a summary. `docs/compat.md` lists every
-  divergence with the test that pins it.
+  runs its 72 classes against this driver, on demand rather than on every pull
+  request, and is **expected to be red** — a red run there is a list of known
+  gaps, class by class, not a broken build, and it is the work queue rather than
+  a summary. `docs/compat.md` lists every divergence with the test that pins it.
+  A kernel-bypass media is available for DPDK-capable ports in the same binary,
+  behind `--features dpdk` (ADR-0006), and is measured against the kernel path in
+  `docs/benchmarks.md`.
 - **The load test rig is complete, in Rust** (`crates/bench`). `loadtest-rig` is
   a port of the reference harness's `LoadTestRig` semantics — the same rate
   control, the same pipeline, the same `expected == sent == received` verdict,
   the same interval-log result files — and `echo-node` is the far end of the
-  same measurement. Both run under `bench/`, the two batches that measure this
-  build against the reference's own benchmark repository.
+  same measurement. Both run under `bench/`, the batches that measure this build
+  against the reference's own benchmark repository (`bench/README.md` lists
+  them).
 - **The archive is complete** (P2), and "complete" is a measurement rather than a
   claim: everything the reference's archive does — recording, replay,
   replication, the catalog, segments, the client's command set, and a persistent
@@ -36,22 +40,33 @@ compatibility with Aeron **1.53.2**.
   reference itself wrote, read back by this build and by the reference's own
   `ArchiveTool`. `docs/roadmap.md` records the six ways the swap is judged
   (LA-0…LA-5) and where the two that are not finished stand.
-- **The cluster is not started** (P3). `crates/cluster` is a placeholder and the
-  seams it will need — cluster schemas, reserved counter ids — are preserved so
-  that it can be added without rework. Premium features (Cluster Standby and
-  friends) are explicitly out of scope for now.
+- **The cluster is implemented** (P3), in five crates under `crates/cluster/`
+  (`crates/cluster/README.md` is the map): the consensus module with its
+  election state machine, the recording log, snapshots and `ClusterBackup`; the
+  service container and the `ClusteredService` API; the client's `AsyncConnect`
+  and egress poller; and the operator's tool. Interop is its evidence the way it
+  is everywhere else here, and it includes **mixed clusters** — members of both
+  implementations in one cluster, judged by what a client sees and by each
+  member's own counters. The reference's own cluster system tests are a Java
+  dependency-injection harness rather than a black box, so they are not a gate;
+  every case they express is enumerated in
+  `crates/cluster/tests/reference-cases-*.tsv`, with what this build does about
+  each. Premium features (Cluster Standby and friends) are out of scope, and the
+  seams they need are preserved.
 
 ## Where it stands
 
-Two batches under `bench/` measure this build against the reference's own
+The batches under `bench/` measure this build against the reference's own
 benchmark harness (`aeron-io/benchmarks`) — a rate-controlled load with the
 harness's own echo client and node — rather than against a `Ping`/`Pong` pair,
-on an 8-core Intel i7-9700K running Ubuntu 24.04 with gcc 13.3.0. Both are read as
-`E[X | X < p99]`, two rounds with the order reversed, against a floor measured
-in the same session. The record — the command that produced each table, the
-harness revision, the digest of every binary, the core placement — is in
-`docs/benchmarks.md`, which is the file to quote from; the numbers here are the
-headline and nothing else.
+on an 8-core Intel i7-9700K running Ubuntu 24.04 with gcc 13.3.0.
+`bench/README.md` lists them and says which layer each one can attribute. The
+two tables below come from `upstream-c-drivers/` and `rust-vs-java/`; both are
+read as `E[X | X < p99]`, two rounds with the order reversed, against a floor
+measured in the same session. The record — the command that produced each
+table, the harness revision, the digest of every binary, the core placement — is
+in `docs/benchmarks.md`, which is the file to quote from; the numbers here are
+the headline and nothing else.
 
 The media driver, one layer swapped. This batch is also the evidence behind the
 three C driver changes sent upstream —
@@ -107,7 +122,7 @@ harness's own Aeron 1.53.3, while this build targets 1.53.2.
 
 ## Layout
 
-    bench/       the two run batches that measure this build against the
+    bench/       the run batches that measure this build against the
                  reference's benchmark harness (see bench/README.md)
     crates/
       core/      protocol-agnostic foundation: buffers, lock-free structures,
@@ -121,8 +136,12 @@ harness's own Aeron 1.53.3, while this build targets 1.53.2.
                  flow control
       archive/   recording, replay, replication, catalog, and the archive's own
                  server and client
-      cluster/   placeholder for the future cluster track (not a workspace
-                 member yet)
+      cluster/   the cluster track, five crates: common (properties and the
+                 layouts that are observable), consensus (the module, election,
+                 recording log, backups), service (the container and the
+                 ClusteredService API), client, and the operator's tool
+      dpdk/      the kernel-bypass media for DPDK-capable ports, empty unless
+                 the `dpdk` feature is on (ADR-0006)
       tools/     cnc-dump, errlog-dump, reclog-dump, deepmsg-stat, and the
                  archive shim the reference's archive suite is pointed at
                  (docs/reference.md)
@@ -149,8 +168,9 @@ Interop tests need the reference C driver from the Aeron 1.53.2 checkout
 
 Benchmarks are snapshots rather than gates. `docs/benchmarks.md` holds the
 numbers, the machine they were taken on, and what they do not say; `bench/`
-holds the batches that produce them, and needs two checkouts beside this one
-(`bench/README.md` names them):
+holds the batches that produce them, and needs checkouts beside this one —
+the harness, the reference, and the fork the C and Java probes live in
+(`bench/README.md` names them and their defaults):
 
     cargo bench -p deepmsg-bench --bench micro
     bench/build.sh
