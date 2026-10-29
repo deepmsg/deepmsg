@@ -1,6 +1,6 @@
 # The run batches
 
-Three batches live here. All of them measure this build against the reference's,
+Four batches live here. All of them measure this build against the reference's,
 all drive the reference's own benchmark harness (`aeron-io/benchmarks`), and all
 write their results into `bench/out/` — which is ignored, because what belongs in
 the tree is the table and the command that produced it, not the histogram files.
@@ -10,6 +10,7 @@ the tree is the table and the command that produced it, not the histogram files.
 | `upstream-c-drivers/` | what are the C driver changes in this tree's upstream work worth? | yes — one layer is swapped, three times over |
 | `rust-vs-java/` | two whole stacks: how far apart are they? | **no** — nothing is swapped inside either arm |
 | `archive-vs-java/` | what is this build's **archive** worth, and what is the driver under it worth? | yes, and each ratio says which: `r-attach/j` is the archive, `r-java/r-attach` is the driver, `r-rust/j` is the whole stack and attributes nothing |
+| `cluster-arms/` | what are this build's **driver**, **archive** and **consensus module and container** worth inside a single-member cluster? | yes, and each ratio says which: `j-d/j` is the driver, `r-a/r` the archive, `r-a/j-d` the consensus module and the container, `r/j` the whole stack |
 
 That distinction is the whole reason the two are separate, and it is the one
 thing to hold on to when reading either: a number from `rust-vs-java` is a
@@ -29,6 +30,10 @@ bench/upstream-c-drivers/run-batch.sh            # ~80 minutes with the defaults
 
 # the two stacks
 bench/rust-vs-java/run-batch.sh                  # ~40 minutes with the defaults
+
+# a single-member cluster, four arms
+bench/cluster-arms/patches/install.sh --apply    # the media-driver launcher, in the harness
+bench/cluster-arms/run-batch.sh --quick          # plumbing, one machine, ~10 minutes
 ```
 
 Every entry script takes `--list` (print the plan, the digests and whether the
