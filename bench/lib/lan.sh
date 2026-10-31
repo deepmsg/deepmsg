@@ -160,10 +160,12 @@ lan_require() {
     if ! _lan_udp_round_trip to-peer; then
         _lan_fail "UDP $BENCH_LAN_PORT does not get from here to $BENCH_PEER_IP and back." \
             "This is the data path a cell will use. On a WSL2 peer the usual causes" \
-            "are the Windows firewall and WSL2's NAT: a port has to be forwarded" \
-            "from Windows to the WSL2 instance (netsh interface portproxy) and the" \
-            "firewall rule has to allow it, or WSL2 has to run in mirrored" \
-            "networking mode."
+            "are the Windows/Hyper-V firewall and WSL2's NAT. `netsh interface" \
+            "portproxy` is not a fix here: it forwards TCP only, and this probe" \
+            "(and the cell) is UDP. Put WSL2 in mirrored networking mode" \
+            "(networkingMode=mirrored in .wslconfig), then either add an inbound" \
+            "Hyper-V firewall rule for the VM creator or disable that profile;" \
+            "`firewall=false` alone has been seen not to open the path."
         problem=1
     fi
 

@@ -16,11 +16,35 @@ single-member tier (the work package's Q6 decision). The three-member tier is a
 functional check — it starts, it echoes, one `--quick` cell — and produces **no
 latency or throughput conclusion**. Nothing in this file applies to it.
 
-The batch runs on one machine in this slice. A cell whose client runs on the
-second machine is what a *read* number needs and is not implemented in
-`run-batch.sh` yet; `--two-host` is refused by name rather than quietly run on
-one host. **A number taken with the client on the same machine is plumbing, not
-evidence**, and may not be quoted as an LC-7 result.
+The batch runs on **two machines**: the node side (driver, archive, consensus
+module, container) on the bench machine, and the client **and its media driver**
+on the peer. `--two-host --peer <user@host>` is the only shape whose numbers are
+readings; a one-host run is plumbing, not evidence, and may not be quoted as an
+LC-7 result.
+
+The client is the reference's in every arm, and so is the client's media driver
+(the reference's `media-driver`, started on the peer). No arm changes the
+instrument. The peer's harness checkout is part of the fingerprint: the batch
+refuses two different reference revisions on the two machines.
+
+## 1a. The client link, and the tiers it can carry
+
+The client leg is a **1GbE direct link**, and that is a hard ceiling on the grid,
+not a matter of tuning. One request and one answer per message, `batch.size=1`,
+with Aeron + UDP/IP + Ethernet headers:
+
+| tier | payload per direction | with ~98 B of headers | verdict |
+|---|---|---|---|
+| `25K:32` | 25K x 32 B = 6.4 Mbps | ~26 Mbps | runnable |
+| `501K:32` | 501K x 32 B = 128 Mbps | ~520 Mbps, ~500K pps | runnable; the packet rate is the risk |
+| `301K:288` | 301K x 288 B = 693 Mbps | ~930 Mbps (~93% of line rate) | **not runnable**: no margin |
+| `101K:1344` | 101K x 1344 B = **1.086 Gbps** | ~1.16 Gbps | **not runnable**: above the link's one-direction rate before any header |
+
+`101K:1344` is excluded by arithmetic, not by a measurement: no header budget
+brings 1.086 Gbps under 1 Gbps. `301K:288` is excluded because 93% of line rate
+leaves nothing for the client's own UDP stack and the USB adapter. If the client
+leg is replaced with a 10GBASE-T adapter, a **new PREREG** is written for the new
+topology; this one is not edited after a reading.
 
 ## 2. The arms, and what each ratio may say
 
@@ -38,17 +62,19 @@ evidence**, and may not be quoted as an LC-7 result.
 | `r-a / r` | driver and consensus module are ours in both | **the archive** |
 | `r / j` | nothing is swapped inside either | the whole stack; attributes nothing |
 
-★ The client is the reference's in all four arms. No ratio here is a ratio
+★ The client is the reference's in all four arms, and so is the client's media
+driver (the reference's `media-driver`, on the peer). No ratio here is a ratio
 between instruments.
 
 ## 3. The grid
 
-- **Tiers** (rate : message length): `25K:32`, `101K:1344`, `301K:288`, `501K:32`
-  — the four the tree's earlier work is read at (`rust-vs-java`'s default).
+- **Tiers** (rate : message length): `25K:32` and `501K:32`. The tree's earlier
+  work is read at four tiers; the other two (`101K:1344`, `301K:288`) are
+  excluded by §1a's link budget **before** any reading, not dropped after one.
 - **Sync levels**: archive `{file,catalog}.sync.level` × cluster
   `file.sync.level`, **each 0 or 2, all four combinations**:
   `0:0`, `0:2`, `2:0`, `2:2` (`archive:cluster`).
-- 4 tiers × 4 sync combinations × 4 arms × 2 rounds = **128 cells**, one run
+- 2 tiers × 4 sync combinations × 4 arms × 2 rounds = **64 cells**, one run
   each. `--quick` exists to check the plumbing and is not a reading.
 
 Every cell uses the same channels, the same cores and the same client. The only
@@ -63,12 +89,20 @@ is what makes "one process fewer, one process more" not a variable.
 
 | arm | process | threads | cores |
 |---|---|---|---|
-| all | media driver | conductor, sender, receiver | 1, 2, 3 (its own properties file) |
+| all | node-side media driver | conductor, sender, receiver | 1, 2, 3 (its own properties file) |
 | `j`, `j-d` | `ClusterNode` (Java) | archive ×3, consensus module, echo service | `0,4,5,6,7` |
 | `r-a`, `r` | archive | ×3 | `4,5,6` |
 | `r-a`, `r` | consensus module | 1 | `7` |
 | `r-a`, `r` | container | 1 | `0` |
-| all | client | 1 | the peer machine |
+| all | **client's media driver** (reference `media-driver`, on the peer) | conductor, sender, receiver | the peer's physical cores, no SMT siblings; read off its `lscpu`, written into RUN-INFO |
+| all | client (reference `cluster-client`, on the peer) | 1 | the peer's physical core, no SMT sibling of the driver's |
+
+The client's driver has its own `aeron.dir` on the peer's `/dev/shm`
+(`/dev/shm/cluster-arms-client/aeron`), not the node's. A term buffer on a
+disk-backed file would put a page fault in the measured path; the peer's `/tmp`
+is its ext4 image, so scripts and histograms live there and the ring does not.
+The peer's driver is given its own `aeron.{conductor,sender,receiver}.cpu.affinity`
+in an override file that comes after the harness's two property files.
 
 Idle strategy is `spin` everywhere. The reference's `ClusterNode` hard-codes
 `BusySpinIdleStrategy` and ignores `-Daeron.cluster.idle.strategy`, so the arms
@@ -86,6 +120,13 @@ The floor is printed with every table: an arm against itself across the two
 rounds. **A difference inside the floor of its own cell is not a difference**,
 and the cell is marked void rather than read.
 
+The **path** is part of the instrument. Before the first cell, the batch sends
+1000 64-byte datagrams from the bench to the peer and back over the same link and
+writes the p50 / p99 / p99.9 into RUN-INFO. The probe is Python at both ends, so
+its number is an upper bound on the wire-plus-stack cost, not a correction to
+subtract from a cell. It exists to be read beside the table: a cell whose effect
+is smaller than the path's own spread is a cell the topology cannot resolve.
+
 The statistic is `E[X | X < p99]`, with p40 / p50 / p99 / p99.9 reported beside
 it. **The mean is not used** — the reference's node stops for ~8 ms in every
 cell, which is a whole microsecond of mean and nothing of a p50.
@@ -96,7 +137,7 @@ cell, which is a whole microsecond of mean and nothing of a p50.
 |---|---|---|
 | LC-7a | no regression | per cell: `r-a / j-d` ≤ 1 + that cell's floor, **and** the two rounds agree in sign (or both lie inside the floor) |
 | LC-7b | the tail | `r-a / j-d` < 1 at p99.9 in **most** cells, both rounds agreeing in sign |
-| LC-7c | throughput | highest tier: `expected == sent == received` — the rig's own check; the histogram may not be `.FAIL` |
+| LC-7c | throughput | the highest runnable tier (`501K:32`): `expected == sent == received` — the rig's own check; the histogram may not be `.FAIL` |
 
 **When a criterion fails:**
 
