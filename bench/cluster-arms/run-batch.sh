@@ -547,8 +547,13 @@ _load_gate() {
     fi
     max=$peer_max_load
     if [ -z "$max" ]; then
-        max=$(( $(_peer "nproc") / 4 ))
-        [ "$max" -lt 1 ] && max=1
+        # Half the peer's cores, not a quarter. The 1-minute average still
+        # carries the previous cell's four busy-spin threads for a minute after
+        # they exit, and a quarter-of-the-cores limit refuses the cell that
+        # follows its own cell (measured 2026-10-31: 4.02 > 4 on a 16-CPU
+        # peer). A compiler is `nproc` and up, so half still catches it.
+        max=$(( $(_peer "nproc") / 2 ))
+        [ "$max" -lt 2 ] && max=2
     fi
     if awk -v l="$load" -v max="$max" 'BEGIN { exit !(l > max) }'; then
         echo "  the peer is busy: 1-minute load $load > $max." >&2
