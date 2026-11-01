@@ -12,6 +12,14 @@ the tree is the table and the command that produced it, not the histogram files.
 | `archive-vs-java/` | what is this build's **archive** worth, and what is the driver under it worth? | yes, and each ratio says which: `r-attach/j` is the archive, `r-java/r-attach` is the driver, `r-rust/j` is the whole stack and attributes nothing |
 | `cluster-arms/` | what are this build's **driver**, **archive** and **consensus module and container** worth inside a single-member cluster? | yes, and each ratio says which: `j-d/j` is the driver, `r-a/r` the archive, `r-a/j-d` the consensus module and the container, `r/j` the whole stack |
 
+Two of these batches have **two shapes**: `rust-vs-java` and `upstream-c-drivers`
+run both halves of a cell on one machine by default (loopback), and with
+`--two-host --peer <user@host>` put the **server half here and the client half
+on the peer** — the shape of the reference's own echo benchmark
+(`scripts/aeron/README.md:6-11`). The shapes are not interchangeable: a cell
+from one may not be compared with a cell from the other, and the two-host shape
+is the only one whose client is not on the same kernel as the server.
+
 That distinction is the whole reason the two are separate, and it is the one
 thing to hold on to when reading either: a number from `rust-vs-java` is a
 statement about two systems, and cannot be used as if it were a statement about
