@@ -358,8 +358,12 @@ fi
         echo "channels        destination=$_two_server_ip:$two_host_destination_port, source=$_two_client_ip:$two_host_source_port, mtu $mtu"
         echo "peer cores      driver conductor=$peer_driver_conductor_cpu sender=$peer_driver_sender_cpu receiver=$peer_driver_receiver_cpu, client=$peer_rig_cpu"
     fi
-    echo "cores           conductor=$DRIVER_CONDUCTOR_CPU_CORE sender=$DRIVER_SENDER_CPU_CORE receiver=$DRIVER_RECEIVER_CPU_CORE echo=$SERVER_ECHO_CPU_CORE rig=$CLIENT_LOAD_TEST_RIG_MAIN_CPU_CORE aux=$NON_ISOLATED_CPU_CORES"
-    echo "channels        dest=$DESTINATION_CHANNEL src=$SOURCE_CHANNEL"
+    if [ "$mode" = two ]; then
+        echo "local cores     driver conductor=$DRIVER_CONDUCTOR_CPU_CORE sender=$DRIVER_SENDER_CPU_CORE receiver=$DRIVER_RECEIVER_CPU_CORE echo=$SERVER_ECHO_CPU_CORE"
+    else
+        echo "cores           conductor=$DRIVER_CONDUCTOR_CPU_CORE sender=$DRIVER_SENDER_CPU_CORE receiver=$DRIVER_RECEIVER_CPU_CORE echo=$SERVER_ECHO_CPU_CORE rig=$CLIENT_LOAD_TEST_RIG_MAIN_CPU_CORE aux=$NON_ISOLATED_CPU_CORES"
+        echo "channels        dest=$DESTINATION_CHANNEL src=$SOURCE_CHANNEL"
+    fi
     echo
     echo "arms, by digest"
     for arm in "${arm_list[@]}"; do
