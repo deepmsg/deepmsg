@@ -126,6 +126,19 @@ _cluster_common_defines() {
 }
 
 _archive_common_defines() {
+    # ★ The `j` and `j-d` arms do not start an archive of their own: the
+    # reference's `cluster-node` script starts one inside the node's JVM and
+    # hands it `scripts/aeron/low-latency-archive.properties`. Without the same
+    # values here the `r-a`/`r` arms would run their archive on the class
+    # defaults -- `BackoffIdleStrategy` for all three agents and a 100 ms cycle
+    # threshold -- and a difference between the arms would be a difference in
+    # configuration. Measured 2026-11-02: `r-a/j-d` read 1.87/2.12 before this.
+    #
+    # The values below are that file, one for one, except two: the archive's
+    # `file.sync.level` is the cell's variable (passing the file would pin it to
+    # 0 and silently override `--sync 0:2`, `2:0`, `2:2`), and
+    # `dir.delete.on.start` is already covered by the member directory being
+    # removed before every cell.
     printf '%s\n' \
         "-Daeron.dir=$aeron_dir" \
         "-Daeron.archive.dir=$dir/archive" \
@@ -135,7 +148,16 @@ _archive_common_defines() {
         "-Daeron.archive.local.control.channel=$local_archive_control" \
         "-Daeron.archive.file.sync.level=$sync_archive" \
         "-Daeron.archive.catalog.file.sync.level=$sync_archive" \
-        "-Daeron.archive.recording.events.enabled=false"
+        "-Daeron.archive.recording.events.enabled=false" \
+        "-Daeron.archive.threading.mode=DEDICATED" \
+        "-Daeron.archive.control.term.buffer.sparse=true" \
+        "-Daeron.archive.file.io.max.length=1m" \
+        "-Daeron.archive.idle.strategy=spin" \
+        "-Daeron.archive.recorder.idle.strategy=noop" \
+        "-Daeron.archive.replayer.idle.strategy=noop" \
+        "-Daeron.archive.conductor.cycle.threshold=1ms" \
+        "-Daeron.archive.recorder.cycle.threshold=1ms" \
+        "-Daeron.archive.replayer.cycle.threshold=1ms"
 }
 
 start_node_java() { # j, j-d
@@ -173,7 +195,7 @@ start_archive_java() {
     local logfile=$dir/archive.log
     local -a defines=()
     while IFS= read -r line; do defines+=("$line"); done < <(_archive_common_defines)
-    JVM_OPTS="${defines[*]} -Daeron.archive.threading.mode=DEDICATED" \
+    JVM_OPTS="${defines[*]}" \
         PROCESS_FILE_NAME=archive-node taskset -c "$archive_cpus" \
         "$benchmarks_dir/scripts/run-java" io.aeron.archive.Archive >"$logfile" 2>&1 &
     local pid=$!
