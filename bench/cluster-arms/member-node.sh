@@ -143,6 +143,7 @@ start_node_java() { # j, j-d
     local -a defines=()
     while IFS= read -r line; do defines+=("$line"); done < <(_cluster_common_defines)
     JVM_OPTS="${defines[*]} \
+-Daeron.cluster.idle.strategy=noop \
 -Daeron.cluster.control.channel=$control \
 -Daeron.cluster.service.name=echo-service \
 -Daeron.cluster.file.sync.level=$sync_cluster \
