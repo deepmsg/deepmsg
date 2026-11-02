@@ -7,7 +7,7 @@
 #                [--runs 1] [--iterations 60] [--warmup-iterations 30]
 #                [--port-base 61500] [--out DIR] [--list] [--quick] [--no-read]
 #                [--peer user@host] [--two-host] [--single-host]
-#                [--session-timeout 10s]
+#                [--session-timeout 10s] [--keep-recordings]
 #
 # The four arms differ by exactly one layer each, and that is what each ratio is
 # allowed to say:
@@ -110,6 +110,7 @@ path_port=${BENCH_PATH_PORT:-61411}
 # is told apart from one that is merely slow. Empty keeps every arm on its
 # default (the reference's is 10 s, `ConsensusModule.java:739`).
 session_timeout=${BENCH_CLUSTER_SESSION_TIMEOUT:-}
+keep_recordings=0
 
 # Both peer paths are `rm -rf`'d before a cell. A typo in an environment
 # variable must not take out a system directory; the guard is cheap.
@@ -129,6 +130,7 @@ while [ $# -gt 0 ]; do
         --runs) runs=$2; shift 2 ;;
         --rounds) rounds_to_run=$2; shift 2 ;;
         --session-timeout) session_timeout=$2; shift 2 ;;
+        --keep-recordings) keep_recordings=1; shift ;;
         --iterations) iterations=$2; shift 2 ;;
         --warmup-iterations) warmup_iterations=$2; shift 2 ;;
         --port-base) port_base=$2; shift 2 ;;
@@ -1003,6 +1005,17 @@ _cell() {
     for ((i = 1; i < member_count; i++)); do
         _member_collect "$i" "$dir" || true
     done
+
+    # ★ The leader's archive is the largest thing a cell writes: 9-12 GB at
+    # `101K:1344`, every cell, and nothing in this batch reads it. Sixteen
+    # cells left 75 GB in the results tree, filled the controller's disk, and a
+    # full disk reports itself as a cluster that cannot keep up -- the archive
+    # answers a recording request with `low storage threshold ... usableSpace=0`
+    # and the client's session then times out. The logs, the pid list and the
+    # histogram stay; the recording segments go unless asked for.
+    if [ "$keep_recordings" -eq 0 ]; then
+        rm -rf "$dir/archive"
+    fi
 
     # The histogram was written where the instrument ran; bring it home before
     # `cell_validate` looks for it. A failed client is a `.FAIL`, not a row.
