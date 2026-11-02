@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use deepmsg_core::logbuffer::descriptor;
 use deepmsg_core::logbuffer::frame::{DATA_HEADER_LENGTH, FLAG_BEGIN, FLAG_END, FLAG_UNFRAGMENTED};
 
-use crate::image::Fragment;
+use crate::image::{ControlledFragments, Fragment};
 
 /// The header a whole message carries, rewritten for the assembled whole.
 ///
@@ -520,6 +520,37 @@ impl Action {
     /// an aborted message.
     pub const fn publishes_now(self) -> bool {
         matches!(self, Self::Commit)
+    }
+}
+
+/// One object a controlled fragment scan can call: the assembler, and the
+/// message handler it answers to.
+///
+/// The scan reads **fragments**; this build's controlled traits speak in
+/// **messages**. The reassembly therefore sits between them, and the scan needs
+/// a single thing to call — which is all this is.
+///
+/// It used to be private to [`crate::subscription`], which hid the seam
+/// (callers there supply a message handler and never meet the assembler). It is
+/// public now because the seam is no longer hidden at the image level:
+/// [`crate::image::Image::bounded_controlled_poll`] takes a fragment handler
+/// directly, and a log or snapshot reader that wants whole messages hands it
+/// one of these.
+pub struct AssemblingSink<'a, H> {
+    assembler: &'a mut FragmentAssembler,
+    handler: &'a mut H,
+}
+
+impl<'a, H> AssemblingSink<'a, H> {
+    /// Borrow an assembler and a handler for the length of one scan.
+    pub fn new(assembler: &'a mut FragmentAssembler, handler: &'a mut H) -> Self {
+        Self { assembler, handler }
+    }
+}
+
+impl<H: ControlledHandler> ControlledFragments for AssemblingSink<'_, H> {
+    fn on_fragment(&mut self, fragment: &Fragment<'_>) -> Action {
+        self.assembler.push_controlled(fragment, self.handler)
     }
 }
 

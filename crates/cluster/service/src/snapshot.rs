@@ -29,7 +29,9 @@
 //! same in both places.
 
 use deepmsg_client::client::Client;
-use deepmsg_client::fragment_assembler::{Action, ControlledHandler, FragmentAssembler, Message};
+use deepmsg_client::fragment_assembler::{
+    Action, AssemblingSink, ControlledHandler, FragmentAssembler, Message,
+};
 use deepmsg_codec_cluster::client_session_codec::ClientSessionDecoder;
 use deepmsg_codec_cluster::message_header_codec::MessageHeaderDecoder;
 use deepmsg_codec_cluster::snapshot_marker_codec::SnapshotMarkerDecoder;
@@ -371,18 +373,24 @@ impl ServiceSnapshotLoader {
             error: None,
         };
 
-        // ★ **One fragment per poll**, where the reference reads a batch of
-        // `FRAGMENT_LIMIT`. `Image.controlledPoll` stops on `Action.BREAK`
-        // **without** consuming the record after END; this build's
-        // `Client::poll_image` hands a whole batch to the closure, and the
-        // assembler's answer cannot stop it. A batch therefore walks the image
-        // past END — measured: the image stood at 352 (the business's record
-        // included) by the time `on_start` was given it, and the state was
-        // unreachable. One at a time costs a few extra calls and leaves the
-        // image where the reference leaves it.
-        let result = client.poll_image(subscription_id, image_registration_id, 1, |fragment| {
-            let _ = assembler.push_controlled(fragment, &mut dispatch);
-        });
+        // ★ This used to be **one fragment per poll**, where the reference
+        // reads a batch of `FRAGMENT_LIMIT`: `Image.controlledPoll` stops on
+        // `Action.BREAK` without consuming the record after END, while
+        // `Client::poll_image` handed a whole batch to the closure and threw
+        // the assembler's answer away — a batch walked the image past END
+        // (measured: the image stood at 352, the business's record included, by
+        // the time `on_start` was given it, and the state was unreachable).
+        // The controlled poll honours the answer, so the batch is back.
+        let result = {
+            let mut sink = AssemblingSink::new(&mut assembler, &mut dispatch);
+            client.poll_image_bounded_controlled(
+                subscription_id,
+                image_registration_id,
+                i64::MAX,
+                FRAGMENT_LIMIT,
+                &mut sink,
+            )
+        };
 
         self.assembler = assembler;
         self.in_snapshot = dispatch.in_snapshot;
