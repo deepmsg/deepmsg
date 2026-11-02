@@ -81,6 +81,9 @@ out=""
 port_base=${CLUSTER_PORT_BASE:-61500}
 mode=single
 peer=""
+# The other two members of a three-member cluster, `--member user@host` twice.
+# Empty means the single-member cell this batch has always run.
+member_ssh=()
 peer_max_load=${BENCH_PEER_MAX_LOAD:-}
 peer_benchmarks=${BENCH_PEER_BENCHMARKS_DIR:-${BENCHMARKS_DIR}}
 peer_java_home=${BENCH_PEER_JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}
@@ -123,6 +126,7 @@ while [ $# -gt 0 ]; do
         --list) list_only=1; shift ;;
         --no-read) read_after=0; shift ;;
         --peer) peer=$2; mode=two; shift 2 ;;
+        --member) member_ssh+=("$2"); shift 2 ;;
         --two-host) mode=two; shift ;;
         --single-host) mode=single; shift ;;
         --quick)
@@ -178,24 +182,74 @@ CLUSTER_HOST=${CLUSTER_HOST:-$_batch_ip}
 # The client's egress endpoint is the *client's* address: the cluster sends the
 # answers there, and on two machines that address is not this one.
 CLIENT_EGRESS_HOST=$_peer_ip
-P_INGRESS=$port_base
-P_CONSENSUS=$((port_base + 1))
-P_LOG=$((port_base + 2))
-P_CATCHUP=$((port_base + 3))
-P_ARCHIVE=$((port_base + 4))
-P_ARCHIVE_REPLICATION=$((port_base + 5))
-P_CLUSTER_REPLICATION=$((port_base + 6))
 
-INGRESS="aeron:udp?endpoint=$CLUSTER_HOST:$P_INGRESS"
-CONSENSUS="aeron:udp?endpoint=$CLUSTER_HOST:$P_CONSENSUS"
-LOG_CHANNEL="aeron:udp?endpoint=$CLUSTER_HOST:$P_LOG"
-CATCHUP="aeron:udp?endpoint=$CLUSTER_HOST:$P_CATCHUP"
-ARCHIVE_CONTROL="aeron:udp?endpoint=$CLUSTER_HOST:$P_ARCHIVE"
-ARCHIVE_REPLICATION="aeron:udp?endpoint=$CLUSTER_HOST:$P_ARCHIVE_REPLICATION"
-CLUSTER_REPLICATION="aeron:udp?endpoint=$CLUSTER_HOST:$P_CLUSTER_REPLICATION"
-# id,ingress,consensus,log,catchup,archive — the reference's order, and the sixth
-# field is where the consensus module dials the archive.
-MEMBERS="0,$CLUSTER_HOST:$P_INGRESS,$CLUSTER_HOST:$P_CONSENSUS,$CLUSTER_HOST:$P_LOG,$CLUSTER_HOST:$P_CATCHUP,$CLUSTER_HOST:$P_ARCHIVE"
+# How many members, and where. One machine unless `--member` was given twice;
+# a two-member cluster is not a thing this batch runs (a quorum of two is a
+# different measurement, not a smaller one).
+member_count=$((1 + ${#member_ssh[@]}))
+case "$member_count" in
+    1|3) ;;
+    *)  echo "--member takes exactly two hosts (this batch runs single-member or" >&2
+        echo "three-member): ${#member_ssh[@]} given." >&2
+        exit 2 ;;
+esac
+
+# Each member owns a ten-port window, and the window is above Linux's ephemeral
+# range (32768-60999) for the reason the port-blocks card paid for: a port inside
+# it can be taken by any process mid-run, and a cluster that loses one of its own
+# endpoints fails in a way that looks like a bug in the cluster.
+_member_ip() { # <index>
+    if [ "$1" -eq 0 ]; then
+        printf '%s' "$CLUSTER_HOST"
+    else
+        printf '%s' "${member_ssh[$1 - 1]#*@}"
+    fi
+}
+
+declare -a M_IP M_INGRESS M_CONSENSUS M_LOG M_CATCHUP M_ARCHIVE_CONTROL M_ARCHIVE_REPLICATION M_CLUSTER_REPLICATION
+for ((_i = 0; _i < member_count; _i++)); do
+    M_IP[_i]=$(_member_ip "$_i")
+    _base=$((port_base + _i * 10))
+    M_INGRESS[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 0))"
+    M_CONSENSUS[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 1))"
+    M_LOG[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 2))"
+    M_CATCHUP[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 3))"
+    M_ARCHIVE_CONTROL[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 4))"
+    M_ARCHIVE_REPLICATION[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 5))"
+    M_CLUSTER_REPLICATION[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 6))"
+done
+
+# The six-field member form, `id,ingress,consensus,log,catchup,archive`; the
+# sixth field is where the consensus module dials its own archive.
+build_members() {
+    local out_m="" i base
+    for ((i = 0; i < member_count; i++)); do
+        base=$((port_base + i * 10))
+        out_m+="${i},${M_IP[i]}:$((base + 0)),${M_IP[i]}:$((base + 1)),${M_IP[i]}:$((base + 2)),"
+        out_m+="${M_IP[i]}:$((base + 3)),${M_IP[i]}:$((base + 4))|"
+    done
+    printf '%s' "${out_m%|}"
+}
+MEMBERS=$(build_members)
+
+# The reference client's own form of the same thing.
+build_client_endpoints() {
+    local out_e="" i
+    for ((i = 0; i < member_count; i++)); do
+        out_e+="${i}=${M_IP[i]}:$((port_base + i * 10)),"
+    done
+    printf '%s' "${out_e%,}"
+}
+CLIENT_INGRESS_ENDPOINTS=$(build_client_endpoints)
+
+# Member 0's channels, under the names the single-member path has always used.
+INGRESS=${M_INGRESS[0]}
+CONSENSUS=${M_CONSENSUS[0]}
+LOG_CHANNEL=${M_LOG[0]}
+CATCHUP=${M_CATCHUP[0]}
+ARCHIVE_CONTROL=${M_ARCHIVE_CONTROL[0]}
+ARCHIVE_REPLICATION=${M_ARCHIVE_REPLICATION[0]}
+CLUSTER_REPLICATION=${M_CLUSTER_REPLICATION[0]}
 CONTROL_CHANNEL="aeron:ipc?term-length=128k"
 LOCAL_ARCHIVE_CONTROL="aeron:ipc?term-length=64k"
 
@@ -306,6 +360,36 @@ _check() {
         lan_require || problem=1
     fi
 
+    if [ "$member_count" -gt 1 ]; then
+        local i host missing
+        for ((i = 1; i < member_count; i++)); do
+            host=${member_ssh[i - 1]}
+            if ! ssh -n -o BatchMode=yes -o ConnectTimeout=5 "$host" true 2>/dev/null; then
+                echo "no ssh to $host (member $i runs there)." >&2
+                problem=1
+                continue
+            fi
+            # The member runs the node side, so it needs what this machine has:
+            # the reference harness (for the arms that use its node) and this
+            # build's binaries (for the arms that use ours), at the same paths.
+            missing=$(ssh -n -o BatchMode=yes "$host" "
+                test -x '$BENCHMARKS_SCRIPTS_DIR/cluster-node' || echo 'no cluster-node launcher'
+                test -f '$BENCHMARKS_DIR/benchmarks-all/build/libs/benchmarks.jar' || echo 'harness not built'
+                test -x '$BENCH_DRIVER' || echo 'no deepmsg driver'
+                test -x '$BENCH_CLUSTER_NODE' || echo 'no consensus module'
+                test -x '$BENCH_CLUSTER_CONTAINER' || echo 'no service container'
+                test -x '$BENCH_ARCHIVE' || echo 'no archive'
+                test -x '$BENCHMARKS_DRIVER_JAVA' || echo 'no reference media-driver'
+                command -v taskset >/dev/null || echo 'no taskset'
+            " 2>&1)
+            if [ -n "$missing" ]; then
+                echo "member $i ($host) is missing:" >&2
+                echo "$missing" | sed 's/^/  /' >&2
+                problem=1
+            fi
+        done
+    fi
+
     [ "$problem" -eq 0 ]
 }
 
@@ -318,11 +402,21 @@ if [ "$list_only" = 1 ]; then
         echo "                not runnable on a 1GbE client leg: 101K:1344 (1.09 Gbps"
         echo "                of payload), 301K:288 (~93% of line rate with headers)"
     fi
+    echo "members string  $MEMBERS"
+    echo "client ingress  $CLIENT_INGRESS_ENDPOINTS"
     echo "sync            archive:cluster file sync level, one cell each — $syncs"
     echo "runs            $runs over $iterations s (warmup ${warmup_iterations}s at $warmup_rate)"
     echo "rounds          forward, reverse"
-    echo "member          single, host $CLUSTER_HOST: ingress $P_INGRESS, consensus $P_CONSENSUS, log $P_LOG,"
-    echo "                catchup $P_CATCHUP, archive $P_ARCHIVE (+$P_ARCHIVE_REPLICATION, +$P_CLUSTER_REPLICATION)"
+    if [ "$member_count" -eq 1 ]; then
+        echo "member          single, host ${M_IP[0]}: ingress ${M_INGRESS[0]#aeron:udp?endpoint=},"
+        echo "                consensus ${M_CONSENSUS[0]#aeron:udp?endpoint=}, log ${M_LOG[0]#aeron:udp?endpoint=},"
+        echo "                catchup ${M_CATCHUP[0]#aeron:udp?endpoint=}, archive ${M_ARCHIVE_CONTROL[0]#aeron:udp?endpoint=}"
+    else
+        echo "members         $member_count, one per host:"
+        for ((_i = 0; _i < member_count; _i++)); do
+            echo "                $((_i)): ${M_IP[_i]}  ingress ${M_INGRESS[_i]#aeron:udp?endpoint=}"
+        done
+    fi
     if [ "$mode" = two ]; then
         echo "where           this machine ($_batch_ip): driver + node side"
         echo "                peer $BENCH_PEER_SSH ($_peer_ip): the reference's"
@@ -332,7 +426,11 @@ if [ "$list_only" = 1 ]; then
         echo "peer paths      harness $peer_benchmarks; aeron dir $peer_aeron_dir"
         echo "client egress   aeron:udp?endpoint=$CLIENT_EGRESS_HOST:0"
     else
-        echo "where           one machine (loopback); the client shares this machine"
+        if [ "$member_count" -eq 1 ]; then
+            echo "where           one machine (loopback); the client shares this machine"
+        else
+            echo "where           $member_count machines, one member each; the client on the peer"
+        fi
     fi
     echo "cores           driver pins 1,2,3; node side $NODE_CPUS"
     echo "results         $out"
@@ -386,6 +484,16 @@ bench_fingerprint "$out/fingerprint.txt" >/dev/null
     echo "                cluster replication $CLUSTER_REPLICATION"
     echo "                control (ipc) $CONTROL_CHANNEL"
     echo "members         $MEMBERS"
+    if [ "$member_count" -gt 1 ]; then
+        echo "member hosts    ${member_count} machines, one member each:"
+        for ((_i = 0; _i < member_count; _i++)); do
+            if [ "$_i" -eq 0 ]; then
+                echo "                  $_i  ${M_IP[_i]}  this machine"
+            else
+                echo "                  $_i  ${M_IP[_i]}  ${member_ssh[_i - 1]}"
+            fi
+        done
+    fi
     echo "cores           driver 1,2,3 (from the properties file); node side $NODE_CPUS;"
     echo "                archive $ARCHIVE_CPUS, consensus module $CM_CPU, container $CONTAINER_CPU"
     echo
@@ -617,7 +725,7 @@ _client_jvm_opts() { # <aeron-dir> <egress-host> <out-dir> <run> <arm> <rate> <l
     printf '%s' \
         "-Daeron.dir=$aeron_dir " \
         "-Daeron.cluster.ingress.channel=$INGRESS " \
-        "-Daeron.cluster.ingress.endpoints=0=$CLUSTER_HOST:$P_INGRESS " \
+        "-Daeron.cluster.ingress.endpoints=$CLIENT_INGRESS_ENDPOINTS " \
         "-Daeron.cluster.egress.channel=aeron:udp?endpoint=$egress_host:0 " \
         "-Daeron.cluster.message.timeout=300000000000 " \
         "-Dio.aeron.benchmarks.aeron.connection.timeout=60s " \
