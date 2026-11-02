@@ -897,16 +897,19 @@ impl Image {
     /// whole of what the controlled face adds to [`Image::poll`]:
     ///
     /// * **`Abort`** — the fragment is not consumed, so the position does not
-    ///   reach it and the same fragment arrives again next time. The reference
-    ///   walks its offset back by the frame it had already stepped over
-    ///   (`aeron_image.c`, the `AERON_ACTION_ABORT` arm); this walks `next`
-    ///   back, which is the same statement about a position.
+    ///   reach it and the same fragment arrives again next time. Only **that**
+    ///   fragment is given back: the ones this poll already took stay taken,
+    ///   and the position is published past them. The reference walks its
+    ///   offset back by the refused frame alone (`aeron_image.c`, the
+    ///   `AERON_ACTION_ABORT` arm) and then publishes `new_position`; here the
+    ///   refused frame was never added to `next`, which is the same statement
+    ///   about a position.
     /// * **`Break`** — consumed, and the scan stops here.
-    /// * **`Commit`** — consumed, and the position is **published now**, so a
-    ///   later refusal cannot take it back. The reference publishes inside the
-    ///   loop for the same reason, and that is what makes `Commit` different
-    ///   from `Continue` rather than merely more eager: what it buys is a
-    ///   watermark that survives a mistake further on.
+    /// * **`Commit`** — consumed, and the position is **published now**,
+    ///   inside the loop, as the reference does: flow control sees the reader
+    ///   got this far before the poll ends. It is not a point an `Abort` falls
+    ///   back to — an `Abort` falls back by one fragment, whatever came
+    ///   before it.
     /// * **`Continue`** — consumed; the position is published once, at the end.
     ///
     /// `publish` is called at each commit and once at the end when the scan
@@ -951,7 +954,6 @@ impl Image {
                     });
 
                     if !action.consumes() {
-                        ledger.refuse();
                         break;
                     }
 
@@ -1023,9 +1025,8 @@ impl std::fmt::Debug for Image {
 struct PositionLedger {
     /// Where the scan has read up to.
     next: Position,
-    /// The last point that was published, and the point a refusal falls back
-    /// to. It starts where the reader started: a refusal with nothing committed
-    /// before it leaves the reader where it was.
+    /// The last point that was published. It starts where the reader started,
+    /// so a poll that moved nothing publishes nothing.
     committed: Position,
 }
 
@@ -1046,12 +1047,6 @@ impl PositionLedger {
     fn commit(&mut self) -> i64 {
         self.committed = self.next;
         self.next.raw()
-    }
-
-    /// `Abort`: the fragment is not consumed, and the position falls back to
-    /// the last committed point rather than to where the scan began.
-    fn refuse(&mut self) {
-        self.next = self.committed;
     }
 
     /// Where the scan ended up, if it moved past the last thing published.
@@ -1114,44 +1109,40 @@ mod ledger_tests {
         assert_eq!(None, ledger.settled(), "the end adds nothing to a commit");
     }
 
-    /// What `Commit` buys over `Continue`: a point a later refusal cannot take
-    /// back. Without this the two actions would be the same action.
-    ///
-    /// The difference is in what was **published**, not in what is left to
-    /// publish — after the refusal neither ledger has anything more to say, and
-    /// only one of them has already said 164.
+    /// An `Abort` costs only the fragment it refused, so the ledger is never
+    /// told about it: what was consumed before it is published at the end,
+    /// with or without a `Commit` among it. (`aeron_image.c`: the ABORT arm
+    /// steps back one frame; `new_position` is published after the loop.)
     #[test]
-    fn a_committed_point_survives_a_refusal_after_it() {
+    fn a_refusal_keeps_what_was_consumed_before_it() {
         let mut published = Vec::new();
 
         let mut committed = at(100);
         committed.consume(64);
         published.push(committed.commit());
         committed.consume(128);
-        committed.refuse();
+        // ... and the next fragment is refused: nothing more is consumed.
         if let Some(position) = committed.settled() {
             published.push(position);
         }
-        assert_eq!(vec![164], published, "the refused fragment is given back");
+        assert_eq!(vec![164, 292], published, "a commit, then the end");
 
-        // The same reads with no commit among them publish nothing at all.
+        // The same reads with no commit among them reach the same point.
         let mut uncommitted = at(100);
         uncommitted.consume(64);
         uncommitted.consume(128);
-        uncommitted.refuse();
         assert_eq!(
-            None,
+            Some(292),
             uncommitted.settled(),
-            "nothing was committed, nothing moved"
+            "what was taken before the refusal stays taken"
         );
     }
 
     /// A refusal as the first answer leaves the reader exactly where it was —
     /// a poll that reads a message it will not take has not read anything.
     #[test]
-    fn a_refusal_with_nothing_committed_moves_nothing() {
+    fn a_refusal_with_nothing_consumed_moves_nothing() {
         let mut ledger = at(100);
-        ledger.refuse();
         assert_eq!(None, ledger.settled());
     }
 }
@@ -1313,6 +1304,31 @@ pub(crate) mod tests {
                 return self.answer;
             }
             Action::Continue
+        }
+    }
+
+    /// A handler that answers from a script, then `Continue` once the script
+    /// runs out, and keeps what it was shown.
+    struct Scripted {
+        seen: Vec<Vec<u8>>,
+        answers: std::collections::VecDeque<Action>,
+    }
+
+    impl Scripted {
+        fn new(answers: &[Action]) -> Self {
+            Self {
+                seen: Vec::new(),
+                answers: answers.iter().copied().collect(),
+            }
+        }
+    }
+
+    impl ControlledFragments for Scripted {
+        fn on_fragment(&mut self, fragment: &Fragment<'_>) -> Action {
+            let mut payload = vec![0u8; fragment.payload_length()];
+            fragment.copy_payload(&mut payload);
+            self.seen.push(payload);
+            self.answers.pop_front().unwrap_or(Action::Continue)
         }
     }
 
@@ -1717,5 +1733,53 @@ pub(crate) mod tests {
         assert_eq!(0, fragments, "a refused fragment is not counted");
         assert!(published.is_empty(), "and nothing was published");
         assert_eq!(0, image.position(), "the reader did not move over it");
+    }
+
+    /// An `Abort` gives back **only the fragment it refused**: the ones the
+    /// same poll already took with `Continue` stay taken. The reference steps
+    /// its offset back by the refused frame alone and then publishes how far
+    /// it got (`aeron_image.c`, `aeron_image_controlled_poll`'s
+    /// `AERON_ACTION_ABORT` arm and the `new_position` after the loop).
+    ///
+    /// A reader that fell back to where the poll began would hand the taken
+    /// messages over a second time — a consensus module appending ingress to
+    /// its log would append them twice.
+    #[test]
+    fn an_abort_keeps_what_the_poll_already_took() {
+        let log = TempLog::new("abort-after-continue");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+            write_message(appender, b"third");
+        });
+        let taken = frame_reach(b"first") + frame_reach(b"second");
+
+        let mut handler = Scripted::new(&[Action::Continue, Action::Continue, Action::Abort]);
+        let mut published = Vec::new();
+        let mut image = log.image(1);
+        let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
+
+        let taken = i64::try_from(taken).expect("small");
+        assert_eq!(2, fragments, "the two taken fragments are counted");
+        assert_eq!(
+            vec![taken],
+            published,
+            "the position is published past the two taken fragments"
+        );
+        assert_eq!(
+            taken,
+            image.position(),
+            "the reader stops at the refused fragment, not where the poll began"
+        );
+
+        // The next poll starts at the refused message and nowhere earlier.
+        let mut again = Scripted::new(&[]);
+        image.controlled_poll(10, &mut again, &mut |_| {});
+        let again = again.seen;
+        assert_eq!(
+            vec![b"third".to_vec()],
+            again,
+            "nothing is handed over twice"
+        );
     }
 }
