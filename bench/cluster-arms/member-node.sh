@@ -123,6 +123,14 @@ _cluster_common_defines() {
         "-Daeron.cluster.log.channel=$log" \
         "-Daeron.cluster.catchup.channel=$catchup" \
         "-Daeron.cluster.replication.channel=$cluster_replication"
+
+    # A diagnostic, never a bench setting: `--session-timeout` raises the
+    # default 10 s so that "the client could not get a message in for 10 s" is
+    # told apart from "the client is slow". Empty means the default, in every
+    # arm.
+    if [ -n "${session_timeout:-}" ]; then
+        printf '%s\n' "-Daeron.cluster.session.timeout=$session_timeout"
+    fi
 }
 
 _archive_common_defines() {

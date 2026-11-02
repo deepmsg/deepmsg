@@ -7,6 +7,7 @@
 #                [--runs 1] [--iterations 60] [--warmup-iterations 30]
 #                [--port-base 61500] [--out DIR] [--list] [--quick] [--no-read]
 #                [--peer user@host] [--two-host] [--single-host]
+#                [--session-timeout 10s]
 #
 # The four arms differ by exactly one layer each, and that is what each ratio is
 # allowed to say:
@@ -104,6 +105,11 @@ peer_root=${BENCH_PEER_ROOT:-/tmp/cluster-arms-client}
 peer_aeron_dir=${BENCH_PEER_AERON_DIR:-/dev/shm/cluster-arms-client/aeron}
 path_samples=${BENCH_PATH_SAMPLES:-1000}
 path_port=${BENCH_PATH_PORT:-61411}
+# A diagnostic knob, not a measurement: the cluster's own session timeout, so
+# that a client which cannot get a message in for longer than the default 10 s
+# is told apart from one that is merely slow. Empty keeps every arm on its
+# default (the reference's is 10 s, `ConsensusModule.java:739`).
+session_timeout=${BENCH_CLUSTER_SESSION_TIMEOUT:-}
 
 # Both peer paths are `rm -rf`'d before a cell. A typo in an environment
 # variable must not take out a system directory; the guard is cheap.
@@ -122,6 +128,7 @@ while [ $# -gt 0 ]; do
         --sync) syncs=$2; shift 2 ;;
         --runs) runs=$2; shift 2 ;;
         --rounds) rounds_to_run=$2; shift 2 ;;
+        --session-timeout) session_timeout=$2; shift 2 ;;
         --iterations) iterations=$2; shift 2 ;;
         --warmup-iterations) warmup_iterations=$2; shift 2 ;;
         --port-base) port_base=$2; shift 2 ;;
@@ -594,6 +601,7 @@ _member_props() { # <i> <run-dir> <arm> <sync-archive> <sync-cluster>
         echo "archive_recorder_cpu=4"
         echo "archive_replayer_cpu=5"
         echo "archive_conductor_cpu=6"
+        echo "session_timeout=$session_timeout"
     } >"$dir/member.properties"
 }
 
