@@ -72,6 +72,7 @@ arms="j,j-d,r-a,r"
 pairs="25K:32,501K:32"
 syncs="0:0,0:2,2:0,2:2"
 runs=1
+rounds_to_run=2
 iterations=60
 warmup_iterations=30
 warmup_rate=25K
@@ -87,6 +88,7 @@ member_ssh=()
 peer_max_load=${BENCH_PEER_MAX_LOAD:-}
 peer_benchmarks=${BENCH_PEER_BENCHMARKS_DIR:-${BENCHMARKS_DIR}}
 peer_java_home=${BENCH_PEER_JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}
+member_java_home=${BENCH_MEMBER_JAVA_HOME:-${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}}
 # The client's four busy-spin threads on the peer. These are defaults, not a
 # measurement: the plan's T2 says the core numbers are read off the peer's
 # `lscpu` (avoid SMT siblings) and written into RUN-INFO.
@@ -119,6 +121,7 @@ while [ $# -gt 0 ]; do
         --pairs) pairs=$2; shift 2 ;;
         --sync) syncs=$2; shift 2 ;;
         --runs) runs=$2; shift 2 ;;
+        --rounds) rounds_to_run=$2; shift 2 ;;
         --iterations) iterations=$2; shift 2 ;;
         --warmup-iterations) warmup_iterations=$2; shift 2 ;;
         --port-base) port_base=$2; shift 2 ;;
@@ -212,7 +215,18 @@ for ((_i = 0; _i < member_count; _i++)); do
     _base=$((port_base + _i * 10))
     M_INGRESS[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 0))"
     M_CONSENSUS[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 1))"
-    M_LOG[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 2))"
+    # ★ The log is the one channel whose shape depends on the membership. A
+    # single member publishes to itself, so an endpoint is the whole channel. A
+    # three-member cluster publishes to the other members, and the reference's
+    # rule (`ConsensusModule.java:2145`) is *udp with no endpoint* = multi-
+    # destination; the publication then gets `control-mode=manual` and a control
+    # endpoint of its own. An endpoint here is a one-destination publication,
+    # and followers time out with "failed to join live log".
+    if [ "$member_count" -gt 1 ]; then
+        M_LOG[_i]="aeron:udp?term-length=64m|control-mode=manual|control=${M_IP[_i]}:$((_base + 2))|mtu=1408"
+    else
+        M_LOG[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 2))"
+    fi
     M_CATCHUP[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 3))"
     M_ARCHIVE_CONTROL[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 4))"
     M_ARCHIVE_REPLICATION[_i]="aeron:udp?endpoint=${M_IP[_i]}:$((_base + 5))"
@@ -380,6 +394,7 @@ _check() {
                 test -x '$BENCH_CLUSTER_CONTAINER' || echo 'no service container'
                 test -x '$BENCH_ARCHIVE' || echo 'no archive'
                 test -x '$BENCHMARKS_DRIVER_JAVA' || echo 'no reference media-driver'
+                test -x '$member_java_home/bin/java' || echo 'no java at $member_java_home'
                 command -v taskset >/dev/null || echo 'no taskset'
             " 2>&1)
             if [ -n "$missing" ]; then
@@ -406,7 +421,7 @@ if [ "$list_only" = 1 ]; then
     echo "client ingress  $CLIENT_INGRESS_ENDPOINTS"
     echo "sync            archive:cluster file sync level, one cell each — $syncs"
     echo "runs            $runs over $iterations s (warmup ${warmup_iterations}s at $warmup_rate)"
-    echo "rounds          forward, reverse"
+    echo "rounds          $(if [ "$rounds_to_run" = 2 ]; then echo 'forward, reverse'; else echo "forward only ($rounds_to_run)"; fi)"
     if [ "$member_count" -eq 1 ]; then
         echo "member          single, host ${M_IP[0]}: ingress ${M_INGRESS[0]#aeron:udp?endpoint=},"
         echo "                consensus ${M_CONSENSUS[0]#aeron:udp?endpoint=}, log ${M_LOG[0]#aeron:udp?endpoint=},"
@@ -456,7 +471,7 @@ bench_fingerprint "$out/fingerprint.txt" >/dev/null
     echo "pairs           $pairs"
     echo "sync            $syncs"
     echo "runs/iterations $runs x ${iterations}s (warmup ${warmup_iterations}s at $warmup_rate)"
-    echo "rounds          forward, reverse"
+    echo "rounds          $(if [ "$rounds_to_run" = 2 ]; then echo 'forward, reverse'; else echo "forward only ($rounds_to_run)"; fi)"
     if [ "$mode" = two ]; then
         echo "mode            two hosts; the client half runs on the peer"
         echo "network         direct link, no gateway: $_batch_ip <-> $_peer_ip"
@@ -561,6 +576,7 @@ _member_props() { # <i> <run-dir> <arm> <sync-archive> <sync-cluster>
         echo "sync_archive=$sync_archive"
         echo "sync_cluster=$sync_cluster"
         echo "mtu=1408"
+        echo "java_home=$member_java_home"
         echo "benchmarks_dir=$BENCHMARKS_DIR"
         echo "benchmarks_scripts_dir=$BENCHMARKS_SCRIPTS_DIR"
         echo "benchmarks_driver_java=$BENCHMARKS_DRIVER_JAVA"
@@ -601,8 +617,11 @@ _member_start() { # <i> <run-dir> <arm> <sync-archive> <sync-cluster>
     timeout 30 ssh -f -n -o BatchMode=yes "$host" \
         "exec setsid bash $mdir/member-node.sh start $mdir </dev/null >$mdir/start.log 2>&1" || return 1
     for _ in $(seq 1 900); do
+        ssh -n -o BatchMode=yes "$host" "test -f $mdir/up || test -f $mdir/failed" 2>/dev/null || { sleep 0.1; continue; }
         ssh -n -o BatchMode=yes "$host" "test -f $mdir/up" 2>/dev/null && return 0
-        sleep 0.1
+        echo "  member $i ($host) failed to start" >&2
+        ssh -n -o BatchMode=yes "$host" "tail -20 $mdir/start.log" >&2 || true
+        return 1
     done
     echo "  member $i ($host) did not come up" >&2
     ssh -n -o BatchMode=yes "$host" "tail -20 $mdir/start.log" >&2 || true
@@ -625,6 +644,17 @@ _member_stop() { # <i> <run-dir>
         pkill -9 -f '[i]o.aeron.benchmarks.aeron.ClusterNode'
         pkill -9 -f '[i]o.aeron.archive.Archive'; pkill -9 -x deepmsg-driver
         pkill -9 -f '[i]o.aeron.driver.MediaDriver'; true" >/dev/null 2>&1 || true
+}
+
+_member_check() { # <i> <run-dir> — did the member survive the cell?
+    local i=$1 dir=$2 host mdir
+    host=$(_member_host "$i")
+    mdir=$(_member_dir "$i" "$dir")
+    if [ -z "$host" ]; then
+        bash "$here/member-node.sh" check "$mdir" 2>&1
+        return $?
+    fi
+    ssh -n -o BatchMode=yes "$host" "bash $mdir/member-node.sh check $mdir" 2>&1
 }
 
 _member_collect() { # <i> <run-dir>
@@ -951,6 +981,16 @@ _cell() {
     # The node side goes first and the driver last: the driver is what every
     # other process above is a client of. On two machines the peer's driver is
     # taken down by the same call.
+    # ★ A three-member cluster runs on a quorum of two, so a member that dies
+    # mid-cell leaves a cell that still sends every message and still reads
+    # well -- and is not a three-member cell. The pids are what says so.
+    for ((i = 0; i < member_count; i++)); do
+        if ! _member_check "$i" "$dir"; then
+            echo "  $arm $rate sync $sync: member $i did not survive the cell" >&2
+            status=1
+        fi
+    done
+
     _stop_all
     for ((i = 1; i < member_count; i++)); do
         _member_collect "$i" "$dir" || true
@@ -1017,7 +1057,13 @@ rev_list=()
 for ((i = ${#arm_list[@]} - 1; i >= 0; i--)); do
     rev_list+=("${arm_list[i]}")
 done
-_run_round round2-reverse "${rev_list[@]}"
+# ★ One round is a smoke, not a reading: the reverse round is what makes a
+# difference that follows the machine show up as a sign flip.
+if [ "$rounds_to_run" -ge 2 ]; then
+    _run_round round2-reverse "${rev_list[@]}"
+else
+    echo "    (one round: this cannot be read as a ratio, it says the shape runs)"
+fi
 
 echo
 echo "results in $out"
