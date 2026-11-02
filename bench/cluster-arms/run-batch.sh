@@ -474,26 +474,19 @@ bench_fingerprint "$out/fingerprint.txt" >/dev/null
         echo "network         loopback"
         echo "client          the reference's cluster-client, pinned to core $BENCH_RIG_CPU"
     fi
-    echo "member          single, host $CLUSTER_HOST"
-    echo "channels        ingress $INGRESS"
-    echo "                consensus $CONSENSUS"
-    echo "                log $LOG_CHANNEL"
-    echo "                catchup $CATCHUP"
-    echo "                archive control $ARCHIVE_CONTROL"
-    echo "                archive replication $ARCHIVE_REPLICATION"
-    echo "                cluster replication $CLUSTER_REPLICATION"
-    echo "                control (ipc) $CONTROL_CHANNEL"
     echo "members         $MEMBERS"
-    if [ "$member_count" -gt 1 ]; then
-        echo "member hosts    ${member_count} machines, one member each:"
-        for ((_i = 0; _i < member_count; _i++)); do
-            if [ "$_i" -eq 0 ]; then
-                echo "                  $_i  ${M_IP[_i]}  this machine"
-            else
-                echo "                  $_i  ${M_IP[_i]}  ${member_ssh[_i - 1]}"
-            fi
-        done
-    fi
+    for ((_i = 0; _i < member_count; _i++)); do
+        echo "member $_i        channels:"
+        echo "                  ingress             ${M_INGRESS[_i]}"
+        echo "                  consensus           ${M_CONSENSUS[_i]}"
+        echo "                  log                 ${M_LOG[_i]}"
+        echo "                  catchup             ${M_CATCHUP[_i]}"
+        echo "                  archive control     ${M_ARCHIVE_CONTROL[_i]}"
+        echo "                  archive replication ${M_ARCHIVE_REPLICATION[_i]}"
+        echo "                  cluster replication ${M_CLUSTER_REPLICATION[_i]}"
+        echo "                  control (ipc)       $CONTROL_CHANNEL"
+        echo "                  local archive ctl   $LOCAL_ARCHIVE_CONTROL"
+    done
     echo "cores           driver 1,2,3 (from the properties file); node side $NODE_CPUS;"
     echo "                archive $ARCHIVE_CPUS, consensus module $CM_CPU, container $CONTAINER_CPU"
     echo
@@ -522,40 +515,136 @@ echo
 # --- processes ---------------------------------------------------------------
 #
 # Every process a cell starts is held here as a pid and taken down by pid. The
-# name-based teardown `lib/cell.sh` uses for the driver is right for a driver a
-# launcher exec'd and wrong for a cell that owns five processes: `pgrep -x` sees
-# 15 characters of a process name, and `deepmsg-cluster-node` and
-# `deepmsg-clustered-service-container` share all fifteen.
+# --- the members -------------------------------------------------------------
+#
+# One member is this machine's; the rest are reached over ssh. Both run the same
+# script, `member-node.sh`, from a `member.properties` the batch writes -- two
+# code paths, one local and one remote, is how an arm stops being one arm.
+#
+# * The directories differ per member. Everything a member writes (its aeron
+# dir, its cluster and archive directories, its logs) is on its own disk; the
+# batch keeps a copy of the logs and the pid list.
 
-CELL_PIDS=()
+member_root=${BENCH_MEMBER_ROOT:-/tmp/cluster-arms-member}
+_cell_dir=""
 
-_start() { # _start <log> <command...>
-    local log=$1; shift
-    "$@" >"$log" 2>&1 &
-    local pid=$!
-    CELL_PIDS+=("$pid")
-    echo "$pid"
+_member_host() { # <i>
+    if [ "$1" -eq 0 ]; then printf '' ; else printf '%s' "${member_ssh[$1 - 1]}"; fi
 }
 
-_stop() { # _stop <pid> — ask first, then take; a spinner that ignores TERM is a
-          # leftover, and a leftover is the next cell's second variable.
-    local pid=$1
-    kill -TERM "$pid" 2>/dev/null || true
-    for _ in $(seq 1 50); do
-        kill -0 "$pid" 2>/dev/null || return 0
+_member_dir() { # <i> <run-dir>
+    if [ "$1" -eq 0 ]; then printf '%s' "$2"; else printf '%s%s/%s' "$member_root" "$1" "$(basename "$2")"; fi
+}
+
+_member_aeron_dir() { # <i>
+    if [ "$1" -eq 0 ]; then printf '%s' "$BENCH_AERON_DIR"; else printf '%s%s/aeron' "$member_root" "$1"; fi
+}
+
+_member_props() { # <i> <run-dir> <arm> <sync-archive> <sync-cluster>
+    local i=$1 dir=$2 arm=$3 sync_archive=$4 sync_cluster=$5
+    {
+        echo "arm=$arm"
+        echo "dir=$(_member_dir "$i" "$dir")"
+        echo "aeron_dir=$(_member_aeron_dir "$i")"
+        echo "member_id=$i"
+        echo "cluster_id=${BENCH_CLUSTER_ID:-0}"
+        echo "members=$MEMBERS"
+        echo "ingress=${M_INGRESS[i]}"
+        echo "consensus=${M_CONSENSUS[i]}"
+        echo "log=${M_LOG[i]}"
+        echo "catchup=${M_CATCHUP[i]}"
+        echo "archive_control=${M_ARCHIVE_CONTROL[i]}"
+        echo "archive_replication=${M_ARCHIVE_REPLICATION[i]}"
+        echo "cluster_replication=${M_CLUSTER_REPLICATION[i]}"
+        echo "control=$CONTROL_CHANNEL"
+        echo "local_archive_control=$LOCAL_ARCHIVE_CONTROL"
+        echo "sync_archive=$sync_archive"
+        echo "sync_cluster=$sync_cluster"
+        echo "mtu=1408"
+        echo "benchmarks_dir=$BENCHMARKS_DIR"
+        echo "benchmarks_scripts_dir=$BENCHMARKS_SCRIPTS_DIR"
+        echo "benchmarks_driver_java=$BENCHMARKS_DRIVER_JAVA"
+        echo "bench_driver=$BENCH_DRIVER"
+        echo "bench_archive=$BENCH_ARCHIVE"
+        echo "bench_cluster_node=$BENCH_CLUSTER_NODE"
+        echo "bench_cluster_container=$BENCH_CLUSTER_CONTAINER"
+        echo "driver_conductor_cpu=1"
+        echo "driver_sender_cpu=2"
+        echo "driver_receiver_cpu=3"
+        echo "node_cpus=$NODE_CPUS"
+        echo "archive_cpus=$ARCHIVE_CPUS"
+        echo "cm_cpu=$CM_CPU"
+        echo "container_cpu=$CONTAINER_CPU"
+        echo "archive_recorder_cpu=4"
+        echo "archive_replayer_cpu=5"
+        echo "archive_conductor_cpu=6"
+    } >"$dir/member.properties"
+}
+
+_member_start() { # <i> <run-dir> <arm> <sync-archive> <sync-cluster>
+    local i=$1 dir=$2 host mdir
+    host=$(_member_host "$i")
+    mdir=$(_member_dir "$i" "$dir")
+    _member_props "$@"
+    if [ -z "$host" ]; then
+        bash "$here/member-node.sh" start "$mdir" >"$dir/member-start.log" 2>&1 || {
+            tail -20 "$dir/member-start.log" >&2
+            return 1
+        }
+        return 0
+    fi
+    ssh -n -o BatchMode=yes "$host" "mkdir -p '$mdir'" || return 1
+    scp -q "$dir/member.properties" "$here/member-node.sh" "$host:$mdir/" || return 1
+    # `ssh -f` + `exec setsid`: the member's processes have to outlive the
+    # session that started them, which is the same reason the peer's client is
+    # started this way.
+    timeout 30 ssh -f -n -o BatchMode=yes "$host" \
+        "exec setsid bash $mdir/member-node.sh start $mdir </dev/null >$mdir/start.log 2>&1" || return 1
+    for _ in $(seq 1 900); do
+        ssh -n -o BatchMode=yes "$host" "test -f $mdir/up" 2>/dev/null && return 0
         sleep 0.1
     done
-    kill -KILL "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    echo "  member $i ($host) did not come up" >&2
+    ssh -n -o BatchMode=yes "$host" "tail -20 $mdir/start.log" >&2 || true
+    return 1
+}
+
+_member_stop() { # <i> <run-dir>
+    local i=$1 dir=$2 host mdir
+    host=$(_member_host "$i")
+    mdir=$(_member_dir "$i" "$dir")
+    if [ -z "$host" ]; then
+        [ -f "$mdir/member.properties" ] && bash "$here/member-node.sh" stop "$mdir" >/dev/null 2>&1 || true
+        return 0
+    fi
+    ssh -n -o BatchMode=yes "$host" "bash $mdir/member-node.sh stop $mdir" >/dev/null 2>&1 || true
+    # The name-based backstop, for a member whose pid list was interrupted.
+    # The bracket keeps `pkill` from matching the shell that carries it.
+    ssh -n -o BatchMode=yes "$host" "
+        pkill -9 -f '[d]eepmsg-cluster-node'; pkill -9 -f '[d]eepmsg-archiv'
+        pkill -9 -f '[i]o.aeron.benchmarks.aeron.ClusterNode'
+        pkill -9 -f '[i]o.aeron.archive.Archive'; pkill -9 -x deepmsg-driver
+        pkill -9 -f '[i]o.aeron.driver.MediaDriver'; true" >/dev/null 2>&1 || true
+}
+
+_member_collect() { # <i> <run-dir>
+    local i=$1 dir=$2 host mdir
+    host=$(_member_host "$i")
+    [ -z "$host" ] && return 0
+    mdir=$(_member_dir "$i" "$dir")
+    mkdir -p "$dir/member$i"
+    scp -q "$host:$mdir"/*.log "$dir/member$i/" 2>/dev/null || true
+    scp -q "$host:$mdir/pids" "$dir/member$i/" 2>/dev/null || true
 }
 
 _stop_all() {
-    local i pid
-    for ((i = ${#CELL_PIDS[@]} - 1; i >= 0; i--)); do
-        pid=${CELL_PIDS[i]}
-        _stop "$pid"
-    done
-    CELL_PIDS=()
+    local i
+    if [ -n "${_cell_dir:-}" ]; then
+        for ((i = 0; i < member_count; i++)); do
+            _member_stop "$i" "$_cell_dir" || true
+        done
+        _cell_dir=""
+    fi
     # The peer's driver is a process of its own and no pid in this shell. The
     # backstop also takes down a client whose ssh session was interrupted, so
     # the next cell does not start on top of it.
@@ -565,42 +654,6 @@ _stop_all() {
 }
 
 trap '_stop_all' EXIT
-
-# The reference's node is one JVM with five busy-spin threads, and the
-# reference's own harness pins each of them to a core by **thread name**
-# (`remote-benchmarks-runner:210-235`). A plain `taskset` mask lets two of them
-# land on one core, which is a different machine from the one the reference
-# benchmarks itself on. A thread that never appears is a warning, not a cell
-# failure: the names below are the reference's, and an arm that renamed one is
-# still a cell.
-_pin_thread() { # _pin_thread <pid> <name-prefix> <cpu>
-    local pid=$1 name=$2 cpu=$3 tid=""
-    for _ in $(seq 1 100); do
-        tid=$(ps -L -o tid=,comm= -p "$pid" 2>/dev/null | awk -v n="$name" '$2 ~ n { print $1; exit }')
-        [ -n "$tid" ] && break
-        sleep 0.1
-    done
-    if [ -z "$tid" ]; then
-        echo "  (no thread named '$name' in pid $pid; left where it was)" >&2
-        return 0
-    fi
-    taskset -pc "$cpu" "$tid" >/dev/null 2>&1 || true
-}
-
-_pin_node_threads() { # _pin_node_threads <pid>
-    _pin_thread "$1" archive-recorde 4
-    _pin_thread "$1" archive-replaye 5
-    _pin_thread "$1" archive-conduct 6
-    _pin_thread "$1" consensus-modul 7
-    _pin_thread "$1" echo-service 0
-}
-
-_alive() { # _alive <what> <pid>
-    kill -0 "$2" 2>/dev/null || {
-        echo "  $1 did not stay up" >&2
-        return 1
-    }
-}
 
 # --- the peer ----------------------------------------------------------------
 #
@@ -848,121 +901,6 @@ PY
 
 # --- the cell ----------------------------------------------------------------
 
-_driver_start() { # _driver_start <arm> <log>
-    local arm=$1 log=$2
-    case "$arm" in
-        j) "$BENCHMARKS_DRIVER_JAVA" >"$log" 2>&1 & echo $! ;;
-        *) DEEPMSG_DRIVER="$BENCH_DRIVER" "$BENCHMARKS_SCRIPTS_DIR/deepmsg-media-driver" >"$log" 2>&1 & echo $! ;;
-    esac
-}
-
-_node_start_java() { # _node_start_java <cell-dir> <log> <sync-archive> <sync-cluster>
-    local dir=$1 log=$2 sync_archive=$3 sync_cluster=$4
-    JVM_OPTS="\
--Daeron.dir=$BENCH_AERON_DIR \
--Daeron.cluster.dir=$dir/cluster \
--Daeron.cluster.id=0 \
--Daeron.cluster.member.id=0 \
--Daeron.cluster.members=$MEMBERS \
--Daeron.cluster.ingress.channel=$INGRESS \
--Daeron.cluster.consensus.channel=$CONSENSUS \
--Daeron.cluster.log.channel=$LOG_CHANNEL \
--Daeron.cluster.replication.channel=$CLUSTER_REPLICATION \
--Daeron.cluster.control.channel=$CONTROL_CHANNEL \
--Daeron.cluster.service.name=echo-service \
--Daeron.cluster.file.sync.level=$sync_cluster \
--Daeron.archive.dir=$dir/archive \
--Daeron.archive.mark.file.dir=$BENCH_AERON_DIR \
--Daeron.archive.control.channel=$ARCHIVE_CONTROL \
--Daeron.archive.replication.channel=$ARCHIVE_REPLICATION \
--Daeron.archive.local.control.channel=$LOCAL_ARCHIVE_CONTROL \
--Daeron.archive.file.sync.level=$sync_archive \
--Daeron.archive.catalog.file.sync.level=$sync_archive \
--Daeron.archive.recording.events.enabled=false \
--Daeron.archive.threading.mode=DEDICATED \
--Dio.aeron.benchmarks.aeron.cluster.service=echo \
--Dio.aeron.benchmarks.output.directory=$dir" \
-        taskset -c "$NODE_CPUS" "$BENCHMARKS_SCRIPTS_DIR/cluster-node" >"$log" 2>&1 &
-    echo $!
-}
-
-_archive_start_java() { # _archive_start_java <cell-dir> <log> <sync-archive>
-    local dir=$1 log=$2 sync_archive=$3
-    JVM_OPTS="\
--Daeron.dir=$BENCH_AERON_DIR \
--Daeron.archive.dir=$dir/archive \
--Daeron.archive.mark.file.dir=$BENCH_AERON_DIR \
--Daeron.archive.control.channel=$ARCHIVE_CONTROL \
--Daeron.archive.replication.channel=$ARCHIVE_REPLICATION \
--Daeron.archive.local.control.channel=$LOCAL_ARCHIVE_CONTROL \
--Daeron.archive.file.sync.level=$sync_archive \
--Daeron.archive.catalog.file.sync.level=$sync_archive \
--Daeron.archive.recording.events.enabled=false \
--Daeron.archive.threading.mode=DEDICATED" \
-        PROCESS_FILE_NAME=archive-node taskset -c "$ARCHIVE_CPUS" \
-        "$BENCHMARKS_DIR/scripts/run-java" io.aeron.archive.Archive >"$log" 2>&1 &
-    echo $!
-}
-
-_archive_start_deepmsg() { # _archive_start_deepmsg <cell-dir> <log> <sync-archive>
-    local dir=$1 log=$2 sync_archive=$3
-    taskset -c "$ARCHIVE_CPUS" "$BENCH_ARCHIVE" \
-        "-Daeron.dir=$BENCH_AERON_DIR" \
-        "-Daeron.archive.dir=$dir/archive" \
-        "-Daeron.archive.mark.file.dir=$BENCH_AERON_DIR" \
-        "-Daeron.archive.control.channel=$ARCHIVE_CONTROL" \
-        "-Daeron.archive.replication.channel=$ARCHIVE_REPLICATION" \
-        "-Daeron.archive.local.control.channel=$LOCAL_ARCHIVE_CONTROL" \
-        "-Daeron.archive.file.sync.level=$sync_archive" \
-        "-Daeron.archive.catalog.file.sync.level=$sync_archive" \
-        "-Daeron.archive.threading.mode=DEDICATED" >"$log" 2>&1 &
-    echo $!
-}
-
-_consensus_start_deepmsg() { # _consensus_start_deepmsg <cell-dir> <log> <sync-cluster>
-    local dir=$1 log=$2 sync_cluster=$3
-    taskset -c "$CM_CPU" "$BENCH_CLUSTER_NODE" \
-        "-Daeron.dir=$BENCH_AERON_DIR" \
-        "-Daeron.cluster.dir=$dir/cluster" \
-        "-Daeron.cluster.id=0" \
-        "-Daeron.cluster.member.id=0" \
-        "-Daeron.cluster.members=$MEMBERS" \
-        "-Daeron.cluster.ingress.channel=$INGRESS" \
-        "-Daeron.cluster.consensus.channel=$CONSENSUS" \
-        "-Daeron.cluster.log.channel=$LOG_CHANNEL" \
-        "-Daeron.cluster.control.channel=$CONTROL_CHANNEL" \
-        "-Daeron.cluster.replication.channel=$CLUSTER_REPLICATION" \
-        "-Daeron.cluster.service.count=1" \
-        "-Daeron.cluster.file.sync.level=$sync_cluster" \
-        "-Daeron.cluster.idle.strategy=spin" >"$log" 2>&1 &
-    echo $!
-}
-
-_container_start_deepmsg() { # _container_start_deepmsg <cell-dir> <log>
-    local dir=$1 log=$2
-    taskset -c "$CONTAINER_CPU" "$BENCH_CLUSTER_CONTAINER" \
-        "-Daeron.dir=$BENCH_AERON_DIR" \
-        "-Daeron.cluster.dir=$dir/cluster" \
-        "-Daeron.cluster.id=0" \
-        "-Daeron.cluster.service.id=0" \
-        "-Ddeepmsg.cluster.service=echo" \
-        "-Daeron.cluster.control.channel=$CONTROL_CHANNEL" \
-        "-Daeron.archive.local.control.channel=$LOCAL_ARCHIVE_CONTROL" \
-        "-Daeron.cluster.idle.strategy=spin" >"$log" 2>&1 &
-    echo $!
-}
-
-_client_run() { # _client_run <cell> <log> <rate> <length> <run> <arm>
-    local cell=$1 log=$2 rate=$3 length=$4 run=$5 arm=$6
-    local jvm_opts
-    jvm_opts=$(_client_jvm_opts "$BENCH_AERON_DIR" "$CLIENT_EGRESS_HOST" \
-        "$cell/run-$run" "$run" "$arm" "$rate" "$length")
-    JVM_OPTS="$jvm_opts" \
-        PROCESS_FILE_NAME=cluster-client \
-        timeout --signal=KILL "${BENCH_CLIENT_TIMEOUT:-600}" \
-        taskset -c "$BENCH_RIG_CPU" "$BENCHMARKS_SCRIPTS_DIR/cluster-client" >"$log" 2>&1
-}
-
 _cell() {
     local round=$1 arm=$2 sync=$3 rate=$4 length=$5 run=$6
     local sync_archive=${sync%%:*} sync_cluster=${sync##*:}
@@ -972,7 +910,6 @@ _cell() {
     local log="$dir/client.log"
     mkdir -p "$dir"
 
-    CELL_PIDS=()
     if [ "$mode" = two ]; then
         # The instrument is on the peer, so its load and its leftovers are
         # checked before anything on this machine starts.
@@ -985,48 +922,17 @@ _cell() {
     rm -rf "$BENCH_AERON_DIR"
     rm -rf "$dir/cluster" "$dir/archive"
 
-    local driver node pid
-    driver=$(_driver_start "$arm" "$dir/driver.log")
-    CELL_PIDS+=("$driver")
-    if ! await_cnc; then
-        echo "  $arm $rate sync $sync: the driver never published its CnC file" >&2
-        tail -20 "$dir/driver.log" >&2
-        _stop_all
-        return 1
-    fi
-
-    case "$arm" in
-        j|j-d)
-            node=$(_node_start_java "$dir" "$dir/node.log" "$sync_archive" "$sync_cluster")
-            CELL_PIDS+=("$node")
-            _pin_node_threads "$node"
-            ;;
-        r-a)
-            node=$(_archive_start_java "$dir" "$dir/archive.log" "$sync_archive")
-            CELL_PIDS+=("$node")
-            sleep 1
-            _alive "the reference archive" "$node" || { tail -10 "$dir/archive.log" >&2; _stop_all; return 1; }
-            ;;
-        r)
-            node=$(_archive_start_deepmsg "$dir" "$dir/archive.log" "$sync_archive")
-            CELL_PIDS+=("$node")
-            sleep 1
-            _alive "the archive" "$node" || { tail -10 "$dir/archive.log" >&2; _stop_all; return 1; }
-            ;;
-    esac
-
-    case "$arm" in
-        r-a|r)
-            pid=$(_consensus_start_deepmsg "$dir" "$dir/module.log" "$sync_cluster")
-            CELL_PIDS+=("$pid")
-            sleep 1
-            _alive "the consensus module" "$pid" || { tail -10 "$dir/module.log" >&2; _stop_all; return 1; }
-            pid=$(_container_start_deepmsg "$dir" "$dir/container.log")
-            CELL_PIDS+=("$pid")
-            sleep 1
-            _alive "the container" "$pid" || { tail -10 "$dir/container.log" >&2; _stop_all; return 1; }
-            ;;
-    esac
+    # Every member starts from nothing; `member-node.sh` is what removes its
+    # own aeron, cluster and archive directories.
+    _cell_dir="$dir"
+    local i
+    for ((i = 0; i < member_count; i++)); do
+        if ! _member_start "$i" "$dir" "$arm" "$sync_archive" "$sync_cluster"; then
+            echo "  $arm $rate sync $sync: member $i did not come up" >&2
+            _stop_all
+            return 1
+        fi
+    done
 
     # The client half's driver is on the peer and is the reference's in every
     # arm. It is started after the node side so that a node that failed to come
@@ -1046,6 +952,9 @@ _cell() {
     # other process above is a client of. On two machines the peer's driver is
     # taken down by the same call.
     _stop_all
+    for ((i = 1; i < member_count; i++)); do
+        _member_collect "$i" "$dir" || true
+    done
 
     # The histogram was written where the instrument ran; bring it home before
     # `cell_validate` looks for it. A failed client is a `.FAIL`, not a row.
