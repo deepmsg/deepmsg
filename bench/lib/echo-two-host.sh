@@ -234,7 +234,9 @@ echo \$\$ >"$BENCH_PEER_ROOT/driver.pid"
 cd "$peer_repo"
 exec env DEEPMSG_DRIVER="$peer_repo/target/release/deepmsg-driver" \\
     BENCH_OUT_DIR="$BENCH_PEER_ROOT/shims" \\
-    ./bench/lib/shims/aeronmd "$BENCH_PEER_ROOT/driver.properties"
+    ./bench/lib/shims/aeronmd \\
+    "$peer_benchmarks_dir/scripts/aeron/low-latency-driver.properties" \\
+    "$BENCH_PEER_ROOT/driver.properties"
 EOF
             ;;
         c)
