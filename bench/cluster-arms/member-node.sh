@@ -53,7 +53,7 @@ _load() {
     _need ingress; _need consensus; _need log; _need catchup
     _need archive_control; _need archive_replication; _need cluster_replication
     _need control; _need local_archive_control
-    _need sync_archive; _need sync_cluster; _need mtu; _need cluster_id
+    _need sync_archive; _need sync_cluster; _need mtu; _need cluster_id; _need java_home
     _need benchmarks_dir; _need benchmarks_scripts_dir; _need benchmarks_driver_java
     _need bench_driver; _need bench_archive; _need bench_cluster_node; _need bench_cluster_container
     _need driver_conductor_cpu; _need driver_sender_cpu; _need driver_receiver_cpu
@@ -230,7 +230,13 @@ _alive() { # <what> <pid>
 
 action_start() {
     _load
-    rm -f "$dir/up"
+    # ★ `run-java` execs `${JAVA_HOME}/bin/java`; an empty one is `/bin/java`,
+    # which exists on the older machines only because a system JDK was
+    # installed. A member's JDK is this build's own copy, so the path comes in
+    # with the properties.
+    export JAVA_HOME=$java_home
+    rm -f "$dir/up" "$dir/failed"
+    trap ': >"$dir/failed"' ERR
     rm -rf "$aeron_dir" "$dir/cluster" "$dir/archive"
     mkdir -p "$aeron_dir" "$dir"
     : >"$CELL_PIDS_FILE"
@@ -272,6 +278,20 @@ action_start() {
     echo "member $member_id ($arm) up: ${PIDS[*]}"
 }
 
+action_check() {
+    _load
+    [ -f "$CELL_PIDS_FILE" ] || { echo "member ${member_id:-?}: no pid list"; return 1; }
+    local dead=0 pid
+    while read -r pid; do
+        [ -n "$pid" ] || continue
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "member $member_id: pid $pid is gone"
+            dead=1
+        fi
+    done <"$CELL_PIDS_FILE"
+    return "$dead"
+}
+
 action_stop() {
     local pid
     if [ -f "$CELL_PIDS_FILE" ]; then
@@ -286,5 +306,6 @@ action_stop() {
 case "$action" in
     start) action_start ;;
     stop)  action_stop ;;
+    check) action_check ;;
     *)     echo "member-node.sh: unknown action '$action'" >&2; exit 2 ;;
 esac
