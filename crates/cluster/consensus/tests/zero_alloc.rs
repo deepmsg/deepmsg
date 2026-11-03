@@ -107,6 +107,14 @@ const MEASURED_MESSAGES: usize = 100_000;
 /// 0 = warm-up, 1 = reset and collect, 2 = stop and report.
 static PHASE: AtomicI32 = AtomicI32::new(0);
 static RESET_DONE: AtomicBool = AtomicBool::new(false);
+/// Set after the drain, so the sender's client outlives it.
+///
+/// A client that closes makes the driver broadcast its counters'
+/// unavailability, and the module's own client copies that message (the
+/// client's scratch copy, not the module's) — one allocation that is not what
+/// this test measures. The sender's **client** therefore stays open until the
+/// drain is over; the messages it left behind are already in the publication.
+static SENDER_RELEASE: AtomicBool = AtomicBool::new(false);
 
 struct TempDir(PathBuf);
 
@@ -361,8 +369,13 @@ fn a_single_member_consensus_module_does_not_allocate_in_steady_state() {
     // service, authenticator and authorisation service are trait objects), so
     // the thread that owns it stays the thread that launched it, and the
     // measured messages come from the other side.
+    // The sender gets the **directory**, not the fixture: a `move` closure
+    // that named `driver.aeron_dir()` took the whole `DriverProcess` with it,
+    // so the driver was killed the moment the sender's thread ended — and the
+    // drain below ran against a dead driver without saying so.
+    let sender_aeron_dir = driver.aeron_dir().to_path_buf();
     let sender = std::thread::spawn(move || {
-        let mut client = Client::connect(driver.aeron_dir()).expect("the sender's client connects");
+        let mut client = Client::connect(&sender_aeron_dir).expect("the sender's client connects");
         let publication = client
             .add_publication("aeron:ipc", INGRESS_STREAM_ID, DEADLINE)
             .expect("the sender's ingress publication");
@@ -381,6 +394,11 @@ fn a_single_member_consensus_module_does_not_allocate_in_steady_state() {
 
         send(&mut client, publication, &message, MEASURED_MESSAGES);
         PHASE.store(2, Ordering::Release);
+
+        // Hold the client open through the drain — see [`SENDER_RELEASE`].
+        while !SENDER_RELEASE.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     });
 
     // The CM's duty cycle on this thread, and the thread-local count read here.
@@ -409,6 +427,7 @@ fn a_single_member_consensus_module_does_not_allocate_in_steady_state() {
         std::thread::sleep(Duration::from_millis(1));
     }
 
+    SENDER_RELEASE.store(true, Ordering::Release);
     sender.join().expect("the sender thread joins");
     let count = allocations();
     assert_eq!(

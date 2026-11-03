@@ -1672,14 +1672,13 @@ impl ConsensusModuleAgent {
 
         // `:2526-2530`: a quiet log whose image is gone is a leader that left;
         // an end of stream means it left gracefully.
-        if count == 0
-            && self
-                .log_adapter
-                .is_image_closed(&self.client, self.live_log_subscription_id)
-        {
-            let is_eos = self
-                .log_adapter
-                .is_log_end_of_stream(&self.client, self.live_log_subscription_id);
+        //
+        // The adapter **holds the image**, as the reference does
+        // (`LogAdapter.java:107-134`), so both questions are asked of the
+        // closed image's snapshot: `isLogEndOfStream()` answers the `isEos` the
+        // close captured.
+        if count == 0 && self.log_adapter.is_image_closed() {
+            let is_eos = self.log_adapter.is_log_end_of_stream();
             self.enter_election(
                 is_eos,
                 &format!("log disconnected from leader: eos={is_eos}"),
@@ -3442,9 +3441,10 @@ impl ElectionHost for ConsensusModuleAgent {
         if self.try_create_append_position(session_id)? {
             // `logAdapter.image(image)` (`:1793`): the adapter reads this image
             // from now on, and the position it starts from is where the
-            // subscription joined.
-            self.log_adapter
-                .set_image(image.registration_id(), join_position);
+            // subscription joined. The **view** is what it keeps — the same
+            // object the reference keeps (`LogAdapter.java:126-134`), askable
+            // after the driver withdraws it.
+            self.log_adapter.set_image(image, join_position);
             self.last_append_position = join_position;
             self.time_of_last_append_position_send_ns = now_ns;
             self.time_of_last_append_position_update_ns = now_ns;
@@ -3799,11 +3799,7 @@ impl ElectionHost for ConsensusModuleAgent {
 
             // `:1980-1987`: the replay's image closing mid-catchup is a
             // `ClusterEvent`; the leader's archive has gone.
-            if outcome.count == 0
-                && self
-                    .log_adapter
-                    .is_image_closed(&self.client, self.live_log_subscription_id)
-            {
+            if outcome.count == 0 && self.log_adapter.is_image_closed() {
                 return Err(ClusterError::ClusterEvent(format!(
                     "unexpected image close during catchup: position={}",
                     self.log_adapter.position()
@@ -3852,10 +3848,7 @@ impl ElectionHost for ConsensusModuleAgent {
         // quarter of an image's term or the live-add limit, whichever is
         // smaller — the same arithmetic `ReplayMerge` uses to decide a replay
         // may be joined to a live stream.
-        let Some(image) = self
-            .log_adapter
-            .image(&self.client, self.live_log_subscription_id)
-        else {
+        let Some(image) = self.log_adapter.image() else {
             return false;
         };
 
@@ -4081,33 +4074,76 @@ impl ElectionHost for ConsensusModuleAgent {
     }
 
     fn poll_archive_events(&mut self) -> Result<usize, ClusterError> {
-        // The reference polls its `RecordingSignalPoller` here (`:2061-2075`).
-        // A replication's progress arrives as `EXTEND`/`SYNC`/`STOP`/
-        // `REPLICATE_END` signals rather than as answers, so the control
-        // channel is read once per turn while a replication is running; with
-        // no replication there is nothing to read and the branch costs one
-        // `Option` test. The same slot also carries the archive's **refusal**
-        // of a copy it had accepted, which is read here and handed to
-        // [`Self::report_replication_refusal`].
+        use deepmsg_codec::archive::recording_signal::RecordingSignal as CodecSignal;
+
+        // `pollArchiveEvents` (`:2061-2140`). The recording signal channel is
+        // read **every turn**, not only while a replication is running: a log
+        // recording that stops is read here (`:2105-2116`), an archive that
+        // refused a copy is read here, and a control subscription that lost its
+        // image is read here — the last one being the reference's own
+        // "local archive is not connected" (`:2123-2128`).
         let mut work = usize::from(self.client.poll());
 
-        if self.log_replication.is_some() {
-            match self.archive.poll_recording_event(&mut self.client) {
-                Ok(Some(RecordingEvent::Signal(signal))) => {
-                    work += 1;
-                    self.route_recording_signal(signal);
-                }
-                Ok(Some(RecordingEvent::Refusal(refusal))) => {
-                    work += 1;
-                    self.report_replication_refusal(refusal)?;
-                }
-                Ok(None) => {}
-                // The signal channel failing is the reference's counted error,
-                // not a reason to stop the agent.
-                Err(error) => self.report_counted_error(Some(&error)),
-            }
+        match self.archive.poll_recording_event(&mut self.client) {
+            Ok(Some(RecordingEvent::Signal(signal))) => {
+                work += 1;
 
+                // `:2105-2116`: the **log** recording stopping is this member
+                // losing its stream, not a copy's progress. The reference
+                // records where it stopped and, if nothing is being elected and
+                // this member is active, asks the closed image whether that
+                // stop was graceful before entering the election.
+                if signal.signal == CodecSignal::STOP
+                    && signal.recording_id == self.log_recording_id
+                {
+                    self.log_recording_stop_position = signal.position;
+
+                    // `null == election` in the reference, which keeps the
+                    // election in the agent while it runs; this build **takes
+                    // it out** for the turn (`election_in_turn`), and
+                    // `pollArchiveEvents` is called from inside that turn
+                    // (`Election.java:924`). An election that is out is still
+                    // an election: entering another one here would abandon the
+                    // running one, and returning would drop the `STOP` its
+                    // replication is waiting for.
+                    if self.election.is_none()
+                        && !self.election_in_turn
+                        && self.state == ModuleState::Active
+                    {
+                        let is_eos = self.log_adapter.is_log_end_of_stream_at(signal.position);
+                        let reason = if is_eos {
+                            "log recording stopped: eos=true"
+                        } else {
+                            "log recording stopped: eos=false"
+                        };
+                        let entered = self.enter_election(is_eos, reason)?;
+                        return Ok(work + entered);
+                    }
+                }
+
+                self.route_recording_signal(signal);
+            }
+            Ok(Some(RecordingEvent::Refusal(refusal))) => {
+                work += 1;
+                self.report_replication_refusal(refusal)?;
+            }
+            Ok(None) => {}
+            // The signal channel failing is the reference's counted error, not
+            // a reason to stop the agent.
+            Err(error) => self.report_counted_error(Some(&error)),
+        }
+
+        if self.log_replication.is_some() {
             self.read_destination_recording_position();
+        }
+
+        // `:2123-2128`: an idle turn whose control subscription has no image is
+        // a local archive that is gone. Spinning on it hides the failure; the
+        // reference counts it and ends the agent.
+        if !self.archive.control_poll_is_complete() && !self.archive.is_connected(&self.client) {
+            let message = "local archive is not connected".to_owned();
+            self.report_counted_error(Some(&message));
+            return Err(self.unexpected_termination(&message));
         }
 
         Ok(work)
@@ -6821,7 +6857,7 @@ impl ConsensusModuleAgent {
                     client
                         .subscription(replay.subscription_id)
                         .and_then(|subscription| {
-                            subscription.image_by_session_id(replay.log_session_id)
+                            subscription.image_view_by_session_id(replay.log_session_id)
                         })
                 else {
                     return Ok(0);
@@ -6833,9 +6869,7 @@ impl ConsensusModuleAgent {
                         replay.start_position
                     )));
                 }
-                replay
-                    .adapter
-                    .set_image(image.registration_id(), join_position);
+                replay.adapter.set_image(image, join_position);
                 Some((
                     replay.channel.clone(),
                     replay.log_session_id,

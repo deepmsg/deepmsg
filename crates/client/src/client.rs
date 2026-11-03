@@ -2852,6 +2852,10 @@ impl Client {
         // it was looking up is gone.
         let mut subscription = self.subscriptions.swap_remove(index);
         subscription.close_handed_out_images();
+        // `Subscription.internalClose` (`Subscription.java:594-599`) closes the
+        // images the subscription still holds as well, not only the ones it
+        // gave away: a reader that has a view of one has to hear it is over.
+        subscription.close_images();
 
         true
     }

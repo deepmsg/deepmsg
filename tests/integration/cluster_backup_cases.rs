@@ -173,6 +173,18 @@ impl Cluster {
         ClientSide::start(&self.ports, self.leader())
     }
 
+    /// A **second** client, on an egress port of its own.
+    ///
+    /// A case that abandons one client and opens another (the leader it was
+    /// talking to has gone) must not ask for the same response channel: the
+    /// first one is still alive until its binding drops, and the cluster may
+    /// still hold it open. `ClientSide::start_at` exists for exactly this, and
+    /// the first case that needed it was the one whose new leader arrived
+    /// faster than the old client's driver reaped it.
+    fn client_at(&self, egress_offset: u16) -> Option<ClientSide> {
+        ClientSide::start_at(&self.ports, self.leader(), egress_offset)
+    }
+
     /// The reference's `sendAndAwaitMessages`: open a session, send `count`
     /// messages and wait for as many replies.
     fn send_and_await_messages(&self, client: &mut ClientSide, count: usize) {
@@ -741,7 +753,7 @@ fn should_backup_cluster_no_snapshots_and_non_empty_log_with_failure() {
             .any(|n| n.role() == Some(ROLE_LEADER))
     });
 
-    let Some(mut client) = cluster.client() else {
+    let Some(mut client) = cluster.client_at(1) else {
         announce_skip();
         return;
     };

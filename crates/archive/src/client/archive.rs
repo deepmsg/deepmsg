@@ -496,7 +496,19 @@ impl Archive {
     pub fn is_connected(&self, client: &Client) -> bool {
         client
             .subscription(self.subscription)
-            .is_some_and(|subscription| !subscription.images().is_empty())
+            .is_some_and(deepmsg_client::subscription::Subscription::is_connected)
+    }
+
+    /// `RecordingSignalPoller.isPollComplete()` (`ConsensusModuleAgent.java:2076`):
+    /// whether the last [`Self::poll_recording_event`] filled its slot — an
+    /// answer, a refusal, or anything else this poller understands.
+    ///
+    /// A caller reads this **after** the poll, for the reference's "the poll
+    /// found nothing and the control subscription has no image" arm
+    /// (`:2123-2128`).
+    #[must_use]
+    pub const fn control_poll_is_complete(&self) -> bool {
+        self.control_response_poller.is_poll_complete()
     }
 
     /// The subscription the answers arrive on.

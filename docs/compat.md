@@ -752,6 +752,30 @@ with a refused message coming back assembled by the same last fragment
 and a paid-for position surviving a later refusal
 (`a_committed_point_survives_a_refusal_after_it`).
 
+## A closed image answers the snapshot it was closed with
+
+The reference closes an image **before** it tells anyone: `Image.close()`
+captures `finalPosition`, `eosPosition`, `isEos`, `isRevoked` and then sets
+`isClosed` (`aeron-client/src/main/java/io/aeron/Image.java:798-806`), and from
+then on `position`, `isEndOfStream`, `endOfStreamPosition`,
+`activeTransportCount` (zero) and `isPublicationRevoked` answer that snapshot
+(`:224-304`), not the log the image used to point at. It is closed in two
+places — the driver withdrawing it (`Subscription.java:607-630`) and the
+subscription itself going away (`:594-599` → `ClientConductor.closeImages`,
+`ClientConductor.java:1656-1675`) — and the object stays askable, which is what
+lets the cluster ask a withdrawn image whether its leader had stopped
+gracefully (`LogAdapter.isLogEndOfStream`, `LogAdapter.java:111-114`).
+
+This build does the same, and **Java is the authority here**: the C client's
+`aeron_image_is_publication_revoked` does not consult `is_closed`
+(`aeron_image.c:231-247`), Java's does, and the cluster exists in Java only. A
+second reader holding an `ImageView` therefore sees `is_closed` after either
+close path, where it used to see the flag only for an image that had been
+handed over. Covered by
+`crates/client/src/image.rs::a_closed_image_answers_the_snapshot_it_was_closed_with`,
+`tests/integration/image_lifecycle.rs::a_withdrawn_image_closes_the_view_a_second_reader_holds`
+and `::a_subscription_that_leaves_closes_the_images_it_still_holds`.
+
 ## The channel URIs this driver refuses
 
 Three shapes the reference *serves*, this driver refuses, because in each one
@@ -1460,6 +1484,23 @@ Five deviations worth naming, because none of them is the interface's shape:
 | Replay channel | `aeron.cluster.replay.channel` (default `aeron:ipc`) stream 103; the subscription names `\|session-id=<low 32 bits of the replay id>` | `ClusteredServiceContainer.java:259-277`, `LogReplay.java:50-55` | `cluster_snapshot.rs` (the snapshot loads over it) |
 | Log replay bounds | `[logPosition, appendPosition)`; the image's join position must equal the start; done when the adapter position reaches the stop and the state is not `SNAPSHOT` | `LogReplay.java:39-60, :114-118` | `cluster_snapshot.rs::a_node_replays_the_log_tail_written_after_its_snapshot` (the tail's session open moves the next session id) |
 | Startup session handling | sessions recovered from a snapshot are `closing(TIMEOUT)` at the end of the **startup** election (`isLeaderStartup`) | `Election.java:1914`, `SessionManager.java:932-946` | `cluster_snapshot.rs` (the recovered session closes; the next id comes from the snapshot) |
+
+## What a consensus module reads from its local archive
+
+`ConsensusModuleAgent.pollArchiveEvents` (`ConsensusModuleAgent.java:2061-2140`)
+reads the archive's recording-signal channel **every turn**, whether or not a
+replication is running, and does three more things with what it finds: an
+`ERROR` control response is a failed catchup replay, a replay that is no longer
+relevant, or an `ArchiveException`; a `STOP` for the **log recording** records
+where it stopped and, when nothing is being elected and the module is active,
+enters the election with the image's end-of-stream snapshot as the "graceful
+leader" hint; and an idle turn whose control subscription has no image is a local
+archive that is gone — counted and terminated, not spun on. This build now does
+the same four things in `crates/cluster/consensus/src/agent/mod.rs::poll_archive_events`;
+it used to read the channel only while a replication was running, which meant a
+`STOP` outside one was never seen. The election's half is
+`Election.java:269-282`, whose `logRecordingId(logReplication.recordingId())`
+this build keeps.
 
 ## The cluster tool (P3-8)
 
