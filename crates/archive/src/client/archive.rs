@@ -505,7 +505,7 @@ impl Archive {
     ///
     /// A caller reads this **after** the poll, for the reference's "the poll
     /// found nothing and the control subscription has no image" arm
-    /// (`:2122-2127`).
+    /// (`:2123-2128`).
     #[must_use]
     pub const fn control_poll_is_complete(&self) -> bool {
         self.control_response_poller.is_poll_complete()

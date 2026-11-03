@@ -4081,14 +4081,14 @@ impl ElectionHost for ConsensusModuleAgent {
         // recording that stops is read here (`:2105-2116`), an archive that
         // refused a copy is read here, and a control subscription that lost its
         // image is read here — the last one being the reference's own
-        // "local archive is not connected" (`:2122-2127`).
+        // "local archive is not connected" (`:2123-2128`).
         let mut work = usize::from(self.client.poll());
 
         match self.archive.poll_recording_event(&mut self.client) {
             Ok(Some(RecordingEvent::Signal(signal))) => {
                 work += 1;
 
-                // `:2108-2116`: the **log** recording stopping is this member
+                // `:2105-2116`: the **log** recording stopping is this member
                 // losing its stream, not a copy's progress. The reference
                 // records where it stopped and, if nothing is being elected and
                 // this member is active, asks the closed image whether that
@@ -4137,7 +4137,7 @@ impl ElectionHost for ConsensusModuleAgent {
             self.read_destination_recording_position();
         }
 
-        // `:2122-2127`: an idle turn whose control subscription has no image is
+        // `:2123-2128`: an idle turn whose control subscription has no image is
         // a local archive that is gone. Spinning on it hides the failure; the
         // reference counts it and ends the agent.
         if !self.archive.control_poll_is_complete() && !self.archive.is_connected(&self.client) {
