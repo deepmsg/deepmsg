@@ -49,9 +49,13 @@ pub enum ImageEvent {
     /// revoked.
     ///
     /// A withdrawal and a revocation read the same here, as they do in the
-    /// reference's handler; an application that needs to tell them apart asks
-    /// [`Image::is_publication_revoked`](crate::image::Image::is_publication_revoked)
-    /// before the image is gone.
+    /// reference's handler; telling them apart needs the image, and this event
+    /// does not carry it. A reader that kept an
+    /// [`ImageView`](crate::image::ImageView) — the second-reader handle — asks
+    /// `is_publication_revoked` on it after the withdrawal, which answers the
+    /// snapshot the close captured (`Image.java:298-304`, and see
+    /// `docs/compat.md`). The reference hands its handler the `Image` itself
+    /// (`ClientConductor.java:449-453`); this build's events are values.
     Unavailable {
         /// The subscription it was under.
         subscription_registration_id: i64,

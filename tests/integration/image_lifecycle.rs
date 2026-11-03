@@ -726,6 +726,176 @@ fn an_image_that_left_the_subscription_hears_that_it_is_over() {
     );
 }
 
+/// A **second reader's view** of an image the subscription still holds hears
+/// that the driver withdrew it, and hears the position it was withdrawn at.
+///
+/// The reference keeps one `Image` object and marks it closed before notifying
+/// (`Subscription.java:607-630`); this build's view is that object's second
+/// reader, and until the close was set on the withdrawal path it was the one
+/// thing a withdrawal never reached.
+#[test]
+fn a_withdrawn_image_closes_the_view_a_second_reader_holds() {
+    let Some((_own, mut client)) = own_driver_and_client("image-view-withdrawal") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let publication = client
+        .add_publication(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication");
+    let subscription = client
+        .add_subscription(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a subscription");
+
+    await_image(&mut client, subscription);
+
+    let session_id = client
+        .subscription(subscription)
+        .expect("the subscription")
+        .images()
+        .first()
+        .expect("an image")
+        .session_id();
+    let view = client
+        .subscription(subscription)
+        .expect("the subscription")
+        .image_view_by_session_id(session_id)
+        .expect("a view of the image");
+    let final_position = view.position();
+
+    assert!(!view.is_closed(), "it is open while the image is");
+
+    client
+        .remove_publication(publication, DEFAULT_TIMEOUT)
+        .expect("the publication is removed");
+
+    let deadline = Instant::now() + DEADLINE;
+    while !view.is_closed() {
+        assert!(Instant::now() < deadline, "the withdrawal never reached it");
+        client.poll();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(
+        final_position,
+        view.position(),
+        "a closed image answers where it was closed"
+    );
+    assert_eq!(
+        Some(0),
+        view.active_transport_count(),
+        "and reports the zero a closed image reports"
+    );
+}
+
+/// A subscription that leaves the client closes the images **it still holds**,
+/// not only the ones it handed over — `Subscription.internalClose` →
+/// `ClientConductor.closeImages` (`Subscription.java:594-599`,
+/// `ClientConductor.java:1656-1675`).
+#[test]
+fn a_subscription_that_leaves_closes_the_images_it_still_holds() {
+    let Some((_own, mut client)) = own_driver_and_client("image-close-on-unsubscribe") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let _publication = client
+        .add_publication(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication");
+    let subscription = client
+        .add_subscription(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a subscription");
+
+    await_image(&mut client, subscription);
+
+    let session_id = client
+        .subscription(subscription)
+        .expect("the subscription")
+        .images()
+        .first()
+        .expect("an image")
+        .session_id();
+    let view = client
+        .subscription(subscription)
+        .expect("the subscription")
+        .image_view_by_session_id(session_id)
+        .expect("a view of the image");
+    assert!(!view.is_closed());
+
+    client
+        .remove_subscription(subscription, DEFAULT_TIMEOUT)
+        .expect("the subscription goes");
+
+    assert!(
+        view.is_closed(),
+        "a subscription that leaves the client ends the images it still held"
+    );
+}
+
+/// A **log adapter** keeps answering a closed image, as the reference's does:
+/// `isImageClosed`, `isLogEndOfStream` and `isLogEndOfStreamAt` read the object
+/// it still holds (`LogAdapter.java:106-120`), and the answers after the
+/// withdrawal come from the snapshot the close captured.
+#[test]
+fn a_log_adapter_answers_the_closed_images_snapshot() {
+    let Some((_own, mut client)) = own_driver_and_client("log-adapter-closed") else {
+        driver::announce_own_skip();
+        return;
+    };
+
+    let publication = client
+        .add_publication(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a publication");
+    let subscription = client
+        .add_subscription(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT)
+        .expect("a subscription");
+
+    await_image(&mut client, subscription);
+
+    let session_id = client
+        .subscription(subscription)
+        .expect("the subscription")
+        .images()
+        .first()
+        .expect("an image")
+        .session_id();
+    let view = client
+        .subscription(subscription)
+        .expect("the subscription")
+        .image_view_by_session_id(session_id)
+        .expect("a view of the image");
+
+    let mut adapter = deepmsg_cluster::log::LogAdapter::new();
+    adapter.set_image(view, 0);
+    assert!(!adapter.is_image_closed());
+    assert!(!adapter.is_log_end_of_stream());
+
+    client
+        .remove_publication(publication, DEFAULT_TIMEOUT)
+        .expect("the publication is removed");
+
+    let deadline = Instant::now() + DEADLINE;
+    while !adapter.is_image_closed() {
+        assert!(Instant::now() < deadline, "the withdrawal never reached it");
+        client.poll();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // Removing the publication is a publisher that **closed**: the driver sets
+    // the end-of-stream position to where it stopped, and the close captured
+    // it. The adapter's answer therefore comes from the snapshot — an adapter
+    // that looked the image up by registration id would find it gone and
+    // answer "no end of stream" instead.
+    assert!(
+        adapter.is_log_end_of_stream(),
+        "the close captured the publisher's end of stream"
+    );
+    assert!(
+        adapter.is_log_end_of_stream_at(0),
+        "and the position it captured"
+    );
+}
+
 /// A subscription that joins an image already running starts where the
 /// **slowest reader** is, not where the image has got to
 /// (`aeron_publication_image_join_position`,
