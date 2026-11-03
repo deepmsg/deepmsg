@@ -17,7 +17,9 @@
 //! the reference throws (`LogAdapter.java:201-205`), and so does this.
 
 use deepmsg_client::client::Client;
-use deepmsg_client::fragment_assembler::{Action, ControlledHandler, FragmentAssembler, Message};
+use deepmsg_client::fragment_assembler::{
+    Action, AssemblingSink, ControlledHandler, FragmentAssembler, Message,
+};
 use deepmsg_cluster_common::decode::at_least;
 use deepmsg_codec_cluster::close_reason::CloseReason;
 use deepmsg_codec_cluster::cluster_action::ClusterAction;
@@ -253,15 +255,20 @@ impl LogAdapter {
             handler,
             error: None,
         };
-        let result = client.poll_image_bounded(
-            subscription_id,
-            image_registration_id,
-            bound_position,
-            fragment_limit,
-            |fragment| {
-                let _ = assembler.push_controlled(fragment, &mut dispatch);
-            },
-        );
+        // The answer is honoured, not discarded: `Abort` leaves the refused
+        // entry where it is and `Break` stops the read where the handler said
+        // to — which is what the reference's `boundedControlledPoll` does with
+        // `LogAdapter`'s answer (`LogAdapter.java:103`).
+        let result = {
+            let mut sink = AssemblingSink::new(&mut assembler, &mut dispatch);
+            client.poll_image_bounded_controlled(
+                subscription_id,
+                image_registration_id,
+                bound_position,
+                fragment_limit,
+                &mut sink,
+            )
+        };
         self.assembler = assembler;
         if let Some(error) = dispatch.error {
             return Err(error);

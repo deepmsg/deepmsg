@@ -14,30 +14,13 @@ use deepmsg_cnc::counters::{
     CHANNEL_ENDPOINT_STATUS_ACTIVE, CountersReader, LOCAL_SOCKADDR_TYPE_ID, LocalSocketAddress,
 };
 
-use crate::fragment_assembler::{Action, ControlledHandler, FragmentAssembler};
-use crate::image::{ControlledFragments, Fragment, Image, ImageView};
+use crate::fragment_assembler::{AssemblingSink, ControlledHandler, FragmentAssembler};
+use crate::image::{Fragment, Image, ImageView};
 
 /// A subscription and the images attached to it.
 /// One object a controlled scan can call: the assembler, and the handler it
 /// answers to.
 ///
-/// The scan reads **fragments**; this build's controlled trait speaks in
-/// **messages**. The reassembly therefore sits between them, and the scan needs
-/// a single thing to call — which is all this is. It is private on purpose: a
-/// caller supplies a message handler and never meets the seam, and the
-/// alternative (handing the scan an assembler and a handler side by side) would
-/// put that seam in the scan's signature instead.
-struct AssemblingSink<'a, H> {
-    assembler: &'a mut FragmentAssembler,
-    handler: &'a mut H,
-}
-
-impl<H: ControlledHandler> ControlledFragments for AssemblingSink<'_, H> {
-    fn on_fragment(&mut self, fragment: &Fragment<'_>) -> Action {
-        self.assembler.push_controlled(fragment, self.handler)
-    }
-}
-
 pub struct Subscription {
     /// The id the driver keys this subscription by — the correlation id the
     /// `ADD_SUBSCRIPTION` used.
@@ -281,7 +264,7 @@ impl Subscription {
             }
 
             let counter_id = image.subscriber_position_id();
-            let mut sink = AssemblingSink { assembler, handler };
+            let mut sink = AssemblingSink::new(assembler, handler);
             let mut relay = |position: i64| publish(counter_id, position);
 
             fragments += image.controlled_poll(remaining, &mut sink, &mut relay);

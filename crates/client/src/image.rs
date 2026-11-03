@@ -891,7 +891,8 @@ impl Image {
         length
     }
 
-    /// The same scan, with the caller answering for each fragment.
+    /// The same scan, with the caller answering for each fragment, and with
+    /// the scan stopped by a bound.
     ///
     /// The answer decides where the reader's position ends up, which is the
     /// whole of what the controlled face adds to [`Image::poll`]:
@@ -912,13 +913,31 @@ impl Image {
     ///   before it.
     /// * **`Continue`** — consumed; the position is published once, at the end.
     ///
+    /// `bound_position` is the same bound [`Image::bounded_poll`] takes: a
+    /// fragment whose **start** is at or after it is left for the next poll,
+    /// padding included. The reference makes that one number —
+    /// `limit_position - initial_position + initial_offset` clamped to the term
+    /// — the loop's own condition (`aeron_image.c`, `aeron_image_bounded_
+    /// controlled_poll`), and checking the position at the top of each step is
+    /// the same statement about it.
+    ///
+    /// **A closed image is not read and its position does not move.** The
+    /// reference asks `is_closed` at the entry, once per step, and again before
+    /// each write to the subscriber position (`aeron_image.c:341-345`,
+    /// `:357-361`, `:414-418`, `:425-429`); the reader-thread counterpart of
+    /// that last check is the one that matters here, because the flag can be
+    /// set by another holder of the same image while this scan runs
+    /// (`ImageView::close`). Its test is
+    /// `a_closed_image_stops_the_controlled_poll_where_it_stands`.
+    ///
     /// `publish` is called at each commit and once at the end when the scan
     /// moved. It is a `dyn` call, and that is deliberate: commits are rare — a
     /// poller that reads a control response refuses far more than it takes —
     /// and the alternative is threading a counter handle through this type,
     /// which is the arrangement [`crate::Client`] already owns.
-    pub(crate) fn controlled_poll<H>(
+    pub fn bounded_controlled_poll<H>(
         &mut self,
+        bound_position: i64,
         fragment_limit: usize,
         handler: &mut H,
         publish: &mut dyn FnMut(i64),
@@ -926,6 +945,10 @@ impl Image {
     where
         H: ControlledFragments,
     {
+        if self.is_closed() || self.position.raw() >= bound_position {
+            return 0;
+        }
+
         let geometry = self.log.geometry();
         let term_length = geometry.term_length as usize;
 
@@ -942,6 +965,14 @@ impl Image {
         let mut fragments = 0;
 
         loop {
+            // The reference asks both of these at the top of every step, and
+            // asks them in this order: a closed image stops the scan wherever
+            // it stands, and the bound stops it before the first frame that
+            // begins at or after it.
+            if self.is_closed() || ledger.next.raw() >= bound_position {
+                break;
+            }
+
             match scanner.advance() {
                 Step::Data {
                     offset,
@@ -961,7 +992,11 @@ impl Image {
                     ledger.consume(i64::from(aligned));
                     fragments += 1;
 
-                    if action.publishes_now() {
+                    // A `Commit` is a write to the subscriber position, so it
+                    // goes through the reference's `is_closed` gate like any
+                    // other (`aeron_image.c:414-418`) — and not calling
+                    // `commit` keeps the ledger equal to what was published.
+                    if action.publishes_now() && !self.is_closed() {
                         publish(ledger.commit());
                     }
 
@@ -984,8 +1019,10 @@ impl Image {
             }
         }
 
-        if let Some(position) = ledger.settled() {
-            publish(position);
+        if !self.is_closed() {
+            if let Some(position) = ledger.settled() {
+                publish(position);
+            }
         }
 
         if ledger.committed.raw() > self.position.raw() {
@@ -993,6 +1030,21 @@ impl Image {
         }
 
         fragments
+    }
+
+    /// The same scan with no bound: [`Image::bounded_controlled_poll`] at
+    /// `i64::MAX`, which is what every caller of the controlled face meant
+    /// before the bound existed.
+    pub(crate) fn controlled_poll<H>(
+        &mut self,
+        fragment_limit: usize,
+        handler: &mut H,
+        publish: &mut dyn FnMut(i64),
+    ) -> usize
+    where
+        H: ControlledFragments,
+    {
+        self.bounded_controlled_poll(i64::MAX, fragment_limit, handler, publish)
     }
 
     /// The term buffer regions, for a test or a tool that wants to look at the
@@ -1165,7 +1217,7 @@ pub(crate) mod tests {
     use deepmsg_core::logbuffer::append::{Appended, Appender};
     use deepmsg_core::logbuffer::{descriptor, frame, position};
 
-    use super::{Action, Block, ControlledFragments, Fragment, Image};
+    use super::{Action, Block, ControlledFragments, Fragment, Image, ImageView};
     use crate::log_buffer::LogBuffer;
 
     /// The smallest legal term length, so the fixture stays small.
@@ -1780,6 +1832,134 @@ pub(crate) mod tests {
             vec![b"third".to_vec()],
             again,
             "nothing is handed over twice"
+        );
+    }
+
+    /// A handler that closes the image through a second holder, the way the
+    /// reference's test calls `aeron_image_close` from inside the handler — and
+    /// the way a real one can: `ImageView` is a second holder, and the flag is
+    /// an atomic for exactly this reason.
+    struct Closing {
+        view: ImageView,
+        answer: Action,
+        seen: usize,
+    }
+
+    impl Closing {
+        fn new(view: ImageView, answer: Action) -> Self {
+            Self {
+                view,
+                answer,
+                seen: 0,
+            }
+        }
+    }
+
+    impl ControlledFragments for Closing {
+        fn on_fragment(&mut self, _fragment: &Fragment<'_>) -> Action {
+            self.seen += 1;
+            self.view.close();
+            self.answer
+        }
+    }
+
+    /// `shouldStopPollFragmentsToControlledFragmentHandlerIfImageIsClosed`
+    /// (`aeron-client/src/test/c/aeron_image_test.cpp:707-734`): a handler that
+    /// closes the image stops the poll where it stands. The reference asks
+    /// `is_closed` once per step (`aeron_image.c:357-361`) and again before the
+    /// final write to the subscriber position (`:425-429`).
+    #[test]
+    fn a_closed_image_stops_the_controlled_poll_where_it_stands() {
+        let log = TempLog::new("closed-during-controlled-poll");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut image = log.image(1);
+        let start = image.position();
+        let mut handler = Closing::new(image.view(), Action::Continue);
+        let mut published = Vec::new();
+
+        let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
+
+        assert!(image.is_closed(), "the handler closed it");
+        assert_eq!(1, fragments, "one fragment was delivered");
+        assert_eq!(1, handler.seen, "and the second was never handed over");
+        assert!(
+            published.is_empty(),
+            "a closed image writes no subscriber position"
+        );
+        assert_eq!(start, image.position(), "and its reader did not move");
+
+        // The next poll is the reference's entry check (`:341-345`).
+        let mut again = Scripted::new(&[]);
+        assert_eq!(
+            0,
+            image.controlled_poll(10, &mut again, &mut |_| {}),
+            "a closed image is not read again"
+        );
+        assert!(again.seen.is_empty());
+    }
+
+    /// `boundedControlledPollCommitShouldNotAdvancePositionWhenClosedDuringHandler`
+    /// (`aeron-client/src/test/c/aeron_image_test.cpp:894-927`): a `Commit` that
+    /// arrives after the image closed is not published — the reference guards
+    /// that write with `is_closed` too (`aeron_image.c:414-418`).
+    #[test]
+    fn a_commit_answered_after_the_image_closed_is_not_published() {
+        let log = TempLog::new("closed-before-commit");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut image = log.image(1);
+        let start = image.position();
+        let mut handler = Closing::new(image.view(), Action::Commit);
+        let mut published = Vec::new();
+
+        let fragments =
+            image.bounded_controlled_poll(i64::MAX, 10, &mut handler, &mut |p| published.push(p));
+
+        assert_eq!(1, fragments);
+        assert_eq!(1, handler.seen);
+        assert!(published.is_empty(), "the commit is skipped");
+        assert_eq!(start, image.position());
+    }
+
+    /// The bound is a **start** position: a fragment that begins at it is left
+    /// for the next poll, and what was read before it is published
+    /// (`aeron_image.c`, `aeron_image_bounded_controlled_poll`'s
+    /// `limit_offset`).
+    #[test]
+    fn a_bound_leaves_the_fragment_that_starts_at_it() {
+        let log = TempLog::new("bounded-controlled");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut image = log.image(1);
+        let start = image.position();
+        let second = start + i64::try_from(frame_reach(b"first")).expect("small");
+
+        let mut handler = Scripted::new(&[]);
+        let mut published = Vec::new();
+        let read =
+            image.bounded_controlled_poll(second, 10, &mut handler, &mut |p| published.push(p));
+
+        assert_eq!(1, read, "only the fragment before the bound is read");
+        assert_eq!(vec![b"first".to_vec()], handler.seen);
+        assert_eq!(vec![second], published);
+        assert_eq!(second, image.position());
+
+        let mut again = Scripted::new(&[]);
+        image.bounded_controlled_poll(i64::MAX, 10, &mut again, &mut |_| {});
+        assert_eq!(
+            vec![b"second".to_vec()],
+            again.seen,
+            "the next poll starts at the fragment the bound left"
         );
     }
 }

@@ -19,7 +19,9 @@
 //! after it in this slice (extension records are P3-9).
 
 use deepmsg_client::client::Client;
-use deepmsg_client::fragment_assembler::{Action, ControlledHandler, FragmentAssembler, Message};
+use deepmsg_client::fragment_assembler::{
+    Action, AssemblingSink, ControlledHandler, FragmentAssembler, Message,
+};
 use deepmsg_cluster_common::decode::at_least;
 use deepmsg_codec_cluster::cluster_session_codec::ClusterSessionDecoder;
 use deepmsg_codec_cluster::cluster_time_unit::ClusterTimeUnit;
@@ -180,14 +182,19 @@ impl ConsensusModuleSnapshotAdapter {
             error: None,
         };
 
-        let result = client.poll_image(
-            subscription_id,
-            image_registration_id,
-            FRAGMENT_LIMIT,
-            |fragment| {
-                let _ = assembler.push_controlled(fragment, &mut dispatch);
-            },
-        );
+        // `END` answers `Break`, and the reference stops there
+        // (`ConsensusModuleSnapshotAdapter.java`); reading a batch used to walk
+        // the image past it because the answer was discarded.
+        let result = {
+            let mut sink = AssemblingSink::new(&mut assembler, &mut dispatch);
+            client.poll_image_bounded_controlled(
+                subscription_id,
+                image_registration_id,
+                i64::MAX,
+                FRAGMENT_LIMIT,
+                &mut sink,
+            )
+        };
 
         self.assembler = assembler;
         self.in_snapshot = dispatch.in_snapshot;
