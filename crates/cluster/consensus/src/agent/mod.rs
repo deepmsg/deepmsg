@@ -3010,6 +3010,18 @@ impl ConsensusModuleAgent {
             });
         let appended_position = match self.append_position {
             Some(_) => self.append_position_value(),
+            // The **startup** election is `ConsensusModuleAgent.onStart`'s
+            // (`:345-357`): it is built from `recoveryPlan.appendedLogPosition()`
+            // alone, before the first `pollArchiveEvents` turn. The `max(…,
+            // logRecordingStopPosition)` is `enterElection`'s (`:3071-3073`), for
+            // a term that already exists. This build enters the startup
+            // election through `enter_election` as well, so "no leadership term
+            // has been established yet" is what tells the two apart — without
+            // it, the `STOP` that `tryStopRecordingByIdentity` asks for at
+            // launch becomes the startup election's append position, and a
+            // member whose log is shorter than that replays forever waiting for
+            // a leader's commit position.
+            None if leadership_term_id == NULL_VALUE => self.recovery_plan.appended_log_position,
             None => self
                 .recovery_plan
                 .appended_log_position
