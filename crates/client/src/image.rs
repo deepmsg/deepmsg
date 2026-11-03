@@ -308,18 +308,91 @@ pub struct Image {
 /// likes, so a second reader of the same image — the archive's replication
 /// session watching the image its recorder is reading is the one that exists —
 /// simply reads the fields off it. Rust gives the image one owner, so what the
-/// second reader gets is this: the two facts that move
-/// ([`ImageShared::position`], `Image.isClosed`'s flag) shared, and the log
-/// behind an `Arc` so everything that does **not** move can still be read live.
+/// second reader gets is this: the facts that move
+/// ([`ImageShared::position`], `Image.isClosed`'s flag) and the ones the
+/// reference freezes when it closes ([`ImageShared::close`]) shared, and the
+/// log behind an `Arc` so everything that does **not** move can still be read
+/// live.
 #[derive(Debug)]
 pub(crate) struct ImageShared {
     /// Where the holder has read to, published after every poll
     /// (`ImageShared::position` is the reference's `Image.position()`, which a
     /// second reader of the same image reads the same way).
     position: AtomicI64,
-    /// `Image.isClosed()` (`Image.java:204-207`): the client that made this
-    /// image has been told the driver withdrew it.
+    /// `Image.finalPosition` (`Image.java:799`): where the reader was when the
+    /// image closed, which is what `position()` answers from then on.
+    final_position: AtomicI64,
+    /// `Image.eosPosition` (`Image.java:800`): the end-of-stream position as it
+    /// stood at the close. [`deepmsg_core::logbuffer::descriptor::END_OF_STREAM_OPEN`]
+    /// when the metadata could not be read, and `eos_known` says which.
+    eos_position: AtomicI64,
+    /// Whether `eos_position` was read at the close at all.
+    eos_known: AtomicBool,
+    /// `Image.isClosed()` (`Image.java:204-207`, `:804`): the image is over.
     closed: AtomicBool,
+    /// `Image.isRevoked` (`Image.java:803`): the publication had been revoked
+    /// as it stood at the close. Read the closed way, unlike the C client —
+    /// see [`ImageView::is_publication_revoked`].
+    is_revoked: AtomicBool,
+}
+
+impl ImageShared {
+    fn new(position: i64) -> Self {
+        Self {
+            position: AtomicI64::new(position),
+            final_position: AtomicI64::new(position),
+            eos_position: AtomicI64::new(descriptor::END_OF_STREAM_OPEN),
+            eos_known: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            is_revoked: AtomicBool::new(false),
+        }
+    }
+
+    /// `Image.close()` (`Image.java:798-806`): capture what the image answered
+    /// at this moment, then publish the flag.
+    ///
+    /// The snapshot is written **before** `closed` is released, so a reader
+    /// that sees the flag (acquire) sees the facts it stands for. Closing twice
+    /// captures the same numbers: a closed image does not move
+    /// ([`Image::advance`] refuses after the flag is set).
+    fn close(&self, log: &LogBuffer) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let final_position = self.position.load(Ordering::Acquire);
+        let metadata = log.metadata();
+        let eos_position = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.load_i64(descriptor::END_OF_STREAM_POSITION_OFFSET));
+        let is_revoked = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.load_u8(descriptor::IS_PUBLICATION_REVOKED_OFFSET))
+            .is_some_and(|value| value != 0);
+
+        self.final_position.store(final_position, Ordering::Relaxed);
+        self.eos_position.store(
+            eos_position.unwrap_or(descriptor::END_OF_STREAM_OPEN),
+            Ordering::Relaxed,
+        );
+        self.eos_known
+            .store(eos_position.is_some(), Ordering::Relaxed);
+        self.is_revoked.store(is_revoked, Ordering::Relaxed);
+
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Where the reader was when the image closed.
+    fn final_position(&self) -> i64 {
+        self.final_position.load(Ordering::Acquire)
+    }
+
+    /// The end-of-stream position captured at the close, if it was readable.
+    fn closed_eos_position(&self) -> Option<i64> {
+        self.eos_known
+            .load(Ordering::Acquire)
+            .then(|| self.eos_position.load(Ordering::Acquire))
+    }
 }
 
 /// An image **read by somebody else**, as a second reader sees it.
@@ -372,8 +445,15 @@ impl ImageView {
         self.join_position
     }
 
-    /// Where the holder has read to (`Image.position()`, `:241`).
+    /// Where the holder has read to (`Image.position()`, `:224`).
+    ///
+    /// A closed image answers `finalPosition` — where the reader was at the
+    /// close — as the reference does (`Image.java:226-232`).
     pub fn position(&self) -> i64 {
+        if self.is_closed() {
+            return self.shared.final_position();
+        }
+
         self.shared.position.load(Ordering::Acquire)
     }
 
@@ -386,7 +466,7 @@ impl ImageView {
     /// Say that the image is over, for the two things that can say it: the
     /// driver withdrawing it, and the subscription it was under going away.
     pub(crate) fn close(&self) {
-        self.shared.closed.store(true, Ordering::Release);
+        self.shared.close(&self.log);
     }
 
     /// How many bytes one term of this image's log buffer is
@@ -397,22 +477,71 @@ impl ImageView {
 
     /// How many transports the driver has seen active
     /// (`Image.activeTransportCount()`, `:283`).
+    ///
+    /// A closed image answers **zero**: the driver has stopped counting for an
+    /// image it withdrew, and the reference replaces a stale reading with the
+    /// only one that is true of a closed image (`Image.java:285-288`).
     pub fn active_transport_count(&self) -> Option<i32> {
+        if self.is_closed() {
+            return Some(0);
+        }
+
         self.log
             .metadata()?
             .load_i32(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET)
     }
 
+    /// The position the stream reached when the publisher signalled end of
+    /// stream (`Image.endOfStreamPosition()`, `Image.java:265`).
+    ///
+    /// A closed image answers the value captured at the close
+    /// (`Image.java:267-270`), so an end of stream that arrives after the
+    /// withdrawal is not read back into it.
+    pub fn end_of_stream_position(&self) -> Option<i64> {
+        if self.is_closed() {
+            return self.shared.closed_eos_position();
+        }
+
+        self.log
+            .metadata()?
+            .load_i64(descriptor::END_OF_STREAM_POSITION_OFFSET)
+    }
+
     /// Whether the holder has reached the end of the stream
     /// (`Image.isEndOfStream()`, `:249`) — the holder's position against the
     /// same end-of-stream marker [`Image::is_end_of_stream`] compares against.
+    ///
+    /// A closed image answers what it answered at the close
+    /// (`Image.java:251-254`).
     pub fn is_end_of_stream(&self) -> Option<bool> {
+        if self.is_closed() {
+            return Some(self.position() >= self.shared.closed_eos_position()?);
+        }
+
         let end_of_stream = self
             .log
             .metadata()?
             .load_i64(descriptor::END_OF_STREAM_POSITION_OFFSET)?;
 
         Some(self.position() >= end_of_stream)
+    }
+
+    /// Whether the publication behind this image had been revoked
+    /// (`Image.isPublicationRevoked()`, `Image.java:298`).
+    ///
+    /// **Java's answer, not C's**: a closed image answers the flag captured at
+    /// the close (`Image.java:300-303`). The C client reads the metadata
+    /// whatever the flag says (`aeron_image.c:231-247`); the cluster exists in
+    /// Java only, and this build is aligned with it.
+    pub fn is_publication_revoked(&self) -> Option<bool> {
+        if self.is_closed() {
+            return Some(self.shared.is_revoked.load(Ordering::Acquire));
+        }
+
+        self.log
+            .metadata()?
+            .load_u8(descriptor::IS_PUBLICATION_REVOKED_OFFSET)
+            .map(|value| value != 0)
     }
 
     /// Where the stream comes from, as the driver described it.
@@ -453,10 +582,7 @@ impl Image {
             source_identity,
             log: Arc::new(LogBuffer::open(path, false)?),
             position: Position::from_raw(join_position),
-            shared: Arc::new(ImageShared {
-                position: AtomicI64::new(join_position),
-                closed: AtomicBool::new(false),
-            }),
+            shared: Arc::new(ImageShared::new(join_position)),
         })
     }
 
@@ -471,6 +597,16 @@ impl Image {
     /// (`RecordingSession.java:242`).
     pub fn is_closed(&self) -> bool {
         self.shared.closed.load(Ordering::Acquire)
+    }
+
+    /// `Image.close()` (`Image.java:798-806`): the image is over.
+    ///
+    /// Called by the client when the driver withdraws the image and when the
+    /// subscription it was under goes away — the two places the reference
+    /// closes it (`Subscription.java:623`, `:594-599`); a second reader's
+    /// [`ImageView::close`] is the same call.
+    pub(crate) fn close(&self) {
+        self.shared.close(&self.log);
     }
 
     /// How a second reader of this image sees it, for the client to keep after
@@ -495,7 +631,16 @@ impl Image {
     /// owner plus this store. Relaxed is enough — the store orders nothing, and
     /// what a reader of it wants is the number, not a happens-before with the
     /// bytes, which the log's own tail ordering already gives.
+    ///
+    /// A closed image does not move: the reference answers `finalPosition`
+    /// from its own position from then on, and freezing here is the same
+    /// statement — and it keeps the captured snapshot stable against a poll
+    /// that was already running when another reader closed the image.
     fn advance(&mut self, position: Position) {
+        if self.is_closed() {
+            return;
+        }
+
         self.position = position;
         self.shared
             .position
@@ -565,7 +710,14 @@ impl Image {
     /// term. The reference rejects an image at this position and not at the
     /// publisher's for that reason: what travels to the far end is where the
     /// stream was cut off, which is where its reader stopped.
-    pub const fn position(&self) -> i64 {
+    ///
+    /// A closed image answers `finalPosition` — where the reader was at the
+    /// close — as the reference does (`Image.java:226-232`).
+    pub fn position(&self) -> i64 {
+        if self.is_closed() {
+            return self.shared.final_position();
+        }
+
         self.position.raw()
     }
 
@@ -606,7 +758,14 @@ impl Image {
     /// stream — [`END_OF_STREAM_OPEN`](deepmsg_core::logbuffer::descriptor::END_OF_STREAM_OPEN)
     /// until then (`Image.endOfStreamPosition()`, `Image.java:265`;
     /// `aeron_image_end_of_stream_position`, `aeron_image.c:195-208`).
+    ///
+    /// A closed image answers the value captured at the close
+    /// (`Image.java:267-270`).
     pub fn end_of_stream_position(&self) -> Option<i64> {
+        if self.is_closed() {
+            return self.shared.closed_eos_position();
+        }
+
         self.metadata()?
             .load_i64(descriptor::END_OF_STREAM_POSITION_OFFSET)
     }
@@ -619,14 +778,27 @@ impl Image {
     /// the same number — this client writes that counter after every poll. Both
     /// are false while the stream is open, because the open marker is
     /// `INT64_MAX` and no position reaches it.
+    ///
+    /// A closed image answers what it answered at the close
+    /// (`Image.java:251-254`).
     pub fn is_end_of_stream(&self) -> Option<bool> {
+        if self.is_closed() {
+            return Some(self.position() >= self.shared.closed_eos_position()?);
+        }
+
         Some(self.position.raw() >= self.end_of_stream_position()?)
     }
 
     /// How many transports the driver has seen active within the image liveness
     /// timeout; zero for an IPC image, which has no transports
     /// (`Image.activeTransportCount()`, `Image.java:283`).
+    ///
+    /// A closed image answers **zero** (`Image.java:285-288`).
     pub fn active_transport_count(&self) -> Option<i32> {
+        if self.is_closed() {
+            return Some(0);
+        }
+
         self.metadata()?
             .load_i32(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET)
     }
@@ -634,7 +806,16 @@ impl Image {
     /// Whether the publication behind this image has been revoked
     /// (`Image.isPublicationRevoked()`, `Image.java:298`;
     /// `aeron_image_is_publication_revoked`, `aeron_image.c:231-247`).
+    ///
+    /// A closed image answers the flag captured at the close
+    /// (`Image.java:300-303`). **Java's answer, not C's**: the C client reads
+    /// the metadata whatever the flag says; the cluster exists in Java only,
+    /// and this build is aligned with it.
     pub fn is_publication_revoked(&self) -> Option<bool> {
+        if self.is_closed() {
+            return Some(self.shared.is_revoked.load(Ordering::Acquire));
+        }
+
         self.metadata()?
             .load_u8(descriptor::IS_PUBLICATION_REVOKED_OFFSET)
             .map(|value| value != 0)
@@ -712,6 +893,13 @@ impl Image {
         let mut next = self.position;
 
         loop {
+            // The reference's loop condition includes `!isClosed`
+            // (`Image.java:348`, `aeron_image.c:275-279`): a closed image
+            // stops the scan wherever it stands.
+            if self.is_closed() {
+                break;
+            }
+
             match scanner.advance() {
                 Step::Data {
                     offset,
@@ -813,6 +1001,13 @@ impl Image {
     where
         F: FnMut(&Block<'_>),
     {
+        // `Image.blockPoll` (`Image.java:667-672`): a closed image reads
+        // nothing. The position write at the end is gated the same way, which
+        // [`Image::advance`] already is.
+        if self.is_closed() {
+            return 0;
+        }
+
         let geometry = self.log.geometry();
         let term_begin = self.position.term_begin(geometry.bits_to_shift);
         let Some(term) = self.log.term(term_begin.index(geometry.bits_to_shift)) else {
@@ -1300,6 +1495,18 @@ pub(crate) mod tests {
             let log = LogBuffer::open(&self.path, true).expect("mappable");
             let term = log.term_mut(0).expect("term 0");
             f(offset, &term);
+        }
+
+        /// Write to the metadata page after the log is mapped, the way a
+        /// publisher does when it signals end of stream or a driver marks a
+        /// publication revoked.
+        fn set_metadata(&self, f: impl FnOnce(&AtomicBuffer<'_, ReadWrite>)) {
+            let log = LogBuffer::open(&self.path, true).expect("mappable");
+            let metadata = log
+                .file()
+                .region_mut(log.geometry().metadata_offset, descriptor::METADATA_LENGTH)
+                .expect("the metadata page");
+            f(&metadata);
         }
 
         /// The image a subscriber would have. The registration id is the
@@ -1925,6 +2132,116 @@ pub(crate) mod tests {
         assert_eq!(1, fragments);
         assert_eq!(1, handler.seen);
         assert!(published.is_empty(), "the commit is skipped");
+        assert_eq!(start, image.position());
+    }
+
+    /// **A closed image answers what it answered at the close** — the five
+    /// facts `Image.close()` captures (`Image.java:798-806`), not whatever the
+    /// log says now.
+    ///
+    /// The metadata is moved *after* the close on purpose: `isEndOfStream`,
+    /// `endOfStreamPosition`, `activeTransportCount` and
+    /// `isPublicationRevoked` all read it while the image is open, and all of
+    /// them must stop reading it once the image is over.
+    #[test]
+    fn a_closed_image_answers_the_snapshot_it_was_closed_with() {
+        let log = TempLog::new("closed-snapshot");
+        log.write(|appender| {
+            write_message(appender, b"first");
+        });
+
+        let image = log.image(1);
+        let final_position = image.position();
+        log.set_metadata(|metadata| {
+            metadata
+                .store_i64_relaxed(descriptor::END_OF_STREAM_POSITION_OFFSET, final_position)
+                .expect("in range");
+            metadata
+                .store_u8_relaxed(descriptor::IS_PUBLICATION_REVOKED_OFFSET, 1)
+                .expect("in range");
+            metadata
+                .store_i32_relaxed(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET, 3)
+                .expect("in range");
+        });
+
+        image.view().close();
+
+        // The log moves on after the close; the image does not.
+        log.set_metadata(|metadata| {
+            metadata
+                .store_i64_relaxed(descriptor::END_OF_STREAM_POSITION_OFFSET, i64::MAX)
+                .expect("in range");
+            metadata
+                .store_u8_relaxed(descriptor::IS_PUBLICATION_REVOKED_OFFSET, 0)
+                .expect("in range");
+            metadata
+                .store_i32_relaxed(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET, 5)
+                .expect("in range");
+        });
+
+        assert!(image.is_closed());
+        assert_eq!(final_position, image.position(), "finalPosition");
+        assert_eq!(
+            Some(final_position),
+            image.end_of_stream_position(),
+            "eosPosition"
+        );
+        assert_eq!(Some(true), image.is_end_of_stream(), "isEos");
+        assert_eq!(Some(0), image.active_transport_count(), "zero when closed");
+        assert_eq!(Some(true), image.is_publication_revoked(), "isRevoked");
+    }
+
+    /// `shouldStopReadingIfImageIsClosed` (`aeron-client/src/test/c/aeron_image_test.cpp:332-356`):
+    /// the plain poll stops where the handler closed the image, and the reader
+    /// does not move. The reference's loop condition carries `!isClosed`
+    /// (`Image.java:348`, `aeron_image.c:275-279`).
+    #[test]
+    fn a_closed_image_stops_the_fragment_poll_where_it_stands() {
+        let log = TempLog::new("closed-during-poll");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut image = log.image(1);
+        let start = image.position();
+        let view = image.view();
+        let mut seen = 0;
+
+        let fragments = image.poll(10, |_| {
+            seen += 1;
+            view.close();
+        });
+
+        assert!(image.is_closed());
+        assert_eq!(1, fragments, "the second frame is never handed over");
+        assert_eq!(1, seen);
+        assert_eq!(start, image.position(), "and the reader did not move");
+
+        assert_eq!(
+            0,
+            image.poll(10, |_| unreachable!("a closed image is not read")),
+            "the entry check stops the next poll"
+        );
+    }
+
+    /// `Image.blockPoll`'s entry check (`Image.java:667-672`): a closed image
+    /// reads no block at all.
+    #[test]
+    fn a_closed_image_reads_no_block() {
+        let log = TempLog::new("closed-block-poll");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut image = log.image(1);
+        let start = image.position();
+        image.view().close();
+
+        let bytes = image.block_poll(4096, |_| unreachable!("a closed image is not read"));
+
+        assert_eq!(0, bytes);
         assert_eq!(start, image.position());
     }
 
