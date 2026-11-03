@@ -8,6 +8,24 @@
 #                [--port-base 61500] [--out DIR] [--list] [--quick] [--no-read]
 #                [--peer user@host] [--two-host] [--single-host]
 #                [--session-timeout 10s] [--keep-recordings]
+#                [--no-track-history] [--no-counters] [--no-irq-snapshots]
+#                [--layout legacy|spread] [--driver-cpuset LIST|none]
+#
+# Two switches for the 2026-11-04 layout study, both recorded in RUN-INFO:
+#
+#   --layout legacy   the layout every reading before 2026-11-04 was taken with:
+#                     node side 0,4,5,6,7, archive 4/5/6, CM 7, and the busy-spin
+#                     echo service on **core 0**, which is also where the node
+#                     JVM's GC/JIT threads can land.
+#   --layout spread   the same five pinned threads, with the service moved to an
+#                     exclusive core (8, outside the JVM's floating set) and the
+#                     floating set reduced to 0,9,10. Cores 13-15 stay idle in
+#                     both; 12 is the IRQ core.
+#   --driver-cpuset   the driver *process*'s own mask, so its GC/JIT cannot land
+#                     on the IRQ core. `none` (legacy default) leaves the driver
+#                     unconstrained, as every reading before today did. `spread`
+#                     sets 1,2,3,11: the three the driver pins for itself plus
+#                     one for everything else it owns.
 #
 # The four arms differ by exactly one layer each, and that is what each ratio is
 # allowed to say:
@@ -111,6 +129,17 @@ path_port=${BENCH_PATH_PORT:-61411}
 # default (the reference's is 10 s, `ConsensusModule.java:739`).
 session_timeout=${BENCH_CLUSTER_SESSION_TIMEOUT:-}
 keep_recordings=0
+# A1 and A2 (2026-11-04): the time series the client's own histogram logger
+# writes (`.hdr.csv`, one row per second) and the members' counters taken before
+# they are stopped. Both are on by default -- a batch is much more expensive
+# than the files it leaves behind, and neither changes what is measured.
+track_history=1
+counters=1
+irq_samples=1
+# The layout study. `legacy` is what every earlier reading used; `spread` moves
+# the busy-spin service off the JVM's floating set. See the header.
+layout=legacy
+driver_cpuset=""
 
 # Both peer paths are `rm -rf`'d before a cell. A typo in an environment
 # variable must not take out a system directory; the guard is cheap.
@@ -131,6 +160,11 @@ while [ $# -gt 0 ]; do
         --rounds) rounds_to_run=$2; shift 2 ;;
         --session-timeout) session_timeout=$2; shift 2 ;;
         --keep-recordings) keep_recordings=1; shift ;;
+        --no-track-history) track_history=0; shift ;;
+        --no-counters) counters=0; shift ;;
+        --no-irq-snapshots) irq_samples=0; shift ;;
+        --layout) layout=$2; shift 2 ;;
+        --driver-cpuset) driver_cpuset=$2; shift 2 ;;
         --iterations) iterations=$2; shift 2 ;;
         --warmup-iterations) warmup_iterations=$2; shift 2 ;;
         --port-base) port_base=$2; shift 2 ;;
@@ -146,7 +180,7 @@ while [ $# -gt 0 ]; do
             syncs="0:0"
             runs=1; iterations=5; warmup_iterations=3
             shift ;;
-        -h|--help) sed -n '3,51p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h|--help) sed -n '3,75p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown option $1" >&2; exit 2 ;;
     esac
 done
@@ -170,6 +204,9 @@ else
 fi
 
 out=${out:-$BENCH_OUT_DIR/cluster-arms/$(date +%Y-%m-%d)-$(hostname -s)}
+
+# A1's switch, decided once: the property is named in exactly one place.
+if [ "$track_history" -eq 1 ]; then track_history_flag=true; else track_history_flag=false; fi
 
 IFS=',' read -ra arm_list <<<"$arms"
 IFS=',' read -ra pair_list <<<"$pairs"
@@ -279,10 +316,37 @@ LOCAL_ARCHIVE_CONTROL="aeron:ipc?term-length=64k"
 # The cores. The driver pins its own three out of the properties file every
 # launcher hands it (1, 2, 3); the node side gets the other five, and both node
 # shapes get the same five so that the arm is the only thing that differs.
-NODE_CPUS=${CLUSTER_NODE_CPUS:-0,4,5,6,7}
+#
+# ★ `NODE_CPUS` is the **floating set**: the node JVM starts under
+# `taskset -c $NODE_CPUS`, and the five busy-spin threads are then moved out of
+# it by name. In `legacy` the service stays on core 0, inside that floating set,
+# so the node JVM's GC/JIT threads are its neighbours. `spread` moves it to a
+# core of its own (8) and leaves the floating set at 0,9,10. Cores 13-15 are
+# unused in both layouts; 12 is the IRQ core.
+layout=${layout,,}
+case "$layout" in
+    legacy) _layout_node=0,4,5,6,7; _layout_container=0; _layout_driver="" ;;
+    spread) _layout_node=0,9,10;    _layout_container=8; _layout_driver=1,2,3,11 ;;
+    *) echo "unknown --layout '$layout' (legacy or spread)" >&2; exit 2 ;;
+esac
+NODE_CPUS=${CLUSTER_NODE_CPUS:-$_layout_node}
 ARCHIVE_CPUS=${CLUSTER_ARCHIVE_CPUS:-4,5,6}
 CM_CPU=${CLUSTER_CM_CPU:-7}
-CONTAINER_CPU=${CLUSTER_CONTAINER_CPU:-0}
+CONTAINER_CPU=${CLUSTER_CONTAINER_CPU:-$_layout_container}
+driver_cpuset=${driver_cpuset:-${CLUSTER_DRIVER_CPUSET:-$_layout_driver}}
+
+# A core a thread is pinned to must not also be in the set its JVM floats over
+# unless that is deliberate: the whole point of `spread` is that the service is
+# alone. This says so by name rather than letting the layout quietly be legacy.
+if [ "$layout" = spread ]; then
+    case ",$NODE_CPUS," in
+        *",$CONTAINER_CPU,"*)
+            echo "--layout spread needs the service's core ($CONTAINER_CPU) outside" >&2
+            echo "the node JVM's floating set ($NODE_CPUS); set CLUSTER_NODE_CPUS or" >&2
+            echo "CLUSTER_CONTAINER_CPU so the two do not overlap." >&2
+            exit 2 ;;
+    esac
+fi
 
 # --- ssh to the peer ---------------------------------------------------------
 #
@@ -457,6 +521,8 @@ if [ "$list_only" = 1 ]; then
         fi
     fi
     echo "cores           driver pins 1,2,3; node side $NODE_CPUS"
+    echo "layout          $layout; service core $CONTAINER_CPU; driver process mask ${driver_cpuset:-every core}"
+    echo "instruments     history $track_history_flag; member counters $([ "$counters" -eq 1 ] && echo on || echo off); irq snapshots $([ "$irq_samples" -eq 1 ] && echo on || echo off)"
     echo "results         $out"
     echo
     if _check; then
@@ -513,6 +579,11 @@ bench_fingerprint "$out/fingerprint.txt" >/dev/null
     done
     echo "cores           driver 1,2,3 (from the properties file); node side $NODE_CPUS;"
     echo "                archive $ARCHIVE_CPUS, consensus module $CM_CPU, container $CONTAINER_CPU"
+    echo "layout          $layout; the node JVM floats over $NODE_CPUS, the service is"
+    echo "                pinned to $CONTAINER_CPU; the driver's process mask is ${driver_cpuset:-every core}"
+    echo "instruments     track.history=$track_history_flag (the client's .hdr.csv is the time series);"
+    echo "                member counters $([ "$counters" -eq 1 ] && echo on || echo off) (run-N/member<i>/counters.txt)"
+    echo "                irq snapshots $([ "$irq_samples" -eq 1 ] && echo on || echo off) (run-N/member<i>/irq-before|after.txt)"
     echo
     echo "what each arm is"
     echo "  j     $BENCHMARKS_DRIVER_JAVA"
@@ -550,6 +621,11 @@ echo
 # batch keeps a copy of the logs and the pid list.
 
 member_root=${BENCH_MEMBER_ROOT:-/tmp/cluster-arms-member}
+# Where a remote member keeps `cnc-dump`: the copy `provision-host.sh` puts
+# beside the driver. The controller's own copy is whichever build is being
+# measured (`BENCH_CNC_DUMP`), and member 0 uses that.
+member_cnc_dump=${BENCH_MEMBER_CNC_DUMP:-${CLUSTER_DEEPMSG_DIR:+$CLUSTER_DEEPMSG_DIR/target/release/cnc-dump}}
+member_cnc_dump=${member_cnc_dump:-$BENCH_CNC_DUMP}
 _cell_dir=""
 
 _member_host() { # <i>
@@ -566,6 +642,13 @@ _member_aeron_dir() { # <i>
 
 _member_props() { # <i> <run-dir> <arm> <sync-archive> <sync-cluster>
     local i=$1 dir=$2 arm=$3 sync_archive=$4 sync_cluster=$5
+    # The counters tool is a file on the member's own disk. A remote member has
+    # it where `provision-host.sh` put it; this machine has it wherever the
+    # build that is being measured put it.
+    local member_cnc_path=$member_cnc_dump
+    if [ "$i" -eq 0 ] && [ -x "$BENCH_CNC_DUMP" ]; then
+        member_cnc_path=$BENCH_CNC_DUMP
+    fi
     {
         echo "arm=$arm"
         echo "dir=$(_member_dir "$i" "$dir")"
@@ -603,6 +686,8 @@ _member_props() { # <i> <run-dir> <arm> <sync-archive> <sync-cluster>
         echo "archive_recorder_cpu=4"
         echo "archive_replayer_cpu=5"
         echo "archive_conductor_cpu=6"
+        echo "driver_cpuset=$driver_cpuset"
+        echo "cnc_dump=$member_cnc_path"
         echo "session_timeout=$session_timeout"
     } >"$dir/member.properties"
 }
@@ -675,6 +760,44 @@ _member_collect() { # <i> <run-dir>
     mkdir -p "$dir/member$i"
     scp -q "$host:$mdir"/*.log "$dir/member$i/" 2>/dev/null || true
     scp -q "$host:$mdir/pids" "$dir/member$i/" 2>/dev/null || true
+}
+
+# A2: the member's counters, taken **while its processes are still up** (the
+# driver's heartbeat is part of the reading, and a SIGTERM shutdown stamps the
+# system counters RECLAIMED). Every member lands as
+# `run-<N>/member<i>/counters.txt`, so a reader never has to know which member
+# was local.
+_member_counters() { # <i> <run-dir>
+    local i=$1 dir=$2 host mdir
+    host=$(_member_host "$i")
+    mdir=$(_member_dir "$i" "$dir")
+    mkdir -p "$dir/member$i"
+    if [ -z "$host" ]; then
+        bash "$here/member-node.sh" counters "$mdir" >/dev/null 2>&1 || true
+        [ -f "$mdir/counters.txt" ] && mv -f "$mdir/counters.txt" "$dir/member$i/counters.txt"
+        return 0
+    fi
+    ssh -n -o BatchMode=yes "$host" "bash $mdir/member-node.sh counters $mdir" >/dev/null 2>&1 || true
+    scp -q "$host:$mdir/counters.txt" "$dir/member$i/counters.txt" 2>/dev/null || true
+}
+
+# A4: `/proc/interrupts` and `/proc/net/softnet_stat` before and after the
+# client runs. The difference is the per-queue packet count and the per-CPU
+# softirq count -- the reading that says whether the traffic is on one queue
+# (RSS hashes the 4-tuple, so a single client flow is) and whether the cores
+# `irq-steer.sh` chose are the cores that took it.
+_member_irq() { # <i> <run-dir> <before|after>
+    local i=$1 dir=$2 when=$3 host mdir
+    host=$(_member_host "$i")
+    mdir=$(_member_dir "$i" "$dir")
+    mkdir -p "$dir/member$i"
+    if [ -z "$host" ]; then
+        bash "$here/member-node.sh" "irq-$when" "$mdir" >/dev/null 2>&1 || true
+        [ -f "$mdir/irq-$when.txt" ] && mv -f "$mdir/irq-$when.txt" "$dir/member$i/irq-$when.txt"
+        return 0
+    fi
+    ssh -n -o BatchMode=yes "$host" "bash $mdir/member-node.sh irq-$when $mdir" >/dev/null 2>&1 || true
+    scp -q "$host:$mdir/irq-$when.txt" "$dir/member$i/irq-$when.txt" 2>/dev/null || true
 }
 
 _stop_all() {
@@ -831,7 +954,7 @@ _client_jvm_opts() { # <aeron-dir> <egress-host> <out-dir> <run> <arm> <rate> <l
         "-Dio.aeron.benchmarks.output.file=cluster-$arm " \
         "-Dio.aeron.benchmarks.output.directory=$out_dir " \
         "-Dio.aeron.benchmarks.output.time.unit=MICROSECONDS " \
-        "-Dio.aeron.benchmarks.track.history=false " \
+        "-Dio.aeron.benchmarks.track.history=$track_history_flag " \
         "-Dio.aeron.benchmarks.report.progress=false " \
         "-Dio.aeron.benchmarks.aeron.use.try.claim=true " \
         "-Dio.aeron.benchmarks.aeron.embedded.media.driver=false " \
@@ -982,10 +1105,20 @@ _cell() {
     fi
 
     local status=0
+    if [ "$irq_samples" -eq 1 ]; then
+        for ((i = 0; i < member_count; i++)); do
+            _member_irq "$i" "$dir" before || true
+        done
+    fi
     if [ "$mode" = two ]; then
         _client_run_peer "$dir" "$log" "$rate" "$length" "$run" "$arm" "$rel" || status=$?
     else
         _client_run "$cell" "$log" "$rate" "$length" "$run" "$arm" || status=$?
+    fi
+    if [ "$irq_samples" -eq 1 ]; then
+        for ((i = 0; i < member_count; i++)); do
+            _member_irq "$i" "$dir" after || true
+        done
     fi
 
     # The node side goes first and the driver last: the driver is what every
@@ -1000,6 +1133,15 @@ _cell() {
             status=1
         fi
     done
+
+    # A2: the server-side evidence, before anything is stopped. A member whose
+    # counter file is missing is a cell that cannot be attributed -- the reader
+    # says so rather than pretending the cell had one leader and no elections.
+    if [ "$counters" -eq 1 ]; then
+        for ((i = 0; i < member_count; i++)); do
+            _member_counters "$i" "$dir" || true
+        done
+    fi
 
     _stop_all
     for ((i = 1; i < member_count; i++)); do
