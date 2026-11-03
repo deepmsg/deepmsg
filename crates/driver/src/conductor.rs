@@ -4927,6 +4927,33 @@ mod tests {
         conductor.counters().set_value(&regions, counter_id, value);
     }
 
+    /// Wait for a counter to reach a value.
+    ///
+    /// A count is not part of the frame it counts. The receiver sends the `ERR`
+    /// and *then* increments — `aeron_receive_channel_endpoint.c:493-506` sends
+    /// and bumps afterwards, and
+    /// `ReceiveChannelEndpoint::send_error_frame` keeps that order — so a test
+    /// that already holds the frame its socket received is still ahead of the
+    /// number in the conductor's mapping. The deadline is what keeps a counter
+    /// that never moves from hanging the suite.
+    fn await_counter(conductor: &Conductor, counter_id: i32, at_least: i64) -> i64 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        loop {
+            let value = counter_value(conductor, counter_id).unwrap_or(0);
+
+            if value >= at_least {
+                return value;
+            }
+
+            assert!(
+                std::time::Instant::now() < deadline,
+                "counter {counter_id} never reached {at_least}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// Wait for the agent thread to remove a file.
     ///
     /// The conductor asks and the agent does it, so a test that asserted on the
@@ -9564,9 +9591,16 @@ mod tests {
             b"Needs to be closed",
             error.text(&frame).expect("the reason it was given")
         );
+
+        // Waited for rather than read on the spot: the datagram is in this
+        // socket before the receiver thread has bumped the count for it, since
+        // the send comes first and the increment second — the reference's
+        // order (`aeron_receive_channel_endpoint.c:493-506`) — and a machine
+        // with more runnable threads than cores stretches the space between
+        // them far enough for this test to lose the race.
         assert_eq!(
-            Some(1),
-            counter_value(&conductor, crate::system_counters::id::ERROR_FRAMES_SENT)
+            1,
+            await_counter(&conductor, crate::system_counters::id::ERROR_FRAMES_SENT, 1)
         );
     }
 
