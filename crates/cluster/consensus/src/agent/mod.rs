@@ -4098,7 +4098,18 @@ impl ElectionHost for ConsensusModuleAgent {
                 {
                     self.log_recording_stop_position = signal.position;
 
-                    if self.election.is_none() && self.state == ModuleState::Active {
+                    // `null == election` in the reference, which keeps the
+                    // election in the agent while it runs; this build **takes
+                    // it out** for the turn (`election_in_turn`), and
+                    // `pollArchiveEvents` is called from inside that turn
+                    // (`Election.java:924`). An election that is out is still
+                    // an election: entering another one here would abandon the
+                    // running one, and returning would drop the `STOP` its
+                    // replication is waiting for.
+                    if self.election.is_none()
+                        && !self.election_in_turn
+                        && self.state == ModuleState::Active
+                    {
                         let is_eos = self.log_adapter.is_log_end_of_stream_at(signal.position);
                         let reason = if is_eos {
                             "log recording stopped: eos=true"
