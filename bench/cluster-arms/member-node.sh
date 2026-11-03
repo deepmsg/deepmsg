@@ -4,6 +4,14 @@
 #
 #   member-node.sh start <dir>
 #   member-node.sh stop  <dir>
+#   member-node.sh check <dir>
+#   member-node.sh counters <dir>
+#
+# `counters` is the cell's server-side evidence: one `cnc-dump --all` against
+# this member's own aeron directory, written to `<dir>/counters.txt`. It is run
+# **before** the processes are stopped (a SIGTERM shutdown stamps the system
+# counters RECLAIMED, and the driver's own heartbeat is what says whether the
+# member was still alive at the end of the cell).
 #
 # `<dir>` is a cell run directory the batch prepared: it holds `member.properties`
 # (written by `run-batch.sh`, one `key=value` a line) and receives the logs and
@@ -27,8 +35,8 @@ set -euo pipefail
 # member that has the binaries and the reference harness, not this repository.
 # Every path it needs comes in the properties file.
 
-action=${1:?usage: member-node.sh start|stop <dir>}
-dir=${2:?usage: member-node.sh start|stop <dir>}
+action=${1:?usage: member-node.sh start|stop|check|counters <dir>}
+dir=${2:?usage: member-node.sh start|stop|check|counters <dir>}
 props=$dir/member.properties
 
 _need() {
@@ -78,6 +86,13 @@ _stop_one() {
 # name** (`remote-benchmarks-runner:210-235`); a plain mask lets two of them land
 # on one core, which is a different machine from the one the reference benchmarks
 # itself on. A thread that never appears is a warning, not a cell failure.
+#
+# ★ A pin that silently does not happen is worse than a missing pin: the cell
+# then reads as if the layout were the one that was asked for. `taskset -pc` is
+# checked by reading the affinity back, and a mismatch is a warning that names
+# the thread. The read-back matters when the JVM's own mask was narrower than
+# the requested core (a process started under `taskset -c 0,9,10` can still be
+# widened per-thread, but only if nothing else -- a cpuset cgroup -- refuses).
 _pin_thread() { # <pid> <name-prefix> <cpu>
     local pid=$1 name=$2 cpu=$3 tid=""
     for _ in $(seq 1 100); do
@@ -88,6 +103,28 @@ _pin_thread() { # <pid> <name-prefix> <cpu>
     done
     [ -n "$tid" ] || { echo "  (no thread named '$name' in pid $pid)" >&2; return 0; }
     taskset -pc "$cpu" "$tid" >/dev/null 2>&1 || true
+    local got
+    got=$(taskset -pc "$tid" 2>/dev/null | sed 's/.*: //' || true)
+    if ! _cpu_in_list "$cpu" "$got"; then
+        echo "  ('$name' asked for core $cpu, holds '$got')" >&2
+    fi
+}
+
+# Is <cpu> part of an affinity list such as `8`, `0,9,10` or `0-3,8`?
+_cpu_in_list() { # <cpu> <list>
+    local want=$1 list=$2 part lo hi
+    [ -n "$list" ] || return 1
+    local IFS=,
+    for part in $list; do
+        case "$part" in
+            *-*) lo=${part%%-*}; hi=${part##*-} ;;
+            *)   lo=$part; hi=$part ;;
+        esac
+        if [ "$want" -ge "$lo" ] 2>/dev/null && [ "$want" -le "$hi" ] 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 _await_cnc() { # <aeron-dir>
@@ -259,6 +296,57 @@ _alive() { # <what> <pid>
     }
 }
 
+# The driver's *process*. Its three agents are pinned by the properties file;
+# everything else the JVM owns (GC, JIT, the agent runner) is only as wide as
+# this mask. Empty or `none` keeps the old behaviour (every core), which is what
+# every reading before 2026-11-04 was taken with.
+_driver_launch() { # <launcher> <properties>
+    local launcher=$1 properties=$2
+    if [ -n "${driver_cpuset:-}" ] && [ "${driver_cpuset}" != none ]; then
+        taskset -c "$driver_cpuset" "$launcher" "$properties" >"$dir/driver.log" 2>&1 &
+    else
+        "$launcher" "$properties" >"$dir/driver.log" 2>&1 &
+    fi
+    PIDS+=("$!"); echo "$!" >>"$CELL_PIDS_FILE"
+}
+
+# The cell's server-side evidence, taken while the processes are still up.
+# `--all` is counters plus the driver's error log: the counters say what the
+# member did (election count, role, commit position, flow control), the error
+# log says whether it complained, and the header's `status` line says whether
+# the driver's heartbeat was still moving when the cell ended.
+action_counters() {
+    _load
+    local out=$dir/counters.txt
+    if [ -z "${cnc_dump:-}" ] || [ ! -x "${cnc_dump:-}" ]; then
+        echo "member ${member_id:-?}: no executable 'cnc_dump' in $props" >&2
+        return 1
+    fi
+    "$cnc_dump" --all "$aeron_dir" >"$out" 2>&1 || {
+        echo "member ${member_id:-?}: cnc-dump failed (see $out)" >&2
+        return 1
+    }
+    echo "member ${member_id:-?} counters -> $out"
+}
+
+# A4: where the NIC's interrupts actually went. Two snapshots, one before the
+# client runs and one after, so the difference is the per-queue packet count --
+# the thing that says whether a flow is on one queue (RSS hashes the 4-tuple)
+# and whether the cores we steered are the cores that took the traffic.
+# `softnet_stat` is here for the same reason: column 1 is packets processed per
+# CPU and column 10 is the drop counter.
+action_irq() { # <before|after>
+    _load
+    local path=$dir/irq-$1.txt
+    {
+        echo "== /proc/interrupts"
+        cat /proc/interrupts
+        echo "== /proc/net/softnet_stat"
+        cat /proc/net/softnet_stat
+    } >"$path"
+    echo "member ${member_id:-?} irq snapshot -> $path"
+}
+
 action_start() {
     _load
     # ★ `run-java` execs `${JAVA_HOME}/bin/java`; an empty one is `/bin/java`,
@@ -274,12 +362,9 @@ action_start() {
     _driver_properties "$dir/driver.properties"
 
     case "$arm" in
-        j)   "$benchmarks_driver_java" "$dir/driver.properties" >"$dir/driver.log" 2>&1 &
-             PIDS+=("$!"); echo "$!" >>"$CELL_PIDS_FILE" ;;
+        j)   _driver_launch "$benchmarks_driver_java" "$dir/driver.properties" ;;
         *)   DEEPMSG_DRIVER="$bench_driver" \
-                 "$benchmarks_scripts_dir/deepmsg-media-driver" "$dir/driver.properties" \
-                 >"$dir/driver.log" 2>&1 &
-             PIDS+=("$!"); echo "$!" >>"$CELL_PIDS_FILE" ;;
+                 _driver_launch "$benchmarks_scripts_dir/deepmsg-media-driver" "$dir/driver.properties" ;;
     esac
     _await_cnc "$aeron_dir" || { tail -20 "$dir/driver.log" >&2 || true; return 1; }
 
@@ -335,8 +420,11 @@ action_stop() {
 }
 
 case "$action" in
-    start) action_start ;;
-    stop)  action_stop ;;
-    check) action_check ;;
-    *)     echo "member-node.sh: unknown action '$action'" >&2; exit 2 ;;
+    start)    action_start ;;
+    stop)     action_stop ;;
+    check)    action_check ;;
+    counters) action_counters ;;
+    irq-before) action_irq before ;;
+    irq-after)  action_irq after ;;
+    *)        echo "member-node.sh: unknown action '$action'" >&2; exit 2 ;;
 esac
