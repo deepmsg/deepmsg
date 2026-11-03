@@ -211,10 +211,19 @@ impl Cluster {
     }
 
     /// `TestCluster.restartAllNodes(false)`: every member back on its own
-    /// directories — the same archive, the same cluster log, the same driver.
+    /// directories — the same archive directory, the same cluster log.
+    ///
+    /// The **driver is restarted too**, because that is what the reference's
+    /// restart is: `TestCluster.startStaticNode` builds a new `TestNode`, and a
+    /// `TestNode` launches its own media driver and archive over the member's
+    /// directories (`TestNode.java:117-121`). A module-only restart leaves the
+    /// previous incarnation's container session — a detaching client, not a
+    /// closing one — alive in the same driver, and what that session still
+    /// holds (a draining publication a late reader can re-read, a receive
+    /// endpoint whose socket is still bound) is state the reference never has.
     fn restart_all(&mut self) {
         for node in &mut self.nodes {
-            node.restart(&self.launched_tx);
+            node.restart_whole(&self.launched_tx);
         }
         await_launched(&self.faults, &self.launched_rx, MEMBER_COUNT);
         self.open_counters();
