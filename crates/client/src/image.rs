@@ -308,18 +308,91 @@ pub struct Image {
 /// likes, so a second reader of the same image — the archive's replication
 /// session watching the image its recorder is reading is the one that exists —
 /// simply reads the fields off it. Rust gives the image one owner, so what the
-/// second reader gets is this: the two facts that move
-/// ([`ImageShared::position`], `Image.isClosed`'s flag) shared, and the log
-/// behind an `Arc` so everything that does **not** move can still be read live.
+/// second reader gets is this: the facts that move
+/// ([`ImageShared::position`], `Image.isClosed`'s flag) and the ones the
+/// reference freezes when it closes ([`ImageShared::close`]) shared, and the
+/// log behind an `Arc` so everything that does **not** move can still be read
+/// live.
 #[derive(Debug)]
 pub(crate) struct ImageShared {
     /// Where the holder has read to, published after every poll
     /// (`ImageShared::position` is the reference's `Image.position()`, which a
     /// second reader of the same image reads the same way).
     position: AtomicI64,
-    /// `Image.isClosed()` (`Image.java:204-207`): the client that made this
-    /// image has been told the driver withdrew it.
+    /// `Image.finalPosition` (`Image.java:799`): where the reader was when the
+    /// image closed, which is what `position()` answers from then on.
+    final_position: AtomicI64,
+    /// `Image.eosPosition` (`Image.java:800`): the end-of-stream position as it
+    /// stood at the close. [`deepmsg_core::logbuffer::descriptor::END_OF_STREAM_OPEN`]
+    /// when the metadata could not be read, and `eos_known` says which.
+    eos_position: AtomicI64,
+    /// Whether `eos_position` was read at the close at all.
+    eos_known: AtomicBool,
+    /// `Image.isClosed()` (`Image.java:204-207`, `:804`): the image is over.
     closed: AtomicBool,
+    /// `Image.isRevoked` (`Image.java:803`): the publication had been revoked
+    /// as it stood at the close. Read the closed way, unlike the C client —
+    /// see [`ImageView::is_publication_revoked`].
+    is_revoked: AtomicBool,
+}
+
+impl ImageShared {
+    fn new(position: i64) -> Self {
+        Self {
+            position: AtomicI64::new(position),
+            final_position: AtomicI64::new(position),
+            eos_position: AtomicI64::new(descriptor::END_OF_STREAM_OPEN),
+            eos_known: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            is_revoked: AtomicBool::new(false),
+        }
+    }
+
+    /// `Image.close()` (`Image.java:798-806`): capture what the image answered
+    /// at this moment, then publish the flag.
+    ///
+    /// The snapshot is written **before** `closed` is released, so a reader
+    /// that sees the flag (acquire) sees the facts it stands for. Closing twice
+    /// captures the same numbers: a closed image does not move
+    /// ([`Image::advance`] refuses after the flag is set).
+    fn close(&self, log: &LogBuffer) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let final_position = self.position.load(Ordering::Acquire);
+        let metadata = log.metadata();
+        let eos_position = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.load_i64(descriptor::END_OF_STREAM_POSITION_OFFSET));
+        let is_revoked = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.load_u8(descriptor::IS_PUBLICATION_REVOKED_OFFSET))
+            .is_some_and(|value| value != 0);
+
+        self.final_position.store(final_position, Ordering::Relaxed);
+        self.eos_position.store(
+            eos_position.unwrap_or(descriptor::END_OF_STREAM_OPEN),
+            Ordering::Relaxed,
+        );
+        self.eos_known
+            .store(eos_position.is_some(), Ordering::Relaxed);
+        self.is_revoked.store(is_revoked, Ordering::Relaxed);
+
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Where the reader was when the image closed.
+    fn final_position(&self) -> i64 {
+        self.final_position.load(Ordering::Acquire)
+    }
+
+    /// The end-of-stream position captured at the close, if it was readable.
+    fn closed_eos_position(&self) -> Option<i64> {
+        self.eos_known
+            .load(Ordering::Acquire)
+            .then(|| self.eos_position.load(Ordering::Acquire))
+    }
 }
 
 /// An image **read by somebody else**, as a second reader sees it.
@@ -372,8 +445,15 @@ impl ImageView {
         self.join_position
     }
 
-    /// Where the holder has read to (`Image.position()`, `:241`).
+    /// Where the holder has read to (`Image.position()`, `:224`).
+    ///
+    /// A closed image answers `finalPosition` — where the reader was at the
+    /// close — as the reference does (`Image.java:226-232`).
     pub fn position(&self) -> i64 {
+        if self.is_closed() {
+            return self.shared.final_position();
+        }
+
         self.shared.position.load(Ordering::Acquire)
     }
 
@@ -386,7 +466,7 @@ impl ImageView {
     /// Say that the image is over, for the two things that can say it: the
     /// driver withdrawing it, and the subscription it was under going away.
     pub(crate) fn close(&self) {
-        self.shared.closed.store(true, Ordering::Release);
+        self.shared.close(&self.log);
     }
 
     /// How many bytes one term of this image's log buffer is
@@ -397,22 +477,71 @@ impl ImageView {
 
     /// How many transports the driver has seen active
     /// (`Image.activeTransportCount()`, `:283`).
+    ///
+    /// A closed image answers **zero**: the driver has stopped counting for an
+    /// image it withdrew, and the reference replaces a stale reading with the
+    /// only one that is true of a closed image (`Image.java:285-288`).
     pub fn active_transport_count(&self) -> Option<i32> {
+        if self.is_closed() {
+            return Some(0);
+        }
+
         self.log
             .metadata()?
             .load_i32(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET)
     }
 
+    /// The position the stream reached when the publisher signalled end of
+    /// stream (`Image.endOfStreamPosition()`, `Image.java:265`).
+    ///
+    /// A closed image answers the value captured at the close
+    /// (`Image.java:267-270`), so an end of stream that arrives after the
+    /// withdrawal is not read back into it.
+    pub fn end_of_stream_position(&self) -> Option<i64> {
+        if self.is_closed() {
+            return self.shared.closed_eos_position();
+        }
+
+        self.log
+            .metadata()?
+            .load_i64(descriptor::END_OF_STREAM_POSITION_OFFSET)
+    }
+
     /// Whether the holder has reached the end of the stream
     /// (`Image.isEndOfStream()`, `:249`) — the holder's position against the
     /// same end-of-stream marker [`Image::is_end_of_stream`] compares against.
+    ///
+    /// A closed image answers what it answered at the close
+    /// (`Image.java:251-254`).
     pub fn is_end_of_stream(&self) -> Option<bool> {
+        if self.is_closed() {
+            return Some(self.position() >= self.shared.closed_eos_position()?);
+        }
+
         let end_of_stream = self
             .log
             .metadata()?
             .load_i64(descriptor::END_OF_STREAM_POSITION_OFFSET)?;
 
         Some(self.position() >= end_of_stream)
+    }
+
+    /// Whether the publication behind this image had been revoked
+    /// (`Image.isPublicationRevoked()`, `Image.java:298`).
+    ///
+    /// **Java's answer, not C's**: a closed image answers the flag captured at
+    /// the close (`Image.java:300-303`). The C client reads the metadata
+    /// whatever the flag says (`aeron_image.c:231-247`); the cluster exists in
+    /// Java only, and this build is aligned with it.
+    pub fn is_publication_revoked(&self) -> Option<bool> {
+        if self.is_closed() {
+            return Some(self.shared.is_revoked.load(Ordering::Acquire));
+        }
+
+        self.log
+            .metadata()?
+            .load_u8(descriptor::IS_PUBLICATION_REVOKED_OFFSET)
+            .map(|value| value != 0)
     }
 
     /// Where the stream comes from, as the driver described it.
@@ -453,10 +582,7 @@ impl Image {
             source_identity,
             log: Arc::new(LogBuffer::open(path, false)?),
             position: Position::from_raw(join_position),
-            shared: Arc::new(ImageShared {
-                position: AtomicI64::new(join_position),
-                closed: AtomicBool::new(false),
-            }),
+            shared: Arc::new(ImageShared::new(join_position)),
         })
     }
 
@@ -471,6 +597,16 @@ impl Image {
     /// (`RecordingSession.java:242`).
     pub fn is_closed(&self) -> bool {
         self.shared.closed.load(Ordering::Acquire)
+    }
+
+    /// `Image.close()` (`Image.java:798-806`): the image is over.
+    ///
+    /// Called by the client when the driver withdraws the image and when the
+    /// subscription it was under goes away — the two places the reference
+    /// closes it (`Subscription.java:623`, `:594-599`); a second reader's
+    /// [`ImageView::close`] is the same call.
+    pub(crate) fn close(&self) {
+        self.shared.close(&self.log);
     }
 
     /// How a second reader of this image sees it, for the client to keep after
@@ -495,7 +631,16 @@ impl Image {
     /// owner plus this store. Relaxed is enough — the store orders nothing, and
     /// what a reader of it wants is the number, not a happens-before with the
     /// bytes, which the log's own tail ordering already gives.
+    ///
+    /// A closed image does not move: the reference answers `finalPosition`
+    /// from its own position from then on, and freezing here is the same
+    /// statement — and it keeps the captured snapshot stable against a poll
+    /// that was already running when another reader closed the image.
     fn advance(&mut self, position: Position) {
+        if self.is_closed() {
+            return;
+        }
+
         self.position = position;
         self.shared
             .position
@@ -565,7 +710,14 @@ impl Image {
     /// term. The reference rejects an image at this position and not at the
     /// publisher's for that reason: what travels to the far end is where the
     /// stream was cut off, which is where its reader stopped.
-    pub const fn position(&self) -> i64 {
+    ///
+    /// A closed image answers `finalPosition` — where the reader was at the
+    /// close — as the reference does (`Image.java:226-232`).
+    pub fn position(&self) -> i64 {
+        if self.is_closed() {
+            return self.shared.final_position();
+        }
+
         self.position.raw()
     }
 
@@ -606,7 +758,14 @@ impl Image {
     /// stream — [`END_OF_STREAM_OPEN`](deepmsg_core::logbuffer::descriptor::END_OF_STREAM_OPEN)
     /// until then (`Image.endOfStreamPosition()`, `Image.java:265`;
     /// `aeron_image_end_of_stream_position`, `aeron_image.c:195-208`).
+    ///
+    /// A closed image answers the value captured at the close
+    /// (`Image.java:267-270`).
     pub fn end_of_stream_position(&self) -> Option<i64> {
+        if self.is_closed() {
+            return self.shared.closed_eos_position();
+        }
+
         self.metadata()?
             .load_i64(descriptor::END_OF_STREAM_POSITION_OFFSET)
     }
@@ -619,14 +778,27 @@ impl Image {
     /// the same number — this client writes that counter after every poll. Both
     /// are false while the stream is open, because the open marker is
     /// `INT64_MAX` and no position reaches it.
+    ///
+    /// A closed image answers what it answered at the close
+    /// (`Image.java:251-254`).
     pub fn is_end_of_stream(&self) -> Option<bool> {
+        if self.is_closed() {
+            return Some(self.position() >= self.shared.closed_eos_position()?);
+        }
+
         Some(self.position.raw() >= self.end_of_stream_position()?)
     }
 
     /// How many transports the driver has seen active within the image liveness
     /// timeout; zero for an IPC image, which has no transports
     /// (`Image.activeTransportCount()`, `Image.java:283`).
+    ///
+    /// A closed image answers **zero** (`Image.java:285-288`).
     pub fn active_transport_count(&self) -> Option<i32> {
+        if self.is_closed() {
+            return Some(0);
+        }
+
         self.metadata()?
             .load_i32(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET)
     }
@@ -634,7 +806,16 @@ impl Image {
     /// Whether the publication behind this image has been revoked
     /// (`Image.isPublicationRevoked()`, `Image.java:298`;
     /// `aeron_image_is_publication_revoked`, `aeron_image.c:231-247`).
+    ///
+    /// A closed image answers the flag captured at the close
+    /// (`Image.java:300-303`). **Java's answer, not C's**: the C client reads
+    /// the metadata whatever the flag says; the cluster exists in Java only,
+    /// and this build is aligned with it.
     pub fn is_publication_revoked(&self) -> Option<bool> {
+        if self.is_closed() {
+            return Some(self.shared.is_revoked.load(Ordering::Acquire));
+        }
+
         self.metadata()?
             .load_u8(descriptor::IS_PUBLICATION_REVOKED_OFFSET)
             .map(|value| value != 0)
@@ -712,6 +893,13 @@ impl Image {
         let mut next = self.position;
 
         loop {
+            // The reference's loop condition includes `!isClosed`
+            // (`Image.java:348`, `aeron_image.c:275-279`): a closed image
+            // stops the scan wherever it stands.
+            if self.is_closed() {
+                break;
+            }
+
             match scanner.advance() {
                 Step::Data {
                     offset,
@@ -813,6 +1001,13 @@ impl Image {
     where
         F: FnMut(&Block<'_>),
     {
+        // `Image.blockPoll` (`Image.java:667-672`): a closed image reads
+        // nothing. The position write at the end is gated the same way, which
+        // [`Image::advance`] already is.
+        if self.is_closed() {
+            return 0;
+        }
+
         let geometry = self.log.geometry();
         let term_begin = self.position.term_begin(geometry.bits_to_shift);
         let Some(term) = self.log.term(term_begin.index(geometry.bits_to_shift)) else {
@@ -891,31 +1086,53 @@ impl Image {
         length
     }
 
-    /// The same scan, with the caller answering for each fragment.
+    /// The same scan, with the caller answering for each fragment, and with
+    /// the scan stopped by a bound.
     ///
     /// The answer decides where the reader's position ends up, which is the
     /// whole of what the controlled face adds to [`Image::poll`]:
     ///
     /// * **`Abort`** — the fragment is not consumed, so the position does not
-    ///   reach it and the same fragment arrives again next time. The reference
-    ///   walks its offset back by the frame it had already stepped over
-    ///   (`aeron_image.c`, the `AERON_ACTION_ABORT` arm); this walks `next`
-    ///   back, which is the same statement about a position.
+    ///   reach it and the same fragment arrives again next time. Only **that**
+    ///   fragment is given back: the ones this poll already took stay taken,
+    ///   and the position is published past them. The reference walks its
+    ///   offset back by the refused frame alone (`aeron_image.c`, the
+    ///   `AERON_ACTION_ABORT` arm) and then publishes `new_position`; here the
+    ///   refused frame was never added to `next`, which is the same statement
+    ///   about a position.
     /// * **`Break`** — consumed, and the scan stops here.
-    /// * **`Commit`** — consumed, and the position is **published now**, so a
-    ///   later refusal cannot take it back. The reference publishes inside the
-    ///   loop for the same reason, and that is what makes `Commit` different
-    ///   from `Continue` rather than merely more eager: what it buys is a
-    ///   watermark that survives a mistake further on.
+    /// * **`Commit`** — consumed, and the position is **published now**,
+    ///   inside the loop, as the reference does: flow control sees the reader
+    ///   got this far before the poll ends. It is not a point an `Abort` falls
+    ///   back to — an `Abort` falls back by one fragment, whatever came
+    ///   before it.
     /// * **`Continue`** — consumed; the position is published once, at the end.
+    ///
+    /// `bound_position` is the same bound [`Image::bounded_poll`] takes: a
+    /// fragment whose **start** is at or after it is left for the next poll,
+    /// padding included. The reference makes that one number —
+    /// `limit_position - initial_position + initial_offset` clamped to the term
+    /// — the loop's own condition (`aeron_image.c`, `aeron_image_bounded_
+    /// controlled_poll`), and checking the position at the top of each step is
+    /// the same statement about it.
+    ///
+    /// **A closed image is not read and its position does not move.** The
+    /// reference asks `is_closed` at the entry, once per step, and again before
+    /// each write to the subscriber position (`aeron_image.c:341-345`,
+    /// `:357-361`, `:414-418`, `:425-429`); the reader-thread counterpart of
+    /// that last check is the one that matters here, because the flag can be
+    /// set by another holder of the same image while this scan runs
+    /// (`ImageView::close`). Its test is
+    /// `a_closed_image_stops_the_controlled_poll_where_it_stands`.
     ///
     /// `publish` is called at each commit and once at the end when the scan
     /// moved. It is a `dyn` call, and that is deliberate: commits are rare — a
     /// poller that reads a control response refuses far more than it takes —
     /// and the alternative is threading a counter handle through this type,
     /// which is the arrangement [`crate::Client`] already owns.
-    pub(crate) fn controlled_poll<H>(
+    pub fn bounded_controlled_poll<H>(
         &mut self,
+        bound_position: i64,
         fragment_limit: usize,
         handler: &mut H,
         publish: &mut dyn FnMut(i64),
@@ -923,6 +1140,10 @@ impl Image {
     where
         H: ControlledFragments,
     {
+        if self.is_closed() || self.position.raw() >= bound_position {
+            return 0;
+        }
+
         let geometry = self.log.geometry();
         let term_length = geometry.term_length as usize;
 
@@ -939,6 +1160,14 @@ impl Image {
         let mut fragments = 0;
 
         loop {
+            // The reference asks both of these at the top of every step, and
+            // asks them in this order: a closed image stops the scan wherever
+            // it stands, and the bound stops it before the first frame that
+            // begins at or after it.
+            if self.is_closed() || ledger.next.raw() >= bound_position {
+                break;
+            }
+
             match scanner.advance() {
                 Step::Data {
                     offset,
@@ -951,7 +1180,6 @@ impl Image {
                     });
 
                     if !action.consumes() {
-                        ledger.refuse();
                         break;
                     }
 
@@ -959,7 +1187,11 @@ impl Image {
                     ledger.consume(i64::from(aligned));
                     fragments += 1;
 
-                    if action.publishes_now() {
+                    // A `Commit` is a write to the subscriber position, so it
+                    // goes through the reference's `is_closed` gate like any
+                    // other (`aeron_image.c:414-418`) — and not calling
+                    // `commit` keeps the ledger equal to what was published.
+                    if action.publishes_now() && !self.is_closed() {
                         publish(ledger.commit());
                     }
 
@@ -982,8 +1214,10 @@ impl Image {
             }
         }
 
-        if let Some(position) = ledger.settled() {
-            publish(position);
+        if !self.is_closed() {
+            if let Some(position) = ledger.settled() {
+                publish(position);
+            }
         }
 
         if ledger.committed.raw() > self.position.raw() {
@@ -991,6 +1225,21 @@ impl Image {
         }
 
         fragments
+    }
+
+    /// The same scan with no bound: [`Image::bounded_controlled_poll`] at
+    /// `i64::MAX`, which is what every caller of the controlled face meant
+    /// before the bound existed.
+    pub(crate) fn controlled_poll<H>(
+        &mut self,
+        fragment_limit: usize,
+        handler: &mut H,
+        publish: &mut dyn FnMut(i64),
+    ) -> usize
+    where
+        H: ControlledFragments,
+    {
+        self.bounded_controlled_poll(i64::MAX, fragment_limit, handler, publish)
     }
 
     /// The term buffer regions, for a test or a tool that wants to look at the
@@ -1023,9 +1272,8 @@ impl std::fmt::Debug for Image {
 struct PositionLedger {
     /// Where the scan has read up to.
     next: Position,
-    /// The last point that was published, and the point a refusal falls back
-    /// to. It starts where the reader started: a refusal with nothing committed
-    /// before it leaves the reader where it was.
+    /// The last point that was published. It starts where the reader started,
+    /// so a poll that moved nothing publishes nothing.
     committed: Position,
 }
 
@@ -1046,12 +1294,6 @@ impl PositionLedger {
     fn commit(&mut self) -> i64 {
         self.committed = self.next;
         self.next.raw()
-    }
-
-    /// `Abort`: the fragment is not consumed, and the position falls back to
-    /// the last committed point rather than to where the scan began.
-    fn refuse(&mut self) {
-        self.next = self.committed;
     }
 
     /// Where the scan ended up, if it moved past the last thing published.
@@ -1114,44 +1356,40 @@ mod ledger_tests {
         assert_eq!(None, ledger.settled(), "the end adds nothing to a commit");
     }
 
-    /// What `Commit` buys over `Continue`: a point a later refusal cannot take
-    /// back. Without this the two actions would be the same action.
-    ///
-    /// The difference is in what was **published**, not in what is left to
-    /// publish — after the refusal neither ledger has anything more to say, and
-    /// only one of them has already said 164.
+    /// An `Abort` costs only the fragment it refused, so the ledger is never
+    /// told about it: what was consumed before it is published at the end,
+    /// with or without a `Commit` among it. (`aeron_image.c`: the ABORT arm
+    /// steps back one frame; `new_position` is published after the loop.)
     #[test]
-    fn a_committed_point_survives_a_refusal_after_it() {
+    fn a_refusal_keeps_what_was_consumed_before_it() {
         let mut published = Vec::new();
 
         let mut committed = at(100);
         committed.consume(64);
         published.push(committed.commit());
         committed.consume(128);
-        committed.refuse();
+        // ... and the next fragment is refused: nothing more is consumed.
         if let Some(position) = committed.settled() {
             published.push(position);
         }
-        assert_eq!(vec![164], published, "the refused fragment is given back");
+        assert_eq!(vec![164, 292], published, "a commit, then the end");
 
-        // The same reads with no commit among them publish nothing at all.
+        // The same reads with no commit among them reach the same point.
         let mut uncommitted = at(100);
         uncommitted.consume(64);
         uncommitted.consume(128);
-        uncommitted.refuse();
         assert_eq!(
-            None,
+            Some(292),
             uncommitted.settled(),
-            "nothing was committed, nothing moved"
+            "what was taken before the refusal stays taken"
         );
     }
 
     /// A refusal as the first answer leaves the reader exactly where it was —
     /// a poll that reads a message it will not take has not read anything.
     #[test]
-    fn a_refusal_with_nothing_committed_moves_nothing() {
+    fn a_refusal_with_nothing_consumed_moves_nothing() {
         let mut ledger = at(100);
-        ledger.refuse();
         assert_eq!(None, ledger.settled());
     }
 }
@@ -1174,7 +1412,7 @@ pub(crate) mod tests {
     use deepmsg_core::logbuffer::append::{Appended, Appender};
     use deepmsg_core::logbuffer::{descriptor, frame, position};
 
-    use super::{Action, Block, ControlledFragments, Fragment, Image};
+    use super::{Action, Block, ControlledFragments, Fragment, Image, ImageView};
     use crate::log_buffer::LogBuffer;
 
     /// The smallest legal term length, so the fixture stays small.
@@ -1259,6 +1497,18 @@ pub(crate) mod tests {
             f(offset, &term);
         }
 
+        /// Write to the metadata page after the log is mapped, the way a
+        /// publisher does when it signals end of stream or a driver marks a
+        /// publication revoked.
+        fn set_metadata(&self, f: impl FnOnce(&AtomicBuffer<'_, ReadWrite>)) {
+            let log = LogBuffer::open(&self.path, true).expect("mappable");
+            let metadata = log
+                .file()
+                .region_mut(log.geometry().metadata_offset, descriptor::METADATA_LENGTH)
+                .expect("the metadata page");
+            f(&metadata);
+        }
+
         /// The image a subscriber would have. The registration id is the
         /// **publication's**, and a subscription keys its images by it, so two
         /// images of one subscription need two ids.
@@ -1313,6 +1563,31 @@ pub(crate) mod tests {
                 return self.answer;
             }
             Action::Continue
+        }
+    }
+
+    /// A handler that answers from a script, then `Continue` once the script
+    /// runs out, and keeps what it was shown.
+    struct Scripted {
+        seen: Vec<Vec<u8>>,
+        answers: std::collections::VecDeque<Action>,
+    }
+
+    impl Scripted {
+        fn new(answers: &[Action]) -> Self {
+            Self {
+                seen: Vec::new(),
+                answers: answers.iter().copied().collect(),
+            }
+        }
+    }
+
+    impl ControlledFragments for Scripted {
+        fn on_fragment(&mut self, fragment: &Fragment<'_>) -> Action {
+            let mut payload = vec![0u8; fragment.payload_length()];
+            fragment.copy_payload(&mut payload);
+            self.seen.push(payload);
+            self.answers.pop_front().unwrap_or(Action::Continue)
         }
     }
 
@@ -1717,5 +1992,291 @@ pub(crate) mod tests {
         assert_eq!(0, fragments, "a refused fragment is not counted");
         assert!(published.is_empty(), "and nothing was published");
         assert_eq!(0, image.position(), "the reader did not move over it");
+    }
+
+    /// An `Abort` gives back **only the fragment it refused**: the ones the
+    /// same poll already took with `Continue` stay taken. The reference steps
+    /// its offset back by the refused frame alone and then publishes how far
+    /// it got (`aeron_image.c`, `aeron_image_controlled_poll`'s
+    /// `AERON_ACTION_ABORT` arm and the `new_position` after the loop).
+    ///
+    /// A reader that fell back to where the poll began would hand the taken
+    /// messages over a second time — a consensus module appending ingress to
+    /// its log would append them twice.
+    #[test]
+    fn an_abort_keeps_what_the_poll_already_took() {
+        let log = TempLog::new("abort-after-continue");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+            write_message(appender, b"third");
+        });
+        let taken = frame_reach(b"first") + frame_reach(b"second");
+
+        let mut handler = Scripted::new(&[Action::Continue, Action::Continue, Action::Abort]);
+        let mut published = Vec::new();
+        let mut image = log.image(1);
+        let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
+
+        let taken = i64::try_from(taken).expect("small");
+        assert_eq!(2, fragments, "the two taken fragments are counted");
+        assert_eq!(
+            vec![taken],
+            published,
+            "the position is published past the two taken fragments"
+        );
+        assert_eq!(
+            taken,
+            image.position(),
+            "the reader stops at the refused fragment, not where the poll began"
+        );
+
+        // The next poll starts at the refused message and nowhere earlier.
+        let mut again = Scripted::new(&[]);
+        image.controlled_poll(10, &mut again, &mut |_| {});
+        let again = again.seen;
+        assert_eq!(
+            vec![b"third".to_vec()],
+            again,
+            "nothing is handed over twice"
+        );
+    }
+
+    /// A handler that closes the image through a second holder, the way the
+    /// reference's test calls `aeron_image_close` from inside the handler — and
+    /// the way a real one can: `ImageView` is a second holder, and the flag is
+    /// an atomic for exactly this reason.
+    struct Closing {
+        view: ImageView,
+        answer: Action,
+        seen: usize,
+    }
+
+    impl Closing {
+        fn new(view: ImageView, answer: Action) -> Self {
+            Self {
+                view,
+                answer,
+                seen: 0,
+            }
+        }
+    }
+
+    impl ControlledFragments for Closing {
+        fn on_fragment(&mut self, _fragment: &Fragment<'_>) -> Action {
+            self.seen += 1;
+            self.view.close();
+            self.answer
+        }
+    }
+
+    /// `shouldStopPollFragmentsToControlledFragmentHandlerIfImageIsClosed`
+    /// (`aeron-client/src/test/c/aeron_image_test.cpp:707-734`): a handler that
+    /// closes the image stops the poll where it stands. The reference asks
+    /// `is_closed` once per step (`aeron_image.c:357-361`) and again before the
+    /// final write to the subscriber position (`:425-429`).
+    #[test]
+    fn a_closed_image_stops_the_controlled_poll_where_it_stands() {
+        let log = TempLog::new("closed-during-controlled-poll");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut image = log.image(1);
+        let start = image.position();
+        let mut handler = Closing::new(image.view(), Action::Continue);
+        let mut published = Vec::new();
+
+        let fragments = image.controlled_poll(10, &mut handler, &mut |p| published.push(p));
+
+        assert!(image.is_closed(), "the handler closed it");
+        assert_eq!(1, fragments, "one fragment was delivered");
+        assert_eq!(1, handler.seen, "and the second was never handed over");
+        assert!(
+            published.is_empty(),
+            "a closed image writes no subscriber position"
+        );
+        assert_eq!(start, image.position(), "and its reader did not move");
+
+        // The next poll is the reference's entry check (`:341-345`).
+        let mut again = Scripted::new(&[]);
+        assert_eq!(
+            0,
+            image.controlled_poll(10, &mut again, &mut |_| {}),
+            "a closed image is not read again"
+        );
+        assert!(again.seen.is_empty());
+    }
+
+    /// `boundedControlledPollCommitShouldNotAdvancePositionWhenClosedDuringHandler`
+    /// (`aeron-client/src/test/c/aeron_image_test.cpp:894-927`): a `Commit` that
+    /// arrives after the image closed is not published — the reference guards
+    /// that write with `is_closed` too (`aeron_image.c:414-418`).
+    #[test]
+    fn a_commit_answered_after_the_image_closed_is_not_published() {
+        let log = TempLog::new("closed-before-commit");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut image = log.image(1);
+        let start = image.position();
+        let mut handler = Closing::new(image.view(), Action::Commit);
+        let mut published = Vec::new();
+
+        let fragments =
+            image.bounded_controlled_poll(i64::MAX, 10, &mut handler, &mut |p| published.push(p));
+
+        assert_eq!(1, fragments);
+        assert_eq!(1, handler.seen);
+        assert!(published.is_empty(), "the commit is skipped");
+        assert_eq!(start, image.position());
+    }
+
+    /// **A closed image answers what it answered at the close** — the five
+    /// facts `Image.close()` captures (`Image.java:798-806`), not whatever the
+    /// log says now.
+    ///
+    /// The metadata is moved *after* the close on purpose: `isEndOfStream`,
+    /// `endOfStreamPosition`, `activeTransportCount` and
+    /// `isPublicationRevoked` all read it while the image is open, and all of
+    /// them must stop reading it once the image is over.
+    #[test]
+    fn a_closed_image_answers_the_snapshot_it_was_closed_with() {
+        let log = TempLog::new("closed-snapshot");
+        log.write(|appender| {
+            write_message(appender, b"first");
+        });
+
+        let image = log.image(1);
+        let final_position = image.position();
+        log.set_metadata(|metadata| {
+            metadata
+                .store_i64_relaxed(descriptor::END_OF_STREAM_POSITION_OFFSET, final_position)
+                .expect("in range");
+            metadata
+                .store_u8_relaxed(descriptor::IS_PUBLICATION_REVOKED_OFFSET, 1)
+                .expect("in range");
+            metadata
+                .store_i32_relaxed(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET, 3)
+                .expect("in range");
+        });
+
+        image.view().close();
+
+        // The log moves on after the close; the image does not.
+        log.set_metadata(|metadata| {
+            metadata
+                .store_i64_relaxed(descriptor::END_OF_STREAM_POSITION_OFFSET, i64::MAX)
+                .expect("in range");
+            metadata
+                .store_u8_relaxed(descriptor::IS_PUBLICATION_REVOKED_OFFSET, 0)
+                .expect("in range");
+            metadata
+                .store_i32_relaxed(descriptor::ACTIVE_TRANSPORT_COUNT_OFFSET, 5)
+                .expect("in range");
+        });
+
+        assert!(image.is_closed());
+        assert_eq!(final_position, image.position(), "finalPosition");
+        assert_eq!(
+            Some(final_position),
+            image.end_of_stream_position(),
+            "eosPosition"
+        );
+        assert_eq!(Some(true), image.is_end_of_stream(), "isEos");
+        assert_eq!(Some(0), image.active_transport_count(), "zero when closed");
+        assert_eq!(Some(true), image.is_publication_revoked(), "isRevoked");
+    }
+
+    /// `shouldStopReadingIfImageIsClosed` (`aeron-client/src/test/c/aeron_image_test.cpp:332-356`):
+    /// the plain poll stops where the handler closed the image, and the reader
+    /// does not move. The reference's loop condition carries `!isClosed`
+    /// (`Image.java:348`, `aeron_image.c:275-279`).
+    #[test]
+    fn a_closed_image_stops_the_fragment_poll_where_it_stands() {
+        let log = TempLog::new("closed-during-poll");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut image = log.image(1);
+        let start = image.position();
+        let view = image.view();
+        let mut seen = 0;
+
+        let fragments = image.poll(10, |_| {
+            seen += 1;
+            view.close();
+        });
+
+        assert!(image.is_closed());
+        assert_eq!(1, fragments, "the second frame is never handed over");
+        assert_eq!(1, seen);
+        assert_eq!(start, image.position(), "and the reader did not move");
+
+        assert_eq!(
+            0,
+            image.poll(10, |_| unreachable!("a closed image is not read")),
+            "the entry check stops the next poll"
+        );
+    }
+
+    /// `Image.blockPoll`'s entry check (`Image.java:667-672`): a closed image
+    /// reads no block at all.
+    #[test]
+    fn a_closed_image_reads_no_block() {
+        let log = TempLog::new("closed-block-poll");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut image = log.image(1);
+        let start = image.position();
+        image.view().close();
+
+        let bytes = image.block_poll(4096, |_| unreachable!("a closed image is not read"));
+
+        assert_eq!(0, bytes);
+        assert_eq!(start, image.position());
+    }
+
+    /// The bound is a **start** position: a fragment that begins at it is left
+    /// for the next poll, and what was read before it is published
+    /// (`aeron_image.c`, `aeron_image_bounded_controlled_poll`'s
+    /// `limit_offset`).
+    #[test]
+    fn a_bound_leaves_the_fragment_that_starts_at_it() {
+        let log = TempLog::new("bounded-controlled");
+        log.write(|appender| {
+            write_message(appender, b"first");
+            write_message(appender, b"second");
+        });
+
+        let mut image = log.image(1);
+        let start = image.position();
+        let second = start + i64::try_from(frame_reach(b"first")).expect("small");
+
+        let mut handler = Scripted::new(&[]);
+        let mut published = Vec::new();
+        let read =
+            image.bounded_controlled_poll(second, 10, &mut handler, &mut |p| published.push(p));
+
+        assert_eq!(1, read, "only the fragment before the bound is read");
+        assert_eq!(vec![b"first".to_vec()], handler.seen);
+        assert_eq!(vec![second], published);
+        assert_eq!(second, image.position());
+
+        let mut again = Scripted::new(&[]);
+        image.bounded_controlled_poll(i64::MAX, 10, &mut again, &mut |_| {});
+        assert_eq!(
+            vec![b"second".to_vec()],
+            again.seen,
+            "the next poll starts at the fragment the bound left"
+        );
     }
 }

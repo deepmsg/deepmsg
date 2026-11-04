@@ -14,30 +14,13 @@ use deepmsg_cnc::counters::{
     CHANNEL_ENDPOINT_STATUS_ACTIVE, CountersReader, LOCAL_SOCKADDR_TYPE_ID, LocalSocketAddress,
 };
 
-use crate::fragment_assembler::{Action, ControlledHandler, FragmentAssembler};
-use crate::image::{ControlledFragments, Fragment, Image, ImageView};
+use crate::fragment_assembler::{AssemblingSink, ControlledHandler, FragmentAssembler};
+use crate::image::{Fragment, Image, ImageView};
 
 /// A subscription and the images attached to it.
 /// One object a controlled scan can call: the assembler, and the handler it
 /// answers to.
 ///
-/// The scan reads **fragments**; this build's controlled trait speaks in
-/// **messages**. The reassembly therefore sits between them, and the scan needs
-/// a single thing to call — which is all this is. It is private on purpose: a
-/// caller supplies a message handler and never meets the seam, and the
-/// alternative (handing the scan an assembler and a handler side by side) would
-/// put that seam in the scan's signature instead.
-struct AssemblingSink<'a, H> {
-    assembler: &'a mut FragmentAssembler,
-    handler: &'a mut H,
-}
-
-impl<H: ControlledHandler> ControlledFragments for AssemblingSink<'_, H> {
-    fn on_fragment(&mut self, fragment: &Fragment<'_>) -> Action {
-        self.assembler.push_controlled(fragment, self.handler)
-    }
-}
-
 pub struct Subscription {
     /// The id the driver keys this subscription by — the correlation id the
     /// `ADD_SUBSCRIPTION` used.
@@ -281,7 +264,7 @@ impl Subscription {
             }
 
             let counter_id = image.subscriber_position_id();
-            let mut sink = AssemblingSink { assembler, handler };
+            let mut sink = AssemblingSink::new(assembler, handler);
             let mut relay = |position: i64| publish(counter_id, position);
 
             fragments += image.controlled_poll(remaining, &mut sink, &mut relay);
@@ -381,17 +364,16 @@ impl Subscription {
     /// `aeron-client/src/main/c/aeron_subscription.c:237-256`).
     ///
     /// The reference asks a slightly narrower question than "has an image": an
-    /// image the client has **closed** but not yet pruned does not count
-    /// (`:304`, `:246`). There is no such image here — an image goes when the
-    /// driver says it is unavailable ([`Self::remove_image`], which is where
-    /// `UN_ON_AVAILABLE_IMAGE` lands), so nothing closed is ever still held and
-    /// the two questions are the same list.
+    /// image that is held but **closed** does not count (`:304`, `:246`), and
+    /// the two are not the same list — another reader's view of an image can
+    /// close it while the subscription still holds it
+    /// ([`crate::image::ImageView`]).
     ///
     /// The archive's replay merge is what asks: until a subscription is
     /// connected there is no image to look for, so the state that waits for the
     /// replay's image does not look (`ReplayMerge.java:429-436`).
     pub fn is_connected(&self) -> bool {
-        !self.images.is_empty()
+        self.images.iter().any(|image| !image.is_closed())
     }
 
     /// The images currently attached, mutably, for a poll.
@@ -525,11 +507,37 @@ impl Subscription {
     }
 
     /// Detach an image, reporting whether there was one.
+    ///
+    /// The image is **closed first**, as the reference does
+    /// (`Subscription.java:607-630`: `removedImage.close()` before the array is
+    /// rebuilt), so a second reader holding a view of it sees `is_closed` and
+    /// the snapshot the close captured.
     pub fn remove_image(&mut self, publication_registration_id: i64) -> bool {
-        let before = self.images.len();
-        self.images
-            .retain(|image| image.registration_id() != publication_registration_id);
-        self.images.len() != before
+        let mut removed = false;
+        self.images.retain(|image| {
+            if image.registration_id() == publication_registration_id {
+                image.close();
+                removed = true;
+                false
+            } else {
+                true
+            }
+        });
+
+        removed
+    }
+
+    /// Close every image still here, for a subscription that is going away —
+    /// `Subscription.internalClose` (`Subscription.java:594-599`) →
+    /// `ClientConductor.closeImages` (`ClientConductor.java:1656-1675`).
+    ///
+    /// What a subscription leaving a live client means for the images it still
+    /// holds: they are over too, and a second reader with a view of one has
+    /// nothing else to hear it from.
+    pub(crate) fn close_images(&mut self) {
+        for image in &self.images {
+            image.close();
+        }
     }
 
     /// Hand an image over to a reader of its own, and remember that it did.

@@ -78,7 +78,7 @@ use deepmsg_cnc::{ClaimError, CncFile, CncOpenError, Received, ToClientsReceiver
 
 use crate::counter::{Counter, CounterEvent, StaticCounter};
 use crate::fragment_assembler::{ControlledHandler, Message};
-use crate::image::{Block, Fragment, Image};
+use crate::image::{Block, ControlledFragments, Fragment, Image};
 use crate::image_event::ImageEvent;
 use crate::publication::{Claim, ExclusivePublication, Publication};
 use crate::publication_error::PublicationErrorEvent;
@@ -2852,6 +2852,10 @@ impl Client {
         // it was looking up is gone.
         let mut subscription = self.subscriptions.swap_remove(index);
         subscription.close_handed_out_images();
+        // `Subscription.internalClose` (`Subscription.java:594-599`) closes the
+        // images the subscription still holds as well, not only the ones it
+        // gave away: a reader that has a view of one has to hear it is over.
+        subscription.close_images();
 
         true
     }
@@ -3319,6 +3323,67 @@ impl Client {
         }
 
         Some(read)
+    }
+
+    /// [`Client::poll_image_bounded`], letting each fragment decide what
+    /// happens to it — the controlled face's bounded form
+    /// (`Image.boundedControlledPoll`, `Image.java:565-665`;
+    /// `aeron_image_bounded_controlled_poll`, `aeron_image.c:528`).
+    ///
+    /// It exists because the reference's log reader is this call
+    /// (`LogAdapter.java:103`): a cluster follower reads its log image up to
+    /// what the leader committed, and stops where the handler says to stop —
+    /// `Break` at the end of a snapshot, `Abort` on a record it could not take.
+    ///
+    /// The position is published **as the read runs** where an answer asks for
+    /// it ([`crate::fragment_assembler::Action::Commit`]) and once at the end
+    /// when the read moved it, which is why the subscription and the counters
+    /// are borrowed apart. That is the whole difference from
+    /// [`Client::poll_image_bounded`], whose one publication happens after the
+    /// handler has returned.
+    ///
+    /// Returns how many fragments were delivered, or `None` if there is no such
+    /// subscription or image.
+    pub fn poll_image_bounded_controlled<H>(
+        &mut self,
+        subscription_id: i64,
+        image_registration_id: i64,
+        bound_position: i64,
+        fragment_limit: usize,
+        handler: &mut H,
+    ) -> Option<usize>
+    where
+        H: ControlledFragments,
+    {
+        let Self {
+            subscriptions, cnc, ..
+        } = self;
+
+        let image = subscriptions
+            .iter_mut()
+            .find(|s| s.registration_id() == subscription_id)?
+            .images_mut()
+            .iter_mut()
+            .find(|i| i.registration_id() == image_registration_id)?;
+
+        let counter_id = image.subscriber_position_id();
+
+        let Some(counters) = cnc.counters_writable() else {
+            // No counters to publish through. The read still happens — a poll
+            // is not a counter write — and the caller sees what it read.
+            let mut discard = |_: i64| {};
+            return Some(image.bounded_controlled_poll(
+                bound_position,
+                fragment_limit,
+                handler,
+                &mut discard,
+            ));
+        };
+
+        let mut publish = |position: i64| {
+            counters.set_value(counter_id, position);
+        };
+        Some(image.bounded_controlled_poll(bound_position, fragment_limit, handler, &mut publish))
     }
 
     /// Read one run of frames from one image, up to `block_length_limit` bytes,

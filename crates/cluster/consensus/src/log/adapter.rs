@@ -17,7 +17,10 @@
 //! the reference throws (`LogAdapter.java:201-205`), and so does this.
 
 use deepmsg_client::client::Client;
-use deepmsg_client::fragment_assembler::{Action, ControlledHandler, FragmentAssembler, Message};
+use deepmsg_client::fragment_assembler::{
+    Action, AssemblingSink, ControlledHandler, FragmentAssembler, Message,
+};
+use deepmsg_client::image::ImageView;
 use deepmsg_cluster_common::decode::at_least;
 use deepmsg_codec_cluster::close_reason::CloseReason;
 use deepmsg_codec_cluster::cluster_action::ClusterAction;
@@ -128,11 +131,19 @@ pub trait LogReplayHandler {
     ) -> Result<(), ClusterError>;
 }
 
-/// `LogAdapter` (`LogAdapter.java:34-297`), without the image it is polled
-/// against (the client owns that).
+/// `LogAdapter` (`LogAdapter.java:34-297`).
+///
+/// It **holds the image**, as the reference does (`LogAdapter.java:107-134`):
+/// the driver withdrawing it does not take it away from this adapter, so
+/// `is_image_closed` / `is_log_end_of_stream` / `is_log_end_of_stream_at` keep
+/// answering the snapshot the close captured. Polling still goes through the
+/// client by registration id, because the reader is the client's.
 pub struct LogAdapter {
     assembler: FragmentAssembler,
     image_registration_id: Option<i64>,
+    /// The reference's `Image image` field — a view, because the client owns
+    /// the reader the image belongs to.
+    image: Option<ImageView>,
     position: i64,
 }
 
@@ -142,62 +153,69 @@ impl LogAdapter {
         Self {
             assembler: FragmentAssembler::new(),
             image_registration_id: None,
+            image: None,
             position: 0,
         }
     }
 
     /// `image(Image)` (`:126-134`): attach the image the election found.
     ///
-    /// The reference reads the position off the image object it keeps; here the
-    /// image stays in the client's subscription and [`Self::poll`] reads it by
-    /// registration id, so the position it starts from is handed over with it.
-    pub fn set_image(&mut self, image_registration_id: i64, position: i64) {
-        self.image_registration_id = Some(image_registration_id);
+    /// `position` seeds the sticky position the adapter falls back to once the
+    /// image is cleared; while one is held, [`Self::position`] answers the
+    /// image's, as the reference's does.
+    pub fn set_image(&mut self, image: ImageView, position: i64) {
+        self.image_registration_id = Some(image.registration_id());
+        self.image = Some(image);
         self.position = position;
     }
 
     /// `image(null)` after the image is gone: the sticky position stays, and no
     /// further poll reads anything (`LogAdapter.java:106-109`).
     pub fn clear_image(&mut self) {
+        if let Some(image) = self.image.take() {
+            self.position = image.position();
+        }
+
         self.image_registration_id = None;
     }
 
-    /// The image this adapter is reading, as the subscription has it
-    /// (`LogAdapter.image()`, `:115-120`).
-    pub fn image<'a>(
-        &self,
-        client: &'a deepmsg_client::client::Client,
-        subscription_id: i64,
-    ) -> Option<&'a deepmsg_client::image::Image> {
-        let image_registration_id = self.image_registration_id?;
-        client
-            .subscription(subscription_id)?
-            .images()
-            .iter()
-            .find(|image| image.registration_id() == image_registration_id)
+    /// The image this adapter is reading (`LogAdapter.image()`, `:115-120`).
+    ///
+    /// The reference's `image` field, which stays askable after the driver
+    /// withdrew it — a closed image answers its snapshot.
+    pub fn image(&self) -> Option<&ImageView> {
+        self.image.as_ref()
     }
 
     /// Whether there is no image, or the one there is has been withdrawn
     /// (`isImageClosed`, `:106-109`).
-    pub fn is_image_closed(
-        &self,
-        client: &deepmsg_client::client::Client,
-        subscription_id: i64,
-    ) -> bool {
-        self.image(client, subscription_id)
-            .is_none_or(deepmsg_client::image::Image::is_closed)
+    pub fn is_image_closed(&self) -> bool {
+        self.image.as_ref().is_none_or(ImageView::is_closed)
     }
 
     /// Whether the publisher signalled end of stream (`isLogEndOfStream`,
     /// `:111-114`). No image answers `false`, as the reference's does.
-    pub fn is_log_end_of_stream(
-        &self,
-        client: &deepmsg_client::client::Client,
-        subscription_id: i64,
-    ) -> bool {
-        self.image(client, subscription_id)
-            .and_then(deepmsg_client::image::Image::is_end_of_stream)
+    ///
+    /// A **closed** image answers what it answered at the close
+    /// (`Image.java:251-254`), which is what makes a leader that stopped
+    /// gracefully distinguishable from one that vanished.
+    pub fn is_log_end_of_stream(&self) -> bool {
+        self.image
+            .as_ref()
+            .and_then(ImageView::is_end_of_stream)
             .unwrap_or(false)
+    }
+
+    /// Whether the end of stream was at this position (`isLogEndOfStreamAt`,
+    /// `:116-120`).
+    ///
+    /// The comparison is against `endOfStreamPosition()`, which a closed image
+    /// answers from its close snapshot (`Image.java:267-270`).
+    pub fn is_log_end_of_stream_at(&self, position: i64) -> bool {
+        self.image
+            .as_ref()
+            .and_then(ImageView::end_of_stream_position)
+            .is_some_and(|end_of_stream| position == end_of_stream)
     }
 
     /// `disconnect(errorHandler, maxLogPosition)` (`:70-84`): pin the last
@@ -206,6 +224,10 @@ impl LogAdapter {
     /// Closing the image's subscription, and waiting for its local sockets to
     /// be free, is the caller's: it owns the client those counters live in.
     pub fn disconnect(&mut self, max_log_position: i64) {
+        if let Some(image) = self.image.take() {
+            self.position = image.position();
+        }
+
         self.image_registration_id = None;
         self.position = self.position.min(max_log_position);
     }
@@ -221,8 +243,13 @@ impl LogAdapter {
     }
 
     /// `position()` (`:86-94`): the image's position, or the sticky one.
-    pub const fn position(&self) -> i64 {
-        self.position
+    ///
+    /// A closed image answers its `finalPosition`, which is what the reference
+    /// reads off the object it still holds.
+    pub fn position(&self) -> i64 {
+        self.image
+            .as_ref()
+            .map_or(self.position, ImageView::position)
     }
 
     /// Poll the image once, up to `bound_position`
@@ -253,29 +280,32 @@ impl LogAdapter {
             handler,
             error: None,
         };
-        let result = client.poll_image_bounded(
-            subscription_id,
-            image_registration_id,
-            bound_position,
-            fragment_limit,
-            |fragment| {
-                let _ = assembler.push_controlled(fragment, &mut dispatch);
-            },
-        );
+        // The answer is honoured, not discarded: `Abort` leaves the refused
+        // entry where it is and `Break` stops the read where the handler said
+        // to — which is what the reference's `boundedControlledPoll` does with
+        // `LogAdapter`'s answer (`LogAdapter.java:103`).
+        let result = {
+            let mut sink = AssemblingSink::new(&mut assembler, &mut dispatch);
+            client.poll_image_bounded_controlled(
+                subscription_id,
+                image_registration_id,
+                bound_position,
+                fragment_limit,
+                &mut sink,
+            )
+        };
         self.assembler = assembler;
         if let Some(error) = dispatch.error {
             return Err(error);
         }
 
-        if let Some(subscription) = client.subscription(subscription_id) {
-            if let Some(image) = subscription
-                .images()
-                .iter()
-                .find(|image| image.registration_id() == image_registration_id)
-            {
-                self.position = image.position();
-            }
+        // `position()` reads the image while one is held; the sticky value is
+        // what the adapter falls back to after `clear_image`/`disconnect`, so
+        // it is kept in step here too (`LogAdapter.java:126-134`).
+        if let Some(image) = &self.image {
+            self.position = image.position();
         }
+
         Ok(result)
     }
 
