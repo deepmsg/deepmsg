@@ -158,6 +158,165 @@ def fmt_ns(value):
     return f"{value:,.0f}" if float(value).is_integer() else f"{value:,.1f}"
 
 
+# --- A3: what the members themselves said -----------------------------------
+#
+# `run-batch.sh` runs `cnc-dump --all` against every member's own aeron
+# directory **before** it stops anything, and lands the text as
+# `run-<N>/member<i>/counters.txt`. Three things in it decide whether a row is
+# a row: the driver's heartbeat (was the member still alive at the end?), the
+# election count (did it re-elect under the load?), and the node role (is there
+# exactly one leader?). None of that is visible from the client's histogram,
+# and a three-member cluster runs on a quorum of two -- so a member that dies
+# mid-cell produces a cell that still sends every message and still reads well.
+
+ROLE_NAMES = {0: "follower", 1: "candidate", 2: "leader"}
+
+
+def read_member_counters(run_dir: Path) -> dict:
+    """{member directory name: {active, elections, role}} for one run."""
+    out = {}
+    for path in sorted(run_dir.glob("member*/counters.txt")):
+        active, elections, role = None, None, None
+        for line in path.read_text(errors="replace").splitlines():
+            # `cnc-dump` indents every field line by two spaces, so the match
+            # is on the stripped line. Missing this made every member read as
+            # "no driver status" -- a silent hole in exactly the field that
+            # says whether the member was alive at the end.
+            line = line.strip()
+            if line.startswith("status"):
+                # `status  ACTIVE (...)` or `status  INACTIVE (...)`; the second
+                # word, because "ACTIVE" is a substring of "INACTIVE".
+                words = line.split()
+                active = len(words) > 1 and words[1] == "ACTIVE"
+                continue
+            # `  id  type  value  registration  label`
+            parts = line.split(None, 4)
+            if len(parts) < 5:
+                continue
+            label = parts[4]
+            try:
+                value = int(parts[2])
+            except ValueError:
+                continue
+            if label.startswith("Cluster election count"):
+                elections = value
+            elif label.startswith("Cluster node role"):
+                role = value
+        out[path.parent.name] = {"active": active, "elections": elections, "role": role}
+    return out
+
+
+def cell_flags(run_dir: Path) -> list:
+    """Every reason this cell is not a clean three-member cell, in words."""
+    members = read_member_counters(run_dir)
+    if not members:
+        return ["no member counters"]
+    flags = []
+    leaders = 0
+    for name, m in sorted(members.items()):
+        role = ROLE_NAMES.get(m["role"], f"role={m['role']}")
+        if m["role"] == 2:
+            leaders += 1
+        if m["elections"] is None:
+            flags.append(f"{name}: no election counter ({role})")
+        elif m["elections"] > 1:
+            flags.append(f"{name}: {m['elections']} elections ({role})")
+        if m["active"] is False:
+            flags.append(f"{name}: driver not active")
+        elif m["active"] is None:
+            flags.append(f"{name}: no driver status")
+    if leaders != 1:
+        flags.append(f"{leaders} leaders")
+    return flags
+
+
+# --- A1: the client's own time series ---------------------------------------
+#
+# With `track.history=true` the harness writes, beside each `.hdr`, a
+# `.hdr.csv` holding one row per logging interval (default 1 s):
+#
+#   timestamp (ms),50.0,99.0,99.9,99.99,99.999,100.0
+#
+# in nanoseconds. That is where "the knee" is a fact rather than something
+# reverse-engineered from the aggregate histogram: the first interval whose
+# p50 leaves the steady state by more than `factor`.
+
+
+def read_history(hdr_csv: Path):
+    """[(offset seconds, p50 ns, p99 ns)] from the client's interval log."""
+    rows = []
+    lines = hdr_csv.read_text(errors="replace").splitlines()
+    if not lines:
+        return rows
+    start = None
+    for line in lines[1:]:
+        fields = line.split(",")
+        if len(fields) < 7:
+            continue
+        try:
+            ts, p50, p99 = int(fields[0]), float(fields[1]), float(fields[2])
+        except ValueError:
+            continue
+        if start is None:
+            start = ts
+        rows.append(((ts - start) / 1000.0, p50, p99))
+    return rows
+
+
+def knee(rows, factor=5.0, baseline_rows=10):
+    """(seconds, p50 before, p50 at the knee) or None."""
+    if len(rows) < baseline_rows + 1:
+        return None
+    base = sorted(r[1] for r in rows[:baseline_rows])[baseline_rows // 2]
+    if base <= 0:
+        return None
+    for seconds, p50, _ in rows[baseline_rows:]:
+        if p50 > factor * base:
+            return seconds, base, p50
+    return None
+
+
+# --- A4: where the interrupts went ------------------------------------------
+#
+# `run-batch.sh` snapshots `/proc/interrupts` before and after the client runs;
+# the difference is the per-queue receive count. RSS hashes the 4-tuple, so a
+# single client flow lands on **one** queue no matter how the IRQs are spread --
+# which is why the question "did spreading the queues help?" is answered by the
+# share of the top queue, not by the number of queues that moved.
+
+IRQ_LINE = re.compile(r"^\s*(\d+):\s*((?:\d+\s+)+)(.*)$")
+
+
+def read_irq_queues(path: Path) -> dict:
+    """{label: count} for the NIC's receive queues in a /proc/interrupts file."""
+    out = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(errors="replace").splitlines():
+        m = IRQ_LINE.match(line)
+        if not m:
+            continue
+        label = m.group(3).strip()
+        if "-input" not in label:
+            continue
+        out[f"{m.group(1)} {label}"] = sum(int(v) for v in m.group(2).split())
+    return out
+
+
+def irq_delta(before: Path, after: Path):
+    """(queues moved, top share, top label, total interrupts) or None."""
+    b, a = read_irq_queues(before), read_irq_queues(after)
+    if not a:
+        return None
+    delta = {k: a[k] - b.get(k, 0) for k in a}
+    moved = {k: v for k, v in delta.items() if v > 0}
+    total = sum(moved.values())
+    if not total:
+        return None
+    top_label, top = max(moved.items(), key=lambda kv: kv[1])
+    return len(moved), top / total, top_label.split()[-1], total
+
+
 def ratio(left, right):
     if left is None or right is None or right == 0:
         return None
@@ -174,6 +333,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("results")
     ap.add_argument("--stat", default="e_lt_p99", choices=sorted(STATS))
+    ap.add_argument(
+        "--history",
+        action="store_true",
+        help="read each cell's .hdr.csv and print where its distribution turns (A1)",
+    )
+    ap.add_argument(
+        "--irq",
+        action="store_true",
+        help="read each cell's /proc/interrupts pair and print where the interrupts went (A4)",
+    )
     args = ap.parse_args()
 
     root = Path(args.results)
@@ -215,7 +384,7 @@ def main() -> int:
             print(f"   sync archive:cluster = {sync}")
             print(f"   {'pair':10s} " + " ".join(f"{a:>10s}" for a in ARMS) + "   note")
             for pair in pairs:
-                row, note = [], ""
+                row, note, flags = [], "", []
                 for arm in ARMS:
                     if (round_name, arm, sync, pair) not in cells:
                         row.append("-")
@@ -226,6 +395,14 @@ def main() -> int:
                         note = " (a cell did not finish)"
                         continue
                     row.append(fmt_ns(sum(runs.values()) / len(runs)))
+                    for run, (run_dir, _hdr, failed) in cells[(round_name, arm, sync, pair)].items():
+                        if failed:
+                            continue
+                        flags.extend(
+                            f"{arm} run-{run}: {flag}" for flag in cell_flags(run_dir)
+                        )
+                if flags:
+                    note = f" ! {len(flags)} member flag(s), see below"
                 print(f"   {pair:10s} " + " ".join(f"{c:>10s}" for c in row) + note)
 
             for name in QUESTIONS:
@@ -243,6 +420,42 @@ def main() -> int:
                         got = f"{q:.4f} {sign(q)}"
                     print(f"      {pair:10s} {got}")
             print()
+
+    print("### the members (A3): election count, role and driver heartbeat per cell\n")
+    print("   silence below means every cell ended with one leader, one election per")
+    print("   member, and every driver still active. Anything else is printed in full:")
+    print("   a quorum of two lets a three-member cell survive a dead member.\n")
+    any_flag = False
+    missing = 0
+    cells_seen = 0
+    for round_name in rounds:
+        for sync in syncs:
+            for pair in pairs:
+                for arm in ARMS:
+                    key = (round_name, arm, sync, pair)
+                    if key not in cells:
+                        continue
+                    for run, (run_dir, _hdr, failed) in sorted(cells[key].items()):
+                        if failed:
+                            continue
+                        cells_seen += 1
+                        flags = cell_flags(run_dir)
+                        if flags == ["no member counters"]:
+                            missing += 1
+                            continue
+                        if flags:
+                            any_flag = True
+                            print(
+                                f"   {round_name} {arm:4s} sync {sync} {pair:10s} run-{run}: "
+                                + "; ".join(flags)
+                            )
+    if cells_seen and missing == cells_seen:
+        print("   (no member counters anywhere: this tree predates A2, or --no-counters)")
+    elif missing:
+        print(f"   ({missing} of {cells_seen} cells have no member counters)")
+    if not any_flag and missing < cells_seen:
+        print("   (none)")
+    print()
 
     print("### ratios, both rounds (a ratio is read only when the sign survives)\n")
     for sync in syncs:
@@ -277,6 +490,73 @@ def main() -> int:
                     drift = abs(vals[0] - vals[1]) / min(vals)
                     print(f"   sync {sync} {arm:4s} {pair:10s} {drift:.2%}")
     print()
+
+    if args.history:
+        print("### time series (A1): where each cell's distribution turns\n")
+        print("   one row per second from the client's own .hdr.csv; the knee is the")
+        print("   first interval whose p50 is 5x the median of the first ten. '-') means")
+        print("   the cell never left its steady state (or the csv is not there.\n")
+        for round_name in rounds:
+            for sync in syncs:
+                for pair in pairs:
+                    for arm in ARMS:
+                        key = (round_name, arm, sync, pair)
+                        if key not in cells:
+                            continue
+                        for run, (run_dir, _hdr, failed) in sorted(cells[key].items()):
+                            if failed:
+                                continue
+                            csvs = sorted(run_dir.glob("*.hdr.csv"))
+                            label = f"   {round_name} {arm:4s} sync {sync} {pair:10s} run-{run}:"
+                            if not csvs:
+                                print(f"{label} no .hdr.csv (track.history off?)")
+                                continue
+                            rows = read_history(csvs[0])
+                            got = knee(rows)
+                            if got is None:
+                                base = rows[-1][1] if rows else 0
+                                print(f"{label} {len(rows):3d} intervals, no knee (last p50 {base / 1000:,.0f} us)")
+                            else:
+                                seconds, base, at = got
+                                print(
+                                    f"{label} {len(rows):3d} intervals, knee at +{seconds:,.0f} s"
+                                    f" (p50 {base / 1000:,.0f} -> {at / 1000:,.0f} us)"
+                                )
+        print()
+    if args.irq:
+        print("### interrupts (A4): which queue took the traffic\n")
+        print("   per member, the change in its NIC receive queues between the two")
+        print("   snapshots. A top share near 100% means one queue took everything (one")
+        print("   flow, or every flow hashed to one queue); 30-50% means the traffic is")
+        print("   already spread. The counts are interrupts, not packets: a NAPI batch")
+        print("   is several packets per interrupt.\n")
+        for round_name in rounds:
+            for sync in syncs:
+                for pair in pairs:
+                    for arm in ARMS:
+                        key = (round_name, arm, sync, pair)
+                        if key not in cells:
+                            continue
+                        for run, (run_dir, _hdr, failed) in sorted(cells[key].items()):
+                            if failed:
+                                continue
+                            for before in sorted(run_dir.glob("member*/irq-before.txt")):
+                                after = before.with_name("irq-after.txt")
+                                member = before.parent.name
+                                got = irq_delta(before, after)
+                                label = (
+                                    f"   {round_name} {arm:4s} sync {sync} {pair:10s}"
+                                    f" run-{run} {member}:"
+                                )
+                                if got is None:
+                                    print(f"{label} no delta (snapshot missing or no rx queues)")
+                                    continue
+                                moved, share, top, total = got
+                                print(
+                                    f"{label} {moved} queue(s) moved, top {share:.0%}"
+                                    f" ({top}), {total:,} interrupts"
+                                )
+        print()
     return 0
 
 
