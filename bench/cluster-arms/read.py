@@ -178,6 +178,11 @@ def read_member_counters(run_dir: Path) -> dict:
     for path in sorted(run_dir.glob("member*/counters.txt")):
         active, elections, role = None, None, None
         for line in path.read_text(errors="replace").splitlines():
+            # `cnc-dump` indents every field line by two spaces, so the match
+            # is on the stripped line. Missing this made every member read as
+            # "no driver status" -- a silent hole in exactly the field that
+            # says whether the member was alive at the end.
+            line = line.strip()
             if line.startswith("status"):
                 # `status  ACTIVE (...)` or `status  INACTIVE (...)`; the second
                 # word, because "ACTIVE" is a substring of "INACTIVE".
@@ -299,7 +304,7 @@ def read_irq_queues(path: Path) -> dict:
 
 
 def irq_delta(before: Path, after: Path):
-    """(queues moved, top share, top label, total packets) or None."""
+    """(queues moved, top share, top label, total interrupts) or None."""
     b, a = read_irq_queues(before), read_irq_queues(after)
     if not a:
         return None
@@ -336,7 +341,7 @@ def main() -> int:
     ap.add_argument(
         "--irq",
         action="store_true",
-        help="read each cell's /proc/interrupts pair and print where the packets went (A4)",
+        help="read each cell's /proc/interrupts pair and print where the interrupts went (A4)",
     )
     args = ap.parse_args()
 
@@ -521,8 +526,10 @@ def main() -> int:
     if args.irq:
         print("### interrupts (A4): which queue took the traffic\n")
         print("   per member, the change in its NIC receive queues between the two")
-        print("   snapshots. RSS hashes the 4-tuple: one client flow is one queue, so")
-        print("   a top share near 100% is expected and spreading the IRQs cannot split it.\n")
+        print("   snapshots. A top share near 100% means one queue took everything (one")
+        print("   flow, or every flow hashed to one queue); 30-50% means the traffic is")
+        print("   already spread. The counts are interrupts, not packets: a NAPI batch")
+        print("   is several packets per interrupt.\n")
         for round_name in rounds:
             for sync in syncs:
                 for pair in pairs:
@@ -547,7 +554,7 @@ def main() -> int:
                                 moved, share, top, total = got
                                 print(
                                     f"{label} {moved} queue(s) moved, top {share:.0%}"
-                                    f" ({top}), {total:,} packets"
+                                    f" ({top}), {total:,} interrupts"
                                 )
         print()
     return 0

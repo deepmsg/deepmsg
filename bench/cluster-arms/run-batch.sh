@@ -690,6 +690,16 @@ _member_props() { # <i> <run-dir> <arm> <sync-archive> <sync-cluster>
         echo "cnc_dump=$member_cnc_path"
         echo "session_timeout=$session_timeout"
     } >"$dir/member.properties"
+    # ★ `$dir/member.properties` is rewritten by each member in turn, so after
+    # the start loop it holds the *last* member's properties -- and member 0's
+    # post-cell actions (counters, interrupt snapshots) were then run with
+    # member 2's paths: its CnC file does not exist on this machine, and the
+    # leader's evidence went missing without a word. Member 0 keeps its own
+    # copy, taken while it is still its own.
+    if [ "$i" -eq 0 ]; then
+        mkdir -p "$dir/member0"
+        cp -f "$dir/member.properties" "$dir/member0/member.properties"
+    fi
 }
 
 _member_start() { # <i> <run-dir> <arm> <sync-archive> <sync-cluster>
@@ -773,8 +783,10 @@ _member_counters() { # <i> <run-dir>
     mdir=$(_member_dir "$i" "$dir")
     mkdir -p "$dir/member$i"
     if [ -z "$host" ]; then
-        bash "$here/member-node.sh" counters "$mdir" >/dev/null 2>&1 || true
-        [ -f "$mdir/counters.txt" ] && mv -f "$mdir/counters.txt" "$dir/member$i/counters.txt"
+        # Member 0's own properties live in `member0/`; the run directory's copy
+        # belongs to whichever member was started last.
+        bash "$here/member-node.sh" counters "$dir/member0" >/dev/null 2>&1 || true
+        [ -f "$dir/counters.txt" ] && mv -f "$dir/counters.txt" "$dir/member$i/counters.txt"
         return 0
     fi
     ssh -n -o BatchMode=yes "$host" "bash $mdir/member-node.sh counters $mdir" >/dev/null 2>&1 || true
@@ -792,8 +804,8 @@ _member_irq() { # <i> <run-dir> <before|after>
     mdir=$(_member_dir "$i" "$dir")
     mkdir -p "$dir/member$i"
     if [ -z "$host" ]; then
-        bash "$here/member-node.sh" "irq-$when" "$mdir" >/dev/null 2>&1 || true
-        [ -f "$mdir/irq-$when.txt" ] && mv -f "$mdir/irq-$when.txt" "$dir/member$i/irq-$when.txt"
+        bash "$here/member-node.sh" "irq-$when" "$dir/member0" >/dev/null 2>&1 || true
+        [ -f "$dir/irq-$when.txt" ] && mv -f "$dir/irq-$when.txt" "$dir/member$i/irq-$when.txt"
         return 0
     fi
     ssh -n -o BatchMode=yes "$host" "bash $mdir/member-node.sh irq-$when $mdir" >/dev/null 2>&1 || true
