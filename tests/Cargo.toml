@@ -36,6 +36,10 @@ name = "basic_roundtrip"
 path = "integration/basic_roundtrip.rs"
 
 [[test]]
+name = "logging_lifecycle"
+path = "integration/logging_lifecycle.rs"
+
+[[test]]
 name = "cluster_cm_launch"
 path = "integration/cluster_cm_launch.rs"
 
