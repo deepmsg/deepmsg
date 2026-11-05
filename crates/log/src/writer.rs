@@ -23,16 +23,28 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::Roll;
-use crate::record::Record;
+use crate::event::{Component, Event};
+use crate::level::Level;
+use crate::record::{Encoder, Record};
 
 /// How long the writer waits before flushing an empty queue.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How often the writer reports the records the queue refused.
+pub(crate) const REPORT_INTERVAL: Duration = Duration::from_secs(10);
+
 /// How many queued records one wake-up writes before it looks at control again.
 const READ_BATCH: usize = 1024;
+
+/// What the writer needs to encode its own `log.dropped` event.
+pub(crate) struct ReportConfig {
+    pub(crate) component: Component,
+    pub(crate) node_id: String,
+    pub(crate) clock: fn() -> i64,
+}
 
 /// What the handle can ask the writer to do besides write records.
 pub(crate) enum Control {
@@ -167,11 +179,24 @@ pub(crate) fn spawn(
     file: RollingFile,
     records: Receiver<Record>,
     io_errors: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
+    report: ReportConfig,
+    report_interval: Duration,
 ) -> io::Result<Writer> {
     let (control, control_receiver) = mpsc::channel();
     let join = thread::Builder::new()
         .name("deepmsg-log-writer".to_owned())
-        .spawn(move || run(file, &records, &control_receiver, &io_errors))?;
+        .spawn(move || {
+            run(
+                file,
+                &records,
+                &control_receiver,
+                &io_errors,
+                &dropped,
+                &report,
+                report_interval,
+            );
+        })?;
 
     Ok(Writer { control, join })
 }
@@ -181,8 +206,18 @@ fn run(
     records: &Receiver<Record>,
     control: &Receiver<Control>,
     io_errors: &AtomicU64,
+    dropped: &AtomicU64,
+    report: &ReportConfig,
+    report_interval: Duration,
 ) {
     let mut buffer = Vec::with_capacity(64 * 1024);
+    // The queue is created empty and its counter starts at zero, so anything
+    // already in it when this thread starts is a drop to report.
+    let mut last_reported = 0;
+    let mut last_report_at = Instant::now();
+    // The writer has to wake often enough to notice a report is due, not only
+    // often enough to flush.
+    let wait = FLUSH_INTERVAL.min(report_interval);
 
     loop {
         let mut stop = false;
@@ -203,13 +238,14 @@ fn run(
         if stop {
             drain(records, &mut buffer);
             write(&mut file, &mut buffer, io_errors);
+            report_dropped(&mut file, dropped, &mut last_reported, report, io_errors);
             if file.flush().is_err() {
                 io_errors.fetch_add(1, Ordering::Relaxed);
             }
             return;
         }
 
-        match records.recv_timeout(FLUSH_INTERVAL) {
+        match records.recv_timeout(wait) {
             Ok(record) => {
                 append(&mut buffer, &record);
                 for _ in 1..READ_BATCH {
@@ -219,16 +255,35 @@ fn run(
                     }
                 }
                 write(&mut file, &mut buffer, io_errors);
+                report_if_due(
+                    &mut file,
+                    dropped,
+                    &mut last_reported,
+                    &mut last_report_at,
+                    report,
+                    io_errors,
+                    report_interval,
+                );
             }
             Err(RecvTimeoutError::Timeout) => {
                 write(&mut file, &mut buffer, io_errors);
                 if file.flush().is_err() {
                     io_errors.fetch_add(1, Ordering::Relaxed);
                 }
+                report_if_due(
+                    &mut file,
+                    dropped,
+                    &mut last_reported,
+                    &mut last_report_at,
+                    report,
+                    io_errors,
+                    report_interval,
+                );
             }
             Err(RecvTimeoutError::Disconnected) => {
                 drain(records, &mut buffer);
                 write(&mut file, &mut buffer, io_errors);
+                report_dropped(&mut file, dropped, &mut last_reported, report, io_errors);
                 if file.flush().is_err() {
                     io_errors.fetch_add(1, Ordering::Relaxed);
                 }
@@ -236,6 +291,62 @@ fn run(
             }
         }
     }
+}
+
+fn report_if_due(
+    file: &mut RollingFile,
+    dropped: &AtomicU64,
+    last_reported: &mut u64,
+    last_report_at: &mut Instant,
+    report: &ReportConfig,
+    io_errors: &AtomicU64,
+    interval: Duration,
+) {
+    if last_report_at.elapsed() >= interval {
+        report_dropped(file, dropped, last_reported, report, io_errors);
+        *last_report_at = Instant::now();
+    }
+}
+
+/// Write `log.dropped` for the records refused since the last report.
+fn report_dropped(
+    file: &mut RollingFile,
+    dropped: &AtomicU64,
+    last_reported: &mut u64,
+    report: &ReportConfig,
+    io_errors: &AtomicU64,
+) {
+    let current = dropped.load(Ordering::Relaxed);
+    if current <= *last_reported {
+        return;
+    }
+
+    let delta = current - *last_reported;
+    let record = Encoder::begin(
+        (report.clock)(),
+        Level::Warn,
+        report.component,
+        &report.node_id,
+        Event::LogDropped,
+    )
+    .field_u64("dropped", delta)
+    .finish();
+
+    if write_record(file, &record, io_errors) {
+        *last_reported = current;
+    }
+}
+
+fn write_record(file: &mut RollingFile, record: &Record, io_errors: &AtomicU64) -> bool {
+    let mut bytes = Vec::with_capacity(record.as_bytes().len() + 1);
+    bytes.extend_from_slice(record.as_bytes());
+    bytes.push(b'\n');
+
+    if file.write_all(&bytes).is_err() {
+        io_errors.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    true
 }
 
 fn append(buffer: &mut Vec<u8>, record: &Record) {
@@ -263,16 +374,41 @@ fn drain(records: &Receiver<Record>, buffer: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, AtomicU64};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::time::Duration;
 
-    use super::{Control, open, spawn};
+    use super::{Control, ReportConfig, open, spawn};
     use crate::config::Roll;
     use crate::event::{Component, Event};
     use crate::level::Level;
     use crate::queue::Queue;
     use crate::record::Encoder;
+
+    fn frozen() -> i64 {
+        0
+    }
+
+    fn report() -> ReportConfig {
+        ReportConfig {
+            component: Component::Driver,
+            node_id: "n".to_owned(),
+            clock: frozen,
+        }
+    }
+
+    fn wait_for(path: &Path, needle: &str) -> String {
+        for _ in 0..400 {
+            if let Ok(text) = fs::read_to_string(path) {
+                if text.contains(needle) {
+                    return text;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("{needle} never appeared in {}", path.display());
+    }
 
     struct TempDir(PathBuf);
 
@@ -308,7 +444,16 @@ mod tests {
         let file = open(&path, Roll::default()).unwrap();
         let (queue, receiver) = Queue::new(8);
         let io_errors = Arc::new(AtomicU64::new(0));
-        let writer = spawn(file, receiver, Arc::clone(&io_errors)).unwrap();
+        let dropped = Arc::new(AtomicU64::new(0));
+        let writer = spawn(
+            file,
+            receiver,
+            Arc::clone(&io_errors),
+            dropped,
+            report(),
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
 
         queue.push(record("one"));
         queue.push(record("two"));
@@ -336,7 +481,16 @@ mod tests {
             let file = open(&path, Roll::default()).unwrap();
             let (queue, receiver) = Queue::new(8);
             let io_errors = Arc::new(AtomicU64::new(0));
-            let writer = spawn(file, receiver, io_errors).unwrap();
+            let dropped = Arc::new(AtomicU64::new(0));
+            let writer = spawn(
+                file,
+                receiver,
+                io_errors,
+                dropped,
+                report(),
+                std::time::Duration::from_secs(3600),
+            )
+            .unwrap();
             queue.push(record(message));
             writer.control.send(Control::Stop).unwrap();
             writer.join.join().unwrap();
@@ -472,5 +626,67 @@ mod tests {
                 .map(index_of)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn dropped_records_are_reported_once() {
+        let directory = TempDir::new();
+        let path = directory.0.join("driver-n.json");
+        let file = open(&path, Roll::default()).unwrap();
+        let (_queue, receiver) = Queue::new(8);
+        let io_errors = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let writer = spawn(
+            file,
+            receiver,
+            Arc::clone(&io_errors),
+            Arc::clone(&dropped),
+            report(),
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        dropped.fetch_add(5, Ordering::Relaxed);
+        let text = wait_for(&path, "\"event\":\"log.dropped\"");
+        assert_eq!(1, text.matches("\"event\":\"log.dropped\"").count());
+        assert!(text.contains("\"dropped\":5"));
+        assert!(text.contains("\"level\":\"warn\""));
+        assert!(text.contains("\"component\":\"driver\""));
+        assert!(text.contains("\"node_id\":\"n\""));
+
+        // The next interval has nothing new to say.
+        std::thread::sleep(Duration::from_millis(30));
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(1, text.matches("\"event\":\"log.dropped\"").count());
+
+        writer.control.send(Control::Stop).unwrap();
+        writer.join.join().unwrap();
+    }
+
+    #[test]
+    fn stopping_reports_the_last_delta() {
+        let directory = TempDir::new();
+        let path = directory.0.join("driver-n.json");
+        let file = open(&path, Roll::default()).unwrap();
+        let (_queue, receiver) = Queue::new(8);
+        let io_errors = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let writer = spawn(
+            file,
+            receiver,
+            io_errors,
+            Arc::clone(&dropped),
+            report(),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+
+        dropped.fetch_add(3, Ordering::Relaxed);
+        writer.control.send(Control::Stop).unwrap();
+        writer.join.join().unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"event\":\"log.dropped\""));
+        assert!(text.contains("\"dropped\":3"));
     }
 }

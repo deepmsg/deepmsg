@@ -173,12 +173,23 @@ pub fn open(config: Config) -> Result<Handle, InitError> {
 
     let (queue, receiver) = Queue::new(config.queue_capacity);
     let io_errors = Arc::new(AtomicU64::new(0));
-    let writer =
-        writer::spawn(file, receiver, Arc::clone(&io_errors)).map_err(|error| InitError::Io {
-            operation: "start the log writer thread",
-            path: path.clone(),
-            message: error.to_string(),
-        })?;
+    let writer = writer::spawn(
+        file,
+        receiver,
+        Arc::clone(&io_errors),
+        queue.dropped_handle(),
+        writer::ReportConfig {
+            component: config.component,
+            node_id: config.node_id.clone(),
+            clock: config.clock,
+        },
+        writer::REPORT_INTERVAL,
+    )
+    .map_err(|error| InitError::Io {
+        operation: "start the log writer thread",
+        path: path.clone(),
+        message: error.to_string(),
+    })?;
 
     let logger = Logger {
         queue,
