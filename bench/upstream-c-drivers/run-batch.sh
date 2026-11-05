@@ -6,6 +6,8 @@
 #   run-batch.sh [--arms java,c-control,c-patched] [--pairs 501K:32,...]
 #                [--runs 3] [--iterations 60] [--warmup-iterations 30] [--mtu 1408]
 #                [--out DIR] [--context LABEL] [--list] [--quick] [--no-read]
+#                [--two-host [--peer user@host]] [--peer-repo DIR]
+#                [--peer-benchmarks DIR]
 #
 # The measurement is the harness's own: `scripts/aeron/remote-echo-single-host-
 # benchmarks`, its default grid (501K<->32, 301K<->288, 101K<->1344), its own
@@ -73,6 +75,7 @@ list_only=0
 out=""
 mode=single
 peer=""
+peer_repo=${BENCH_PEER_REPO:-$DEEPMSG_DIR}
 peer_benchmarks_dir=${BENCH_PEER_BENCHMARKS_DIR:-$BENCHMARKS_DIR}
 peer_java_home=${BENCH_PEER_JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}
 peer_rig_cpu=${BENCH_PEER_RIG_CPU:-8}
@@ -98,6 +101,7 @@ while [ $# -gt 0 ]; do
         --single-host) mode=single; shift ;;
         --peer) peer=$2; mode=two; shift 2 ;;
         --peer-benchmarks) peer_benchmarks_dir=$2; shift 2 ;;
+        --peer-repo) peer_repo=$2; shift 2 ;;
         --peer-java-home) peer_java_home=$2; shift 2 ;;
         --peer-rig-cpu) peer_rig_cpu=$2; shift 2 ;;
         --peer-driver-conductor-cpu) peer_driver_conductor_cpu=$2; shift 2 ;;
