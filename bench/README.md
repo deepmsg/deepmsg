@@ -28,6 +28,42 @@ thing to hold on to when reading either: a number from `rust-vs-java` is a
 statement about two systems, and cannot be used as if it were a statement about
 this build's driver, client or node.
 
+## Getting the two checkouts
+
+Only this build is in this repository. The two stacks it is compared against are
+checkouts of this project's forks, and **nothing here clones or fetches them** —
+a batch reads the checkouts it is given and stops with `need_dir` when one is
+missing.
+
+```
+# the harness the cells are measured with (aeron-io/benchmarks at 1b11bfc)
+git clone https://github.com/deepmsg/benchmarks ../benchmarks-deepmsg
+git -C ../benchmarks-deepmsg checkout 1b11bfc
+git -C ../benchmarks-deepmsg ./gradlew :benchmarks-all:shadowJar
+
+# the upstream work the C driver arms are built from
+git clone https://github.com/deepmsg/aeron ../aeron-deepmsg
+git -C ../aeron-deepmsg checkout driver/c-driver-recvfrom-single   # c-patched
+# c-control is built from the default branch
+```
+
+The harness needs the patches in this tree before it can drive this build; each
+batch names its own installer, and `--check` says what is and is not in place:
+
+```
+bench/cluster-arms/patches/install.sh --apply        # the launcher and the deepmsg driver row
+bench/archive-vs-java/patches/install.sh --apply     # an ArchiveNode that can use an archive it did not launch
+bench/upstream-c-drivers/patches/install.sh --apply  # the C arm names and the local launch shim
+```
+
+The archive installer rebuilds the harness's shadow jar, because its change is
+Java; the other two are shell and a launcher. The two paths are defaults —
+`BENCHMARKS_DIR` and `AERON_FORK_DIR` name checkouts anywhere else — and the
+revision each arm was built from is written into the batch's `RUN-INFO.txt`.
+
+The harness fork's `master` is `1b11bfc` today, but the checkout above pins the
+commit: the difference is the patches, not a branch.
+
 ## Running one
 
 ```
