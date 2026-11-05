@@ -52,6 +52,7 @@ use std::process::ExitCode;
 use deepmsg_archive::launch::{self, DriverHalf};
 use deepmsg_archive::server::config::{ArchiveConfig, ThreadingMode};
 use deepmsg_driver::sys;
+use deepmsg_log::{Component, Guard};
 
 const NAME: &str = "deepmsg-archive";
 
@@ -84,6 +85,14 @@ fn main() -> ExitCode {
         eprintln!("{NAME}: could not install the signal handler: {error}");
         return ExitCode::FAILURE;
     }
+
+    // Off unless DEEPMSG_LOG_DIR is set; the guard drains the writer on every
+    // return path below.
+    let _logging = match Guard::from_env(Component::Archive, Some(sys::set_current_thread_affinity))
+    {
+        Ok(guard) => guard,
+        Err(error) => return fail(&format_args!("{error}")),
+    };
 
     match launch::run(NAME, &mut DriverHalf::Attached, &archive_config) {
         Ok(()) => ExitCode::SUCCESS,

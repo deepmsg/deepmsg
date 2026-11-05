@@ -16,6 +16,8 @@ dpdk = ["dep:deepmsg-dpdk", "deepmsg-dpdk/dpdk"]
 
 [dependencies]
 deepmsg-core = { path = "../core" }
+# The driver process's file log; off unless DEEPMSG_LOG_DIR is set.
+deepmsg-log = { path = "../log" }
 deepmsg-cnc = { path = "../cnc" }
 # The kernel-bypass media crate (ADR-0002's sixth zone). Optional: nothing here
 # links DPDK unless the `dpdk` feature is on.
