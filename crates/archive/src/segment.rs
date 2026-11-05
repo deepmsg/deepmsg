@@ -75,6 +75,7 @@ use deepmsg_core::logbuffer::frame::{
 };
 use deepmsg_core::logbuffer::position::{align_up, bits_to_shift};
 use deepmsg_core::pal::MappedFile;
+use deepmsg_log::{Component as LogComponent, Event as LogEvent, Level as LogLevel};
 
 use crate::checksum::Checksum;
 
@@ -669,6 +670,9 @@ impl SegmentWriter {
 
         if self.offset >= self.segment_length {
             self.roll_over()?;
+            deepmsg_log::event(LogLevel::Info, LogComponent::Archive, LogEvent::SegmentRoll)
+                .field_i64("position", self.segment_base_position)
+                .emit();
         }
 
         Ok(written)

@@ -120,6 +120,7 @@ use deepmsg_core::logbuffer::position::bits_to_shift;
 use deepmsg_core::pal::usable_space;
 use deepmsg_core::uri::{ChannelUri, ChannelUriStringBuilder, UriError, parse_size};
 use deepmsg_core::version::{format_version, semantic_version_major};
+use deepmsg_log::{Component as LogComponent, Event as LogEvent, Level as LogLevel};
 
 use crate::catalog::{Catalog, CatalogError, Recording, channel_contains};
 use crate::client::context::ArchiveContext;
@@ -3050,6 +3051,16 @@ impl Sessions {
             },
         );
 
+        deepmsg_log::event(
+            LogLevel::Info,
+            LogComponent::Archive,
+            LogEvent::RecordingStart,
+        )
+        .field_i64("recording_id", recording_id)
+        .field_i64("session_id", i64::from(image_session_id))
+        .field_i64("stream_id", i64::from(stream_id))
+        .emit();
+
         session
     }
 
@@ -3071,6 +3082,14 @@ impl Sessions {
         let recording_id = session.recording_id();
         let subscription_id = session.subscription_id();
         let position = session.recorded_position(counters).unwrap_or(NULL_POSITION);
+
+        deepmsg_log::event(
+            LogLevel::Info,
+            LogComponent::Archive,
+            LogEvent::RecordingStop,
+        )
+        .field_i64("recording_id", recording_id)
+        .emit();
 
         // `if (!isAbort)`: the reference writes nothing when the archive itself
         // is going down. This build has no such path yet — a session is only
