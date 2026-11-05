@@ -25,7 +25,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::config::Roll;
+use crate::config::{Pinner, Roll};
 use crate::event::{Component, Event};
 use crate::level::Level;
 use crate::record::{Encoder, Record};
@@ -175,6 +175,11 @@ fn rename_if_exists(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// Start the writer thread over an already-open file.
+///
+/// `pinning` is the binary's own platform seam: this crate has no `unsafe`, so
+/// the process that owns one passes a function that sets the calling thread's
+/// affinity. A failure is counted in `io_errors` and the writer keeps running
+/// unpinned — a log thread is not worth killing a driver over.
 pub(crate) fn spawn(
     file: RollingFile,
     records: Receiver<Record>,
@@ -182,11 +187,17 @@ pub(crate) fn spawn(
     dropped: Arc<AtomicU64>,
     report: ReportConfig,
     report_interval: Duration,
+    pinning: Option<(i32, Pinner)>,
 ) -> io::Result<Writer> {
     let (control, control_receiver) = mpsc::channel();
     let join = thread::Builder::new()
         .name("deepmsg-log-writer".to_owned())
         .spawn(move || {
+            if let Some((cpu, pinner)) = pinning {
+                if pinner(cpu).is_err() {
+                    io_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             run(
                 file,
                 &records,
@@ -452,6 +463,7 @@ mod tests {
             dropped,
             report(),
             std::time::Duration::from_secs(3600),
+            None,
         )
         .unwrap();
 
@@ -489,6 +501,7 @@ mod tests {
                 dropped,
                 report(),
                 std::time::Duration::from_secs(3600),
+                None,
             )
             .unwrap();
             queue.push(record(message));
@@ -643,6 +656,7 @@ mod tests {
             Arc::clone(&dropped),
             report(),
             Duration::from_millis(10),
+            None,
         )
         .unwrap();
 
@@ -678,6 +692,7 @@ mod tests {
             Arc::clone(&dropped),
             report(),
             Duration::from_secs(3600),
+            None,
         )
         .unwrap();
 

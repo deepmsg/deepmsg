@@ -43,7 +43,9 @@ pub mod record;
 mod time;
 mod writer;
 
-pub use config::{Config, DEFAULT_LEVEL, DEFAULT_QUEUE_CAPACITY, DEFAULT_ROLL, InitError, Roll};
+pub use config::{
+    Config, DEFAULT_LEVEL, DEFAULT_QUEUE_CAPACITY, DEFAULT_ROLL, InitError, Pinner, Roll,
+};
 pub use event::{Component, Event};
 pub use level::{COMPILED_MAX, Level};
 pub use logger::{EventBuilder, Handle, Logger, event, init_from_env, open};
