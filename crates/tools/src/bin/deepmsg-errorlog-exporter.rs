@@ -20,17 +20,22 @@
 //! identified by `(text, first_observation_timestamp_ms)` and reported by the
 //! growth of `observation_count`; each rescued file is consumed once, by path.
 //!
-//! This slice is the skeleton: options, the log, and the poll loop's shape. The
-//! sources arrive in the next commits.
+//! The CnC source is here; the two rescued-file sources arrive in the next
+//! commits.
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use deepmsg_log::{Component, Config, DEFAULT_QUEUE_CAPACITY, Guard, Handle, Level, Roll, open};
+use deepmsg_cnc::CncFile;
+use deepmsg_cnc::error_log::ErrorLogEntry;
+use deepmsg_log::{
+    Component, Config, DEFAULT_QUEUE_CAPACITY, Event, Guard, Handle, Level, Roll, open,
+};
 
 const USAGE: &str = "\
 Usage: deepmsg-errorlog-exporter [options]
@@ -216,6 +221,13 @@ fn open_log(options: &Options) -> Result<Handle, deepmsg_log::InitError> {
     })
 }
 
+/// How many identities the count table remembers before it forgets the oldest.
+///
+/// One entry is one description; a busy driver does not produce tens of
+/// thousands of distinct ones, so reaching this bound means something is
+/// generating unbounded text and the oldest are the safest to forget.
+const MAX_IDENTITIES: usize = 65_536;
+
 /// What the exporter has seen of each source, so a status line is printed when
 /// it changes and not once per interval.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -248,6 +260,122 @@ impl State {
     }
 }
 
+/// The sweep's memory: what every error log said last time, and what it has
+/// seen of each source.
+#[derive(Debug, Default)]
+struct Sweep {
+    /// Identity -> the largest `observation_count` already reported.
+    ///
+    /// The identity is `(text, first_observation_timestamp_ms)` rather than the
+    /// text alone: the region stores no error code, so the same text can be two
+    /// entries written for two codes, and the first-seen time is the only field
+    /// that tells them apart. Two such entries written in the same millisecond
+    /// are indistinguishable from the reader and are reported once; the lost
+    /// sighting arrives on the next one.
+    emitted: HashMap<(String, i64), u64>,
+    state: State,
+}
+
+impl Sweep {
+    /// One sweep over every source.
+    fn poll(&mut self, options: &Options, logger: &Handle) {
+        self.poll_cnc(options, logger);
+    }
+
+    fn poll_cnc(&mut self, options: &Options, logger: &Handle) {
+        let cnc = match CncFile::try_open(&options.dir) {
+            Ok(cnc) => cnc,
+            Err(_) => {
+                self.note(SourceState::Unreadable);
+                return;
+            }
+        };
+        self.note(SourceState::Readable);
+
+        let Some(reader) = cnc.error_log() else {
+            return;
+        };
+        let mut entries = Vec::new();
+        let scan = reader.read(i64::MIN, &mut entries);
+
+        // A region the reader could not walk is a fact about the source, not
+        // "no errors": say it, or the exporter looks quiet while it is blind.
+        if scan.malformed != 0 || scan.truncated {
+            eprintln!(
+                "deepmsg-errorlog-exporter: the driver's error log is {}; {} entries read",
+                if scan.truncated {
+                    "truncated"
+                } else {
+                    "malformed"
+                },
+                scan.entries,
+            );
+        }
+
+        for entry in &entries {
+            self.report(
+                logger,
+                Component::Driver,
+                Event::DriverError,
+                "cnc",
+                entry,
+                None,
+            );
+        }
+    }
+
+    fn note(&mut self, now: SourceState) {
+        if let Some(line) = self.state.cnc(now) {
+            eprintln!("deepmsg-errorlog-exporter: {line}");
+        }
+    }
+
+    /// Report one entry when its count grew, which is the only signal the
+    /// region gives that it was seen again.
+    fn report(
+        &mut self,
+        logger: &Handle,
+        component: Component,
+        event: Event,
+        source: &'static str,
+        entry: &ErrorLogEntry,
+        rescued_from: Option<&Path>,
+    ) {
+        // A count of zero is an entry published but not yet counted; it is
+        // reported on the sweep after the writer's increment.
+        let count = u64::try_from(entry.observation_count).unwrap_or(0);
+        let identity = (entry.text.clone(), entry.first_observation_timestamp_ms);
+        let seen = self.emitted.get(&identity).copied().unwrap_or(0);
+        if count <= seen {
+            return;
+        }
+
+        let mut log_event = logger
+            .event(Level::Error, component, event)
+            .message(&entry.text)
+            .field_str("source", source)
+            .field_u64("observations", count - seen)
+            .field_u64("observation_count", count)
+            .field_i64("first_observation_ms", entry.first_observation_timestamp_ms)
+            .field_i64("last_observation_ms", entry.last_observation_timestamp_ms);
+        if let Some(path) = rescued_from {
+            log_event = log_event.field_str("rescue_path", &path.to_string_lossy());
+        }
+        log_event.emit();
+
+        self.remember(identity, count);
+    }
+
+    fn remember(&mut self, identity: (String, i64), count: u64) {
+        if self.emitted.len() >= MAX_IDENTITIES && !self.emitted.contains_key(&identity) {
+            if let Some(oldest) = self.emitted.keys().min_by_key(|(_, first)| *first).cloned() {
+                self.emitted.remove(&oldest);
+            }
+        }
+        self.emitted.insert(identity, count);
+    }
+}
+
 fn main() -> ExitCode {
     let options = match Options::from_args(std::env::args().skip(1)) {
         Ok(options) => options,
@@ -264,43 +392,31 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let _guard = Guard::new(handle);
+    let guard = Guard::new(handle);
+    let logger = guard.handle().expect("a guard wraps a handle");
 
     eprintln!("{}", options.startup_line());
-    let mut state = State::default();
-    if let Err(error) = run(&options, &mut state) {
+    let mut sweep = Sweep::default();
+    if let Err(error) = run(&options, logger, &mut sweep) {
         eprintln!("deepmsg-errorlog-exporter: {error}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
 
-fn run(options: &Options, state: &mut State) -> io::Result<()> {
+fn run(options: &Options, logger: &Handle, sweep: &mut Sweep) -> io::Result<()> {
     loop {
-        poll_once(options, state);
+        sweep.poll(options, logger);
         std::thread::sleep(options.interval);
-    }
-}
-
-/// One sweep over every source.
-///
-/// This commit only establishes the shape of the sweep and the CnC's status
-/// line; the reads and the events arrive next.
-fn poll_once(options: &Options, state: &mut State) {
-    let readable = deepmsg_cnc::CncFile::try_open(&options.dir).is_ok();
-    let now = if readable {
-        SourceState::Readable
-    } else {
-        SourceState::Unreadable
-    };
-    if let Some(line) = state.cnc(now) {
-        eprintln!("deepmsg-errorlog-exporter: {line}");
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    use deepmsg_cnc::create::{COUNTERS_VALUES_BUFFER_LENGTH_MIN, CncIdentity, CncLayout};
+    use deepmsg_cnc::error_log::DistinctErrorLog;
 
     use super::*;
 
@@ -484,5 +600,208 @@ mod tests {
             Some("driver error log: not readable yet; still watching"),
             state.cnc(SourceState::Unreadable)
         );
+    }
+
+    const NOW_MS: i64 = 1_700_000_000_000;
+
+    /// A published CnC with a writable error log, the exporter reading it, and
+    /// the first-seen state the exporter has.
+    struct Fixture {
+        options: Options,
+        logger: Handle,
+        cnc: CncFile,
+        log: DistinctErrorLog,
+        sweep: Sweep,
+        // Dropped last: the directory outlives the writer and the mapping.
+        _root: TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let root = TempDir::new();
+            let options = Options {
+                dir: root.path().join("aeron"),
+                log_dir: root.path().join("logs"),
+                node_id: "node-1".to_owned(),
+                interval: DEFAULT_INTERVAL,
+                cluster_dir: None,
+            };
+            std::fs::create_dir_all(&options.dir).expect("aeron directory");
+
+            let layout = CncLayout {
+                counters_values_length: COUNTERS_VALUES_BUFFER_LENGTH_MIN,
+                ..CncLayout::default()
+            };
+            let mut cnc = CncFile::create(
+                &options.dir,
+                &layout,
+                &CncIdentity {
+                    liveness_timeout_ns: 10_000_000_000,
+                    start_timestamp_ms: NOW_MS,
+                    pid: 4242,
+                },
+            )
+            .expect("create the CnC file");
+            cnc.write_consumer_heartbeat(NOW_MS).expect("heartbeat");
+            cnc.publish().expect("publish");
+
+            let logger = open_log(&options).expect("open the log");
+            Self {
+                options,
+                logger,
+                cnc,
+                log: DistinctErrorLog::new(),
+                sweep: Sweep::default(),
+                _root: root,
+            }
+        }
+
+        fn record(&mut self, code: i32, text: &str) {
+            self.record_at(code, text, NOW_MS);
+        }
+
+        fn record_at(&mut self, code: i32, text: &str, now_ms: i64) {
+            let region = self.cnc.error_log_writable().expect("writable error log");
+            self.log
+                .record(&region, now_ms, code, text)
+                .expect("record");
+        }
+
+        fn poll(&mut self) {
+            self.sweep.poll(&self.options, &self.logger);
+            self.logger.flush();
+        }
+
+        fn lines(&self) -> Vec<String> {
+            std::fs::read_to_string(self.options.log_dir.join("tool-node-1.json"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn the_first_sweep_reports_every_distinct_error_once() {
+        let mut fixture = Fixture::new();
+        fixture.record(11, "first failure");
+        fixture.record(11, "second failure");
+        fixture.poll();
+
+        let lines = fixture.lines();
+        assert_eq!(2, lines.len(), "{lines:?}");
+        for line in &lines {
+            assert!(line.contains("\"level\":\"error\""), "{line}");
+            assert!(line.contains("\"component\":\"driver\""), "{line}");
+            assert!(line.contains("\"event\":\"driver.error\""), "{line}");
+            assert!(line.contains("\"source\":\"cnc\""), "{line}");
+            assert!(line.contains("\"observations\":1"), "{line}");
+            assert!(line.contains("\"observation_count\":1"), "{line}");
+            assert!(!line.contains("error_code"), "{line}");
+        }
+        assert!(lines.iter().any(|line| line.contains("first failure")));
+        assert!(lines.iter().any(|line| line.contains("second failure")));
+    }
+
+    #[test]
+    fn a_sweep_with_no_growth_says_nothing() {
+        let mut fixture = Fixture::new();
+        fixture.record(11, "a failure");
+        fixture.poll();
+        assert_eq!(1, fixture.lines().len());
+
+        fixture.poll();
+        fixture.poll();
+        assert_eq!(1, fixture.lines().len(), "a quiet sweep emitted again");
+    }
+
+    #[test]
+    fn a_repeated_sighting_reports_only_the_growth() {
+        let mut fixture = Fixture::new();
+        fixture.record(11, "a failure");
+        fixture.poll();
+        assert_eq!(1, fixture.lines().len());
+
+        fixture.record(11, "a failure");
+        fixture.record(11, "a failure");
+        fixture.poll();
+
+        let lines = fixture.lines();
+        assert_eq!(2, lines.len(), "{lines:?}");
+        let growth = &lines[1];
+        assert!(growth.contains("\"observations\":2"), "{growth}");
+        assert!(growth.contains("\"observation_count\":3"), "{growth}");
+    }
+
+    #[test]
+    fn a_new_description_is_reported_after_the_first_sweep() {
+        let mut fixture = Fixture::new();
+        fixture.record(11, "a failure");
+        fixture.poll();
+
+        fixture.record(11, "another failure");
+        fixture.poll();
+
+        let lines = fixture.lines();
+        assert_eq!(2, lines.len(), "{lines:?}");
+        assert!(lines[1].contains("another failure"), "{}", lines[1]);
+        assert!(lines[1].contains("\"observation_count\":1"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn the_same_text_under_two_codes_is_two_entries() {
+        let mut fixture = Fixture::new();
+        fixture.record_at(11, "same problem", NOW_MS);
+        fixture.record_at(3, "same problem", NOW_MS + 1);
+        fixture.poll();
+
+        assert_eq!(2, fixture.lines().len());
+    }
+
+    #[test]
+    fn a_sweep_changes_no_input_byte_and_no_directory_entry() {
+        let mut fixture = Fixture::new();
+        fixture.record(11, "a failure");
+
+        let before = directory_digest(&fixture.options.dir);
+        fixture.poll();
+        assert_eq!(1, fixture.lines().len(), "the sweep was alive");
+        let after = directory_digest(&fixture.options.dir);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn the_count_table_forgets_the_oldest_identity_at_its_bound() {
+        let mut sweep = Sweep::default();
+        for index in 0..=MAX_IDENTITIES {
+            let first = i64::try_from(index).expect("an index that fits");
+            sweep.remember((format!("error {index}"), first), 1);
+        }
+
+        assert_eq!(MAX_IDENTITIES, sweep.emitted.len());
+        assert!(
+            !sweep.emitted.contains_key(&("error 0".to_owned(), 0)),
+            "the oldest identity survived"
+        );
+        assert!(
+            sweep
+                .emitted
+                .contains_key(&(format!("error {MAX_IDENTITIES}"), MAX_IDENTITIES as i64))
+        );
+    }
+
+    fn directory_digest(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut entries: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .expect("read the directory")
+            .map(|entry| {
+                let entry = entry.expect("a directory entry");
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).expect("read the entry"),
+                )
+            })
+            .collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
     }
 }
