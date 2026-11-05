@@ -21,9 +21,10 @@ three members on three hosts with the client on a fourth.
 ## What it needs
 
 - **Four machines of one type**, on one VPC/subnet. The 2026-11-02 run used
-  `ecs.c7.8xlarge` (16 cores, no SMT, 64 GiB). The addresses live in
-  `hosts.env` and nowhere else; `cluster_require_hosts` refuses a missing or
-  duplicated host rather than guessing one.
+  `ecs.c7.8xlarge` (16 cores, no SMT, 64 GiB). The four addresses in
+  `hosts.env` are **examples**: a run that still has one of them and was not
+  given a machine in the environment is refused, by name, rather than allowed
+  to measure a host nobody described.
 - **`provision-host.sh --check <user@host>`**, then again without `--check`, on
   every machine that is not the controller. It copies the harness, this build's
   driver and an offline JDK (with the `/etc` trees the JDK's absolute symlinks
@@ -70,6 +71,7 @@ whose members are not all named in them is not a reading.
 ## Where the numbers are
 
 The readings this runner produced are in the maintainer's analysis notes, not in
-this repository. The default addresses in `hosts.env` are the machines of the
+this repository. The four addresses in `hosts.env` are the examples of the
 2026-11-02 run; cloud instances get new addresses when they are stopped, so ask
-before reusing them.
+before reusing them — the examples are the only place they appear, and the
+refusal above keeps them out of a run nobody named.
