@@ -128,6 +128,9 @@ harness's own Aeron 1.53.3, while this build targets 1.53.2.
       core/      protocol-agnostic foundation: buffers, lock-free structures,
                  log-buffer framing, counters, URI, versioning
       cnc/       the CnC file contract (client <-> driver shared memory)
+      log/       the application-side log facade: a controlled event
+                 vocabulary, a fixed JSON schema, and a non-blocking file
+                 writer (no third-party dependency)
       codec/     the SBE codecs (ADR-0004): this crate is the façade over five
                  generated crates in the directories inside it — archive/,
                  archive-mark/, cluster/, cluster-mark/, cluster-node-state/
