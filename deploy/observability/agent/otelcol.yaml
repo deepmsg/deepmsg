@@ -27,8 +27,13 @@ receivers:
         severity:
           # Without this the level stays an attribute and severity_text is empty.
           parse_from: attributes.level
-      # The line is one JSON object; the useful message is its `msg`, not the
-      # whole object. `if` keeps a line that has no msg from being dropped.
+      # The line is one JSON object; the useful message is its `msg`. An event
+      # that has none (the driver's lifecycle events) is named by its `event`,
+      # and `copy` leaves `event` queryable as an ordinary field.
+      - type: copy
+        if: attributes.msg == nil
+        from: attributes.event
+        to: body
       - type: move
         if: attributes.msg != nil
         from: attributes.msg

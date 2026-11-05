@@ -11,12 +11,14 @@ and a Prometheus endpoint, and turning collection off degrades queries to
 
 ## Status
 
-**Configuration and the process harness.** The agent config, its static checks
-and the end-to-end launcher are here; the applications, the exporters and the
-pipeline assertions arrive in the later commits of the L2 slice. The launcher
-proves the four processes start, listen and stay alive — nothing under
-`systemd/` or `k8s/` has been run on a machine yet, and a static review is not
-a run.
+**Configuration, the process harness and the log path.** The agent config, its
+static checks, the launcher and the log assertions are here; the metrics path,
+durability, authentication and resource assertions arrive in the later commits
+of the L2 slice. The launcher proves the four processes start, listen and stay
+alive, that the driver runs with no collector at all (empty stderr, lines on
+disk), and that its log file reaches VictoriaLogs with the expected fields and
+stream. Nothing under `systemd/` or `k8s/` has been run on a machine yet, and a
+static review is not a run.
 
 ## Layout
 
@@ -42,6 +44,13 @@ downloads the pinned releases on first use (about 290 MB, cached under
 starts VictoriaLogs, VictoriaMetrics, vmauth and `otelcol-contrib` on loopback.
 Every file and every port is under the script's control; the four ports must be
 free before it starts.
+
+The run builds `deepmsg-driver` (debug) and uses it as the application: it runs
+first with **no collector** and must keep its stderr empty and both lifecycle
+lines on disk, then the agent starts and ships that file to VictoriaLogs. The
+assertions are the log path's contract: `driver.start` arrives, `_msg` is the
+event's name (or its `msg` when it has one, checked with a synthetic line), and
+`_stream` is exactly `component` and `node_id`.
 
 | override | default | meaning |
 |---|---|---|

@@ -117,6 +117,25 @@ def main() -> int:
         and operator.get("to") == "body"
     ]
     check("exactly one move from attributes.msg to body", len(moves), 1)
+    copies = [
+        operator
+        for operator in operators
+        if operator.get("type") == "copy"
+        and operator.get("from") == "attributes.event"
+        and operator.get("to") == "body"
+    ]
+    check("exactly one copy from attributes.event to body", len(copies), 1)
+    # The order is the contract: the copy must not overwrite a message, so it
+    # runs on the events that have none. Both conditions are asserted because
+    # swapping them is a silent bug (every line would say its event name).
+    if copies and moves:
+        check("copy runs only when msg is absent", copies[0].get("if"), "attributes.msg == nil")
+        check("move runs only when msg is present", moves[0].get("if"), "attributes.msg != nil")
+        check(
+            "copy comes before move",
+            operators.index(copies[0]) < operators.index(moves[0]),
+            True,
+        )
 
     # The host metrics and the collector's own metrics.
     hostmetrics = mapping(receivers.get("hostmetrics"), "receivers.hostmetrics")

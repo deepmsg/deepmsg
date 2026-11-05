@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # The L2 end-to-end stack: VictoriaLogs, VictoriaMetrics, vmauth and the agent.
 #
-# This commit proves the four processes start, listen and stay alive. The
-# applications, the exporters and the pipeline assertions arrive in the next
-# commits; a run that gets here has proved the configuration loads and the
-# backends answer, nothing more.
+# This commit proves the four processes start, listen and stay alive, and that
+# the log path works end to end: the driver runs with no collector (empty
+# stderr, lines on disk), then the agent reads that backlog and VictoriaLogs
+# answers with the right fields and stream.
 #
 # Everything lives under target/observability-e2e/<timestamp>-<pid>/. A failed
 # run keeps it (logs, listeners, process table) and says where it is; a
@@ -69,7 +69,7 @@ cleanup() {
 trap cleanup EXIT
 
 need() { command -v "$1" >/dev/null || fail "missing $1"; }
-for tool in curl ss awk grep tail ps python3; do need "$tool"; done
+for tool in curl ss awk grep tail ps python3 cargo jq date; do need "$tool"; done
 
 alive() {
   local pid=$1 stat
@@ -125,15 +125,6 @@ start victoria-metrics "$BIN/victoria-metrics" \
   -retentionPeriod=90d
 start vmauth "$BIN/vmauth" \
   -auth.config "$WORK/vmauth.yaml" -httpListenAddr "127.0.0.1:$VMAUTH_PORT"
-start otelcol env \
-  DEEPMSG_LOG_DIR="$WORK/logs" \
-  DEEPMSG_OBS_STATE_DIR="$WORK/state" \
-  DEEPMSG_COUNTERS_ENDPOINT="127.0.0.1:$COUNTERS_PORT" \
-  DEEPMSG_OTELCOL_TELEMETRY_ENDPOINT="127.0.0.1:$TELEMETRY_PORT" \
-  DEEPMSG_VL_LOGS_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/insert/opentelemetry/v1/logs" \
-  DEEPMSG_VM_WRITE_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/api/v1/write" \
-  DEEPMSG_OBS_WRITE_TOKEN="$TOKEN" \
-  "$BIN/otelcol-contrib" --config "$REPO/deploy/observability/agent/otelcol.yaml"
 
 wait_http() {
   local name=$1 url=$2 timeout=${3:-30}
@@ -157,10 +148,106 @@ wait_any_http() {
   fail "$name did not answer $url within ${timeout}s"
 }
 
+wait_for_line() {
+  local file=$1 needle=$2 timeout=${3:-10}
+  local deadline=$((SECONDS + timeout))
+  while ((SECONDS < deadline)); do
+    grep -q "$needle" "$file" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 wait_http victoria-logs "http://127.0.0.1:$VL_PORT/health"
 wait_http victoria-metrics "http://127.0.0.1:$VM_PORT/health"
 wait_any_http vmauth "http://127.0.0.1:$VMAUTH_PORT/"
+
+# C9: the application runs with the collector not started at all. It must not
+# notice — stderr stays empty and the file keeps its lines. The same file is
+# the backlog the agent reads in the next step.
+cargo build --manifest-path "$REPO/Cargo.toml" -p deepmsg-driver --bin deepmsg-driver \
+  >"$WORK/build.log" 2>&1 || fail "the driver did not build; see $WORK/build.log"
+DRIVER_BIN=${DEEPMSG_DRIVER_BIN:-$REPO/target/debug/deepmsg-driver}
+DEEPMSG_LOG_DIR="$WORK/logs" DEEPMSG_NODE_ID=e2e \
+  "$DRIVER_BIN" -Daeron.dir="$WORK/aeron" >"$WORK/driver.out" 2>"$WORK/driver.err" &
+PID[driver]=$!
+echo "e2e: started driver (pid ${PID[driver]}, no collector)"
+wait_for_line "$WORK/logs/driver-e2e.json" '"event":"driver.start"' 15 ||
+  fail "the driver did not record driver.start"
+kill -TERM "${PID[driver]}" 2>/dev/null || true
+driver_status=0
+wait "${PID[driver]}" || driver_status=$?
+unset 'PID[driver]'
+# The driver returns the signal number, by design: a signalled driver must not
+# look like one that was asked to stop.
+[[ $driver_status == 15 ]] || fail "the driver exited with $driver_status, not 15"
+[[ $(stat -c%s "$WORK/driver.err") == 0 ]] || fail "the driver wrote to stderr with no collector"
+grep -q '"event":"driver.start"' "$WORK/logs/driver-e2e.json" || fail "driver.start is missing"
+grep -q '"event":"driver.stop"' "$WORK/logs/driver-e2e.json" || fail "driver.stop is missing"
+echo "e2e: C9: the driver ran with no collector; stderr 0 bytes, start and stop on disk"
+
+# Now the agent, reading that file from its start.
+start otelcol env \
+  DEEPMSG_LOG_DIR="$WORK/logs" \
+  DEEPMSG_OBS_STATE_DIR="$WORK/state" \
+  DEEPMSG_COUNTERS_ENDPOINT="127.0.0.1:$COUNTERS_PORT" \
+  DEEPMSG_OTELCOL_TELEMETRY_ENDPOINT="127.0.0.1:$TELEMETRY_PORT" \
+  DEEPMSG_VL_LOGS_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/insert/opentelemetry/v1/logs" \
+  DEEPMSG_VM_WRITE_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/api/v1/write" \
+  DEEPMSG_OBS_WRITE_TOKEN="$TOKEN" \
+  "$BIN/otelcol-contrib" --config "$REPO/deploy/observability/agent/otelcol.yaml"
 wait_http otelcol "http://127.0.0.1:$TELEMETRY_PORT/metrics"
+
+logs_query() {
+  curl -s -H "Authorization: Bearer $TOKEN" \
+    --data-urlencode "query=$1" --data-urlencode "limit=20" \
+    "http://127.0.0.1:$VMAUTH_PORT/select/logsql/query"
+}
+
+wait_logs() {
+  local query=$1 predicate=$2 timeout=${3:-30}
+  local deadline=$((SECONDS + timeout)) out
+  while ((SECONDS < deadline)); do
+    out=$(logs_query "$query")
+    if printf '%s' "$out" | jq -s -e "$predicate" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "e2e: last answer for $query: $out" >&2
+  return 1
+}
+
+# C1: the backlog written with the collector off is in VictoriaLogs.
+wait_logs 'event:"driver.start"' 'any(.[]; .event == "driver.start")' 30 ||
+  fail "VictoriaLogs never saw the driver's backlog"
+row=$(logs_query 'event:"driver.start"' | jq -c 'select(.event == "driver.start")' | head -n 1)
+[[ -n $row ]] || fail "no driver.start row"
+message=$(printf '%s' "$row" | jq -r '._msg')
+[[ $message == driver.start ]] || fail "driver.start's _msg is '$message', not its event name"
+[[ $(printf '%s' "$row" | jq -r '.component') == driver ]] || fail "component is not driver"
+[[ $(printf '%s' "$row" | jq -r '.node_id') == e2e ]] || fail "node_id is not e2e"
+[[ $(printf '%s' "$row" | jq -r '.level') == info ]] || fail "level is not info"
+[[ $(printf '%s' "$row" | jq -r '.severity_text') == info ]] || fail "severity_text is not info"
+echo "e2e: C1: driver.start reached VictoriaLogs; _msg is its event name"
+
+# C6: the stream identifies the source, and level/event stay ordinary fields.
+stream=$(printf '%s' "$row" | jq -r '._stream')
+[[ $stream == *'component="driver"'* && $stream == *'node_id="e2e"'* ]] ||
+  fail "_stream does not name the source: $stream"
+[[ $stream != *level* && $stream != *event* ]] ||
+  fail "level or event leaked into _stream: $stream"
+echo "e2e: C6: _stream is $stream"
+
+# C1's other half: a line that has a message gets it in _msg. This is a config
+# vector, not the application: the driver's lifecycle events have no message.
+timestamp=$(date -u +%Y-%m-%dT%H:%M:%S.000000000Z)
+printf '{"ts":"%s","level":"info","component":"tool","node_id":"e2e","event":"backpressure.enter","msg":"a synthetic message"}\n' \
+  "$timestamp" >>"$WORK/logs/tool-e2e.json"
+wait_logs 'event:"backpressure.enter"' \
+  'any(.[]; .event == "backpressure.enter" and ._msg == "a synthetic message")' 30 ||
+  fail "a line with msg did not reach _msg"
+echo "e2e: C1: a line with msg reaches _msg as text"
 
 for name in victoria-logs victoria-metrics vmauth otelcol; do
   alive "${PID[$name]}" || fail "$name is not alive after readiness"
