@@ -1175,6 +1175,23 @@ mod tests {
     }
 
     #[test]
+    fn a_description_past_the_record_budget_is_still_a_valid_line() {
+        let mut fixture = Fixture::new();
+        fixture.record(11, &"x".repeat(2_048));
+        fixture.poll();
+
+        let lines = fixture.lines();
+        assert_eq!(1, lines.len(), "{lines:?}");
+        let line = &lines[0];
+        assert!(line.starts_with('{'), "{line}");
+        assert!(line.ends_with('}'), "{line}");
+        assert!(line.contains("\"truncated\":true"), "{line}");
+        assert!(line.contains(&"x".repeat(64)), "the text is not a prefix");
+        assert!(!line.contains("error_code"), "{line}");
+        assert!(line.len() <= 512, "a record is 512 bytes: {}", line.len());
+    }
+
+    #[test]
     fn a_sweep_changes_no_input_byte_and_no_directory_entry() {
         let mut fixture = Fixture::new();
         fixture.record(11, "a failure");
