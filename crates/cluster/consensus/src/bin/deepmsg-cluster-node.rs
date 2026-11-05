@@ -41,6 +41,7 @@ use deepmsg_cluster::{ConsensusModuleAgent, ConsensusModuleConfig};
 use deepmsg_cluster_common::config::Properties;
 use deepmsg_driver::idle::Strategy;
 use deepmsg_driver::sys;
+use deepmsg_log::{Component, Guard};
 
 const NAME: &str = "deepmsg-cluster-node";
 
@@ -72,6 +73,11 @@ fn run() -> Result<(), String> {
         print!("{USAGE}");
         return Ok(());
     }
+
+    // Off unless DEEPMSG_LOG_DIR is set. The writer can be pinned with
+    // DEEPMSG_LOG_CPU through the driver's platform seam.
+    let _logging = Guard::from_env(Component::Cluster, Some(sys::set_current_thread_affinity))
+        .map_err(|error| error.to_string())?;
 
     let mut properties = Properties::new();
     properties

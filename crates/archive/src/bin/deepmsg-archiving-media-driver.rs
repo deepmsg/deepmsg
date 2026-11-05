@@ -50,6 +50,7 @@ use deepmsg_core::clock;
 use deepmsg_driver::config::{DriverConfig, ThreadingMode};
 use deepmsg_driver::driver::Driver;
 use deepmsg_driver::{cpuset, dir, sys};
+use deepmsg_log::{Component, Guard};
 
 const NAME: &str = "deepmsg-archiving-media-driver";
 
@@ -103,6 +104,15 @@ fn main() -> ExitCode {
         eprintln!("{NAME}: could not install the signal handler: {error}");
         return ExitCode::FAILURE;
     }
+
+    // One process, two products: its file log is named for the archive, while
+    // an event from the driver half names the driver. Off unless
+    // DEEPMSG_LOG_DIR is set; the CPU is DEEPMSG_LOG_CPU.
+    let _logging = match Guard::from_env(Component::Archive, Some(sys::set_current_thread_affinity))
+    {
+        Ok(guard) => guard,
+        Err(error) => return fail(&format_args!("{error}")),
+    };
 
     let affinity = match cpuset::apply(&driver_config) {
         Ok(affinity) => affinity,

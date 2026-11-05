@@ -59,6 +59,7 @@ use deepmsg_driver::driver::Driver;
 use deepmsg_driver::media::TransportBindings;
 use deepmsg_driver::media::userspace::port_claim::Claim;
 use deepmsg_driver::{dir, sys};
+use deepmsg_log::{Component, Guard};
 
 fn main() -> ExitCode {
     let mut config = match DriverConfig::from_args(std::env::args().skip(1)) {
@@ -76,6 +77,17 @@ fn main() -> ExitCode {
         eprintln!("deepmsg-driver: could not install the signal handler: {error}");
         return ExitCode::FAILURE;
     }
+
+    // Logging comes after the handlers and before the media or the directory:
+    // a failure in either should be the last thing the file says. Off unless
+    // `DEEPMSG_LOG_DIR` is set. The writer can be pinned because this process
+    // owns the platform seam; the CPU is `DEEPMSG_LOG_CPU`, and no CPU means
+    // no pinning.
+    let _logging = match Guard::from_env(Component::Driver, Some(sys::set_current_thread_affinity))
+    {
+        Ok(guard) => guard,
+        Err(error) => return fail(&format_args!("{error}")),
+    };
 
     // Where the agents should run, before anything touches the file system:
     // the reference applies the cpuset in `aeronmd`'s own order, ahead of the

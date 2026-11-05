@@ -14,6 +14,8 @@ deepmsg-cnc = { path = "../../cnc" }
 deepmsg-codec-cluster = { path = "../../codec/cluster" }
 deepmsg-codec-cluster-mark = { path = "../../codec/cluster-mark" }
 deepmsg-core = { path = "../../core" }
+# The service container's file log; off unless DEEPMSG_LOG_DIR is set.
+deepmsg-log = { path = "../../log" }
 deepmsg-driver = { path = "../../driver" }
 
 [lints]
