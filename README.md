@@ -163,9 +163,9 @@ elsewhere in `docs/benchmarks.md`.
                  ClusteredService API), client, and the operator's tool
       dpdk/      the kernel-bypass media for DPDK-capable ports, empty unless
                  the `dpdk` feature is on (ADR-0006)
-      tools/     cnc-dump, errlog-dump, reclog-dump, deepmsg-stat, and the
-                 archive shim the reference's archive suite is pointed at
-                 (docs/reference.md)
+      tools/     cnc-dump, errlog-dump, reclog-dump, deepmsg-stat,
+                 deepmsg-counters-exporter, and the archive shim the
+                 reference's archive suite is pointed at (docs/reference.md)
       bench/     the rig, the echo node, the micro-benchmarks and the latency
                  harness
     examples/    ping/pong, pub/sub, record/replay
