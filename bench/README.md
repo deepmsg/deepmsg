@@ -1,9 +1,11 @@
 # The run batches
 
-Four batches live here. All of them measure this build against the reference's,
-all drive the reference's own benchmark harness (`aeron-io/benchmarks`), and all
-write their results into `bench/out/` — which is ignored, because what belongs in
-the tree is the table and the command that produced it, not the histogram files.
+Five batches live here. All of them measure this build against the reference's
+and all drive the reference's own benchmark harness (`aeron-io/benchmarks`): four
+are this tree's own runners, and `cluster-4host/` drives the harness's own cluster
+orchestration across four machines. All write their results into `bench/out/` —
+which is ignored, because what belongs in the tree is the table and the command
+that produced it, not the histogram files.
 
 | batch | question | can it say which layer? |
 |---|---|---|
@@ -11,6 +13,7 @@ the tree is the table and the command that produced it, not the histogram files.
 | `rust-vs-java/` | two whole stacks: how far apart are they? | **no** — nothing is swapped inside either arm |
 | `archive-vs-java/` | what is this build's **archive** worth, and what is the driver under it worth? | yes, and each ratio says which: `r-attach/j` is the archive, `r-java/r-attach` is the driver, `r-rust/j` is the whole stack and attributes nothing |
 | `cluster-arms/` | what are this build's **driver**, **archive** and **consensus module and container** worth inside a single-member cluster? | yes, and each ratio says which: `j-d/j` is the driver, `r-a/r` the archive, `r-a/j-d` the consensus module and the container, `r/j` the whole stack |
+| `cluster-4host/` | what is this build's **driver** worth when a whole reference cluster — three members on three hosts, the client on a fourth — runs on top of it? | yes — only the media driver changes; the consensus module, archive and service are the reference's |
 
 Two of these batches have **two shapes**: `rust-vs-java` and `upstream-c-drivers`
 run both halves of a cell on one machine by default (loopback), and with
@@ -42,6 +45,10 @@ bench/rust-vs-java/run-batch.sh                  # ~40 minutes with the defaults
 # a single-member cluster, four arms
 bench/cluster-arms/patches/install.sh --apply    # the media-driver launcher, in the harness
 bench/cluster-arms/run-batch.sh --quick          # plumbing, one machine, ~10 minutes
+
+# a three-member reference cluster, three hosts plus a client
+bench/cluster-4host/run-cluster-4host.sh --quick # plumbing, four hosts; needs the patch above
+                                                 # and provision-host.sh on the other machines
 ```
 
 Every entry script takes `--list` (print the plan, the digests and whether the
