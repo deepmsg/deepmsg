@@ -101,11 +101,11 @@ cannot say which layer a difference came from. One quantity in it is a known
 unknown and is named as such in `docs/benchmarks.md`: the Java side is the
 harness's own Aeron 1.53.3, while this build targets 1.53.2.
 
-A second machine identity: four `ecs.c7.8xlarge` hosts (Xeon 8369B, 16 cores,
-64 GiB, Ubuntu 24.04.5) on one VPC, with the two ends of a cell on separate
-machines. `docs/benchmarks.md` records that machine, the harness revision and
-every binary digest; these rows are not merged with the tables above and are
-not read against them bit for bit.
+A second machine identity: four Alibaba Cloud (`ecs.c7.8xlarge`) hosts (Xeon
+8369B, 16 cores, 64 GiB, Ubuntu 24.04.5) on one VPC, with the two ends of a cell
+on separate machines. `docs/benchmarks.md` records that machine, the harness
+revision and every binary digest; these rows are not merged with the tables
+above and are not read against them bit for bit.
 
 | layer | what changes between the rows | reading |
 |---|---|---|
