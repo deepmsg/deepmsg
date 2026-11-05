@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::config::{Config, InitError};
+use crate::config::{Config, InitError, Pinner};
 use crate::event::{Component, Event};
 use crate::level::{COMPILED_MAX, Level};
 use crate::queue::Queue;
@@ -151,6 +151,46 @@ impl Drop for Handle {
         // Do not join here: a handle dropped during unwinding must not block.
         // `shutdown` is the explicit, blocking path.
         self.stop();
+    }
+}
+
+/// Owns a [`Handle`] and shuts it down when dropped.
+///
+/// A binary's entry point has many `return` paths, and the last log line is
+/// often the one written on the way out. `Handle`'s own `Drop` only signals the
+/// writer; this guard joins it, so the queue is drained before the process
+/// leaves. Put it in `main` where every path passes through it.
+pub struct Guard(Option<Handle>);
+
+impl Guard {
+    /// Configure from the environment and install the process's logger.
+    ///
+    /// `pinner` is the binary's platform seam; it is set on the configuration
+    /// before `open`, so a `DEEPMSG_LOG_CPU` without one is refused here.
+    pub fn from_env(component: Component, pinner: Option<Pinner>) -> Result<Self, InitError> {
+        let Some(mut config) = Config::from_env(component)? else {
+            return Ok(Self(None));
+        };
+        config.pinner = pinner;
+        Ok(Self(Some(open(config)?)))
+    }
+
+    /// Wrap an already-open handle.
+    pub fn new(handle: Handle) -> Self {
+        Self(Some(handle))
+    }
+
+    /// The handle, when logging is on.
+    pub fn handle(&self) -> Option<&Handle> {
+        self.0.as_ref()
+    }
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.shutdown();
+        }
     }
 }
 
@@ -331,7 +371,7 @@ mod tests {
     use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
     use std::sync::mpsc::Receiver;
 
-    use super::{Handle, Logger, open};
+    use super::{Guard, Handle, Logger, open};
     use crate::config::{Config, InitError, Roll};
     use crate::event::{Component, Event};
     use crate::level::Level;
@@ -572,5 +612,21 @@ mod tests {
         handle.flush();
         assert_eq!(1, handle.io_errors());
         handle.shutdown();
+    }
+
+    #[test]
+    fn a_guard_shuts_the_writer_down_when_it_drops() {
+        let directory = TempDir::new();
+        let handle = open(config(directory.path(), Level::Info)).unwrap();
+        handle
+            .event(Level::Info, Component::Driver, Event::RoleChange)
+            .message("last line")
+            .emit();
+
+        // No explicit flush or shutdown: the guard's Drop must drain and join.
+        drop(Guard::new(handle));
+
+        let text = fs::read_to_string(directory.path().join("driver-node-1.json")).unwrap();
+        assert!(text.contains("\"msg\":\"last line\""));
     }
 }
