@@ -1,9 +1,11 @@
 # The run batches
 
-Four batches live here. All of them measure this build against the reference's,
-all drive the reference's own benchmark harness (`aeron-io/benchmarks`), and all
-write their results into `bench/out/` — which is ignored, because what belongs in
-the tree is the table and the command that produced it, not the histogram files.
+Five batches live here. All of them measure this build against the reference's
+and all drive the reference's own benchmark harness (`aeron-io/benchmarks`): four
+are this tree's own runners, and `cluster-4host/` drives the harness's own cluster
+orchestration across four machines. All write their results into `bench/out/` —
+which is ignored, because what belongs in the tree is the table and the command
+that produced it, not the histogram files.
 
 | batch | question | can it say which layer? |
 |---|---|---|
@@ -11,11 +13,56 @@ the tree is the table and the command that produced it, not the histogram files.
 | `rust-vs-java/` | two whole stacks: how far apart are they? | **no** — nothing is swapped inside either arm |
 | `archive-vs-java/` | what is this build's **archive** worth, and what is the driver under it worth? | yes, and each ratio says which: `r-attach/j` is the archive, `r-java/r-attach` is the driver, `r-rust/j` is the whole stack and attributes nothing |
 | `cluster-arms/` | what are this build's **driver**, **archive** and **consensus module and container** worth inside a single-member cluster? | yes, and each ratio says which: `j-d/j` is the driver, `r-a/r` the archive, `r-a/j-d` the consensus module and the container, `r/j` the whole stack |
+| `cluster-4host/` | what is this build's **driver** worth when a whole reference cluster — three members on three hosts, the client on a fourth — runs on top of it? | yes — only the media driver changes; the consensus module, archive and service are the reference's |
+
+Two of these batches have **two shapes**: `rust-vs-java` and `upstream-c-drivers`
+run both halves of a cell on one machine by default (loopback), and with
+`--two-host --peer <user@host>` put the **server half here and the client half
+on the peer** — the shape of the reference's own echo benchmark
+(`scripts/aeron/README.md:6-11`). The shapes are not interchangeable: a cell
+from one may not be compared with a cell from the other, and the two-host shape
+is the only one whose client is not on the same kernel as the server.
 
 That distinction is the whole reason the two are separate, and it is the one
 thing to hold on to when reading either: a number from `rust-vs-java` is a
 statement about two systems, and cannot be used as if it were a statement about
 this build's driver, client or node.
+
+## Getting the two checkouts
+
+Only this build is in this repository. The two stacks it is compared against are
+checkouts of this project's forks, and **nothing here clones or fetches them** —
+a batch reads the checkouts it is given and stops with `need_dir` when one is
+missing.
+
+```
+# the harness the cells are measured with (aeron-io/benchmarks at 1b11bfc)
+git clone https://github.com/deepmsg/benchmarks ../benchmarks-deepmsg
+git -C ../benchmarks-deepmsg checkout 1b11bfc
+git -C ../benchmarks-deepmsg ./gradlew :benchmarks-all:shadowJar
+
+# the upstream work the C driver arms are built from
+git clone https://github.com/deepmsg/aeron ../aeron-deepmsg
+git -C ../aeron-deepmsg checkout driver/c-driver-recvfrom-single   # c-patched
+# c-control is built from the default branch
+```
+
+The harness needs the patches in this tree before it can drive this build; each
+batch names its own installer, and `--check` says what is and is not in place:
+
+```
+bench/cluster-arms/patches/install.sh --apply        # the launcher and the deepmsg driver row
+bench/archive-vs-java/patches/install.sh --apply     # an ArchiveNode that can use an archive it did not launch
+bench/upstream-c-drivers/patches/install.sh --apply  # the C arm names and the local launch shim
+```
+
+The archive installer rebuilds the harness's shadow jar, because its change is
+Java; the other two are shell and a launcher. The two paths are defaults —
+`BENCHMARKS_DIR` and `AERON_FORK_DIR` name checkouts anywhere else — and the
+revision each arm was built from is written into the batch's `RUN-INFO.txt`.
+
+The harness fork's `master` is `1b11bfc` today, but the checkout above pins the
+commit: the difference is the patches, not a branch.
 
 ## Running one
 
@@ -34,6 +81,10 @@ bench/rust-vs-java/run-batch.sh                  # ~40 minutes with the defaults
 # a single-member cluster, four arms
 bench/cluster-arms/patches/install.sh --apply    # the media-driver launcher, in the harness
 bench/cluster-arms/run-batch.sh --quick          # plumbing, one machine, ~10 minutes
+
+# a three-member reference cluster, three hosts plus a client
+bench/cluster-4host/run-cluster-4host.sh --quick # plumbing, four hosts; needs the patch above
+                                                 # and provision-host.sh on the other machines
 ```
 
 Every entry script takes `--list` (print the plan, the digests and whether the
@@ -47,6 +98,31 @@ results:
 - `RUN-INFO.txt` — what this particular batch was: the arms, the grid, the cores,
   the channels, the settings the drivers were actually given.
 - the histograms themselves, one per cell, in the harness's own layout.
+
+## The interrupt layout
+
+A reading from a machine with a sleeping core is not a reading of the driver:
+the NIC has hashed the flow to one receive queue, and if the core taking that
+queue's interrupt is in HLT the wakeup is part of the path. On the two-host runs
+the same 25K:32 cell read 100–185 µs in that state and 45.6–46.7 µs after the
+layout below was applied, on both stacks.
+
+`bench/tools/irq-steer.sh` writes the layout and puts it back:
+
+```
+bench/tools/irq-steer.sh apply          # every queue's interrupt on CPU 12, C1 off there
+bench/tools/irq-steer.sh spread         # round-robin over 8-15; for a cluster's several flows
+bench/tools/irq-steer.sh show           # the current mapping and C1 flags
+bench/tools/irq-steer.sh restore        # put every saved value back, and drop the save
+```
+
+The defaults name the cloud hosts' NIC (`virtio2`) and interface (`eth0`);
+`IRQ_STEER_NIC`, `IRQ_STEER_IFACE` and `IRQ_STEER_SAVE` override them. The save
+file is written once, before the first change, and `restore` is the only thing
+that consumes it — a machine must not be left steered. `apply` is the layout
+every reading up to 2026-11-04 used; `spread` exists because a cluster has several
+flows (client ingress, log replication, catchup, archive) and one core taking all
+of them queues the client behind the rest.
 
 ## Why a batch needs three directories
 

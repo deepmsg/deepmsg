@@ -52,10 +52,17 @@ bench_fingerprint() {
         # so the paths are named rather than counted: what a batch applies to the
         # harness should be the two patches and the two launchers and nothing
         # else, and a reader can check that at a glance.
-        local dirty
-        dirty=$(git -C "$BENCHMARKS_DIR" status --porcelain 2>/dev/null | wc -l)
+        # A checkout without a `.git` is a legitimate way to ship this batch (a
+        # tree copied to a machine that cannot reach GitHub): `_rev` already
+        # says so, and these two must not take the batch down with them. Under
+        # `pipefail` a failing `git` at the head of a pipe is the status of the
+        # pipe, which `set -e` then treats as the end of the script — measured
+        # on the first cloud run, 2026-11-01, as exit 128 with no output.
+        local dirty dirty_lines
+        dirty_lines=$(git -C "$BENCHMARKS_DIR" status --porcelain 2>/dev/null || true)
+        dirty=$(printf '%s\n' "$dirty_lines" | grep -c . || true)
         echo "harness dirty   $dirty path(s)"
-        git -C "$BENCHMARKS_DIR" status --porcelain 2>/dev/null | sed 's/^/                  /'
+        [ -n "$dirty_lines" ] && printf '%s\n' "$dirty_lines" | sed 's/^/                  /'
         echo "harness aeron   $(grep -E '^aeron *=' "$BENCHMARKS_DIR/gradle/libs.versions.toml" 2>/dev/null)"
 
         echo

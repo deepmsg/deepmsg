@@ -101,6 +101,23 @@ cannot say which layer a difference came from. One quantity in it is a known
 unknown and is named as such in `docs/benchmarks.md`: the Java side is the
 harness's own Aeron 1.53.3, while this build targets 1.53.2.
 
+A second machine identity: four Alibaba Cloud (`ecs.c7.8xlarge`) hosts (Xeon
+8369B, 16 cores, 64 GiB, Ubuntu 24.04.5) on one VPC, with the two ends of a cell
+on separate machines. `docs/benchmarks.md` records that machine, the harness
+revision and every binary digest; these rows are not merged with the tables
+above and are not read against them bit for bit.
+
+| layer | what changes between the rows | reading |
+|---|---|---|
+| client | this build's whole stack against the reference's, two hosts | no tier is outside its floor: `25K:32` and `501K:32` differ by less than it, `101K:1344` and `301K:288` disagree in sign; the absolute values behind them agree within 1% (25K:32 46.1–46.7 µs, 101K:1344 82.8–83.2 µs) |
+| archive | this build's archive beside the reference's, two hosts, `101K:1344` | `fsync=0` ties (0.9807 / 0.9934, the first round barely outside the reference's floor); `fsync=2` reads 10.7–16.4% faster here and 12–22% slower on the bench machine — with fsync the comparison is the disk's, not the archive's |
+| cluster | a whole reference cluster — three members on three hosts, the client on a fourth — with only the media driver changing | `101K:1344` p50 0.9778 / 0.9867, 1.3–2.2% faster; `25K:32` is inside the java arm's own drift between rounds; `301K:288` and `501K:32` saturate (p50 6–33 ms) |
+
+The cluster row's nodes are all the reference's — driver, archive, consensus
+module and service — so that row says nothing about this build's consensus
+module or container; those are measured by `bench/cluster-arms` and read
+elsewhere in `docs/benchmarks.md`.
+
 ## Principles
 
 1. **Compatibility is proven, not asserted.** The CnC file, the wire protocol

@@ -96,7 +96,7 @@ index 9cbff0f..b3264ac 100755
 +  echo "sudo pkill -SIGTERM '^aeronmd'; $(kill_java_process "io.aeron.driver.MediaDriver"); pkill -SIGTERM -x '^deepmsg-driver$'; true"
  }
 diff --git a/scripts/aeron/remote-cluster-benchmarks b/scripts/aeron/remote-cluster-benchmarks
-index 5f2ffae..2a4f9b4 100755
+index 5f2ffae..7e044d9 100755
 --- a/scripts/aeron/remote-cluster-benchmarks
 +++ b/scripts/aeron/remote-cluster-benchmarks
 @@ -115,7 +115,7 @@ onload="onload --profile=latency "
@@ -108,11 +108,12 @@ index 5f2ffae..2a4f9b4 100755
  cluster_service="${CLUSTER_SERVICE:-echo}"
  download_dir="${DIR}/.."
  
-@@ -378,6 +378,9 @@ drivers['java-onload']="${driver_properties}; \
+@@ -378,6 +378,10 @@ drivers['java-onload']="${driver_properties}; \
  drivers['c']="${driver_properties}; \
        $(start_media_driver "${scripts_path}/c-media-driver" "" "driver_cpu_node_var" "driver_non_isolated_cpu_cores_var" "driver_conductor_cpu_core_var" "driver_sender_cpu_core_var" "driver_receiver_cpu_core_var")"
  
 +drivers['deepmsg']="${driver_properties}; \
++      export DEEPMSG_DRIVER=${DEEPMSG_DIR}/target/release/deepmsg-driver; \
 +      $(start_media_driver "${scripts_path}/deepmsg-media-driver" "" "driver_cpu_node_var" "driver_non_isolated_cpu_cores_var" "driver_conductor_cpu_core_var" "driver_sender_cpu_core_var" "driver_receiver_cpu_core_var")"
 +
  drivers['c-onload']="${driver_properties}; \

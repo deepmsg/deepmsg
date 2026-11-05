@@ -338,6 +338,121 @@ They are this tree at `b7d8d1f`, which is `main` plus this section's own commits
 read against one of those even by direction alone. The histograms and the
 record are in `bench/out/rust-vs-java/<date>-<host>/` (ignored by git).
 
+### On Alibaba Cloud, two hosts and four
+
+**What makes this a second machine.** Four Alibaba Cloud `ecs.c7.8xlarge`
+instances: Xeon 8369B, 16 cores with no SMT, 64 GiB (61 GiB visible to the
+guest), Ubuntu 24.04.5, kernel 6.8.0-147, ESSD PL1, one VPC
+(`172.16.1.0/24`). The two-host batches put the server half on `172.16.1.15`
+and the client half on `172.16.1.17`; the cluster puts three members on
+`.15`/`.19`/`.20` with the client on `.17`. Two things follow, and neither is
+optional: the two halves run on **different kernels**, which is the point of the
+two-host shape, and a row here is **not read against the bench machine's**
+tables, not even by direction — different CPU, different NIC, different disk.
+
+**The interrupt layout is part of the setup.** Every machine runs
+`bench/tools/irq-steer.sh apply` first: all sixteen virtio2 receive queues'
+interrupts on CPU 12, with C1 off there. Without it the same 25K:32 cell reads
+100–185 µs on both stacks, because RSS puts the flow's interrupt on a core in
+HLT and the wakeup is then part of the path.
+
+**The harness and the binaries.** `aeron-io/benchmarks` at `1b11bfc`, with the
+two patches this tree needs: `bench/cluster-arms/patches/install.sh --apply`
+(the `deepmsg-media-driver` launcher and the `drivers['deepmsg']` row) and
+`bench/archive-vs-java/patches/install.sh --apply` (an `ArchiveNode` that can
+connect to an archive somebody else runs). This build at `bef6dc7`; the binaries
+that every cell below used, by digest:
+
+| binary | digest |
+|---|---|
+| `deepmsg-driver` | `b3d5d94e…` |
+| `loadtest-rig` | `34e903ab…` |
+| `echo-node` | `d0425d34…` |
+| `deepmsg-archive` | `76bcc93b…` |
+| `deepmsg-archiving-media-driver` | `afbfb566…` |
+| `archive-node` | `d05df885…` |
+| `cnc-dump` | `f6f3c3ba…` |
+
+**The commands and the grid.**
+
+    bench/rust-vs-java/run-batch.sh --two-host --peer root@172.16.1.17
+    bench/upstream-c-drivers/run-batch.sh --two-host --peer root@172.16.1.17
+    bench/archive-vs-java/run-batch.sh --peer root@172.16.1.17 --fsync 0 --rate 101K --length 1344
+    bench/cluster-4host/run-cluster-4host.sh
+
+The first two use four tiers (`25K:32`, `101K:1344`, `301K:288`, `501K:32`),
+60 s plus a 30 s warm-up at 25K, two rounds with the order reversed. The archive
+runs at `101K:1344` only, once per `fsync` level. The cluster runs the same four
+tiers with `fsync=0`.
+
+**The client, two runs, kept apart.** `rust / java`, `E[X | X < p99]`:
+
+| tier | 2026-11-02 (`178a136`) | 2026-11-05 (`bef6dc7`) | floor on 11-05 (java / rust) |
+|---|---|---|---|
+| 25K:32 | 0.9915 / 1.0006 — sign flips | 0.9891 / 0.9979 — inside the floor | 1.19% / 0.31% |
+| 101K:1344 | **0.9928 / 0.9821 — 0.7–1.8% faster** | 0.9988 / 1.0020 — sign flips | 0.43% / 0.11% |
+| 301K:288 | 0.9891 / 0.9997 — inside the floor | 0.9916 / 1.0034 — sign flips | 0.87% / 0.31% |
+| 501K:32 | 1.0069 / 0.9942 — sign flips | 0.9986 / 0.9873 — inside the floor | 0.48% / 0.65% |
+
+The two runs are **not merged**: they are different trees, and the second does
+not reproduce the first's one readable tier. What the second run does say is
+that the difference is inside the floor everywhere, and that the absolute values
+agree within 1% (25K:32 46.1–46.7 µs on both). That paragraph in the README is
+this table's second column only.
+
+**The C driver, 2026-11-05.** `c-patched / c-control` has no readable tier:
+`101K:1344` 0.9977 / 0.9904 with the first round 0.23% from unity against a
+c-control floor of 0.26%; `301K:288` and `501K:32` disagree in sign. The one
+readable ratio is `c-control / java` at `101K:1344`: 1.0048 / 1.0038, both
+rounds outside both floors — **the unpatched C driver is 0.38–0.48% slower than
+the Java one**, a much smaller gap than the bench machine's 2.3–7.1% and in the
+same direction. ★ The `java` `501K:32` cell of the reverse round is a backlog
+(p50 8.78 ms against ~82 µs in every other cell); every 501K ratio with java in
+it is void, and the cell passed the batch's own count-and-warning gate.
+
+**The archive, 2026-11-05.** `r-attach / j`, `E[X | X < p99]`:
+
+| fsync | round 1 / round 2 | floor (j / r-attach) | reading |
+|---|---|---|---|
+| 0 | 0.9807 / 0.9934 | 1.77% / 0.50% | 0.7–1.9% faster; the first round is only 0.16 points outside the reference's floor |
+| 2 | **0.8927 / 0.8358** | 7.04% / 0.22% | **10.7–16.4% faster** |
+
+The bench machine reads the same pair at `1.2212 / 1.1199` — **12–22% slower**.
+The sign difference is the disk's, not the archive's: ESSD PL1 here against a
+local disk there that was itself later written past its fast state. Neither
+number stands alone, and this document will not pick one: **with fsync, the
+comparison is the disk's**.
+
+**The cluster, 2026-11-05.** Three members on three hosts, the client on a
+fourth, every node the reference's, only the media driver changing —
+`deepmsg / java` at p50:
+
+| tier | round 1 / round 2 | floor (java / deepmsg) | reading |
+|---|---|---|---|
+| 25K:32 | 0.9726 / 0.8257 | **17.40%** / 0.32% | inside the java arm's own drift between rounds |
+| **101K:1344** | **0.9778 / 0.9867** | 1.04% / 0.14% | **1.3–2.2% faster** |
+| 301K:288 | 0.8545 / 0.6582 | 3.26% / 25.5% | saturated (p50 6–10 ms) |
+| 501K:32 | 1.0290 / 1.0316 | 0.15% / 0.10% | saturated (p50 ~33 ms) |
+
+An earlier run on the 2026-11-02 tree read `101K:1344` at 0.974 / 0.975 — the
+same direction and size. The 25K tier does not disagree between the stacks: the
+`deepmsg` arm reads 99.8 and 99.5 µs in its two rounds, and it is the java arm
+that moves 17.4% (102.6 → 120.4 µs), which is the position effect this batch's
+floor is designed to catch. 301K and 501K saturate, so they measure queueing,
+not latency; the ceiling of the reference cluster on this topology sits between
+`101K:1344` and `301K:288`.
+
+**What this section does not say.** The client batch swaps whole stacks and
+attributes no layer. The archive batch's fsync rows are the disk's. The cluster
+batch's nodes are the reference's, so it says nothing about this build's
+consensus module, archive or service container — those are `bench/cluster-arms`,
+measured elsewhere.
+
+**The record.** Each batch writes `fingerprint.txt`, `RUN-INFO.txt` and its
+histograms under `bench/out/` (ignored by git), and reads them with
+`bench/tools/quantiles.sh`. The full trees for these two dates are kept outside
+this repository, with the digests above as the pointer.
+
 ### The media, against the kernel path
 
     analysis/dpdk/d6-abba/run.sh

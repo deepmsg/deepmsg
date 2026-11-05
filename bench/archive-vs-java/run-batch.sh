@@ -77,9 +77,9 @@ runs=1
 iterations=60
 warmup_iterations=30
 warmup_rate=25K
-archive_dir=${ARCHIVE_DIR:-/home/gavin/archive-bench}
+archive_dir=${ARCHIVE_DIR:-$HOME/archive-bench}
 peer=""
-peer_repo=${BENCH_PEER_REPO:-/home/gavin/data/trader/deepmsg}
+peer_repo=${BENCH_PEER_REPO:-$DEEPMSG_DIR}
 peer_rig_cpu=${BENCH_PEER_RIG_CPU:-4}
 peer_max_load=${BENCH_PEER_MAX_LOAD:-}
 out=""
@@ -404,7 +404,9 @@ _start_rust_server() {
     while IFS= read -r line; do defines+=("$line"); done < <(_archive_defines "$_fsync")
 
     DEEPMSG_DRIVER="$BENCH_DRIVER" BENCH_OUT_DIR="$dir/shims" \
-        "$BENCH_LIB/shims/aeronmd" "$_local_driver_properties" \
+        "$BENCH_LIB/shims/aeronmd" \
+        "$BENCHMARKS_SCRIPTS_DIR/low-latency-driver.properties" \
+        "$_local_driver_properties" \
         </dev/null >"$dir/driver.log" 2>&1 &
     _driver_pid=$!
     _await_file "$BENCH_AERON_DIR/cnc.dat" local || {
@@ -441,7 +443,9 @@ _start_attached_server() {
         _java_driver_pid=$!
     else
         DEEPMSG_DRIVER="$BENCH_DRIVER" BENCH_OUT_DIR="$dir/shims" \
-            "$BENCH_LIB/shims/aeronmd" "$_local_driver_properties" \
+            "$BENCH_LIB/shims/aeronmd" \
+            "$BENCHMARKS_SCRIPTS_DIR/low-latency-driver.properties" \
+            "$_local_driver_properties" \
             </dev/null >"$dir/driver.log" 2>&1 &
         _driver_pid=$!
     fi
@@ -484,7 +488,9 @@ echo \$\$ >"$_peer_root/driver.pid"
 cd "$peer_repo"
 exec env DEEPMSG_DRIVER="$peer_repo/target/release/deepmsg-driver" \\
     BENCH_OUT_DIR="$_peer_root/shims" \\
-    ./bench/lib/shims/aeronmd "$_peer_root/driver.properties"
+    ./bench/lib/shims/aeronmd \\
+    "$BENCHMARKS_SCRIPTS_DIR/low-latency-driver.properties" \\
+    "$_peer_root/driver.properties"
 EOF
     scp -q "$_local_driver_properties" "$BENCH_PEER_SSH:$_peer_root/driver.properties"
     _peer_start "$dir/peer-driver.sh" "$_peer_root/driver.log" "$_peer_root/driver.pid" || return 1
