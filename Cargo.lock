@@ -384,6 +384,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepmsg-log"
+version = "0.1.0"
+dependencies = [
+ "deepmsg-core",
+]
+
+[[package]]
 name = "deepmsg-tests"
 version = "0.1.0"
 dependencies = [

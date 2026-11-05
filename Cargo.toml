@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/cnc",
+    "crates/log",
     "crates/codec",
     "crates/codec/archive",
     "crates/codec/archive-mark",
