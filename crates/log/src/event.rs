@@ -102,11 +102,16 @@ pub enum Event {
     BackpressureEnter,
     /// The log writer dropped records because its queue was full.
     LogDropped,
+    /// A distinct error the driver recorded, read back from its error log by
+    /// an exporter rather than reported by the driver itself.
+    DriverError,
+    /// A distinct error a cluster mark file recorded, read back by an exporter.
+    ClusterError,
 }
 
 impl Event {
     /// Every event, in declaration order.
-    pub const ALL: [Event; 12] = [
+    pub const ALL: [Event; 14] = [
         Event::DriverStart,
         Event::DriverStop,
         Event::ClientTimeout,
@@ -119,6 +124,8 @@ impl Event {
         Event::SegmentRoll,
         Event::BackpressureEnter,
         Event::LogDropped,
+        Event::DriverError,
+        Event::ClusterError,
     ];
 
     /// The stable name written to the log.
@@ -136,6 +143,8 @@ impl Event {
             Event::SegmentRoll => "segment.roll",
             Event::BackpressureEnter => "backpressure.enter",
             Event::LogDropped => "log.dropped",
+            Event::DriverError => "driver.error",
+            Event::ClusterError => "cluster.error",
         }
     }
 }
@@ -173,5 +182,7 @@ mod tests {
         assert_eq!("segment.roll", Event::SegmentRoll.as_str());
         assert_eq!("backpressure.enter", Event::BackpressureEnter.as_str());
         assert_eq!("log.dropped", Event::LogDropped.as_str());
+        assert_eq!("driver.error", Event::DriverError.as_str());
+        assert_eq!("cluster.error", Event::ClusterError.as_str());
     }
 }
