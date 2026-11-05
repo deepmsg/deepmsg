@@ -16,15 +16,16 @@
 //! one, which is the same degradation a line-oriented collector already has to
 //! tolerate.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::config::Roll;
 use crate::record::Record;
 
 /// How long the writer waits before flushing an empty queue.
@@ -47,14 +48,123 @@ pub(crate) struct Writer {
     pub(crate) join: JoinHandle<()>,
 }
 
-/// Open the log file for appending, creating it if it is not there.
-pub(crate) fn open(path: &Path) -> io::Result<File> {
-    OpenOptions::new().create(true).append(true).open(path)
+/// The current file and its rotation policy.
+///
+/// Rotation happens **before** a write that would take the file over the
+/// limit, so the file never overshoots by a batch and the line that crosses
+/// the limit is kept. A single write larger than the limit is written whole
+/// and rotated before the next one.
+///
+/// The names are `base.json` (current), then `base.1.json`, `base.2.json`, …
+/// up to `roll.files - 1`; every one still ends in `.json`, which is what the
+/// collector's include glob matches. A crash between two renames leaves a gap;
+/// that is accepted — the next start reads whatever is there.
+pub(crate) struct RollingFile {
+    base: PathBuf,
+    file: File,
+    bytes: u64,
+    roll: Roll,
+}
+
+/// Open the current file for append, rotating first if it is already full.
+pub(crate) fn open(path: &Path, roll: Roll) -> io::Result<RollingFile> {
+    RollingFile::open(path.to_path_buf(), roll)
+}
+
+impl RollingFile {
+    /// Open the current file for append, rotating first if it is already full.
+    pub(crate) fn open(base: PathBuf, roll: Roll) -> io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(&base)?;
+        let bytes = file.metadata()?.len();
+        let mut rolling = Self {
+            base,
+            file,
+            bytes,
+            roll,
+        };
+
+        if rolling.bytes >= rolling.roll.bytes {
+            rolling.rotate()?;
+        }
+
+        Ok(rolling)
+    }
+
+    /// Write bytes, rotating first if they would take the file over the limit.
+    pub(crate) fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let length = bytes.len() as u64;
+
+        if self.bytes > 0 && self.bytes.saturating_add(length) > self.roll.bytes {
+            self.rotate()?;
+        }
+
+        self.file.write_all(bytes)?;
+        self.bytes += length;
+
+        // A single write can be larger than the limit (the writer hands over a
+        // batch). Rotate it out so the next write starts from an empty current
+        // file; with one file there is nowhere to move it, and the next write
+        // truncates instead.
+        if self.bytes > self.roll.bytes && self.roll.files > 1 {
+            self.rotate()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        if self.roll.files <= 1 {
+            // One file means "truncate in place": there is nowhere to move it.
+            remove_if_exists(&self.base)?;
+        } else {
+            remove_if_exists(&numbered(&self.base, self.roll.files - 1))?;
+            for index in (1..self.roll.files - 1).rev() {
+                rename_if_exists(
+                    &numbered(&self.base, index),
+                    &numbered(&self.base, index + 1),
+                )?;
+            }
+            rename_if_exists(&self.base, &numbered(&self.base, 1))?;
+        }
+
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.base)?;
+        self.bytes = 0;
+        Ok(())
+    }
+}
+
+/// `base.3.json` for the third rotated file.
+fn numbered(base: &Path, index: usize) -> PathBuf {
+    let stem = base.file_stem().unwrap_or_default().to_string_lossy();
+    let extension = base.extension().unwrap_or_default().to_string_lossy();
+    base.with_file_name(format!("{stem}.{index}.{extension}"))
+}
+
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn rename_if_exists(from: &Path, to: &Path) -> io::Result<()> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Start the writer thread over an already-open file.
 pub(crate) fn spawn(
-    file: File,
+    file: RollingFile,
     records: Receiver<Record>,
     io_errors: Arc<AtomicU64>,
 ) -> io::Result<Writer> {
@@ -67,7 +177,7 @@ pub(crate) fn spawn(
 }
 
 fn run(
-    mut file: File,
+    mut file: RollingFile,
     records: &Receiver<Record>,
     control: &Receiver<Control>,
     io_errors: &AtomicU64,
@@ -134,7 +244,7 @@ fn append(buffer: &mut Vec<u8>, record: &Record) {
 }
 
 /// Write what has accumulated; a failure is counted and the bytes are lost.
-fn write(file: &mut File, buffer: &mut Vec<u8>, io_errors: &AtomicU64) {
+fn write(file: &mut RollingFile, buffer: &mut Vec<u8>, io_errors: &AtomicU64) {
     if buffer.is_empty() {
         return;
     }
@@ -158,6 +268,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, AtomicU64};
 
     use super::{Control, open, spawn};
+    use crate::config::Roll;
     use crate::event::{Component, Event};
     use crate::level::Level;
     use crate::queue::Queue;
@@ -194,7 +305,7 @@ mod tests {
     fn records_are_appended_with_a_newline() {
         let directory = TempDir::new();
         let path = directory.0.join("driver-n.json");
-        let file = open(&path).unwrap();
+        let file = open(&path, Roll::default()).unwrap();
         let (queue, receiver) = Queue::new(8);
         let io_errors = Arc::new(AtomicU64::new(0));
         let writer = spawn(file, receiver, Arc::clone(&io_errors)).unwrap();
@@ -222,7 +333,7 @@ mod tests {
         let path = directory.0.join("driver-n.json");
 
         for message in ["first", "second"] {
-            let file = open(&path).unwrap();
+            let file = open(&path, Roll::default()).unwrap();
             let (queue, receiver) = Queue::new(8);
             let io_errors = Arc::new(AtomicU64::new(0));
             let writer = spawn(file, receiver, io_errors).unwrap();
@@ -235,5 +346,131 @@ mod tests {
         assert_eq!(2, text.lines().count());
         assert!(text.lines().next().unwrap().contains("\"msg\":\"first\""));
         assert!(text.lines().nth(1).unwrap().contains("\"msg\":\"second\""));
+    }
+
+    fn index_of(line: &str) -> u32 {
+        line.trim().parse().expect("a 100-byte test line")
+    }
+
+    fn line(index: u32) -> String {
+        format!("{index:0>99}\n")
+    }
+
+    #[test]
+    fn three_files_are_kept_and_the_oldest_lines_go() {
+        let directory = TempDir::new();
+        let base = directory.0.join("driver-n.json");
+        let mut file = open(
+            &base,
+            Roll {
+                bytes: 300,
+                files: 3,
+            },
+        )
+        .unwrap();
+
+        for index in 0..20 {
+            file.write_all(line(index).as_bytes()).unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+
+        let mut names: Vec<String> = fs::read_dir(&directory.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            vec![
+                "driver-n.1.json".to_owned(),
+                "driver-n.2.json".to_owned(),
+                "driver-n.json".to_owned()
+            ],
+            names
+        );
+        assert!(names.iter().all(|name| name.ends_with(".json")));
+
+        let newest: Vec<u32> = fs::read_to_string(&base)
+            .unwrap()
+            .lines()
+            .map(index_of)
+            .collect();
+        let middle: Vec<u32> = fs::read_to_string(directory.0.join("driver-n.1.json"))
+            .unwrap()
+            .lines()
+            .map(index_of)
+            .collect();
+        let oldest: Vec<u32> = fs::read_to_string(directory.0.join("driver-n.2.json"))
+            .unwrap()
+            .lines()
+            .map(index_of)
+            .collect();
+
+        assert_eq!(vec![18, 19], newest);
+        assert_eq!(vec![15, 16, 17], middle);
+        assert_eq!(vec![12, 13, 14], oldest);
+        assert!(
+            !oldest.contains(&0) && !oldest.contains(&11),
+            "lines older than the retention window survived"
+        );
+    }
+
+    #[test]
+    fn a_file_already_at_the_limit_rotates_when_it_is_opened() {
+        let directory = TempDir::new();
+        let base = directory.0.join("driver-n.json");
+        fs::write(&base, "x".repeat(300)).unwrap();
+
+        let mut file = open(
+            &base,
+            Roll {
+                bytes: 300,
+                files: 3,
+            },
+        )
+        .unwrap();
+        file.write_all(b"new\n").unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        assert_eq!(
+            "x".repeat(300),
+            fs::read_to_string(directory.0.join("driver-n.1.json")).unwrap()
+        );
+        assert_eq!("new\n", fs::read_to_string(&base).unwrap());
+    }
+
+    #[test]
+    fn one_file_keeps_only_the_newest_line() {
+        let directory = TempDir::new();
+        let base = directory.0.join("driver-n.json");
+        let mut file = open(
+            &base,
+            Roll {
+                bytes: 300,
+                files: 1,
+            },
+        )
+        .unwrap();
+
+        for index in 0..4 {
+            file.write_all(line(index).as_bytes()).unwrap();
+        }
+        file.flush().unwrap();
+        drop(file);
+
+        let names: Vec<String> = fs::read_dir(&directory.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(vec!["driver-n.json".to_owned()], names);
+        assert_eq!(
+            vec![3],
+            fs::read_to_string(&base)
+                .unwrap()
+                .lines()
+                .map(index_of)
+                .collect::<Vec<_>>()
+        );
     }
 }
