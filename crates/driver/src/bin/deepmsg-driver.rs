@@ -143,6 +143,15 @@ fn main() -> ExitCode {
             dir::Notice::DirectoryExists { path } => {
                 eprintln!("deepmsg-driver: WARNING: {} exists", path.display());
             }
+            // The reference's own warning, and the same stderr: a reclaimed
+            // directory whose driver left errors behind is a diagnostic, not
+            // a failure (`aeron_driver.c:118-119`).
+            dir::Notice::ErrorsSaved { path } => {
+                eprintln!(
+                    "deepmsg-driver: WARNING: Existing errors saved to: {}",
+                    path.display()
+                );
+            }
         }
     }
 

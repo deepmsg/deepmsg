@@ -16,13 +16,15 @@
 //! that was killed with `SIGKILL` leaves a directory that the next driver
 //! reclaims without an operator having to clear anything.
 //!
-//! # What is not here yet
+//! # The old driver's error log
 //!
-//! The reference rescues the *old* driver's error log before deleting the
-//! directory, and prints a warning when it has
-//! (`aeron_driver.c:83-132`, called at `:198`). That belongs with the error
-//! log itself, and arrives with it in P1-3; until then a stale directory's
-//! error log is deleted with everything else.
+//! Before a dead driver's directory is deleted, its error log is saved beside
+//! the directory as `<aeron_dir>-<datestamp>-error.log`, in the reference's
+//! format (`aeron_driver.c:83-132`, called at `:205-212`). That is the only
+//! chance to see why the previous driver died: the directory — and the CnC
+//! file the errors were recorded in — is about to go. The reference's
+//! delete-on-start branch does not read the old CnC at all, so neither does
+//! this one.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -137,6 +139,11 @@ pub enum Notice {
         /// Which directory.
         path: PathBuf,
     },
+    /// A dead driver's error log was saved before its directory was removed.
+    ErrorsSaved {
+        /// The file written beside the directory.
+        path: PathBuf,
+    },
 }
 
 impl PreparedDir {
@@ -191,7 +198,13 @@ pub fn prepare(config: &DriverConfig, now_ms: i64) -> Result<PreparedDir, DirErr
         if config.dirs_delete_on_start {
             remove_dir_all(dir)?;
         } else {
-            check_for_a_live_driver(config, now_ms)?;
+            let dead = check_for_a_live_driver(config, now_ms)?;
+            if let Some(cnc) = dead.as_ref() {
+                if let Some(path) = rescue_existing_errors(dir, cnc, now_ms)? {
+                    notices.push(Notice::ErrorsSaved { path });
+                }
+            }
+            drop(dead);
             remove_dir_all(dir)?;
         }
     }
@@ -233,7 +246,10 @@ pub fn prepare(config: &DriverConfig, now_ms: i64) -> Result<PreparedDir, DirErr
 /// published, a different major version, a corrupt block, a heartbeat that went
 /// stale or was set to [`deepmsg_cnc::layout::NULL_VALUE`] on the way out — is
 /// a dead driver, and the caller deletes it.
-fn check_for_a_live_driver(config: &DriverConfig, now_ms: i64) -> Result<(), DirError> {
+fn check_for_a_live_driver(
+    config: &DriverConfig,
+    now_ms: i64,
+) -> Result<Option<CncFile>, DirError> {
     let dir = config.aeron_dir.as_path();
 
     // The wait is a *duration*, so it is measured with a monotonic clock — not
@@ -268,7 +284,9 @@ fn check_for_a_live_driver(config: &DriverConfig, now_ms: i64) -> Result<(), Dir
                     });
                 }
 
-                return Ok(());
+                // Dead, and mapped: the caller may still rescue its error log
+                // before the directory goes.
+                return Ok(Some(cnc));
             }
             // Creating, not dead. Look again until the window closes.
             Err(CncOpenError::NotReady) if started.elapsed() < window => {
@@ -284,18 +302,19 @@ fn check_for_a_live_driver(config: &DriverConfig, now_ms: i64) -> Result<(), Dir
             // Nothing to read: an empty directory, or one whose CnC file was
             // never created. Both mean nobody is home.
             Err(CncOpenError::Io(error)) if io::ErrorKind::NotFound == error.kind() => {
-                return Ok(());
+                return Ok(None);
             }
             // A file that exists and is not a CnC file this build can use:
             // too short to hold a region, created and never published, a
             // version from a different implementation, or metadata that does
-            // not describe a layout.
+            // not describe a layout. There is no error log to rescue from a
+            // file this build could not decode.
             Err(
                 CncOpenError::TooShort { .. }
                 | CncOpenError::NotReady
                 | CncOpenError::Incompatible(_)
                 | CncOpenError::Malformed(_),
-            ) => return Ok(()),
+            ) => return Ok(None),
             // The file is there and could not be read, which is not a
             // statement about who owns the directory.
             Err(CncOpenError::Io(source)) => {
@@ -306,6 +325,59 @@ fn check_for_a_live_driver(config: &DriverConfig, now_ms: i64) -> Result<(), Dir
             }
         }
     }
+}
+
+/// Save a dead driver's error log beside its directory, before the directory is
+/// removed.
+///
+/// This is the reference's `aeron_report_existing_errors`
+/// (`aeron-driver/src/main/c/aeron_driver.c:83-132`): it only runs on the
+/// "somebody may be here" path, only for a CnC file this build could decode,
+/// and only when the log has entries. The file's name is
+/// `<aeron_dir>-<datestamp>-error.log`, with the datestamp's `:` replaced by
+/// `-`; the body is the reference's `***` block per entry followed by the
+/// distinct count.
+fn rescue_existing_errors(
+    dir: &Path,
+    cnc: &CncFile,
+    now_ms: i64,
+) -> Result<Option<PathBuf>, DirError> {
+    use std::io::Write;
+
+    let Some(reader) = cnc.error_log() else {
+        return Ok(None);
+    };
+    if !reader.has_entries() {
+        return Ok(None);
+    }
+
+    let mut entries = Vec::new();
+    let _ = reader.read(i64::MIN, &mut entries);
+
+    let datestamp = crate::sys::format_date(now_ms).replace(':', "-");
+    let path = PathBuf::from(format!("{}-{datestamp}-error.log", dir.display()));
+    let io_error = |source| DirError::Io {
+        path: path.clone(),
+        source,
+    };
+
+    let mut file = std::fs::File::create(&path).map_err(io_error)?;
+    for entry in &entries {
+        writeln!(file, "***").map_err(io_error)?;
+        writeln!(
+            file,
+            "{} observations from {} to {} for:",
+            entry.observation_count,
+            crate::sys::format_date(entry.first_observation_timestamp_ms),
+            crate::sys::format_date(entry.last_observation_timestamp_ms),
+        )
+        .map_err(io_error)?;
+        writeln!(file, " {}", entry.text).map_err(io_error)?;
+    }
+    writeln!(file).map_err(io_error)?;
+    writeln!(file, "{} distinct errors observed.", entries.len()).map_err(io_error)?;
+
+    Ok(Some(path))
 }
 
 fn create_dir(path: &Path) -> Result<(), DirError> {
@@ -326,6 +398,7 @@ fn remove_dir_all(path: &Path) -> Result<(), DirError> {
 mod tests {
     use super::*;
     use deepmsg_cnc::create::COUNTERS_VALUES_BUFFER_LENGTH_MIN;
+    use deepmsg_cnc::error_log::DistinctErrorLog;
     use deepmsg_cnc::layout;
     use deepmsg_cnc::{CncIdentity, CncLayout, ToDriverRingConsumer};
     use std::io::{Seek as _, Write as _};
@@ -402,6 +475,29 @@ mod tests {
 
         // The version last, as a driver publishes it: a file with a heartbeat
         // and no version is not one this driver would read as a live peer.
+        cnc.publish().expect("publish");
+    }
+
+    /// A CnC file a dead driver left: one error entry, a stale heartbeat, and
+    /// the published version that makes it readable.
+    fn cnc_with_error(dir: &Path, heartbeat_ms: i64, description: &str) {
+        let mut cnc = CncFile::create(dir, &layout(), &identity()).expect("create the CnC file");
+
+        {
+            let mut log = DistinctErrorLog::new();
+            let region = cnc
+                .error_log_writable()
+                .expect("the layout has an error log");
+            log.record(&region, NOW_MS, 7, description)
+                .expect("record the error");
+        }
+
+        let region = cnc.to_driver_region().expect("created read-write");
+        let consumer =
+            ToDriverRingConsumer::new(&region.as_read_only()).expect("a valid to-driver ring");
+        consumer
+            .write_consumer_heartbeat(&region, heartbeat_ms)
+            .expect("write the heartbeat");
         cnc.publish().expect("publish");
     }
 
@@ -501,6 +597,115 @@ mod tests {
             temp.path().join(PUBLICATIONS_DIR).is_dir(),
             "and then takes the directory over"
         );
+    }
+
+    /// The reference's filename: `<aeron_dir>-<datestamp>-error.log`, with the
+    /// datestamp's `:` replaced by `-`.
+    fn rescue_path(dir: &Path, now_ms: i64) -> PathBuf {
+        PathBuf::from(format!(
+            "{}-{}-error.log",
+            dir.display(),
+            crate::sys::format_date(now_ms).replace(':', "-")
+        ))
+    }
+
+    #[test]
+    fn a_dead_drivers_error_log_is_saved_beside_the_directory() {
+        let temp = TempDir::new();
+        std::fs::create_dir_all(temp.path()).expect("mkdir");
+        cnc_with_error(temp.path(), NOW_MS - SMALL_TIMEOUT_MS - 1, "boom");
+        let path = rescue_path(temp.path(), NOW_MS);
+
+        let prepared = prepare(&config(temp.path()), NOW_MS).expect("the dead driver is reclaimed");
+
+        assert!(
+            prepared.notices().iter().any(
+                |notice| matches!(notice, Notice::ErrorsSaved { path: saved } if *saved == path)
+            ),
+            "the caller is told where the log went: {:?}",
+            prepared.notices()
+        );
+        let text = std::fs::read_to_string(&path).expect("the rescued log");
+        assert!(text.contains("***\n1 observations from "), "{text}");
+        assert!(text.contains(" for:\n boom\n"), "{text}");
+        assert!(text.ends_with("1 distinct errors observed.\n"), "{text}");
+
+        let name = path
+            .file_name()
+            .expect("a file name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.ends_with("-error.log"), "{name}");
+        assert!(
+            name.contains(".000"),
+            "the datestamp carries milliseconds: {name}"
+        );
+
+        std::fs::remove_file(&path).expect("clean up the rescue file");
+    }
+
+    #[test]
+    fn an_empty_error_log_saves_nothing() {
+        let temp = TempDir::new();
+        std::fs::create_dir_all(temp.path()).expect("mkdir");
+        cnc_with_heartbeat(temp.path(), NOW_MS - SMALL_TIMEOUT_MS - 1);
+        let path = rescue_path(temp.path(), NOW_MS);
+
+        let prepared = prepare(&config(temp.path()), NOW_MS).expect("the dead driver is reclaimed");
+
+        assert!(
+            !prepared
+                .notices()
+                .iter()
+                .any(|notice| matches!(notice, Notice::ErrorsSaved { .. })),
+            "{:?}",
+            prepared.notices()
+        );
+        assert!(!path.exists(), "no file for an empty log");
+    }
+
+    #[test]
+    fn delete_on_start_does_not_rescue() {
+        let temp = TempDir::new();
+        std::fs::create_dir_all(temp.path()).expect("mkdir");
+        cnc_with_error(temp.path(), NOW_MS - SMALL_TIMEOUT_MS - 1, "boom");
+        let path = rescue_path(temp.path(), NOW_MS);
+
+        let config = DriverConfig {
+            dirs_delete_on_start: true,
+            ..config(temp.path())
+        };
+        let prepared = prepare(&config, NOW_MS).expect("delete on start");
+
+        assert!(
+            !prepared
+                .notices()
+                .iter()
+                .any(|notice| matches!(notice, Notice::ErrorsSaved { .. })),
+            "the reference's delete-on-start branch does not read the old CnC: {:?}",
+            prepared.notices()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_failed_rescue_leaves_the_directory_alone() {
+        let temp = TempDir::new();
+        std::fs::create_dir_all(temp.path()).expect("mkdir");
+        cnc_with_error(temp.path(), NOW_MS - SMALL_TIMEOUT_MS - 1, "boom");
+        let path = rescue_path(temp.path(), NOW_MS);
+        std::fs::create_dir(&path).expect("a directory where the file must go");
+
+        let error =
+            prepare(&config(temp.path()), NOW_MS).expect_err("the rescue cannot be written");
+
+        assert!(matches!(error, DirError::Io { .. }), "{error:?}");
+        assert!(
+            temp.path().join(deepmsg_cnc::CNC_FILE_NAME).is_file(),
+            "a failed rescue must not delete the directory it could not read"
+        );
+
+        std::fs::remove_dir(&path).expect("clean up the blocker");
     }
 
     #[test]
