@@ -58,6 +58,10 @@ BENCH_DIR=$(dirname "$here")
 . "$BENCH_DIR/lib/fingerprint.sh"
 # shellcheck source=../lib/cell.sh
 . "$BENCH_DIR/lib/cell.sh"
+# lan.sh falls back to a default peer (the WSL machine). A two-host cell has to
+# be told which machine the other half is on, so remember whether one was named
+# before that default exists.
+peer_named=${BENCH_PEER_SSH:-}
 # shellcheck source=../lib/lan.sh
 . "$BENCH_DIR/lib/lan.sh"
 # shellcheck source=../lib/peer.sh
@@ -155,7 +159,7 @@ _check() {
     done
 
     if [ "$mode" = two ]; then
-        if [ -z "$BENCH_PEER_SSH" ]; then
+        if [ -z "$peer" ] && [ -z "$peer_named" ]; then
             echo "--two-host needs --peer <user@host>" >&2
             problem=1
         else
