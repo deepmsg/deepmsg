@@ -141,16 +141,16 @@ fn main() -> ExitCode {
             // `getAdditionalEnvVarsMap` — so `warn_if_dirs_exist` keeps its
             // `false` default and no notice is ever pushed.
             dir::Notice::DirectoryExists { path } => {
-                eprintln!("deepmsg-driver: WARNING: {} exists", path.display());
+                // The reference's own words (`aeron_driver.c:143-149`), without
+                // this build's prefix: a test that parses stderr should see
+                // what it sees from `aeronmd`.
+                eprintln!("WARNING: {} exists", path.display());
             }
             // The reference's own warning, and the same stderr: a reclaimed
             // directory whose driver left errors behind is a diagnostic, not
             // a failure (`aeron_driver.c:118-119`).
             dir::Notice::ErrorsSaved { path } => {
-                eprintln!(
-                    "deepmsg-driver: WARNING: Existing errors saved to: {}",
-                    path.display()
-                );
+                eprintln!("WARNING: Existing errors saved to: {}", path.display());
             }
         }
     }
