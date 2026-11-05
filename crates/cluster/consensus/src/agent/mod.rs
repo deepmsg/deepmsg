@@ -74,6 +74,7 @@ use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
 use deepmsg_core::clock;
 use deepmsg_core::uri::ChannelUri;
 use deepmsg_driver::idle::Strategy;
+use deepmsg_log::{Component as LogComponent, Event as LogEvent, Level as LogLevel};
 
 use crate::clock::{ClusterClock, MillisecondClusterClock};
 use crate::config::{CLUSTER_IDLE_STRATEGY_PROP_NAME, CLUSTER_TIME_UNIT, ConsensusModuleConfig};
@@ -227,6 +228,12 @@ impl SnapshotDuration {
     /// `onSnapshotBegin` (`:74-77`).
     fn on_snapshot_begin(&mut self, time_ns: i64) {
         self.start_ns = Some(time_ns);
+        deepmsg_log::event(
+            LogLevel::Info,
+            LogComponent::Cluster,
+            LogEvent::SnapshotBegin,
+        )
+        .emit();
     }
 
     /// `onSnapshotEnd` (`:84-97`): propose the max, count a threshold breach.
@@ -236,12 +243,23 @@ impl SnapshotDuration {
         };
 
         let duration_ns = time_ns.saturating_sub(start_ns);
+        deepmsg_log::event(LogLevel::Info, LogComponent::Cluster, LogEvent::SnapshotEnd)
+            .field_i64("duration_ns", duration_ns)
+            .emit();
         if duration_ns > self.threshold_ns {
             increment_counter(client, self.threshold_exceeded, 1);
         }
         if duration_ns > read_counter(client, self.max_duration).unwrap_or(0) {
             write_counter(client, self.max_duration, duration_ns);
         }
+    }
+}
+
+fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Follower => "follower",
+        Role::Candidate => "candidate",
+        Role::Leader => "leader",
     }
 }
 
@@ -1814,8 +1832,16 @@ impl ConsensusModuleAgent {
 
     /// `role(...)` (`:1337`), counter 201.
     fn set_role(&mut self, role: Role) {
+        let changed = self.role != role;
         self.role = role;
         self.set_counter_value(self.counters.node_role, i64::from(role.code()));
+
+        if changed {
+            deepmsg_log::event(LogLevel::Info, LogComponent::Cluster, LogEvent::RoleChange)
+                .field_str("role", role_name(role))
+                .field_i64("term", self.leadership_term_id)
+                .emit();
+        }
     }
 
     fn set_counter_value(&self, counter: Counter, value: i64) {
@@ -4006,6 +4032,16 @@ impl ElectionHost for ConsensusModuleAgent {
 
     fn election_complete(&mut self, now_ns: i64) -> Result<(), ClusterError> {
         self.set_counter_value(self.counters.leadership_term, self.leadership_term_id);
+
+        deepmsg_log::event(
+            LogLevel::Info,
+            LogComponent::Cluster,
+            LogEvent::ElectionComplete,
+        )
+        .field_i64("term", self.leadership_term_id)
+        .field_i64("member_id", i64::from(self.config.member_id))
+        .field_str("role", role_name(self.role))
+        .emit();
 
         if self.role == Role::Leader {
             self.time_of_last_log_update_ns = now_ns - self.config.leader_heartbeat_interval_ns;
