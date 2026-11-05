@@ -147,7 +147,8 @@ elsewhere in `docs/benchmarks.md`.
       cnc/       the CnC file contract (client <-> driver shared memory)
       log/       the application-side log facade: a controlled event
                  vocabulary, a fixed JSON schema, and a non-blocking file
-                 writer (no third-party dependency)
+                 writer with size rotation (`crates/log/README.md` is the
+                 contract; no third-party dependency)
       codec/     the SBE codecs (ADR-0004): this crate is the façade over five
                  generated crates in the directories inside it — archive/,
                  archive-mark/, cluster/, cluster-mark/, cluster-node-state/

@@ -239,6 +239,7 @@ dependencies = [
  "deepmsg-archive",
  "deepmsg-client",
  "deepmsg-core",
+ "deepmsg-log",
  "deepmsg-tests",
  "hdrhistogram",
 ]

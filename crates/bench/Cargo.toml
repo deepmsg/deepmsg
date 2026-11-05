@@ -22,6 +22,9 @@ hdrhistogram = "7.5.4"
 
 [dev-dependencies]
 criterion = "0.8.2"
+# The log facade's caller-side cost: the only benchmark that needs it, so the
+# product bench crate does not link it into anything else.
+deepmsg-log = { path = "../log" }
 # Starting a driver, and starting the reference's own tools, is the same work
 # the interop suite already does — `tests/src/driver.rs` and `samples.rs` — and
 # a second copy of it here would drift from the one every other suite uses.
@@ -35,6 +38,13 @@ harness = false
 # driver, so it is not a `bench_function` and cannot be one.
 [[bench]]
 name = "latency"
+harness = false
+
+# The log facade's caller-side cost is a micro-harness, not a criterion group:
+# a fixed operation count keeps the enabled groups' output bounded, and the
+# budget is a percentile, which the harness reports itself.
+[[bench]]
+name = "logging"
 harness = false
 
 [lints]
