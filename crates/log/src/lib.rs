@@ -33,6 +33,8 @@
 mod config;
 mod event;
 mod level;
+pub mod record;
+mod time;
 
 pub use config::{Config, DEFAULT_LEVEL, DEFAULT_QUEUE_CAPACITY, DEFAULT_ROLL, InitError, Roll};
 pub use event::{Component, Event};
