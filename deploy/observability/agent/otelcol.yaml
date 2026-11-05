@@ -1,0 +1,116 @@
+extensions:
+  # The three places this must appear: here, the filelog receiver's `storage`
+  # and both exporters' `sending_queue.storage`. Without all three, a restart
+  # of the collector loses the lines written while it was down.
+  file_storage:
+    directory: ${env:DEEPMSG_OBS_STATE_DIR}
+    create_directory: true
+
+receivers:
+  filelog:
+    include: ["${env:DEEPMSG_LOG_DIR}/*.json"]
+    # Provisional until the L2 C3b measurement: `end` skips a file first seen
+    # after a rotation that happened while the collector was down, and that is
+    # exactly the case "restart without loss" has to cover. `beginning` pays a
+    # one-time read of what is on disk (at most the 500 MB the writer keeps).
+    start_at: beginning
+    storage: file_storage
+    operators:
+      - type: json_parser
+        parse_from: body
+        timestamp:
+          parse_from: attributes.ts
+          # RFC3339Nano is a Go layout name, not a strptime one: a strptime
+          # layout here fails silently and the timestamp becomes "now".
+          layout_type: gotime
+          layout: '2006-01-02T15:04:05.999999999Z07:00'
+        severity:
+          # Without this the level stays an attribute and severity_text is empty.
+          parse_from: attributes.level
+      # The line is one JSON object; the useful message is its `msg`, not the
+      # whole object. `if` keeps a line that has no msg from being dropped.
+      - type: move
+        if: attributes.msg != nil
+        from: attributes.msg
+        to: body
+
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: deepmsg-counters
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["${env:DEEPMSG_COUNTERS_ENDPOINT}"]
+        - job_name: deepmsg-otelcol
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["${env:DEEPMSG_OTELCOL_TELEMETRY_ENDPOINT}"]
+
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu: {}
+      memory: {}
+      disk: {}
+      filesystem: {}
+      network: {}
+
+processors:
+  # First in the pipeline: the collector is a guest on the media driver's host.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+  batch:
+    timeout: 5s
+
+exporters:
+  otlphttp/victorialogs:
+    logs_endpoint: ${env:DEEPMSG_VL_LOGS_ENDPOINT}
+    headers:
+      # The stream identifies where a line came from; level and event are
+      # query fields. A role or level in here splits the timeline.
+      VL-Stream-Fields: "component,node_id"
+      Authorization: "Bearer ${env:DEEPMSG_OBS_WRITE_TOKEN}"
+    sending_queue:
+      enabled: true
+      storage: file_storage
+      queue_size: 10000
+      num_consumers: 4
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  prometheusremotewrite/victoriametrics:
+    endpoint: ${env:DEEPMSG_VM_WRITE_ENDPOINT}
+    headers:
+      Authorization: "Bearer ${env:DEEPMSG_OBS_WRITE_TOKEN}"
+    sending_queue:
+      enabled: true
+      storage: file_storage
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+
+service:
+  extensions: [file_storage]
+  telemetry:
+    metrics:
+      level: basic
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 127.0.0.1
+                port: 8888
+  pipelines:
+    logs:
+      receivers: [filelog]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/victorialogs]
+    metrics:
+      receivers: [prometheus, hostmetrics]
+      processors: [memory_limiter, batch]
+      exporters: [prometheusremotewrite/victoriametrics]

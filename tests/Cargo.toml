@@ -41,6 +41,10 @@ name = "logging_lifecycle"
 path = "integration/logging_lifecycle.rs"
 
 [[test]]
+name = "observability_config"
+path = "integration/observability_config.rs"
+
+[[test]]
 name = "cluster_log_events"
 path = "integration/cluster_log_events.rs"
 
