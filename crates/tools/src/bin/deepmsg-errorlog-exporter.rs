@@ -20,8 +20,9 @@
 //! identified by `(text, first_observation_timestamp_ms)` and reported by the
 //! growth of `observation_count`; each rescued file is consumed once, by path.
 //!
-//! The CnC and the driver's rescued file are here; the cluster's rescued file
-//! arrives in the next commit.
+//! The CnC region and the two rescued-file sources are read here; the cluster's
+//! `save_existing_errors` file is a copy of its error buffer, parsed by the
+//! same reader.
 
 #![forbid(unsafe_code)]
 
@@ -34,7 +35,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use deepmsg_cnc::CncFile;
-use deepmsg_cnc::error_log::ErrorLogEntry;
+use deepmsg_cnc::error_log::{ErrorLogEntry, ErrorLogReader};
+use deepmsg_core::pal::MappedFile;
 use deepmsg_log::{
     Component, Config, DEFAULT_QUEUE_CAPACITY, Event, Guard, Handle, Level, Roll, open,
 };
@@ -286,6 +288,11 @@ impl Sweep {
     fn poll(&mut self, options: &Options, logger: &Handle) {
         self.poll_cnc(options, logger);
         self.poll_rescued(options, logger);
+        self.poll_cluster(options, logger);
+
+        // Forget files that were rotated away, so a long-running exporter does
+        // not remember every crash it has ever seen.
+        self.consumed.retain(|path| path.exists());
     }
 
     fn poll_cnc(&mut self, options: &Options, logger: &Handle) {
@@ -399,10 +406,57 @@ impl Sweep {
             );
             self.consumed.insert(path);
         }
+    }
 
-        // Forget files that were rotated away, so a long-running exporter does
-        // not remember every crash it has ever seen.
-        self.consumed.retain(|path| path.exists());
+    /// Read the files `ClusterMarkFile::save_existing_errors` writes beside a
+    /// cluster mark file: `<prefix>-<epoch_ms>-error.log`, a copy of the error
+    /// buffer's own bytes.
+    fn poll_cluster(&mut self, options: &Options, logger: &Handle) {
+        let Some(cluster_dir) = options.cluster_dir.as_deref() else {
+            return;
+        };
+        let Ok(listing) = std::fs::read_dir(cluster_dir) else {
+            return;
+        };
+        let mut paths: Vec<PathBuf> = listing
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| is_cluster_rescue(path))
+            .collect();
+        paths.sort();
+
+        for path in paths {
+            if self.consumed.contains(&path) {
+                continue;
+            }
+            let Some(entries) = parse_cluster_rescue(&path) else {
+                // A file still being written, or one that is not a distinct
+                // error log at all: say it, and look again.
+                eprintln!(
+                    "deepmsg-errorlog-exporter: cannot read {} as a cluster error log yet; \
+                     will look again",
+                    path.display(),
+                );
+                continue;
+            };
+
+            for entry in &entries {
+                self.report(
+                    logger,
+                    Component::Cluster,
+                    Event::ClusterError,
+                    "cluster-mark",
+                    entry,
+                    Some(&path),
+                );
+            }
+            eprintln!(
+                "deepmsg-errorlog-exporter: read {} cluster errors from {}",
+                entries.len(),
+                path.display(),
+            );
+            self.consumed.insert(path);
+        }
     }
 
     fn note(&mut self, now: SourceState) {
@@ -509,6 +563,41 @@ fn has_prefix_suffix(name: &OsStr, prefix: &[u8], suffix: &[u8]) -> bool {
     bytes.len() >= prefix.len() + suffix.len()
         && bytes.starts_with(prefix)
         && bytes.ends_with(suffix)
+}
+
+/// `save_existing_errors` names its file `<prefix>-<epoch_ms>-error.log`; the
+/// driver's text rescue ends in a date's offset (`+0800`), not in digits, so
+/// the two shapes cannot be mistaken for one another.
+fn is_cluster_rescue(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let bytes = name.as_bytes();
+    let Some(stem) = bytes.strip_suffix(b"-error.log") else {
+        return false;
+    };
+    let Some(index) = stem.iter().rposition(|byte| *byte == b'-') else {
+        return false;
+    };
+    let stamp = &stem[index + 1..];
+    !stamp.is_empty() && stamp.iter().all(u8::is_ascii_digit)
+}
+
+/// The cluster's rescued file is a copy of the error buffer, so the same reader
+/// parses it after a read-only mapping — page-aligned and without a copy.
+fn parse_cluster_rescue(path: &Path) -> Option<Vec<ErrorLogEntry>> {
+    let mapping = MappedFile::open_readonly(path).ok()?;
+    let buffer = mapping.region(0, mapping.len())?;
+    let reader = ErrorLogReader::new(buffer);
+    let mut entries = Vec::new();
+    let scan = reader.read(i64::MIN, &mut entries);
+    if scan.malformed != 0 || scan.truncated {
+        return None;
+    }
+    Some(entries)
 }
 
 /// Parse the reference's text form (`aeron_report_existing_errors`):
@@ -667,10 +756,14 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use deepmsg_cluster_common::mark::{self, ClusterMarkFile};
     use deepmsg_cnc::create::{COUNTERS_VALUES_BUFFER_LENGTH_MIN, CncIdentity, CncLayout};
-    use deepmsg_cnc::error_log::DistinctErrorLog;
+    use deepmsg_cnc::error_log::{DistinctErrorLog, ErrorLogRegion};
+    use deepmsg_codec_cluster_mark::cluster_component_type::ClusterComponentType;
 
     use super::*;
+
+    const CLUSTER_PAGE: usize = 4096;
 
     struct TempDir(PathBuf);
 
@@ -871,14 +964,16 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let root = TempDir::new();
+            let cluster_dir = root.path().join("cluster");
             let options = Options {
                 dir: root.path().join("aeron"),
                 log_dir: root.path().join("logs"),
                 node_id: "node-1".to_owned(),
                 interval: DEFAULT_INTERVAL,
-                cluster_dir: None,
+                cluster_dir: Some(cluster_dir.clone()),
             };
             std::fs::create_dir_all(&options.dir).expect("aeron directory");
+            std::fs::create_dir_all(&cluster_dir).expect("cluster directory");
 
             let layout = CncLayout {
                 counters_values_length: COUNTERS_VALUES_BUFFER_LENGTH_MIN,
@@ -944,6 +1039,43 @@ mod tests {
             let path = parent.join(format!("{name}-{stamp}-error.log"));
             std::fs::write(&path, text).expect("write the rescued log");
             path
+        }
+
+        /// Write what `ClusterMarkFile::save_existing_errors` writes: the
+        /// error buffer's own bytes, through the producer itself.
+        fn write_cluster_rescue(&self, prefix: &str, entries: &[(&str, i32)]) -> PathBuf {
+            let cluster_dir = self
+                .options
+                .cluster_dir
+                .as_ref()
+                .expect("a cluster directory");
+            let file = ClusterMarkFile::create(
+                &cluster_dir.join(mark::FILENAME),
+                ClusterComponentType::CONSENSUS_MODULE,
+                mark::ERROR_BUFFER_MIN_LENGTH,
+                CLUSTER_PAGE,
+                NOW_MS,
+                4242,
+            )
+            .expect("create the cluster mark file");
+
+            {
+                let buffer = file.error_buffer().expect("the error buffer");
+                let region = ErrorLogRegion::new(buffer);
+                let mut log = DistinctErrorLog::new();
+                for (text, count) in entries {
+                    for _ in 0..*count {
+                        log.record(&region, NOW_MS, 11, text).expect("record");
+                    }
+                }
+            }
+
+            let saved = file
+                .save_existing_errors(prefix, NOW_MS)
+                .expect("save the existing errors")
+                .expect("a non-empty error buffer");
+            file.signal_terminated().expect("terminate the mark file");
+            saved
         }
     }
 
@@ -1238,5 +1370,80 @@ mod tests {
         let lines = fixture.lines();
         assert_eq!(1, lines.len(), "{lines:?}");
         assert!(lines[0].contains("a failure"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn a_cluster_rescue_name_ends_in_a_numeric_stamp() {
+        let root = TempDir::new();
+        for (name, expected) in [
+            ("consensus-module-1700000000000-error.log", true),
+            ("cluster-1-error.log", true),
+            (
+                "consensus-module-2023-11-14 22-13-20.123+0000-error.log",
+                false,
+            ),
+            ("consensus-module-1700000000000-error.txt", false),
+            ("1700000000000-error.log", false),
+            ("consensus-module--error.log", false),
+        ] {
+            let path = root.path().join(name);
+            std::fs::write(&path, b"x").expect("write the candidate");
+            assert_eq!(expected, is_cluster_rescue(&path), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_cluster_rescue_file_is_read_once() {
+        let mut fixture = Fixture::new();
+        let path = fixture.write_cluster_rescue("consensus-module", &[("cluster failure", 3)]);
+
+        fixture.poll();
+        let lines = fixture.lines();
+        assert_eq!(1, lines.len(), "{lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("\"component\":\"cluster\""), "{line}");
+        assert!(line.contains("\"event\":\"cluster.error\""), "{line}");
+        assert!(line.contains("\"source\":\"cluster-mark\""), "{line}");
+        assert!(line.contains("\"observations\":3"), "{line}");
+        assert!(line.contains("\"observation_count\":3"), "{line}");
+        assert!(line.contains("cluster failure"), "{line}");
+        assert!(line.contains(&path.display().to_string()), "{line}");
+
+        fixture.poll();
+        assert_eq!(
+            1,
+            fixture.lines().len(),
+            "the same cluster file was read again"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_cluster_file_is_not_consumed_and_is_retried() {
+        let mut fixture = Fixture::new();
+        let cluster_dir = fixture
+            .options
+            .cluster_dir
+            .clone()
+            .expect("a cluster directory");
+        let path = cluster_dir.join("consensus-module-1-error.log");
+        let mut broken = vec![0_u8; 64];
+        broken[0..4].copy_from_slice(&1_000_000_i32.to_le_bytes());
+        std::fs::write(&path, broken).expect("write a truncated log");
+
+        fixture.poll();
+        assert!(
+            fixture.lines().is_empty(),
+            "a truncated cluster file produced events"
+        );
+
+        // The real bytes at the same path are read on the next sweep.
+        let real = fixture.write_cluster_rescue("consensus-module", &[("cluster failure", 1)]);
+        let bytes = std::fs::read(real).expect("the saved bytes");
+        std::fs::write(&path, bytes).expect("complete the truncated path");
+        fixture.poll();
+
+        let lines = fixture.lines();
+        assert_eq!(1, lines.len(), "{lines:?}");
+        assert!(lines[0].contains("cluster failure"), "{}", lines[0]);
     }
 }

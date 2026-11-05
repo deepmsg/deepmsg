@@ -420,7 +420,9 @@ name = "deepmsg-tools"
 version = "0.1.0"
 dependencies = [
  "deepmsg-archive",
+ "deepmsg-cluster-common",
  "deepmsg-cnc",
+ "deepmsg-codec-cluster-mark",
  "deepmsg-core",
  "deepmsg-log",
  "libc",
