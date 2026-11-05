@@ -11,14 +11,16 @@ and a Prometheus endpoint, and turning collection off degrades queries to
 
 ## Status
 
-**Configuration, the process harness and the log path.** The agent config, its
-static checks, the launcher and the log assertions are here; the metrics path,
-durability, authentication and resource assertions arrive in the later commits
-of the L2 slice. The launcher proves the four processes start, listen and stay
-alive, that the driver runs with no collector at all (empty stderr, lines on
-disk), and that its log file reaches VictoriaLogs with the expected fields and
-stream. Nothing under `systemd/` or `k8s/` has been run on a machine yet, and a
-static review is not a run.
+**Configuration, the process harness, the log path and the metrics path.** The
+agent config, its static checks, the launcher, the log assertions and the
+metrics assertions are here; durability, authentication and the resource
+budgets arrive in the later commits of the L2 slice. The launcher proves the
+four processes start, listen and stay alive, that the driver runs with no
+collector at all (empty stderr, lines on disk), that its log file reaches
+VictoriaLogs with the expected fields and stream, and that the counters
+exporter's scrape (the collector's own metrics included) reaches
+VictoriaMetrics. Nothing under `systemd/` or `k8s/` has been run on a machine
+yet, and a static review is not a run.
 
 ## Layout
 
@@ -52,12 +54,23 @@ assertions are the log path's contract: `driver.start` arrives, `_msg` is the
 event's name (or its `msg` when it has one, checked with a synthetic line), and
 `_stream` is exactly `component` and `node_id`.
 
+Then a second driver stays up with `deepmsg-counters-exporter` beside it, and
+the script asks VictoriaMetrics for `deepmsg_driver_up`, the heartbeat age (it
+must be under ten seconds — a live driver), and `deepmsg_error_total`. The
+collector's own metrics take the same pipeline: the telemetry level is
+`normal`, because `otelcol_exporter_*` does not exist at `basic`, and the
+script requires at least one of those names in VictoriaMetrics.
+
+vmauth's `src_paths` are **exact paths** — no prefix and no glob — so the
+generated auth config names every path the pipeline and a Grafana datasource
+use. A missing one is a 400 `missing route`, not a 404.
+
 | override | default | meaning |
 |---|---|---|
 | `E2E_VL_PORT` | `9428` | VictoriaLogs |
 | `E2E_VM_PORT` | `8428` | VictoriaMetrics |
 | `E2E_VMAUTH_PORT` | `8427` | vmauth |
-| `E2E_COUNTERS_PORT` | `9101` | the counters exporter (nothing listens there yet) |
+| `E2E_COUNTERS_PORT` | `9101` | the counters exporter |
 | `E2E_OBS_TOKEN` | `e2e-token` | the bearer token the agent and the script use |
 | `DEEPMSG_OBS_E2E_DIR` | `target/observability-e2e` | where a run's state and evidence go |
 | `E2E_KEEP` | `0` | keep the run directory even on success |

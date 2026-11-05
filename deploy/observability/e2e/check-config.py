@@ -181,6 +181,9 @@ def main() -> int:
     # The collector's own telemetry, and the pipelines that carry everything.
     telemetry = mapping(service.get("telemetry"), "service.telemetry")
     metrics = mapping(telemetry.get("metrics"), "service.telemetry.metrics")
+    # Component-level otelcol_exporter_* metrics exist only at normal and above;
+    # basic is silent about the exporter, which is the P3 alert's source.
+    check("collector telemetry level", metrics.get("level"), "normal")
     readers = sequence(metrics.get("readers"), "service.telemetry.metrics.readers")
     pull = mapping(mapping(readers[0], "readers[0]").get("pull"), "readers[0].pull") if readers else {}
     exporter = mapping(pull.get("exporter"), "readers[0].pull.exporter")

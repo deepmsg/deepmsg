@@ -103,7 +103,9 @@ service:
   extensions: [file_storage]
   telemetry:
     metrics:
-      level: basic
+      # normal, not basic: the per-component otelcol_exporter_* metrics (the
+      # P3 alert's source) are emitted only at normal and above.
+      level: normal
       readers:
         - pull:
             exporter:

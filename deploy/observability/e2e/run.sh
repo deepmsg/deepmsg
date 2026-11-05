@@ -2,9 +2,10 @@
 # The L2 end-to-end stack: VictoriaLogs, VictoriaMetrics, vmauth and the agent.
 #
 # This commit proves the four processes start, listen and stay alive, and that
-# the log path works end to end: the driver runs with no collector (empty
-# stderr, lines on disk), then the agent reads that backlog and VictoriaLogs
-# answers with the right fields and stream.
+# both paths work: the log path (the driver runs with no collector, then the
+# agent reads that backlog and VictoriaLogs answers), and the metrics path (the
+# counters exporter's scrape reaches VictoriaMetrics, the collector's own
+# metrics included).
 #
 # Everything lives under target/observability-e2e/<timestamp>-<pid>/. A failed
 # run keeps it (logs, listeners, process table) and says where it is; a
@@ -52,7 +53,13 @@ fail() {
 cleanup() {
   local code=$?
   local name
-  for name in "${!PID[@]}"; do
+  # The agent goes first, so its queue can still reach vmauth: killing the
+  # backend first makes a successful run look like a send failure.
+  for name in otelcol counters-exporter driver-metrics driver; do
+    [[ -n ${PID[$name]:-} ]] && kill "${PID[$name]}" 2>/dev/null || true
+  done
+  sleep 1
+  for name in vmauth victoria-logs victoria-metrics; do
     [[ -n ${PID[$name]:-} ]] && kill "${PID[$name]}" 2>/dev/null || true
   done
   sleep 0.2
@@ -99,13 +106,29 @@ python3 "$HERE/check-config.py" || fail "the agent config failed its static chec
 mkdir -p "$WORK"/{vl,vm,state,logs,evidence}
 
 # vmauth is the only way in: the agent and the E2E both hold one token.
+# src_paths are exact paths (vmauth has no prefix or glob match here), so every
+# path the pipeline and a Grafana datasource use is named.
 cat >"$WORK/vmauth.yaml" <<YAML
 users:
   - bearer_token: "$TOKEN"
     url_map:
-      - src_paths: ["/insert/opentelemetry/v1/logs", "/select/logsql/query"]
+      - src_paths:
+          - /insert/opentelemetry/v1/logs
+          - /select/logsql/query
+          - /select/logsql/streams
+          - /select/logsql/stream_field_names
+          - /select/logsql/stream_field_values
+          - /select/logsql/field_names
+          - /select/logsql/field_values
         url_prefix: "http://127.0.0.1:$VL_PORT"
-      - src_paths: ["/api/v1/write", "/api/v1/query", "/api/v1/label"]
+      - src_paths:
+          - /api/v1/write
+          - /api/v1/query
+          - /api/v1/query_range
+          - /api/v1/series
+          - /api/v1/labels
+          - /api/v1/label/__name__/values
+          - /api/v1/metadata
         url_prefix: "http://127.0.0.1:$VM_PORT"
 YAML
 
@@ -248,6 +271,76 @@ wait_logs 'event:"backpressure.enter"' \
   'any(.[]; .event == "backpressure.enter" and ._msg == "a synthetic message")' 30 ||
   fail "a line with msg did not reach _msg"
 echo "e2e: C1: a line with msg reaches _msg as text"
+
+# C2/C8: a live driver, the counters exporter, the agent's scrape, and
+# VictoriaMetrics answering. A second driver on its own directory keeps a
+# heartbeat fresh; the first one is gone and its directory is not reused.
+cargo build --manifest-path "$REPO/Cargo.toml" -p deepmsg-tools --bin deepmsg-counters-exporter \
+  >"$WORK/build-exporter.log" 2>&1 || fail "the counters exporter did not build; see $WORK/build-exporter.log"
+DEEPMSG_LOG_DIR="$WORK/logs" DEEPMSG_NODE_ID=e2e \
+  "$DRIVER_BIN" -Daeron.dir="$WORK/aeron-metrics" >"$WORK/driver-metrics.out" 2>"$WORK/driver-metrics.err" &
+PID[driver-metrics]=$!
+echo "e2e: started driver-metrics (pid ${PID[driver-metrics]})"
+
+EXPORTER_BIN=${DEEPMSG_COUNTERS_EXPORTER_BIN:-$REPO/target/debug/deepmsg-counters-exporter}
+"$EXPORTER_BIN" --dir "$WORK/aeron-metrics" --listen "127.0.0.1:$COUNTERS_PORT" --node-id e2e \
+  >"$WORK/counters-exporter.log" 2>&1 &
+PID[counters-exporter]=$!
+echo "e2e: started counters-exporter (pid ${PID[counters-exporter]})"
+
+vm_query() {
+  curl -s -H "Authorization: Bearer $TOKEN" --get \
+    --data-urlencode "query=$1" "http://127.0.0.1:$VMAUTH_PORT/api/v1/query"
+}
+
+wait_promql() {
+  local query=$1 timeout=${2:-90}
+  local deadline=$((SECONDS + timeout)) out
+  while ((SECONDS < deadline)); do
+    out=$(vm_query "$query")
+    if printf '%s' "$out" | jq -e '.data.result | length > 0' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "e2e: last answer for $query: $out" >&2
+  return 1
+}
+
+# The exporter must first see the driver; then the agent's scrape has to run
+# (15 s interval), pass the batch, and be written.
+exporter_up_deadline=$((SECONDS + 30))
+until curl -sf "http://127.0.0.1:$COUNTERS_PORT/metrics" |
+  grep -q 'deepmsg_driver_up{node_id="e2e"} 1'; do
+  ((SECONDS < exporter_up_deadline)) || fail "the counters exporter never saw the driver"
+  sleep 0.5
+done
+echo "e2e: the counters exporter reports the driver up"
+
+wait_promql 'deepmsg_driver_up{node_id="e2e"}' 90 ||
+  fail "deepmsg_driver_up did not reach VictoriaMetrics"
+wait_promql 'deepmsg_driver_heartbeat_age_seconds{node_id="e2e"}' 90 ||
+  fail "the heartbeat age did not reach VictoriaMetrics"
+wait_promql 'deepmsg_error_total{node_id="e2e",component="driver"}' 90 ||
+  fail "deepmsg_error_total did not reach VictoriaMetrics"
+heartbeat=$(vm_query 'deepmsg_driver_heartbeat_age_seconds{node_id="e2e"}' |
+  jq -r '.data.result[0].value[1] // empty')
+[[ -n $heartbeat ]] || fail "the heartbeat series disappeared between two queries"
+awk -v value="$heartbeat" 'BEGIN { exit !(value < 10) }' ||
+  fail "the heartbeat age is $heartbeat, not a live driver"
+echo "e2e: C2: heartbeat age $heartbeat s, error counter and up are in VictoriaMetrics"
+
+# C8: the collector's own metrics take the same pipeline. Its scrape job runs
+# on the same 15 s cycle, so wait for one more turn.
+collector_metrics_deadline=$((SECONDS + 90))
+until curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:$VMAUTH_PORT/api/v1/label/__name__/values" |
+  jq -e '.data | map(select(startswith("otelcol_exporter_"))) | length > 0' >/dev/null 2>&1; do
+  ((SECONDS < collector_metrics_deadline)) ||
+    fail "the collector's own metrics are not in VictoriaMetrics"
+  sleep 1
+done
+echo "e2e: C8: otelcol_exporter_* metrics are in VictoriaMetrics"
 
 for name in victoria-logs victoria-metrics vmauth otelcol; do
   alive "${PID[$name]}" || fail "$name is not alive after readiness"
