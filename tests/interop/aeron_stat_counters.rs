@@ -18,9 +18,13 @@
 //! that read a *different* file would fail the first of those; one that read
 //! the same file with a broken decoder would fail the second and third.
 
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
 use deepmsg_cnc::{CncFile, CncIdentity, CncLayout};
@@ -220,4 +224,139 @@ fn label_of(counters: &[(i32, String)], id: i32) -> Option<String> {
         .iter()
         .find(|(found, _)| *found == id)
         .map(|(_, label)| label.clone())
+}
+
+/// The counter values in `AeronStat`'s output, as `id -> value`.
+///
+/// The format is `<id>: <value> - <label>`, the same shape [`counter_lines`]
+/// reads.
+fn counter_values(text: &str) -> BTreeMap<i32, i64> {
+    text.lines()
+        .filter_map(|line| {
+            let (id, rest) = line.trim_start().split_once(':')?;
+            let id = id.trim().parse::<i32>().ok()?;
+            let value = rest.split_once(" - ")?.0.trim().parse::<i64>().ok()?;
+            Some((id, value))
+        })
+        .collect()
+}
+
+const EXPORTER_ENV: &str = "DEEPMSG_COUNTERS_EXPORTER";
+const DEFAULT_EXPORTER: &str = "../target/debug/deepmsg-counters-exporter";
+
+fn locate_exporter() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(EXPORTER_ENV) {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+    let path = PathBuf::from(DEFAULT_EXPORTER);
+    path.is_file().then_some(path)
+}
+
+/// Start the exporter on a free port, scrape `/metrics`, stop it, answer the
+/// body.
+fn scrape(exporter: &Path, dir: &Path, node_id: &str) -> String {
+    let probe = TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let port = probe.local_addr().expect("the probe's address").port();
+    drop(probe);
+    let listen = format!("127.0.0.1:{port}");
+
+    let mut child = Command::new(exporter)
+        .arg("--dir")
+        .arg(dir)
+        .arg("--listen")
+        .arg(&listen)
+        .arg("--node-id")
+        .arg(node_id)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn the exporter");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut stream = loop {
+        match TcpStream::connect(&listen) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the exporter did not listen on {listen}: {error}");
+            }
+        }
+    };
+
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\n\r\n")
+        .expect("write the request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read the response");
+
+    let _ = child.kill();
+    let _ = child.wait();
+
+    response
+        .split_once("\r\n\r\n")
+        .map_or(response.clone(), |(_, body)| body.to_owned())
+}
+
+fn metric_value(body: &str, prefix: &str) -> Option<i64> {
+    body.lines()
+        .find(|line| line.starts_with(prefix))
+        .and_then(|line| line.rsplit_once(' '))
+        .and_then(|(_, value)| value.parse().ok())
+}
+
+/// C6: the exporter's numbers are `AeronStat`'s numbers.
+///
+/// The same CnC, read by the reference's own tool and by ours: two decoders of
+/// the same bytes, and the system counters are the ones both of them name.
+#[test]
+fn the_exporter_agrees_with_aeron_stat_on_the_system_counters() {
+    let Some(aeron_stat_binary) = driver::locate_aeron_stat() else {
+        driver::announce_tool_skip("AeronStat");
+        return;
+    };
+    let Some(exporter) = locate_exporter() else {
+        eprintln!(
+            "SKIPPED: not verified -- no counters exporter binary found. \
+             Build it (`cargo build -p deepmsg-tools --bin deepmsg-counters-exporter`) \
+             or set {EXPORTER_ENV}."
+        );
+        return;
+    };
+
+    let (temp, _conductor) = running_driver();
+    let output = aeron_stat(&aeron_stat_binary, &temp.0);
+    let stat = counter_values(&output);
+    let body = scrape(&exporter, &temp.0, "aeron-stat-test");
+
+    let checks = [
+        (
+            5,
+            "deepmsg_nak_total{node_id=\"aeron-stat-test\",direction=\"sent\"}",
+        ),
+        (
+            6,
+            "deepmsg_nak_total{node_id=\"aeron-stat-test\",direction=\"received\"}",
+        ),
+        (
+            15,
+            "deepmsg_error_total{node_id=\"aeron-stat-test\",component=\"driver\"}",
+        ),
+        (23, "deepmsg_loss_total{node_id=\"aeron-stat-test\"} "),
+    ];
+
+    for (id, prefix) in checks {
+        let expected = *stat
+            .get(&id)
+            .unwrap_or_else(|| panic!("AeronStat has no counter {id}:\n{output}"));
+        let actual = metric_value(&body, prefix)
+            .unwrap_or_else(|| panic!("the exporter has no {prefix}:\n{body}"));
+        assert_eq!(expected, actual, "counter {id} disagrees with AeronStat");
+    }
 }

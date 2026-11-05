@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use deepmsg_archive::server::recording_pos::parse_key as parse_archive_key;
 use deepmsg_cnc::CncFile;
+use deepmsg_cnc::loss_report::LossReportFile;
 use deepmsg_cnc::position_key::StreamPositionKey;
 use deepmsg_core::clock;
 
@@ -360,6 +361,22 @@ fn render_at(dir: &Path, node_id: &str, now: i64) -> String {
         format!("deepmsg_unknown_counters{{node_id=\"{node}\"}} {unknown}"),
     );
 
+    // The per-stream loss the driver reports is in its own file, not in a
+    // counter: the system counter is a global count of gap fills.
+    if let Ok(report) = LossReportFile::open_readonly(dir) {
+        for entry in report.entries() {
+            families.sample(
+                "deepmsg_loss_total",
+                "Bytes lost on a stream",
+                "counter",
+                format!(
+                    "deepmsg_loss_total{{node_id=\"{node}\",stream_id=\"{}\",session_id=\"{}\"}} {}",
+                    entry.stream_id, entry.session_id, entry.total_bytes_lost
+                ),
+            );
+        }
+    }
+
     families.render()
 }
 
@@ -514,6 +531,7 @@ mod tests {
     use std::path::PathBuf;
 
     use deepmsg_cnc::create::COUNTERS_VALUES_BUFFER_LENGTH_MIN;
+    use deepmsg_cnc::loss_report::{LossReportEntry, LossReportFile};
     use deepmsg_cnc::position_key::StreamPositionKey;
     use deepmsg_cnc::{CncFile, CncIdentity, CncLayout, CounterManager};
 
@@ -608,6 +626,21 @@ mod tests {
         cnc.write_consumer_heartbeat(NOW_MS - 1500)
             .expect("heartbeat");
         cnc.publish().expect("publish");
+
+        let file = LossReportFile::create(dir, 4096).expect("loss report");
+        let buffer = file.writable().expect("writable");
+        LossReportEntry {
+            observation_count: 2,
+            total_bytes_lost: 77,
+            first_observation_timestamp: NOW_MS,
+            last_observation_timestamp: NOW_MS,
+            session_id: 7,
+            stream_id: 1002,
+            channel: b"aeron:ipc".to_vec(),
+            source: b"src".to_vec(),
+        }
+        .encode(&buffer, 0)
+        .expect("encode the loss report");
     }
 
     #[test]
@@ -628,6 +661,7 @@ mod tests {
             "deepmsg_nak_total{node_id=\"node-1\",direction=\"sent\"} 11",
             "deepmsg_nak_total{node_id=\"node-1\",direction=\"received\"} 12",
             "deepmsg_loss_total{node_id=\"node-1\"} 13",
+            "deepmsg_loss_total{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\"} 77",
             "deepmsg_error_total{node_id=\"node-1\",component=\"driver\"} 14",
             "deepmsg_cluster_is_leader{node_id=\"node-1\",cluster_id=\"7\"} 1",
             "deepmsg_cluster_term{node_id=\"node-1\",cluster_id=\"7\"} 5",
