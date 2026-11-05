@@ -20,13 +20,15 @@
 //! identified by `(text, first_observation_timestamp_ms)` and reported by the
 //! growth of `observation_count`; each rescued file is consumed once, by path.
 //!
-//! The CnC source is here; the two rescued-file sources arrive in the next
-//! commits.
+//! The CnC and the driver's rescued file are here; the cluster's rescued file
+//! arrives in the next commit.
 
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -273,6 +275,9 @@ struct Sweep {
     /// are indistinguishable from the reader and are reported once; the lost
     /// sighting arrives on the next one.
     emitted: HashMap<(String, i64), u64>,
+    /// Rescued files already read, by path. A file is consumed only once it
+    /// parsed completely, so a half-written one is retried.
+    consumed: HashSet<PathBuf>,
     state: State,
 }
 
@@ -280,6 +285,7 @@ impl Sweep {
     /// One sweep over every source.
     fn poll(&mut self, options: &Options, logger: &Handle) {
         self.poll_cnc(options, logger);
+        self.poll_rescued(options, logger);
     }
 
     fn poll_cnc(&mut self, options: &Options, logger: &Handle) {
@@ -322,6 +328,81 @@ impl Sweep {
                 None,
             );
         }
+    }
+
+    /// Read the files the next driver wrote beside the directory it reclaimed:
+    /// `<aeron_dir>-<datestamp>-error.log`.
+    fn poll_rescued(&mut self, options: &Options, logger: &Handle) {
+        let Some(parent) = rescue_directory(&options.dir) else {
+            return;
+        };
+        let Some(name) = options.dir.file_name() else {
+            return;
+        };
+
+        let mut prefix = name.as_bytes().to_vec();
+        prefix.push(b'-');
+        const SUFFIX: &[u8] = b"-error.log";
+
+        let Ok(listing) = std::fs::read_dir(parent) else {
+            return;
+        };
+        let mut paths: Vec<PathBuf> = listing
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| has_prefix_suffix(name, &prefix, SUFFIX))
+            })
+            .collect();
+        // A sweep reads the files in one order whatever the file system says.
+        paths.sort();
+
+        for path in paths {
+            if self.consumed.contains(&path) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                eprintln!(
+                    "deepmsg-errorlog-exporter: cannot read {}; will look again",
+                    path.display(),
+                );
+                continue;
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            let Some(entries) = parse_rescue_log(&text) else {
+                // A file still being written has no trailer yet. Saying so and
+                // looking again is what keeps "cannot read" from looking like
+                // "no errors".
+                eprintln!(
+                    "deepmsg-errorlog-exporter: {} is not a complete rescued error log yet; \
+                     will look again",
+                    path.display(),
+                );
+                continue;
+            };
+
+            for entry in &entries {
+                self.report(
+                    logger,
+                    Component::Driver,
+                    Event::DriverError,
+                    "rescued",
+                    entry,
+                    Some(&path),
+                );
+            }
+            eprintln!(
+                "deepmsg-errorlog-exporter: read {} rescued errors from {}",
+                entries.len(),
+                path.display(),
+            );
+            self.consumed.insert(path);
+        }
+
+        // Forget files that were rotated away, so a long-running exporter does
+        // not remember every crash it has ever seen.
+        self.consumed.retain(|path| path.exists());
     }
 
     fn note(&mut self, now: SourceState) {
@@ -409,6 +490,177 @@ fn run(options: &Options, logger: &Handle, sweep: &mut Sweep) -> io::Result<()> 
         sweep.poll(options, logger);
         std::thread::sleep(options.interval);
     }
+}
+
+/// The directory beside the aeron directory, where the driver writes a dead
+/// one's error log. An empty parent — a bare relative name — means the current
+/// directory.
+fn rescue_directory(dir: &Path) -> Option<&Path> {
+    let parent = dir.parent()?;
+    Some(if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    })
+}
+
+fn has_prefix_suffix(name: &OsStr, prefix: &[u8], suffix: &[u8]) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() >= prefix.len() + suffix.len()
+        && bytes.starts_with(prefix)
+        && bytes.ends_with(suffix)
+}
+
+/// Parse the reference's text form (`aeron_report_existing_errors`):
+///
+/// ```text
+/// ***
+/// N observations from <first> to <last> for:
+///  <the description, which may span lines>
+///
+/// M distinct errors observed.
+/// ```
+///
+/// The trailer is the completeness proof, not decoration: a file without it is
+/// still being written, and `None` means "look again", never "no errors". A
+/// description containing a line that is exactly `***` would end its block
+/// early; the reference's format has the same ambiguity.
+fn parse_rescue_log(text: &str) -> Option<Vec<ErrorLogEntry>> {
+    let mut lines: Vec<&str> = text.lines().collect();
+    let trailer = lines.last()?;
+    let declared = trailer
+        .strip_suffix(" distinct errors observed.")?
+        .parse::<usize>()
+        .ok()?;
+    lines.pop();
+    // The writer puts one blank line between the last entry and the trailer.
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index] != "***" {
+            return None;
+        }
+        index += 1;
+        let (count, first, last) = parse_rescue_header(lines.get(index)?)?;
+        index += 1;
+
+        let start = index;
+        while index < lines.len() && lines[index] != "***" {
+            index += 1;
+        }
+        let mut body = lines[start..index].join("\n");
+        // Only the first line bears the space the writer adds.
+        if let Some(rest) = body.strip_prefix(' ') {
+            body = rest.to_owned();
+        }
+
+        entries.push(ErrorLogEntry {
+            observation_count: count,
+            first_observation_timestamp_ms: first,
+            last_observation_timestamp_ms: last,
+            text: body,
+        });
+    }
+
+    if entries.len() != declared {
+        return None;
+    }
+    Some(entries)
+}
+
+fn parse_rescue_header(line: &str) -> Option<(i32, i64, i64)> {
+    let (count, rest) = line.split_once(" observations from ")?;
+    let (first, rest) = rest.split_once(" to ")?;
+    let last = rest.strip_suffix(" for:")?;
+    Some((
+        count.parse().ok()?,
+        parse_reference_date(first)?,
+        parse_reference_date(last)?,
+    ))
+}
+
+/// `YYYY-MM-DD HH:MM:SS.mmm±HHMM` — `crates/driver/src/sys.rs`'s
+/// `format_date` — read back to epoch milliseconds. The offset is part of the
+/// text, so the answer does not depend on this machine's zone.
+fn parse_reference_date(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if !bytes.is_ascii() || bytes.len() < 5 {
+        return None;
+    }
+    let (body, offset) = bytes.split_at(bytes.len() - 5);
+    if body.len() != 23 {
+        return None;
+    }
+    for (index, expected) in [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b' '),
+        (13, b':'),
+        (16, b':'),
+        (19, b'.'),
+    ] {
+        if body.get(index) != Some(&expected) {
+            return None;
+        }
+    }
+
+    let year = digits(&body[0..4])?;
+    let month = digits(&body[5..7])?;
+    let day = digits(&body[8..10])?;
+    let hour = digits(&body[11..13])?;
+    let minute = digits(&body[14..16])?;
+    let second = digits(&body[17..19])?;
+    let millis = digits(&body[20..23])?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+
+    let sign = match offset.first()? {
+        b'+' => 1_i64,
+        b'-' => -1_i64,
+        _ => return None,
+    };
+    let offset_hours = digits(&offset[1..3])?;
+    let offset_minutes = digits(&offset[3..5])?;
+    if offset_hours > 23 || offset_minutes > 59 {
+        return None;
+    }
+
+    let seconds = days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+    let offset_seconds = sign * (offset_hours * 3_600 + offset_minutes * 60);
+    Some((seconds - offset_seconds) * 1_000 + millis)
+}
+
+fn digits(bytes: &[u8]) -> Option<i64> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut value = 0_i64;
+    for byte in bytes {
+        value = value.checked_mul(10)?.checked_add(i64::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date: Howard Hinnant's
+/// `days_from_civil`, which needs no table and no libc.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = (month + 9) % 12;
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 #[cfg(test)]
@@ -679,7 +931,39 @@ mod tests {
                 .map(str::to_owned)
                 .collect()
         }
+
+        /// Write a driver-format rescued file beside the aeron directory.
+        fn write_rescue(&self, stamp: &str, text: &str) -> PathBuf {
+            let parent = self.options.dir.parent().expect("a parent directory");
+            let name = self
+                .options
+                .dir
+                .file_name()
+                .expect("a directory name")
+                .to_string_lossy();
+            let path = parent.join(format!("{name}-{stamp}-error.log"));
+            std::fs::write(&path, text).expect("write the rescued log");
+            path
+        }
     }
+
+    /// The writer's text, byte for byte (`crates/driver/src/dir.rs`).
+    fn rescue_text(entries: &[(i32, &str, &str, &str)]) -> String {
+        use std::fmt::Write as _;
+
+        let mut text = String::new();
+        for (count, first, last, body) in entries {
+            writeln!(text, "***").unwrap();
+            writeln!(text, "{count} observations from {first} to {last} for:").unwrap();
+            writeln!(text, " {body}").unwrap();
+        }
+        writeln!(text).unwrap();
+        writeln!(text, "{} distinct errors observed.", entries.len()).unwrap();
+        text
+    }
+
+    const FIRST: &str = "2023-11-14 22:13:20.123+0000";
+    const LAST: &str = "2023-11-14 22:13:21.123+0000";
 
     #[test]
     fn the_first_sweep_reports_every_distinct_error_once() {
@@ -803,5 +1087,156 @@ mod tests {
             .collect();
         entries.sort_by(|left, right| left.0.cmp(&right.0));
         entries
+    }
+
+    #[test]
+    fn the_reference_date_is_read_back_to_epoch_milliseconds() {
+        assert_eq!(Some(1_700_000_000_123), parse_reference_date(FIRST));
+        // The same instant, said in two other zones.
+        assert_eq!(
+            Some(1_700_000_000_123),
+            parse_reference_date("2023-11-15 06:13:20.123+0800")
+        );
+        assert_eq!(
+            Some(1_700_000_000_123),
+            parse_reference_date("2023-11-14 17:13:20.123-0500")
+        );
+
+        for bad in [
+            "",
+            "2023-11-14",
+            "2023-13-14 22:13:20.123+0000",
+            "2023-11-14 24:13:20.123+0000",
+            "2023-11-14 22:13:20+0000",
+            "2023-11-14 22:13:20.123+000",
+            "2023-11-14 22:13:20.123+00x0",
+            "2023/11/14 22:13:20.123+0000",
+        ] {
+            assert_eq!(None, parse_reference_date(bad), "{bad} parsed");
+        }
+    }
+
+    #[test]
+    fn a_rescued_file_is_read_back_entry_for_entry() {
+        let text = rescue_text(&[
+            (2, FIRST, LAST, "first failure\nwith a second line\n"),
+            (1, FIRST, FIRST, "another failure"),
+        ]);
+
+        let entries = parse_rescue_log(&text).expect("parsed");
+        assert_eq!(2, entries.len());
+        assert_eq!(2, entries[0].observation_count);
+        assert_eq!(
+            "first failure\nwith a second line\n", entries[0].text,
+            "the multi-line description lost a line or gained one"
+        );
+        assert_eq!(1_700_000_000_123, entries[0].first_observation_timestamp_ms);
+        assert_eq!(1_700_000_001_123, entries[0].last_observation_timestamp_ms);
+        assert_eq!(1, entries[1].observation_count);
+        assert_eq!("another failure", entries[1].text);
+    }
+
+    #[test]
+    fn a_rescued_file_is_consumed_once() {
+        let mut fixture = Fixture::new();
+        let path = fixture.write_rescue(
+            "2023-11-14 22-13-20.123+0000",
+            &rescue_text(&[(2, FIRST, LAST, "rescued failure")]),
+        );
+
+        fixture.poll();
+        let lines = fixture.lines();
+        assert_eq!(1, lines.len(), "{lines:?}");
+        let line = &lines[0];
+        assert!(line.contains("\"component\":\"driver\""), "{line}");
+        assert!(line.contains("\"event\":\"driver.error\""), "{line}");
+        assert!(line.contains("\"source\":\"rescued\""), "{line}");
+        assert!(line.contains("\"observations\":2"), "{line}");
+        assert!(line.contains("\"observation_count\":2"), "{line}");
+        assert!(
+            line.contains("\"first_observation_ms\":1700000000123"),
+            "{line}"
+        );
+        assert!(
+            line.contains("\"last_observation_ms\":1700000001123"),
+            "{line}"
+        );
+        assert!(line.contains("rescued failure"), "{line}");
+        assert!(line.contains(&path.display().to_string()), "{line}");
+
+        fixture.poll();
+        assert_eq!(1, fixture.lines().len(), "the same file was read again");
+    }
+
+    #[test]
+    fn a_rescued_file_that_appears_after_the_first_sweep_is_found() {
+        let mut fixture = Fixture::new();
+        fixture.poll();
+        assert!(fixture.lines().is_empty());
+
+        fixture.write_rescue(
+            "2023-11-14 22-13-20.123+0000",
+            &rescue_text(&[(1, FIRST, LAST, "a late failure")]),
+        );
+        fixture.poll();
+
+        let lines = fixture.lines();
+        assert_eq!(1, lines.len(), "{lines:?}");
+        assert!(lines[0].contains("a late failure"), "{}", lines[0]);
+    }
+
+    #[test]
+    fn the_rescued_copy_of_a_reported_error_is_not_repeated() {
+        let mut fixture = Fixture::new();
+        fixture.record_at(11, "shared failure", 1_700_000_000_123);
+        fixture.poll();
+        assert_eq!(1, fixture.lines().len());
+
+        // The same sighting, already reported from the CnC.
+        fixture.write_rescue(
+            "2023-11-14 22-13-20.123+0000",
+            &rescue_text(&[(1, FIRST, FIRST, "shared failure")]),
+        );
+        fixture.poll();
+        assert_eq!(1, fixture.lines().len(), "the rescued copy was repeated");
+
+        // One more sighting happened after the CnC's last sweep: only that one
+        // is new, and it arrives under its own file.
+        fixture.write_rescue(
+            "2023-11-14 22-13-21.123+0000",
+            &rescue_text(&[(2, FIRST, LAST, "shared failure")]),
+        );
+        fixture.poll();
+
+        let lines = fixture.lines();
+        assert_eq!(2, lines.len(), "{lines:?}");
+        assert!(lines[1].contains("\"observations\":1"), "{}", lines[1]);
+        assert!(lines[1].contains("\"observation_count\":2"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn an_incomplete_rescued_file_is_not_consumed_and_is_retried() {
+        let mut fixture = Fixture::new();
+        let text = rescue_text(&[(1, FIRST, LAST, "a failure")]);
+        let without_trailer = text
+            .trim_end_matches('\n')
+            .rsplit_once('\n')
+            .expect("a trailer line")
+            .0;
+
+        fixture.write_rescue("2023-11-14 22-13-20.123+0000", without_trailer);
+        fixture.poll();
+        assert!(
+            fixture.lines().is_empty(),
+            "an incomplete file produced events"
+        );
+
+        // The writer finished: the same path is looked at again.
+        fixture.write_rescue("2023-11-14 22-13-20.123+0000", &text);
+        fixture.poll();
+
+        let lines = fixture.lines();
+        assert_eq!(1, lines.len(), "{lines:?}");
+        assert!(lines[0].contains("a failure"), "{}", lines[0]);
     }
 }
