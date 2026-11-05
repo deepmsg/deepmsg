@@ -168,11 +168,7 @@ impl Guard {
     /// `pinner` is the binary's platform seam; it is set on the configuration
     /// before `open`, so a `DEEPMSG_LOG_CPU` without one is refused here.
     pub fn from_env(component: Component, pinner: Option<Pinner>) -> Result<Self, InitError> {
-        let Some(mut config) = Config::from_env(component)? else {
-            return Ok(Self(None));
-        };
-        config.pinner = pinner;
-        Ok(Self(Some(open(config)?)))
+        Ok(Self(init_from_env_with(component, pinner)?))
     }
 
     /// Wrap an already-open handle.
@@ -262,9 +258,17 @@ pub fn open(config: Config) -> Result<Handle, InitError> {
 /// `Ok(None)` means `DEEPMSG_LOG_DIR` was unset or empty: logging is off, and
 /// nothing was created.
 pub fn init_from_env(component: Component) -> Result<Option<Handle>, InitError> {
-    let Some(config) = Config::from_env(component)? else {
+    init_from_env_with(component, None)
+}
+
+fn init_from_env_with(
+    component: Component,
+    pinner: Option<Pinner>,
+) -> Result<Option<Handle>, InitError> {
+    let Some(mut config) = Config::from_env(component)? else {
         return Ok(None);
     };
+    config.pinner = pinner;
 
     let handle = open(config)?;
     LOGGER

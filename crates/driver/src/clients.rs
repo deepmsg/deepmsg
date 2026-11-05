@@ -39,6 +39,7 @@ use deepmsg_cnc::command::PublicationError;
 use deepmsg_cnc::command::{ImageBuffersReady, PublicationBuffersReady};
 use deepmsg_cnc::counters::CLIENT_HEARTBEAT_TYPE_ID;
 use deepmsg_cnc::{CounterManager, CounterRegions};
+use deepmsg_log::{Component as LogComponent, Event as LogEvent, Level as LogLevel};
 
 use crate::ipc_publications::IpcPublications;
 use crate::ipc_subscriptions::IpcSubscriptions;
@@ -361,6 +362,13 @@ impl Clients {
 
             if !record.closed_by_command {
                 system_counters::increment(manager, regions, system_counters::id::CLIENT_TIMEOUTS);
+                deepmsg_log::event(
+                    LogLevel::Warn,
+                    LogComponent::Driver,
+                    LogEvent::ClientTimeout,
+                )
+                .field_i64("client_id", record.client_id)
+                .emit();
                 events.client_timed_out(record.client_id);
             }
             events.counter_unavailable(record.client_id, record.heartbeat_counter_id);
