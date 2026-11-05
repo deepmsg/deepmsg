@@ -158,6 +158,12 @@ impl Drop for Handle {
 ///
 /// This does not install the logger globally; [`init_from_env`] does that.
 pub fn open(config: Config) -> Result<Handle, InitError> {
+    let pinning = match (config.cpu, config.pinner) {
+        (Some(cpu), Some(pinner)) => Some((cpu, pinner)),
+        (Some(_), None) => return Err(InitError::MissingPinner),
+        (None, _) => None,
+    };
+
     std::fs::create_dir_all(&config.dir).map_err(|error| InitError::Io {
         operation: "create the log directory",
         path: config.dir.clone(),
@@ -184,6 +190,7 @@ pub fn open(config: Config) -> Result<Handle, InitError> {
             clock: config.clock,
         },
         writer::REPORT_INTERVAL,
+        pinning,
     )
     .map_err(|error| InitError::Io {
         operation: "start the log writer thread",
@@ -321,11 +328,11 @@ fn safe_node_id(node_id: &str) -> String {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
     use std::sync::mpsc::Receiver;
 
     use super::{Handle, Logger, open};
-    use crate::config::{Config, Roll};
+    use crate::config::{Config, InitError, Roll};
     use crate::event::{Component, Event};
     use crate::level::Level;
     use crate::queue::Queue;
@@ -514,5 +521,56 @@ mod tests {
             ],
             names
         );
+    }
+
+    static PINNED_CPU: AtomicI32 = AtomicI32::new(-1);
+
+    fn pin_to(cpu: i32) -> std::io::Result<()> {
+        PINNED_CPU.store(cpu, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn refuse_to_pin(_cpu: i32) -> std::io::Result<()> {
+        Err(std::io::Error::other("no affinity for you"))
+    }
+
+    #[test]
+    fn a_configured_cpu_reaches_the_writer_thread() {
+        let directory = TempDir::new();
+        let mut config = config(directory.path(), Level::Info);
+        config.cpu = Some(7);
+        config.pinner = Some(pin_to);
+        let handle = open(config).unwrap();
+
+        // The pinner runs before the writer's first control message.
+        handle.flush();
+        handle.shutdown();
+
+        assert_eq!(7, PINNED_CPU.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_cpu_without_a_pinner_is_refused_before_anything_is_created() {
+        let directory = TempDir::new();
+        let target = directory.path().join("not-created");
+        let mut config = config(&target, Level::Info);
+        config.cpu = Some(3);
+        config.pinner = None;
+
+        assert_eq!(Err(InitError::MissingPinner), open(config).map(|_| ()));
+        assert!(!target.exists(), "the refusal came after a side effect");
+    }
+
+    #[test]
+    fn a_failing_pinner_is_counted_and_the_writer_keeps_running() {
+        let directory = TempDir::new();
+        let mut config = config(directory.path(), Level::Info);
+        config.cpu = Some(0);
+        config.pinner = Some(refuse_to_pin);
+        let handle = open(config).unwrap();
+
+        handle.flush();
+        assert_eq!(1, handle.io_errors());
+        handle.shutdown();
     }
 }

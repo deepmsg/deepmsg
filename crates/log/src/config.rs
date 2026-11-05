@@ -125,6 +125,13 @@ fn parse_size(value: &str) -> Result<u64, &'static str> {
         .ok_or("the size does not fit in 64 bits")
 }
 
+/// How a binary pins the writer thread to a CPU.
+///
+/// The crate has no `unsafe`, so it cannot call `sched_setaffinity` itself; the
+/// binary that owns a platform seam supplies the function. This is what keeps
+/// `deepmsg-log` out of ADR-0002's unsafe zones.
+pub type Pinner = fn(i32) -> std::io::Result<()>;
+
 /// The configuration a process logs with.
 ///
 /// Built once, before any thread starts. `component` is the process's default
@@ -149,7 +156,7 @@ pub struct Config {
     pub cpu: Option<i32>,
     /// How to pin the writer thread. The crate has no `unsafe`, so the binary
     /// that owns a platform seam passes its own function here.
-    pub pinner: Option<fn(i32) -> std::io::Result<()>>,
+    pub pinner: Option<Pinner>,
     /// The clock used for `ts`; a function pointer so tests can freeze it.
     pub clock: fn() -> i64,
 }
@@ -306,6 +313,8 @@ pub enum InitError {
     },
     /// `init_from_env` was called twice in one process.
     AlreadyInstalled,
+    /// A CPU was configured without a function that can pin to it.
+    MissingPinner,
     /// Creating the directory, opening the file, or starting the writer failed.
     Io {
         /// What was being attempted.
@@ -342,6 +351,8 @@ impl fmt::Display for InitError {
             InitError::AlreadyInstalled => {
                 formatter.write_str("a logger is already installed in this process")
             }
+            InitError::MissingPinner => formatter
+                .write_str("a writer CPU was configured but no pinner was supplied to set it"),
             InitError::Io {
                 operation,
                 path,
