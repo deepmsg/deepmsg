@@ -165,7 +165,7 @@ pub fn open(config: Config) -> Result<Handle, InitError> {
     })?;
 
     let path = file_path(&config);
-    let file = writer::open(&path).map_err(|error| InitError::Io {
+    let file = writer::open(&path, config.roll).map_err(|error| InitError::Io {
         operation: "open the log file",
         path: path.clone(),
         message: error.to_string(),
@@ -470,5 +470,38 @@ mod tests {
         super::event(Level::Info, Component::Driver, Event::RoleChange)
             .message("nowhere")
             .emit();
+    }
+
+    #[test]
+    fn the_configured_roll_is_the_one_the_writer_uses() {
+        let directory = TempDir::new();
+        let mut config = config(directory.path(), Level::Info);
+        config.roll = Roll {
+            bytes: 300,
+            files: 2,
+        };
+        let handle = open(config).unwrap();
+
+        for index in 0..20 {
+            handle
+                .event(Level::Info, Component::Driver, Event::RoleChange)
+                .message("a message long enough to matter")
+                .field_u64("index", index)
+                .emit();
+        }
+        handle.shutdown();
+
+        let mut names: Vec<String> = fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            vec![
+                "driver-node-1.1.json".to_owned(),
+                "driver-node-1.json".to_owned()
+            ],
+            names
+        );
     }
 }
