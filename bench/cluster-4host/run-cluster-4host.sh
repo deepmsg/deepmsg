@@ -156,7 +156,9 @@ _hosts_all() {
     done
 }
 
-_on() { ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$1" "${@:2}"; }
+_ssh_key_opt=()
+[ -f "$CLUSTER_SSH_KEY" ] && _ssh_key_opt=(-i "$CLUSTER_SSH_KEY")
+_on() { ssh -n "${_ssh_key_opt[@]+"${_ssh_key_opt[@]}"}" -o BatchMode=yes -o ConnectTimeout=8 "$1" "${@:2}"; }
 
 preflight() {
     local host bad=0

@@ -39,11 +39,13 @@ if [ "${1:-}" = "--check" ]; then check_only=1; shift; fi
 target=${1:?usage: provision-host.sh [--check] <user@host>}
 target_ip=$(_cluster_host_of "$target")
 
-_on() { ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$target" "$@"; }
+_ssh_key_opt=()
+[ -f "$CLUSTER_SSH_KEY" ] && _ssh_key_opt=(-i "$CLUSTER_SSH_KEY")
+_on() { ssh -n "${_ssh_key_opt[@]+"${_ssh_key_opt[@]}"}" -o BatchMode=yes -o ConnectTimeout=8 "$target" "$@"; }
 
 # ★ Without `-n`: `-n` sends stdin from /dev/null, which silently turns a piped
 # `tar` into "This does not look like a tar archive".
-_on_stream() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$target" "$@"; }
+_on_stream() { ssh "${_ssh_key_opt[@]+"${_ssh_key_opt[@]}"}" -o BatchMode=yes -o ConnectTimeout=8 "$target" "$@"; }
 
 echo "=== $target ($target_ip) ==="
 _on true || { echo "provision: $target is not reachable over ssh (key-based ssh from the controller to all four, including itself; see README)" >&2; exit 1; }
