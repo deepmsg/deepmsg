@@ -412,6 +412,7 @@ dependencies = [
  "deepmsg-codec-cluster-mark",
  "deepmsg-core",
  "deepmsg-driver",
+ "deepmsg-log",
 ]
 
 [[package]]
