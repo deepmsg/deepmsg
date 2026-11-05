@@ -48,7 +48,7 @@ pub use config::{
 };
 pub use event::{Component, Event};
 pub use level::{COMPILED_MAX, Level};
-pub use logger::{EventBuilder, Handle, Logger, event, init_from_env, open};
+pub use logger::{EventBuilder, Guard, Handle, Logger, event, init_from_env, open};
 
 #[cfg(test)]
 mod tests {

@@ -78,10 +78,24 @@ impl fmt::Display for Component {
 /// and alerts match on. They describe the event, not the message text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
+    /// A long-running process started.
+    DriverStart,
+    /// A long-running process stopped; `reason` says why.
+    DriverStop,
+    /// The driver reaped a client that stopped speaking.
+    ClientTimeout,
     /// A node's role changed (leader, follower, candidate).
     RoleChange,
     /// An election completed; the term is in the event's fields.
     ElectionComplete,
+    /// A snapshot began.
+    SnapshotBegin,
+    /// A snapshot finished; the duration is in the event's fields.
+    SnapshotEnd,
+    /// An archive recording started.
+    RecordingStart,
+    /// An archive recording stopped.
+    RecordingStop,
     /// An archive segment was rolled.
     SegmentRoll,
     /// A publication or subscription entered backpressure.
@@ -92,9 +106,16 @@ pub enum Event {
 
 impl Event {
     /// Every event, in declaration order.
-    pub const ALL: [Event; 5] = [
+    pub const ALL: [Event; 12] = [
+        Event::DriverStart,
+        Event::DriverStop,
+        Event::ClientTimeout,
         Event::RoleChange,
         Event::ElectionComplete,
+        Event::SnapshotBegin,
+        Event::SnapshotEnd,
+        Event::RecordingStart,
+        Event::RecordingStop,
         Event::SegmentRoll,
         Event::BackpressureEnter,
         Event::LogDropped,
@@ -103,8 +124,15 @@ impl Event {
     /// The stable name written to the log.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Event::DriverStart => "driver.start",
+            Event::DriverStop => "driver.stop",
+            Event::ClientTimeout => "client.timeout",
             Event::RoleChange => "role.change",
             Event::ElectionComplete => "election.complete",
+            Event::SnapshotBegin => "snapshot.begin",
+            Event::SnapshotEnd => "snapshot.end",
+            Event::RecordingStart => "recording.start",
+            Event::RecordingStop => "recording.stop",
             Event::SegmentRoll => "segment.roll",
             Event::BackpressureEnter => "backpressure.enter",
             Event::LogDropped => "log.dropped",
@@ -133,8 +161,15 @@ mod tests {
 
     #[test]
     fn event_names_are_stable() {
+        assert_eq!("driver.start", Event::DriverStart.as_str());
+        assert_eq!("driver.stop", Event::DriverStop.as_str());
+        assert_eq!("client.timeout", Event::ClientTimeout.as_str());
         assert_eq!("role.change", Event::RoleChange.as_str());
         assert_eq!("election.complete", Event::ElectionComplete.as_str());
+        assert_eq!("snapshot.begin", Event::SnapshotBegin.as_str());
+        assert_eq!("snapshot.end", Event::SnapshotEnd.as_str());
+        assert_eq!("recording.start", Event::RecordingStart.as_str());
+        assert_eq!("recording.stop", Event::RecordingStop.as_str());
         assert_eq!("segment.roll", Event::SegmentRoll.as_str());
         assert_eq!("backpressure.enter", Event::BackpressureEnter.as_str());
         assert_eq!("log.dropped", Event::LogDropped.as_str());

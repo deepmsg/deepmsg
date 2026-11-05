@@ -1,6 +1,6 @@
 //! Configuration, read once at startup.
 //!
-//! The application-side contract has four names, and only four:
+//! The application-side contract has five names, and only five:
 //!
 //! | name | default | meaning |
 //! |---|---|---|
@@ -8,6 +8,7 @@
 //! | `DEEPMSG_LOG_LEVEL` | `info` | a level, or `component=level` overrides |
 //! | `DEEPMSG_LOG_ROLL` | `100MB:5` | file size limit, and how many files |
 //! | `DEEPMSG_NODE_ID` | required when enabled | written into every line |
+//! | `DEEPMSG_LOG_CPU` | unset = unpinned | CPU for the writer thread |
 //!
 //! "Unset directory = off" is the important one. Tests, benchmarks and one-off
 //! runs must not create a thread or a directory as a side effect, and the
@@ -178,14 +179,20 @@ impl Config {
         let node_id = env_value("DEEPMSG_NODE_ID")?;
         let level = env_value("DEEPMSG_LOG_LEVEL")?;
         let roll = env_value("DEEPMSG_LOG_ROLL")?;
+        let cpu = env_value("DEEPMSG_LOG_CPU")?;
 
-        Self::from_values(
+        let Some(mut config) = Self::from_values(
             component,
             Some(&dir),
             node_id.as_deref(),
             level.as_deref(),
             roll.as_deref(),
-        )
+        )?
+        else {
+            return Ok(None);
+        };
+        config.cpu = parse_cpu(cpu.as_deref())?;
+        Ok(Some(config))
     }
 
     /// The pure half of [`Config::from_env`].
@@ -229,6 +236,23 @@ fn env_value(name: &'static str) -> Result<Option<String>, InitError> {
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(InitError::NotUnicode { name }),
     }
+}
+
+/// `DEEPMSG_LOG_CPU`: a non-negative CPU id, or absent for no pinning.
+pub(crate) fn parse_cpu(value: Option<&str>) -> Result<Option<i32>, InitError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    let cpu = value.parse::<i32>().map_err(|_| InitError::InvalidCpu {
+        value: value.to_owned(),
+    })?;
+    if cpu < 0 {
+        return Err(InitError::InvalidCpu {
+            value: value.to_owned(),
+        });
+    }
+    Ok(Some(cpu))
 }
 
 /// Parse `info`, or `driver=debug,cluster=info`, into a global level and overrides.
@@ -304,6 +328,11 @@ pub enum InitError {
         /// The offending text.
         value: String,
     },
+    /// `DEEPMSG_LOG_CPU` is not a CPU id.
+    InvalidCpu {
+        /// The offending text.
+        value: String,
+    },
     /// A roll policy that does not parse.
     InvalidRoll {
         /// The offending text.
@@ -342,6 +371,9 @@ impl fmt::Display for InitError {
             InitError::UnknownComponent { value } => {
                 write!(formatter, "unknown log component: {value}")
             }
+            InitError::InvalidCpu { value } => {
+                write!(formatter, "DEEPMSG_LOG_CPU is not a CPU id: {value}")
+            }
             InitError::InvalidRoll { value, reason } => {
                 write!(
                     formatter,
@@ -370,7 +402,9 @@ impl std::error::Error for InitError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, DEFAULT_QUEUE_CAPACITY, InitError, Roll, parse_level_directives};
+    use super::{
+        Config, DEFAULT_QUEUE_CAPACITY, InitError, Roll, parse_cpu, parse_level_directives,
+    };
     use crate::event::Component;
     use crate::level::Level;
 
@@ -521,5 +555,19 @@ mod tests {
         assert_eq!(None, config.cpu);
         assert!(config.pinner.is_none());
         assert_eq!("node-7", config.node_id);
+    }
+
+    #[test]
+    fn a_cpu_is_optional_and_must_be_a_non_negative_id() {
+        assert_eq!(Ok(None), parse_cpu(None));
+        assert_eq!(Ok(Some(7)), parse_cpu(Some("7")));
+        assert_eq!(Ok(Some(0)), parse_cpu(Some(" 0 ")));
+
+        for value in ["-1", "cpu0", "", "9999999999999"] {
+            assert!(
+                matches!(parse_cpu(Some(value)), Err(InitError::InvalidCpu { .. })),
+                "{value} was accepted"
+            );
+        }
     }
 }
