@@ -269,12 +269,19 @@ fn init_from_env_with(
         return Ok(None);
     };
     config.pinner = pinner;
+    init(config).map(Some)
+}
 
+/// Open a logger **and** install it as the process's logger.
+///
+/// The same installation `init_from_env` does, for a caller that builds its
+/// configuration itself (a test, or a binary reading its own properties).
+pub fn init(config: Config) -> Result<Handle, InitError> {
     let handle = open(config)?;
     LOGGER
         .set(handle.logger.clone())
         .map_err(|_| InitError::AlreadyInstalled)?;
-    Ok(Some(handle))
+    Ok(handle)
 }
 
 /// Build an event for the process's installed logger.
