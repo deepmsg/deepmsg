@@ -20,6 +20,7 @@ nothing. `DEEPMSG_NODE_ID` is required when logging is enabled.
 | `DEEPMSG_LOG_LEVEL` | `info` | a level, or `component=level` overrides, e.g. `driver=debug,cluster=info` |
 | `DEEPMSG_LOG_ROLL` | `100MB:5` | `<size>:<file count>`; sizes are binary, the count is the **total** on disk |
 | `DEEPMSG_NODE_ID` | required when enabled | written into every line and used as the `node_id` stream field |
+| `DEEPMSG_LOG_CPU` | unset = unpinned | CPU for the writer thread; the binary must supply a pinner |
 
 ## Usage
 
