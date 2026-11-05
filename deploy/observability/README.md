@@ -11,21 +11,51 @@ and a Prometheus endpoint, and turning collection off degrades queries to
 
 ## Status
 
-**Configuration only.** The agent config and its static checks are here; the
-end-to-end scripts arrive in the later commits of the L2 slice. Nothing under
-`systemd/` or `k8s/` has been run on a machine yet — the one form that is
-exercised by the E2E is "the same executables with the same flags, started by
-the script". A static review is not a run.
+**Configuration and the process harness.** The agent config, its static checks
+and the end-to-end launcher are here; the applications, the exporters and the
+pipeline assertions arrive in the later commits of the L2 slice. The launcher
+proves the four processes start, listen and stay alive — nothing under
+`systemd/` or `k8s/` has been run on a machine yet, and a static review is not
+a run.
 
 ## Layout
 
 ```
 agent/otelcol.yaml              the one config, used by systemd and by the DaemonSet
 e2e/check-config.py             the properties that fail silently if wrong
+e2e/versions.env                the pinned tags, asset names and SHA256
+e2e/fetch-tools.sh              download + verify into target/observability-tools
+e2e/run.sh                      start the four processes and prove they are alive
 ```
 
-The systemd units, the k8s manifests, the backend configs and the E2E scripts
-are added by the later commits.
+The systemd units, the k8s manifests and the backend configs are added by the
+later commits.
+
+## End-to-end
+
+```
+./deploy/observability/e2e/run.sh
+```
+
+downloads the pinned releases on first use (about 290 MB, cached under
+`target/observability-tools/`), verifies each against `versions.env`, then
+starts VictoriaLogs, VictoriaMetrics, vmauth and `otelcol-contrib` on loopback.
+Every file and every port is under the script's control; the four ports must be
+free before it starts.
+
+| override | default | meaning |
+|---|---|---|
+| `E2E_VL_PORT` | `9428` | VictoriaLogs |
+| `E2E_VM_PORT` | `8428` | VictoriaMetrics |
+| `E2E_VMAUTH_PORT` | `8427` | vmauth |
+| `E2E_COUNTERS_PORT` | `9101` | the counters exporter (nothing listens there yet) |
+| `E2E_OBS_TOKEN` | `e2e-token` | the bearer token the agent and the script use |
+| `DEEPMSG_OBS_E2E_DIR` | `target/observability-e2e` | where a run's state and evidence go |
+| `E2E_KEEP` | `0` | keep the run directory even on success |
+
+A failed run keeps its directory (process logs, `ss -ltn`, process table) and
+prints the path. The collector's telemetry port is fixed at `8888` because the
+checked-in config names it; a second value would be a second config.
 
 ## What it reads
 
