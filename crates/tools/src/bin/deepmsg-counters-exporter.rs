@@ -738,6 +738,43 @@ mod tests {
     }
 
     #[test]
+    fn a_scrape_does_not_change_the_directory() {
+        let temp = TempDir::new();
+        synthetic(temp.path());
+        let cnc = temp.path().join(deepmsg_cnc::CNC_FILE_NAME);
+        let before_bytes = std::fs::read(&cnc).expect("the CnC file");
+        let before_names: Vec<String> = std::fs::read_dir(temp.path())
+            .expect("the directory")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+
+        let _ = render_at(temp.path(), "node-1", NOW_MS);
+
+        assert_eq!(
+            before_bytes,
+            std::fs::read(&cnc).expect("the CnC file again"),
+            "the exporter wrote to the CnC file"
+        );
+        let after_names: Vec<String> = std::fs::read_dir(temp.path())
+            .expect("the directory again")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(before_names, after_names, "the exporter added a file");
+    }
+
+    #[test]
     fn options_read_arguments_and_environment() {
         // The environment is not touched here: `from_args` takes its defaults
         // from it, and a test that rewrote the process environment would race

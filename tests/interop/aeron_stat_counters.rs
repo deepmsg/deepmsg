@@ -311,6 +311,33 @@ fn metric_value(body: &str, prefix: &str) -> Option<i64> {
         .and_then(|(_, value)| value.parse().ok())
 }
 
+fn assert_system_counters(stat: &BTreeMap<i32, i64>, body: &str, node: &str) {
+    let checks = [
+        (
+            5,
+            format!("deepmsg_nak_total{{node_id=\"{node}\",direction=\"sent\"}}"),
+        ),
+        (
+            6,
+            format!("deepmsg_nak_total{{node_id=\"{node}\",direction=\"received\"}}"),
+        ),
+        (
+            15,
+            format!("deepmsg_error_total{{node_id=\"{node}\",component=\"driver\"}}"),
+        ),
+        (23, format!("deepmsg_loss_total{{node_id=\"{node}\"}} ")),
+    ];
+
+    for (id, prefix) in checks {
+        let expected = *stat
+            .get(&id)
+            .unwrap_or_else(|| panic!("AeronStat has no counter {id}"));
+        let actual = metric_value(body, &prefix)
+            .unwrap_or_else(|| panic!("the exporter has no {prefix}:\n{body}"));
+        assert_eq!(expected, actual, "counter {id} disagrees with AeronStat");
+    }
+}
+
 /// C6: the exporter's numbers are `AeronStat`'s numbers.
 ///
 /// The same CnC, read by the reference's own tool and by ours: two decoders of
@@ -335,28 +362,43 @@ fn the_exporter_agrees_with_aeron_stat_on_the_system_counters() {
     let stat = counter_values(&output);
     let body = scrape(&exporter, &temp.0, "aeron-stat-test");
 
-    let checks = [
-        (
-            5,
-            "deepmsg_nak_total{node_id=\"aeron-stat-test\",direction=\"sent\"}",
-        ),
-        (
-            6,
-            "deepmsg_nak_total{node_id=\"aeron-stat-test\",direction=\"received\"}",
-        ),
-        (
-            15,
-            "deepmsg_error_total{node_id=\"aeron-stat-test\",component=\"driver\"}",
-        ),
-        (23, "deepmsg_loss_total{node_id=\"aeron-stat-test\"} "),
-    ];
+    assert_system_counters(&stat, &body, "aeron-stat-test");
+}
 
-    for (id, prefix) in checks {
-        let expected = *stat
-            .get(&id)
-            .unwrap_or_else(|| panic!("AeronStat has no counter {id}:\n{output}"));
-        let actual = metric_value(&body, prefix)
-            .unwrap_or_else(|| panic!("the exporter has no {prefix}:\n{body}"));
-        assert_eq!(expected, actual, "counter {id} disagrees with AeronStat");
-    }
+/// The same comparison, but the CnC is the **reference driver's**: the
+/// exporter has to read a file this build did not create, which is the
+/// compatibility claim on the read side.
+#[test]
+fn the_exporter_reads_the_reference_drivers_cnc() {
+    let Some(aeron_stat_binary) = driver::locate_aeron_stat() else {
+        driver::announce_tool_skip("AeronStat");
+        return;
+    };
+    let Some(reference_binary) = driver::locate_verified() else {
+        driver::announce_tool_skip("aeronmd");
+        return;
+    };
+    let Some(exporter) = locate_exporter() else {
+        eprintln!(
+            "SKIPPED: not verified -- no counters exporter binary found. \
+             Build it (`cargo build -p deepmsg-tools --bin deepmsg-counters-exporter`) \
+             or set {EXPORTER_ENV}."
+        );
+        return;
+    };
+
+    let mut reference = driver::ReferenceDriver::start(&reference_binary, "exporter-reference")
+        .expect("start the reference driver");
+    reference
+        .await_cnc(Duration::from_secs(30))
+        .expect("the reference driver's CnC");
+
+    let dir = reference.aeron_dir().to_path_buf();
+    let output = aeron_stat(&aeron_stat_binary, &dir);
+    let stat = counter_values(&output);
+    let body = scrape(&exporter, &dir, "reference-driver");
+
+    assert_system_counters(&stat, &body, "reference-driver");
+
+    let _ = reference.stop();
 }
