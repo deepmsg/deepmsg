@@ -681,6 +681,62 @@ mod tests {
         assert!(!text.contains("deepmsg_publication_position"));
     }
 
+    /// A CnC with one system counter (the errors id), for the re-read test.
+    fn a_cnc_with_errors(dir: &std::path::Path, errors: i64) {
+        let layout = CncLayout {
+            counters_values_length: COUNTERS_VALUES_BUFFER_LENGTH_MIN.max(64 * 1024),
+            ..CncLayout::default()
+        };
+        let mut cnc = CncFile::create(
+            dir,
+            &layout,
+            &CncIdentity {
+                liveness_timeout_ns: 10_000_000_000,
+                start_timestamp_ms: NOW_MS,
+                pid: 99,
+            },
+        )
+        .expect("create the CnC file");
+
+        {
+            let regions = cnc.counter_regions().expect("counter regions");
+            let mut manager =
+                CounterManager::new(layout.counters_values_length, 1000).expect("manager");
+            let id = manager
+                .allocate(&regions, 0, &15_i32.to_le_bytes(), b"Errors", NOW_MS)
+                .expect("allocate");
+            manager.set_value(&regions, id, errors).expect("set value");
+        }
+
+        cnc.write_consumer_heartbeat(NOW_MS).expect("heartbeat");
+        cnc.publish().expect("publish");
+    }
+
+    #[test]
+    fn a_new_cnc_is_read_without_restarting_the_exporter() {
+        let temp = TempDir::new();
+        a_cnc_with_errors(temp.path(), 1);
+        assert!(
+            render_at(temp.path(), "node-1", NOW_MS)
+                .contains("deepmsg_error_total{node_id=\"node-1\",component=\"driver\"} 1")
+        );
+
+        // Same path, new file: the next scrape is the new driver.
+        std::fs::remove_dir_all(temp.path()).expect("remove the old directory");
+        std::fs::create_dir_all(temp.path()).expect("the new directory");
+        a_cnc_with_errors(temp.path(), 99);
+
+        assert!(
+            render_at(temp.path(), "node-1", NOW_MS)
+                .contains("deepmsg_error_total{node_id=\"node-1\",component=\"driver\"} 99")
+        );
+    }
+
+    #[test]
+    fn label_values_are_escaped() {
+        assert_eq!("a\\\"b\\\\c\\nd", super::escape_label("a\"b\\c\nd"));
+    }
+
     #[test]
     fn options_read_arguments_and_environment() {
         // The environment is not touched here: `from_args` takes its defaults
