@@ -567,6 +567,11 @@ name = "aeron_stat_counters"
 path = "interop/aeron_stat_counters.rs"
 required-features = ["interop"]
 
+[[test]]
+name = "error_log_rescue_parity"
+path = "interop/error_log_rescue_parity.rs"
+required-features = ["interop"]
+
 # The other direction of the pair above: the reference's own client samples
 # against a driver *this* build wrote. Needs the reference build for the
 # samples, and our own driver binary for the driver.
