@@ -59,7 +59,7 @@ use deepmsg_driver::driver::Driver;
 use deepmsg_driver::media::TransportBindings;
 use deepmsg_driver::media::userspace::port_claim::Claim;
 use deepmsg_driver::{dir, sys};
-use deepmsg_log::{Component, Guard};
+use deepmsg_log::{Component as LogComponent, Event as LogEvent, Guard, Level as LogLevel};
 
 fn main() -> ExitCode {
     let mut config = match DriverConfig::from_args(std::env::args().skip(1)) {
@@ -83,11 +83,11 @@ fn main() -> ExitCode {
     // `DEEPMSG_LOG_DIR` is set. The writer can be pinned because this process
     // owns the platform seam; the CPU is `DEEPMSG_LOG_CPU`, and no CPU means
     // no pinning.
-    let _logging = match Guard::from_env(Component::Driver, Some(sys::set_current_thread_affinity))
-    {
-        Ok(guard) => guard,
-        Err(error) => return fail(&format_args!("{error}")),
-    };
+    let _logging =
+        match Guard::from_env(LogComponent::Driver, Some(sys::set_current_thread_affinity)) {
+            Ok(guard) => guard,
+            Err(error) => return fail(&format_args!("{error}")),
+        };
 
     // Where the agents should run, before anything touches the file system:
     // the reference applies the cpuset in `aeronmd`'s own order, ahead of the
@@ -188,6 +188,10 @@ fn main() -> ExitCode {
         }
     };
 
+    deepmsg_log::event(LogLevel::Info, LogComponent::Driver, LogEvent::DriverStart)
+        .field_str("version", env!("CARGO_PKG_VERSION"))
+        .emit();
+
     // stdout, not stderr: this line is written on every healthy start, and the
     // reference's own harness asserts stderr is empty (see the module docs).
     println!(
@@ -216,6 +220,15 @@ fn main() -> ExitCode {
     drop(driver);
     config.transport_bindings = TransportBindings::Default;
     close_the_media(media);
+
+    let reason = if sys::stop_signal().is_some() {
+        "signal"
+    } else {
+        "terminate"
+    };
+    deepmsg_log::event(LogLevel::Info, LogComponent::Driver, LogEvent::DriverStop)
+        .field_str("reason", reason)
+        .emit();
 
     code
 }
