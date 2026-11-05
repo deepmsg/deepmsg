@@ -49,6 +49,11 @@ impl Queue {
     pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
+
+    /// The counter itself, for the writer thread that reports it.
+    pub(crate) fn dropped_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.dropped)
+    }
 }
 
 #[cfg(test)]
