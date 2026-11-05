@@ -24,21 +24,29 @@
 //!   environment are parsed once at startup; an event is encoded into a
 //!   fixed-size record (ADR-0003: "hot paths stay allocation-free").
 //!
-//! This first slice contains the vocabulary, the levels and the configuration
-//! parsing. The record encoder, the queue, the writer thread and rolling arrive
-//! in the following slices (§6 of the design); nothing here writes a byte yet.
+//! This slice contains the vocabulary, the levels, the configuration parsing,
+//! the record encoder, the bounded queue and the writer thread. Rolling — the
+//! size limit and the old-file rotation — is the next slice (§6 of the design).
+//!
+//! [`open`] builds an instance without touching process-global state;
+//! [`init_from_env`] additionally installs it as the process's logger, which is
+//! what [`event`] reads.
 
 #![forbid(unsafe_code)]
 
 mod config;
 mod event;
 mod level;
+mod logger;
+mod queue;
 pub mod record;
 mod time;
+mod writer;
 
 pub use config::{Config, DEFAULT_LEVEL, DEFAULT_QUEUE_CAPACITY, DEFAULT_ROLL, InitError, Roll};
 pub use event::{Component, Event};
 pub use level::{COMPILED_MAX, Level};
+pub use logger::{EventBuilder, Handle, Logger, event, init_from_env, open};
 
 #[cfg(test)]
 mod tests {
