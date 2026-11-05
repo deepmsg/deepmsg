@@ -25,6 +25,14 @@ three members on three hosts with the client on a fourth.
   `hosts.env` are **examples**: a run that still has one of them and was not
   given a machine in the environment is refused, by name, rather than allowed
   to measure a host nobody described.
+- **Key-based ssh from the controller (node 0) to all four machines, including
+  itself.** The harness generates a script per member and ships it over ssh, and
+  node 0 is the controller *and* member 0, so `ssh -o BatchMode=yes root@node0
+  true` has to work too. `CLUSTER_SSH_KEY` names the private key
+  (`$HOME/.ssh/id_ed25519`); its public half must be in root's
+  `authorized_keys` on every machine. That first trust is out of band — the
+  cloud console, or one password login and `ssh-copy-id` — because
+  `provision-host.sh` itself travels over the same ssh.
 - **`provision-host.sh --check <user@host>`**, then again without `--check`, on
   every machine that is not the controller. It copies the harness, this build's
   driver and an offline JDK (with the `/etc` trees the JDK's absolute symlinks

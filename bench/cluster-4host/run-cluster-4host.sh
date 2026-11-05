@@ -162,7 +162,7 @@ preflight() {
     local host bad=0
     while read -r host; do
         if ! _on "$host" true 2>/dev/null; then
-            echo "preflight: $host is not reachable over ssh" >&2
+            echo "preflight: $host is not reachable over ssh (key-based ssh from the controller to all four, including itself; see README)" >&2
             bad=1
             continue
         fi

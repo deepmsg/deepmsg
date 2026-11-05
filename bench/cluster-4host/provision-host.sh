@@ -46,7 +46,7 @@ _on() { ssh -n -o BatchMode=yes -o ConnectTimeout=8 "$target" "$@"; }
 _on_stream() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$target" "$@"; }
 
 echo "=== $target ($target_ip) ==="
-_on true || { echo "provision: $target is not reachable over ssh" >&2; exit 1; }
+_on true || { echo "provision: $target is not reachable over ssh (key-based ssh from the controller to all four, including itself; see README)" >&2; exit 1; }
 
 verify() {
     local bad=0
