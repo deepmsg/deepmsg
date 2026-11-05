@@ -304,6 +304,17 @@ pub enum InitError {
         /// What was wrong with it.
         reason: &'static str,
     },
+    /// `init_from_env` was called twice in one process.
+    AlreadyInstalled,
+    /// Creating the directory, opening the file, or starting the writer failed.
+    Io {
+        /// What was being attempted.
+        operation: &'static str,
+        /// The path involved.
+        path: PathBuf,
+        /// The platform's message.
+        message: String,
+    },
 }
 
 impl fmt::Display for InitError {
@@ -328,6 +339,18 @@ impl fmt::Display for InitError {
                     "invalid DEEPMSG_LOG_ROLL value {value}: {reason}"
                 )
             }
+            InitError::AlreadyInstalled => {
+                formatter.write_str("a logger is already installed in this process")
+            }
+            InitError::Io {
+                operation,
+                path,
+                message,
+            } => write!(
+                formatter,
+                "could not {operation} at {}: {message}",
+                path.display()
+            ),
         }
     }
 }
