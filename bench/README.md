@@ -56,6 +56,31 @@ results:
   the channels, the settings the drivers were actually given.
 - the histograms themselves, one per cell, in the harness's own layout.
 
+## The interrupt layout
+
+A reading from a machine with a sleeping core is not a reading of the driver:
+the NIC has hashed the flow to one receive queue, and if the core taking that
+queue's interrupt is in HLT the wakeup is part of the path. On the two-host runs
+the same 25K:32 cell read 100–185 µs in that state and 45.6–46.7 µs after the
+layout below was applied, on both stacks.
+
+`bench/tools/irq-steer.sh` writes the layout and puts it back:
+
+```
+bench/tools/irq-steer.sh apply          # every queue's interrupt on CPU 12, C1 off there
+bench/tools/irq-steer.sh spread         # round-robin over 8-15; for a cluster's several flows
+bench/tools/irq-steer.sh show           # the current mapping and C1 flags
+bench/tools/irq-steer.sh restore        # put every saved value back, and drop the save
+```
+
+The defaults name the cloud hosts' NIC (`virtio2`) and interface (`eth0`);
+`IRQ_STEER_NIC`, `IRQ_STEER_IFACE` and `IRQ_STEER_SAVE` override them. The save
+file is written once, before the first change, and `restore` is the only thing
+that consumes it — a machine must not be left steered. `apply` is the layout
+every reading up to 2026-11-04 used; `spread` exists because a cluster has several
+flows (client ingress, log replication, catchup, archive) and one core taking all
+of them queues the client behind the rest.
+
 ## Why a batch needs three directories
 
 Only one of the two stacks being compared is in this repository. The harness is a
