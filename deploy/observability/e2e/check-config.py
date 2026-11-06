@@ -16,6 +16,8 @@ Run: python3 deploy/observability/e2e/check-config.py
 
 from __future__ import annotations
 
+import configparser
+import json
 import re
 import sys
 from pathlib import Path
@@ -51,6 +53,83 @@ def sequence(value: object, label: str) -> list:
         failures.append(f"{label}: expected a list, found {type(value).__name__}")
         return []
     return value
+
+
+GRAFANA = HERE.parent / "grafana"
+
+
+def grafana_checks() -> None:
+    """The Grafana side of the deployment: the same silent-failure discipline."""
+    ini_path = GRAFANA / "grafana.ini"
+    ini = configparser.ConfigParser()
+    try:
+        ini.read(ini_path)
+    except (FileNotFoundError, configparser.Error) as error:
+        failures.append(f"cannot read {ini_path}: {error}")
+        return
+    check("grafana server address", ini.get("server", "http_addr", fallback=None), "127.0.0.1")
+    check("grafana server port", ini.get("server", "http_port", fallback=None), "3000")
+    check("grafana anonymous access", ini.get("auth.anonymous", "enabled", fallback=None), "false")
+    check(
+        "grafana admin password is not in the file",
+        ini.has_option("security", "admin_password"),
+        False,
+    )
+    check(
+        "grafana provisioning path",
+        ini.get("paths", "provisioning", fallback="").startswith("/etc/deepmsg/"),
+        True,
+    )
+
+    datasource_dir = GRAFANA / "provisioning" / "datasources"
+    files = sorted(datasource_dir.glob("*.yaml")) if datasource_dir.is_dir() else []
+    check("two datasource files", len(files), 2)
+    types = set()
+    for path in files:
+        try:
+            config = yaml.safe_load(path.read_text())
+        except yaml.YAMLError as error:
+            failures.append(f"{path}: {error}")
+            continue
+        for datasource in config.get("datasources", []):
+            types.add(datasource.get("type"))
+            check(f"{path.name}: url is vmauth", datasource.get("url"), "http://127.0.0.1:8427")
+            header = datasource.get("secureJsonData", {}).get("httpHeaderValue1", "")
+            check(
+                f"{path.name}: token is environment-driven",
+                header.startswith("Bearer $__env{DEEPMSG_GRAFANA_READ_TOKEN}"),
+                True,
+            )
+        check(
+            f"{path.name}: no literal bearer token",
+            bool(re.search(r"Bearer (?!\$__env\{)", path.read_text())),
+            False,
+        )
+    check(
+        "datasource types",
+        types,
+        {"prometheus", "victoriametrics-logs-datasource"},
+    )
+
+    # The dashboards and the alert rules arrive in later commits; once they are
+    # here, they parse or this fails.
+    for path in sorted((GRAFANA / "provisioning" / "dashboards").glob("*.json")):
+        try:
+            json.loads(path.read_text())
+        except json.JSONDecodeError as error:
+            failures.append(f"{path}: {error}")
+    for path in sorted((GRAFANA / "provisioning" / "alerting").glob("*.yaml")):
+        try:
+            yaml.safe_load(path.read_text())
+        except yaml.YAMLError as error:
+            failures.append(f"{path}: {error}")
+
+    readme = README.read_text() if README.exists() else ""
+    check(
+        "DEEPMSG_GRAFANA_READ_TOKEN is documented in README.md",
+        "DEEPMSG_GRAFANA_READ_TOKEN" in readme,
+        True,
+    )
 
 
 def main() -> int:
@@ -225,6 +304,8 @@ def main() -> int:
     referenced = sorted(set(re.findall(r"\$\{env:([A-Z0-9_]+)\}", text)))
     for name in referenced:
         check(f"{name} is documented in README.md", name in readme, True)
+
+    grafana_checks()
 
     if failures:
         print(f"{CONFIG.relative_to(CONFIG.parents[2])}: {len(failures)} check(s) failed", file=sys.stderr)

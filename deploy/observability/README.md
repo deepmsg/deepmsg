@@ -29,6 +29,8 @@ has been run on a machine yet, and a static review is not a run.
 
 ```
 agent/otelcol.yaml              the one config, used by systemd and by the DaemonSet
+grafana/grafana.ini             Grafana's own settings; provisioning under grafana/provisioning
+grafana/provisioning/           the datasources (dashboards and alert rules arrive next)
 systemd/                        four units, the environment example
 backends/vmauth.example.yaml    the two-token auth config, exact paths
 k8s/agent-daemonset.yaml        the DaemonSet (static: not run)
@@ -142,6 +144,24 @@ what it has read.
 - **cluster** — the collector runs. Production keeps the backends on a
   dedicated log host, never on a media-driver host; the E2E runs both on one
   machine and says so in its evidence.
+
+## Grafana
+
+The dashboards and the alert rules are provisioned from `grafana/provisioning/`;
+those files are the product. Grafana is co-located with vmauth (the log host),
+so both datasources use `http://127.0.0.1:8427` and the **read-only** token —
+a different token from the agent's write token.
+
+| variable | meaning |
+|---|---|
+| `DEEPMSG_GRAFANA_READ_TOKEN` | the read token vmauth accepts for Grafana's datasources |
+| `GF_SECURITY_ADMIN_PASSWORD` | Grafana's admin password; read on the first start only |
+| `GF_PATHS_PROVISIONING` | the provisioning tree; the unit sets it to `/etc/deepmsg/grafana/provisioning` |
+
+Anonymous access is off, the admin password is never in the tree, and the
+datasources' token is expanded from the environment (`$__env{…}`). The
+dashboards and the alert rules arrive in the next commits; nothing on this side
+has been run against a live Grafana yet.
 
 ## Deploy
 

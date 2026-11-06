@@ -1,0 +1,21 @@
+# Grafana provisioning: VictoriaMetrics through vmauth.
+#
+# The URL is vmauth on the log host — Grafana is co-located with it, so the
+# loopback is right in both profiles. The token is expanded from the unit's
+# environment (`DEEPMSG_GRAFANA_READ_TOKEN`); no literal credential is in the
+# tree, and the token is the read-only one, not the agent's write token.
+apiVersion: 1
+
+datasources:
+  - name: VictoriaMetrics
+    uid: victoriametrics
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:8427
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s
+      httpHeaderName1: Authorization
+    secureJsonData:
+      httpHeaderValue1: "Bearer $__env{DEEPMSG_GRAFANA_READ_TOKEN}"
