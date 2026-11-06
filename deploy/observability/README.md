@@ -215,6 +215,27 @@ First check: `curl -s 127.0.0.1:8888/metrics | grep -c '^otelcol_'` is
 non-zero on the agent host, and a vmauth request without a token is `401`
 (`curl -s -o /dev/null -w '%{http_code}' 127.0.0.1:8427/api/v1/query`).
 
+**Grafana** runs on the same log host, over vmauth. Install it from the pinned
+tarball (`grafana-13.3.0.linux-amd64.tar.gz`) at `/usr/share/grafana`, the
+plugin zip into `/var/lib/grafana/plugins`, then:
+
+```sh
+useradd --system --no-create-home grafana
+install -d -o grafana -g grafana /var/lib/grafana /var/log/grafana
+install -m 0644 grafana/grafana.ini /etc/deepmsg/grafana.ini
+install -d /etc/deepmsg/grafana
+cp -r grafana/provisioning /etc/deepmsg/grafana/
+ln -s /usr/share/grafana/bin/grafana /usr/local/bin/grafana
+# the read token, the webhook URL and GF_SECURITY_ADMIN_PASSWORD live in
+# /etc/deepmsg/observability.env (0600)
+install -m 0644 systemd/grafana.service /etc/systemd/system/
+systemctl enable --now grafana
+```
+
+The admin password is read on Grafana's **first** start with an empty data
+directory; changing `GF_SECURITY_ADMIN_PASSWORD` later needs
+`grafana-cli admin reset-admin-password`.
+
 ### Kubernetes (profile B)
 
 The DaemonSet is `k8s/agent-daemonset.yaml`; its header has the three

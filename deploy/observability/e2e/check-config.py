@@ -80,6 +80,20 @@ def grafana_checks() -> None:
         ini.get("paths", "provisioning", fallback="").startswith("/etc/deepmsg/"),
         True,
     )
+    unit = HERE.parent / "systemd" / "grafana.service"
+    check("grafana unit exists", unit.is_file(), True)
+    if unit.is_file():
+        unit_text = unit.read_text()
+        check(
+            "grafana unit uses the environment file",
+            "EnvironmentFile=/etc/deepmsg/observability.env" in unit_text,
+            True,
+        )
+        check(
+            "grafana unit runs the pinned binary",
+            "/usr/local/bin/grafana server --homepath /usr/share/grafana" in unit_text,
+            True,
+        )
 
     datasource_dir = GRAFANA / "provisioning" / "datasources"
     files = sorted(datasource_dir.glob("*.yaml")) if datasource_dir.is_dir() else []
