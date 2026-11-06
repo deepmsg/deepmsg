@@ -219,6 +219,7 @@ start_agent() {
     DEEPMSG_VL_LOGS_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/insert/opentelemetry/v1/logs" \
     DEEPMSG_VM_WRITE_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/api/v1/write" \
     DEEPMSG_OBS_WRITE_TOKEN="$TOKEN" \
+    DEEPMSG_NODE_ID=e2e \
     DEEPMSG_HOSTMETRICS_ROOT=/ \
     "$BIN/otelcol-contrib" --config "$REPO/deploy/observability/agent/otelcol.yaml"
 }

@@ -122,6 +122,7 @@ refuses to start if one is unset.
 |---|---|---|
 | `DEEPMSG_LOG_DIR` | the directory the applications write into | `/var/log/deepmsg` |
 | `DEEPMSG_OBS_STATE_DIR` | the collector's durable state (file offsets, queues) | `/var/lib/deepmsg-otelcol` |
+| `DEEPMSG_NODE_ID` | the agent's metrics resource label (host and collector metrics have no other node identity) | `node-1` |
 | `DEEPMSG_COUNTERS_ENDPOINT` | the counters exporter's host:port | `127.0.0.1:9101` |
 | `DEEPMSG_OTELCOL_TELEMETRY_ENDPOINT` | the collector's own Prometheus endpoint | `127.0.0.1:8888` |
 | `DEEPMSG_VL_LOGS_ENDPOINT` | VictoriaLogs' OTLP/HTTP logs URL (through vmauth in the cluster profile) | `http://127.0.0.1:8427/insert/opentelemetry/v1/logs` |
@@ -129,9 +130,11 @@ refuses to start if one is unset.
 | `DEEPMSG_OBS_WRITE_TOKEN` | the bearer token vmauth accepts for writes | (secret) |
 | `DEEPMSG_HOSTMETRICS_ROOT` | the host tree `hostmetrics` reads; a container mounts it at `/hostfs`, a host uses `/` | `/` |
 
-`DEEPMSG_NODE_ID` is not read by the agent: every line already carries the
-`node_id` its writer was configured with, and rewriting it here would hide a
-node that was started with the wrong one. The applications still need it.
+`DEEPMSG_NODE_ID` is attached by the agent to the **metrics** as a resource
+label — the host and collector metrics have no other node identity, and without
+it a dashboard cannot tell two nodes apart. The log lines keep the identity
+their own writer was configured with, so a process started with the wrong one
+is still visible rather than rewritten.
 
 `DEEPMSG_OBS_STATE_DIR` must not be inside `DEEPMSG_LOG_DIR`: the log writer
 rotates and deletes files there, and the state is the collector's memory of
@@ -155,6 +158,7 @@ a different token from the agent's write token.
 | variable | meaning |
 |---|---|
 | `DEEPMSG_GRAFANA_READ_TOKEN` | the read token vmauth accepts for Grafana's datasources |
+| `DEEPMSG_GRAFANA_DASHBOARDS_DIR` | the directory the dashboard provider loads | `/etc/deepmsg/grafana/provisioning/dashboards` |
 | `GF_SECURITY_ADMIN_PASSWORD` | Grafana's admin password; read on the first start only |
 | `GF_PATHS_PROVISIONING` | the provisioning tree; the unit sets it to `/etc/deepmsg/grafana/provisioning` |
 

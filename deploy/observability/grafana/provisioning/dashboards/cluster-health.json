@@ -1,0 +1,240 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+          "editorMode": "code",
+          "expr": "max(deepmsg_cluster_is_leader{node_id=~\"$node\"})",
+          "instant": true,
+          "legendFormat": "leader",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "is leader",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "thresholds"}, "mappings": [], "unit": "short"},
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 4, "x": 4, "y": 0},
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+          "editorMode": "code",
+          "expr": "max(deepmsg_cluster_term{node_id=~\"$node\"})",
+          "instant": true,
+          "legendFormat": "term",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "term",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "thresholds"}, "mappings": [], "unit": "s"},
+        "overrides": []
+      },
+      "gridPos": {"h": 5, "w": 4, "x": 8, "y": 0},
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+          "editorMode": "code",
+          "expr": "max(deepmsg_driver_heartbeat_age_seconds{node_id=~\"$node\"})",
+          "instant": true,
+          "legendFormat": "heartbeat age",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "heartbeat age",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "id": 4,
+      "options": {
+        "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+          "editorMode": "code",
+          "expr": "deepmsg_cluster_commit_position{node_id=~\"$node\"}",
+          "legendFormat": "cluster {{cluster_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "commit position",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}, {"color": "red", "value": 3}]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "id": 5,
+      "options": {
+        "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+          "editorMode": "code",
+          "expr": "deepmsg_driver_heartbeat_age_seconds{node_id=~\"$node\"}",
+          "legendFormat": "{{node_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "driver heartbeat age (alert threshold 3 s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "victoriametrics-logs-datasource", "uid": "victorialogs"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "id": 6,
+      "options": {"showLabels": false, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true},
+      "targets": [
+        {
+          "datasource": {"type": "victoriametrics-logs-datasource", "uid": "victorialogs"},
+          "editorMode": "code",
+          "expr": "event:\"role.change\" node_id:\"$node\"",
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "title": "role changes (VictoriaLogs)",
+      "type": "logs"
+    },
+    {
+      "gridPos": {"h": 4, "w": 24, "x": 0, "y": 16},
+      "id": 7,
+      "options": {
+        "content": "**Not available as a counter:** `cluster_append_position`. The L1 exporter has no append position (the commit position is type 203); the commit/append lag alert is therefore not provisioned (see the L3 plan, §2.3).",
+        "mode": "markdown"
+      },
+      "title": "known gap",
+      "type": "text"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["deepmsg", "l3"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+        "definition": "label_values(deepmsg_driver_up, node_id)",
+        "includeAll": false,
+        "label": "node_id",
+        "multi": false,
+        "name": "node",
+        "options": [],
+        "query": {"query": "label_values(deepmsg_driver_up, node_id)", "refId": "StandardVariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "deepmsg cluster health",
+  "uid": "deepmsg-cluster-health",
+  "version": 1,
+  "weekStart": ""
+}

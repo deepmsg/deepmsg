@@ -52,6 +52,12 @@ spec:
             # is mounted at /hostfs, not at /.
             - name: DEEPMSG_HOSTMETRICS_ROOT
               value: /hostfs
+            # The metrics resource label. The applications set their own; this
+            # is the agent's, for the host and collector metrics.
+            - name: DEEPMSG_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           volumeMounts:
             - name: config
               mountPath: /etc/deepmsg

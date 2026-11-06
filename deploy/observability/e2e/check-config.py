@@ -118,6 +118,24 @@ def grafana_checks() -> None:
             json.loads(path.read_text())
         except json.JSONDecodeError as error:
             failures.append(f"{path}: {error}")
+    provider_files = sorted((GRAFANA / "provisioning" / "dashboards").glob("*.yaml"))
+    check("one dashboard provider file", len(provider_files), 1)
+    for path in provider_files:
+        try:
+            config = yaml.safe_load(path.read_text())
+        except yaml.YAMLError as error:
+            failures.append(f"{path}: {error}")
+            continue
+        providers = config.get("providers", [])
+        check(f"{path.name}: one provider", len(providers), 1)
+        if providers:
+            provider = providers[0]
+            check(f"{path.name}: provider type", provider.get("type"), "file")
+            check(
+                f"{path.name}: dashboard path is environment-driven",
+                provider.get("options", {}).get("path"),
+                "$__env{DEEPMSG_GRAFANA_DASHBOARDS_DIR}",
+            )
     for path in sorted((GRAFANA / "provisioning" / "alerting").glob("*.yaml")):
         try:
             yaml.safe_load(path.read_text())
@@ -128,6 +146,11 @@ def grafana_checks() -> None:
     check(
         "DEEPMSG_GRAFANA_READ_TOKEN is documented in README.md",
         "DEEPMSG_GRAFANA_READ_TOKEN" in readme,
+        True,
+    )
+    check(
+        "DEEPMSG_GRAFANA_DASHBOARDS_DIR is documented in README.md",
+        "DEEPMSG_GRAFANA_DASHBOARDS_DIR" in readme,
         True,
     )
 
@@ -283,12 +306,31 @@ def main() -> int:
     check("logs.exporters", logs.get("exporters"), ["otlphttp/victorialogs"])
     metrics_pipeline = mapping(pipelines.get("metrics"), "service.pipelines.metrics")
     check("metrics.receivers", metrics_pipeline.get("receivers"), ["prometheus", "hostmetrics"])
-    check("metrics.processors", metrics_pipeline.get("processors"), ["memory_limiter", "batch"])
+    check(
+        "metrics.processors",
+        metrics_pipeline.get("processors"),
+        ["memory_limiter", "resource/node_id", "batch"],
+    )
     check(
         "metrics.exporters",
         metrics_pipeline.get("exporters"),
         ["prometheusremotewrite/victoriametrics"],
     )
+    resource = mapping(
+        mapping(config.get("processors"), "processors").get("resource/node_id"),
+        "processors.resource/node_id",
+    )
+    actions = sequence(resource.get("attributes"), "processors.resource/node_id.attributes")
+    check("resource/node_id has one action", len(actions), 1)
+    if actions:
+        action = mapping(actions[0], "processors.resource/node_id.attributes[0]")
+        check("metrics node_id key", action.get("key"), "node_id")
+        check("metrics node_id action", action.get("action"), "upsert")
+        check(
+            "metrics node_id is environment-driven",
+            str(action.get("value", "")),
+            "${env:DEEPMSG_NODE_ID}",
+        )
     limiter = mapping(
         mapping(config.get("processors"), "processors").get("memory_limiter"),
         "processors.memory_limiter",

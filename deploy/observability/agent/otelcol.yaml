@@ -71,6 +71,14 @@ processors:
   memory_limiter:
     check_interval: 1s
     limit_mib: 256
+  # The log lines carry their own node_id, but the host and collector metrics
+  # have none; without this a dashboard cannot tell two nodes apart, and the
+  # disk alert would be cluster-wide.
+  resource/node_id:
+    attributes:
+      - key: node_id
+        value: ${env:DEEPMSG_NODE_ID}
+        action: upsert
   batch:
     timeout: 5s
 
@@ -125,5 +133,5 @@ service:
       exporters: [otlphttp/victorialogs]
     metrics:
       receivers: [prometheus, hostmetrics]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter, resource/node_id, batch]
       exporters: [prometheusremotewrite/victoriametrics]

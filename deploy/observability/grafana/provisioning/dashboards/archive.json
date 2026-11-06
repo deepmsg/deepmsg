@@ -1,0 +1,126 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Recording position from counter type 100, by recording id. A flat line is a recording that is not being written; it is not a failure by itself.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "legend": {"calcs": [], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+          "editorMode": "code",
+          "expr": "deepmsg_archive_recording_position{node_id=~\"$node\"}",
+          "legendFormat": "recording {{recording_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "recording position",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+      "description": "Host filesystem utilisation from hostmetrics, on the node the agent runs on. The metric name is confirmed against the collector's own name list by the L3 E2E; a rename makes this panel empty, not wrong.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "showPoints": "never"
+          },
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.8}]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "id": 2,
+      "options": {
+        "legend": {"calcs": [], "displayMode": "table", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "none"}
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+          "editorMode": "code",
+          "expr": "system_filesystem_utilization_ratio{node_id=~\"$node\"} > 0",
+          "legendFormat": "{{mountpoint}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "disk utilisation (alert threshold 80%)",
+      "type": "timeseries"
+    },
+    {
+      "gridPos": {"h": 4, "w": 24, "x": 0, "y": 8},
+      "id": 3,
+      "options": {
+        "content": "**Not available as counters:** archive segment count and replication lag. The exporter has the recording position (type 100) and nothing for segments or replication; both need new counters or a catalog read, which is out of this slice (L3 plan, §1.2).",
+        "mode": "markdown"
+      },
+      "title": "known gaps",
+      "type": "text"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["deepmsg", "l3"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": {"type": "prometheus", "uid": "victoriametrics"},
+        "definition": "label_values(deepmsg_driver_up, node_id)",
+        "includeAll": false,
+        "label": "node_id",
+        "multi": false,
+        "name": "node",
+        "options": [],
+        "query": {"query": "label_values(deepmsg_driver_up, node_id)", "refId": "StandardVariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "deepmsg archive",
+  "uid": "deepmsg-archive",
+  "version": 1,
+  "weekStart": ""
+}
