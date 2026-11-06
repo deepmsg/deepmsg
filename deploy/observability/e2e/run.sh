@@ -115,6 +115,8 @@ users:
       - src_paths:
           - /insert/opentelemetry/v1/logs
           - /select/logsql/query
+          - /select/logsql/stats_query
+          - /select/logsql/stats_query_range
           - /select/logsql/streams
           - /select/logsql/stream_field_names
           - /select/logsql/stream_field_values
@@ -545,6 +547,8 @@ if [[ -n ${E2E_HOLD:-} ]]; then
     echo "VMAUTH_PORT=$VMAUTH_PORT"
     echo "TELEMETRY_PORT=$TELEMETRY_PORT"
     echo "COUNTERS_PORT=$COUNTERS_PORT"
+    echo "DRIVER_METRICS_PID=${PID[driver-metrics]:-}"
+    echo "COUNTERS_EXPORTER_PID=${PID[counters-exporter]:-}"
   } >"$E2E_HOLD.tmp"
   mv "$E2E_HOLD.tmp" "$E2E_HOLD"
   echo "e2e: stack held for $E2E_HOLD (pid $$); SIGTERM to stop"

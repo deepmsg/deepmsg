@@ -23,6 +23,8 @@ users:
     url_map:
       - src_paths:
           - /select/logsql/query
+          - /select/logsql/stats_query
+          - /select/logsql/stats_query_range
           - /select/logsql/streams
           - /select/logsql/stream_field_names
           - /select/logsql/stream_field_values

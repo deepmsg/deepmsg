@@ -30,6 +30,7 @@ KEEP=${E2E_KEEP:-0}
 STATUS=started
 STACK_PID=""
 GF_PID=""
+WEBHOOK_PID=""
 STACK_WORK=""
 
 fail() { echo "grafana-e2e: $*" >&2; exit 1; }
@@ -55,6 +56,10 @@ cleanup() {
     done
     kill -9 "$GF_PID" 2>/dev/null || true
     wait "$GF_PID" 2>/dev/null || true
+  fi
+  if [[ -n $WEBHOOK_PID ]]; then
+    kill "$WEBHOOK_PID" 2>/dev/null || true
+    wait "$WEBHOOK_PID" 2>/dev/null || true
   fi
   if [[ -n $STACK_PID ]]; then
     kill -TERM "$STACK_PID" 2>/dev/null || true
@@ -198,5 +203,73 @@ printf '%s' "$policy" | jq -e '.receiver == "deepmsg-webhook"' >/dev/null ||
   fail "the root policy does not route to the webhook"
 echo "grafana-e2e: C3: six rules, the contact point and the policy are provisioned"
 
-echo "grafana-e2e: C1–C3 green (Grafana $("$GF_HOME/bin/grafana" --version 2>&1 | head -n 1))"
+# C4-C7: the alerts have to fire, and the contact point has to be reached.
+# The webhook is started first; the contact point already names it.
+python3 -u "$HERE/webhook.py" "$WORK/webhook.log" "$WEBHOOK_PORT" &
+WEBHOOK_PID=$!
+webhook_deadline=$((SECONDS + 30))
+until curl -s -o /dev/null "http://127.0.0.1:$WEBHOOK_PORT/"; do
+  ((SECONDS < webhook_deadline)) || fail "the webhook receiver did not start"
+  sleep 0.2
+done
+echo "grafana-e2e: webhook receiver on $WEBHOOK_PORT"
+
+wait_alert() {
+  local title=$1 timeout=${2:-180}
+  local deadline=$((SECONDS + timeout)) alerts
+  while ((SECONDS < deadline)); do
+    alerts=$(grafana_api /api/prometheus/grafana/api/v1/alerts)
+    if printf '%s' "$alerts" |
+      jq -e --arg t "$title" '.data.alerts | map(select(.labels.alertname == $t and .state == "Alerting")) | length > 0' \
+        >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "grafana-e2e: last alerts: $alerts" >&2
+  fail "$title did not fire within ${timeout}s"
+}
+
+DRIVER_METRICS_PID=$(sed -n 's/^DRIVER_METRICS_PID=//p' "$READY")
+COUNTERS_EXPORTER_PID=$(sed -n 's/^COUNTERS_EXPORTER_PID=//p' "$READY")
+[[ -n $DRIVER_METRICS_PID && -n $COUNTERS_EXPORTER_PID ]] ||
+  fail "the stack did not name the driver and exporter PIDs"
+
+# C4: the driver crashes; its heartbeat stops moving.
+kill -9 "$DRIVER_METRICS_PID" 2>/dev/null || fail "could not kill the metrics driver"
+wait_alert "Driver heartbeat stale" 180 ||
+  fail "the heartbeat alert did not fire"
+echo "grafana-e2e: C4: the heartbeat alert is firing"
+
+# C5: the counters exporter goes away; the scrape's up goes to zero.
+kill -9 "$COUNTERS_EXPORTER_PID" 2>/dev/null || fail "could not kill the counters exporter"
+wait_alert "Driver metrics gone" 240 ||
+  fail "the metrics-gone alert did not fire"
+echo "grafana-e2e: C5: the metrics-gone alert is firing"
+
+# C6: three role changes, written where the agent's filelog reads.
+for index in 1 2 3; do
+  printf '{"ts":"%s","level":"info","component":"cluster","node_id":"e2e","event":"role.change","role":"leader"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%S.000000000Z)" >>"$STACK_WORK/logs/role-e2e.json"
+done
+wait_alert "Cluster role jitter" 240 ||
+  fail "the role-jitter alert did not fire"
+echo "grafana-e2e: C6: the role-jitter alert is firing"
+
+# C7: the contact point received all three.
+for title in "Driver heartbeat stale" "Driver metrics gone" "Cluster role jitter"; do
+  delivered=false
+  deadline=$((SECONDS + 120))
+  while ((SECONDS < deadline)); do
+    if grep -qF "\"$title\"" "$WORK/webhook.log" 2>/dev/null; then
+      delivered=true
+      break
+    fi
+    sleep 2
+  done
+  [[ $delivered == true ]] || fail "the webhook did not receive '$title'"
+done
+echo "grafana-e2e: C7: the webhook received all three alerts"
+
+echo "grafana-e2e: C1–C7 green (Grafana $("$GF_HOME/bin/grafana" --version 2>&1 | head -n 1))"
 STATUS=ok
