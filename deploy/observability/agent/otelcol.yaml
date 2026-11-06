@@ -79,6 +79,16 @@ processors:
       - key: node_id
         value: ${env:DEEPMSG_NODE_ID}
         action: upsert
+  # ...and the resource alone is not enough: the remote-write exporter keeps
+  # resource attributes on the resource (they would only show up in
+  # `target_info`), so a sample from two hosts with the same target stays one
+  # series, and VictoriaMetrics drops all but one of them as "same timestamp,
+  # different value". This copies the identity onto every data point.
+  transform/node_id:
+    metric_statements:
+      - context: datapoint
+        statements:
+          - set(attributes["node_id"], resource.attributes["node_id"])
   batch:
     timeout: 5s
 
@@ -133,5 +143,5 @@ service:
       exporters: [otlphttp/victorialogs]
     metrics:
       receivers: [prometheus, hostmetrics]
-      processors: [memory_limiter, resource/node_id, batch]
+      processors: [memory_limiter, resource/node_id, transform/node_id, batch]
       exporters: [prometheusremotewrite/victoriametrics]

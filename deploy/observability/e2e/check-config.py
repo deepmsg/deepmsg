@@ -480,7 +480,7 @@ def main() -> int:
     check(
         "metrics.processors",
         metrics_pipeline.get("processors"),
-        ["memory_limiter", "resource/node_id", "batch"],
+        ["memory_limiter", "resource/node_id", "transform/node_id", "batch"],
     )
     check(
         "metrics.exporters",
@@ -501,6 +501,25 @@ def main() -> int:
             "metrics node_id is environment-driven",
             str(action.get("value", "")),
             "${env:DEEPMSG_NODE_ID}",
+        )
+    # The resource attribute is not on the sample; the remote-write exporter
+    # keeps resources on the resource, so without this copy two hosts' samples
+    # for the same target are one series and one of them is dropped at ingest.
+    transform = mapping(
+        mapping(config.get("processors"), "processors").get("transform/node_id"),
+        "processors.transform/node_id",
+    )
+    statements = sequence(
+        transform.get("metric_statements"), "processors.transform/node_id.metric_statements"
+    )
+    check("transform/node_id has one statement block", len(statements), 1)
+    if statements:
+        block = mapping(statements[0], "processors.transform/node_id.metric_statements[0]")
+        check("transform/node_id context", block.get("context"), "datapoint")
+        check(
+            "transform/node_id copies the resource attribute onto the sample",
+            block.get("statements"),
+            ['set(attributes["node_id"], resource.attributes["node_id"])'],
         )
     limiter = mapping(
         mapping(config.get("processors"), "processors").get("memory_limiter"),
