@@ -180,6 +180,18 @@ def grafana_checks() -> None:
         for uid in ("driver-heartbeat-stale", "driver-metrics-absent", "cluster-role-jitter"):
             check(f"rule {uid} is provisioned", uid in uids, True)
 
+    # Every rule's runbook fragment must have an anchor, or an alert links to
+    # nothing when it fires.
+    runbook_path = GRAFANA / "runbook.md"
+    check("runbook exists", runbook_path.is_file(), True)
+    runbook = runbook_path.read_text() if runbook_path.is_file() else ""
+    for rule in rules:
+        url = str(rule.get("annotations", {}).get("runbook_url", ""))
+        fragment = url.rsplit("#", 1)[-1] if "#" in url else ""
+        check(f"runbook anchor for {rule.get('uid')}", f'id="{fragment}"' in runbook, True)
+    for anchor in ("drill-collector-off", "drill-swap-backend", "commit-lag"):
+        check(f"runbook anchor {anchor}", f'id="{anchor}"' in runbook, True)
+
     contact_files = sorted(alerting_dir.glob("contact-points.yaml"))
     check("one contact-points file", len(contact_files), 1)
     if contact_files:

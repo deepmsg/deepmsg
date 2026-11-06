@@ -549,6 +549,7 @@ if [[ -n ${E2E_HOLD:-} ]]; then
     echo "COUNTERS_PORT=$COUNTERS_PORT"
     echo "DRIVER_METRICS_PID=${PID[driver-metrics]:-}"
     echo "COUNTERS_EXPORTER_PID=${PID[counters-exporter]:-}"
+    echo "VMAUTH_PID=${PID[vmauth]:-}"
   } >"$E2E_HOLD.tmp"
   mv "$E2E_HOLD.tmp" "$E2E_HOLD"
   echo "e2e: stack held for $E2E_HOLD (pid $$); SIGTERM to stop"
