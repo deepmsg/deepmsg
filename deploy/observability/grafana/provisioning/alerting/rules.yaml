@@ -1,0 +1,235 @@
+# The six provisioned alert rules (the seventh, the cluster commit lag, needs
+# an append-position counter and is not provisioned — see the L3 plan §2.3).
+#
+# No rule uses a dashboard variable: an alert rule is evaluated without a
+# dashboard, and a `$node` written into one is a silent filter that never
+# matches. The series carry `node_id` (the exporter's labels and the agent's
+# resource label), so the alert instances are per node by construction.
+#
+# The thresholds live in the classic condition (query A, condition C), so the
+# query stays the raw signal and the rule says what "too much" is.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: deepmsg
+    folder: deepmsg
+    interval: 30s
+    rules:
+      - uid: driver-heartbeat-stale
+        title: Driver heartbeat stale
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 60, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              editorMode: code
+              expr: deepmsg_driver_heartbeat_age_seconds
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [3], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {params: [], type: last}
+                  type: query
+              datasource: {type: __expr__, uid: __expr__}
+              expression: ""
+              refId: C
+              type: classic_conditions
+        noDataState: OK
+        execErrState: Error
+        for: 5s
+        annotations:
+          summary: A driver's consumer heartbeat is older than 3 seconds.
+          runbook_url: https://github.com/deepmsg/deepmsg/blob/main/deploy/observability/grafana/runbook.md#driver-heartbeat-stale
+        labels:
+          severity: P1
+        isPaused: false
+
+      - uid: driver-metrics-absent
+        title: Driver metrics gone
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 120, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              editorMode: code
+              # absent() alone would not fire until VM's staleness window has
+              # passed; `up == bool 0` goes false on the first failed scrape,
+              # and the absent leg is the total-absence backstop.
+              expr: absent(deepmsg_driver_heartbeat_age_seconds) or (up{job="deepmsg-counters"} == bool 0)
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {params: [], type: last}
+                  type: query
+              datasource: {type: __expr__, uid: __expr__}
+              expression: ""
+              refId: C
+              type: classic_conditions
+        noDataState: Alerting
+        execErrState: Error
+        for: 30s
+        annotations:
+          summary: The driver's metrics are gone or the counters scrape is failing.
+          runbook_url: https://github.com/deepmsg/deepmsg/blob/main/deploy/observability/grafana/runbook.md#driver-metrics-absent
+        labels:
+          severity: P1
+        isPaused: false
+
+      - uid: cluster-role-jitter
+        title: Cluster role jitter
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: victorialogs
+            model:
+              editorMode: code
+              expr: 'event:"role.change" | stats by (node_id) count() as changes'
+              queryType: stats
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [3], type: gte}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {params: [], type: last}
+                  type: query
+              datasource: {type: __expr__, uid: __expr__}
+              expression: ""
+              refId: C
+              type: classic_conditions
+        noDataState: OK
+        execErrState: Error
+        for: 0s
+        annotations:
+          summary: Three or more role changes in five minutes.
+          runbook_url: https://github.com/deepmsg/deepmsg/blob/main/deploy/observability/grafana/runbook.md#cluster-role-jitter
+        labels:
+          severity: P1
+        isPaused: false
+
+      - uid: loss-rate
+        title: Loss rate above zero
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              editorMode: code
+              expr: rate(deepmsg_loss_total[5m])
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {params: [], type: last}
+                  type: query
+              datasource: {type: __expr__, uid: __expr__}
+              expression: ""
+              refId: C
+              type: classic_conditions
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: Loss gap fills are being counted.
+          runbook_url: https://github.com/deepmsg/deepmsg/blob/main/deploy/observability/grafana/runbook.md#loss-rate
+        labels:
+          severity: P2
+        isPaused: false
+
+      - uid: disk-watermark
+        title: Disk above eighty percent
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              editorMode: code
+              expr: system_filesystem_utilization_ratio
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0.8], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {params: [], type: last}
+                  type: query
+              datasource: {type: __expr__, uid: __expr__}
+              expression: ""
+              refId: C
+              type: classic_conditions
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: A filesystem on a deepmsg host is above 80% used.
+          runbook_url: https://github.com/deepmsg/deepmsg/blob/main/deploy/observability/grafana/runbook.md#disk-watermark
+        labels:
+          severity: P2
+        isPaused: false
+
+      - uid: log-export-dropped
+        title: Log export failing or queue full
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 120, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              editorMode: code
+              expr: (otelcol_exporter_send_failed_log_records_total > bool 0) or (otelcol_exporter_queue_size >= bool 10000)
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {params: [], type: last}
+                  type: query
+              datasource: {type: __expr__, uid: __expr__}
+              expression: ""
+              refId: C
+              type: classic_conditions
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        annotations:
+          summary: The collector is dropping log records or its queue is at the cap.
+          runbook_url: https://github.com/deepmsg/deepmsg/blob/main/deploy/observability/grafana/runbook.md#log-export-dropped
+        labels:
+          severity: P3
+        isPaused: false

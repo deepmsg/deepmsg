@@ -159,6 +159,7 @@ a different token from the agent's write token.
 |---|---|
 | `DEEPMSG_GRAFANA_READ_TOKEN` | the read token vmauth accepts for Grafana's datasources |
 | `DEEPMSG_GRAFANA_DASHBOARDS_DIR` | the directory the dashboard provider loads | `/etc/deepmsg/grafana/provisioning/dashboards` |
+| `DEEPMSG_GRAFANA_WEBHOOK_URL` | where the alerting contact point posts firing alerts | `http://127.0.0.1:9099/alerts` |
 | `GF_SECURITY_ADMIN_PASSWORD` | Grafana's admin password; read on the first start only |
 | `GF_PATHS_PROVISIONING` | the provisioning tree; the unit sets it to `/etc/deepmsg/grafana/provisioning` |
 

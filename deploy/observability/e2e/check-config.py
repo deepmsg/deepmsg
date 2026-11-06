@@ -136,11 +136,82 @@ def grafana_checks() -> None:
                 provider.get("options", {}).get("path"),
                 "$__env{DEEPMSG_GRAFANA_DASHBOARDS_DIR}",
             )
-    for path in sorted((GRAFANA / "provisioning" / "alerting").glob("*.yaml")):
+    # The alert rules: six, the three the E2E fires among them, no dashboard
+    # variable in a rule, and a contact point the root policy names.
+    alerting_dir = GRAFANA / "provisioning" / "alerting"
+    rules_files = sorted(alerting_dir.glob("rules.yaml"))
+    check("one rules file", len(rules_files), 1)
+    rules: list = []
+    if rules_files:
         try:
-            yaml.safe_load(path.read_text())
+            config = yaml.safe_load(rules_files[0].read_text())
         except yaml.YAMLError as error:
-            failures.append(f"{path}: {error}")
+            failures.append(f"{rules_files[0]}: {error}")
+            config = {}
+        groups = config.get("groups", [])
+        check("one alert group", len(groups), 1)
+        if groups:
+            rules = groups[0].get("rules", [])
+        check("six alert rules", len(rules), 6)
+        for rule in rules:
+            uid = rule.get("uid", "")
+            check(f"rule {uid}: condition", rule.get("condition"), "C")
+            check(
+                f"rule {uid}: severity",
+                rule.get("labels", {}).get("severity") in {"P1", "P2", "P3"},
+                True,
+            )
+            check(
+                f"rule {uid}: runbook_url",
+                "runbook.md#" in rule.get("annotations", {}).get("runbook_url", ""),
+                True,
+            )
+        expressions = [
+            str(entry.get("model", {}).get("expr", ""))
+            for rule in rules
+            for entry in rule.get("data", [])
+        ]
+        check(
+            "no dashboard variable in the rule expressions",
+            any("$node" in expression or "$NODE" in expression for expression in expressions),
+            False,
+        )
+        uids = {rule.get("uid") for rule in rules}
+        for uid in ("driver-heartbeat-stale", "driver-metrics-absent", "cluster-role-jitter"):
+            check(f"rule {uid} is provisioned", uid in uids, True)
+
+    contact_files = sorted(alerting_dir.glob("contact-points.yaml"))
+    check("one contact-points file", len(contact_files), 1)
+    if contact_files:
+        try:
+            config = yaml.safe_load(contact_files[0].read_text())
+        except yaml.YAMLError as error:
+            failures.append(f"{contact_files[0]}: {error}")
+            config = {}
+        points = config.get("contactPoints", [])
+        check("one contact point", len(points), 1)
+        if points:
+            receivers = points[0].get("receivers", [])
+            check("one receiver", len(receivers), 1)
+            if receivers:
+                check(
+                    "webhook url is environment-driven",
+                    receivers[0].get("settings", {}).get("url"),
+                    "$__env{DEEPMSG_GRAFANA_WEBHOOK_URL}",
+                )
+
+    policy_files = sorted(alerting_dir.glob("policies.yaml"))
+    check("one policies file", len(policy_files), 1)
+    if policy_files:
+        try:
+            config = yaml.safe_load(policy_files[0].read_text())
+        except yaml.YAMLError as error:
+            failures.append(f"{policy_files[0]}: {error}")
+            config = {}
+        policies = config.get("policies", [])
+        check("one root policy", len(policies), 1)
+        if policies:
+            check("root policy receiver", policies[0].get("receiver"), "deepmsg-webhook")
 
     readme = README.read_text() if README.exists() else ""
     check(
@@ -151,6 +222,11 @@ def grafana_checks() -> None:
     check(
         "DEEPMSG_GRAFANA_DASHBOARDS_DIR is documented in README.md",
         "DEEPMSG_GRAFANA_DASHBOARDS_DIR" in readme,
+        True,
+    )
+    check(
+        "DEEPMSG_GRAFANA_WEBHOOK_URL is documented in README.md",
+        "DEEPMSG_GRAFANA_WEBHOOK_URL" in readme,
         True,
     )
 

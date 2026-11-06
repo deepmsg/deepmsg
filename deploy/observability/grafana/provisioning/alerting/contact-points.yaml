@@ -1,0 +1,16 @@
+# The one contact point: a webhook. The URL is expanded from the environment,
+# so the E2E can point it at a local receiver and production at the real
+# channel without editing the tree. Nothing else is provisioned here on
+# purpose: routing stays one route until a deployment asks for more.
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: deepmsg-webhook
+    receivers:
+      - uid: deepmsg-webhook
+        type: webhook
+        settings:
+          url: $__env{DEEPMSG_GRAFANA_WEBHOOK_URL}
+          httpMethod: POST
+        disableResolveMessage: false
