@@ -532,3 +532,23 @@ echo "e2e: four processes alive; ports $VL_PORT/$VM_PORT/$VMAUTH_PORT/$TELEMETRY
 "$BIN/otelcol-contrib" --version | head -n 1
 
 STATUS=ok
+
+# Hold mode: everything above passed and the stack is left running for a
+# caller that layers on top of it (the Grafana E2E). The ready file names the
+# work directory and the ports; SIGTERM ends the hold and runs the normal
+# cleanup. Without E2E_HOLD nothing changes.
+if [[ -n ${E2E_HOLD:-} ]]; then
+  {
+    echo "WORK=$WORK"
+    echo "VL_PORT=$VL_PORT"
+    echo "VM_PORT=$VM_PORT"
+    echo "VMAUTH_PORT=$VMAUTH_PORT"
+    echo "TELEMETRY_PORT=$TELEMETRY_PORT"
+    echo "COUNTERS_PORT=$COUNTERS_PORT"
+  } >"$E2E_HOLD.tmp"
+  mv "$E2E_HOLD.tmp" "$E2E_HOLD"
+  echo "e2e: stack held for $E2E_HOLD (pid $$); SIGTERM to stop"
+  hold_stop() { exit 0; }
+  trap hold_stop TERM INT
+  while true; do sleep 5; done
+fi
