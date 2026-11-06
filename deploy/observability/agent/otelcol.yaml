@@ -9,10 +9,13 @@ extensions:
 receivers:
   filelog:
     include: ["${env:DEEPMSG_LOG_DIR}/*.json"]
-    # Provisional until the L2 C3b measurement: `end` skips a file first seen
-    # after a rotation that happened while the collector was down, and that is
-    # exactly the case "restart without loss" has to cover. `beginning` pays a
-    # one-time read of what is on disk (at most the 500 MB the writer keeps).
+    # `start_at` governs the files present at the collector's *first* start:
+    # `beginning` reads the backlog the applications have already written;
+    # `end` silently skips it (measured: 3 pre-existing lines, 0 vs 3). Once a
+    # persisted state exists, offsets govern, and a rotation that happens while
+    # the collector is down is read from the beginning under either value
+    # (measured). The cost of `beginning` is one bounded read of what the
+    # writer keeps on disk.
     start_at: beginning
     storage: file_storage
     operators:

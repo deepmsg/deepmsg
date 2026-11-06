@@ -11,16 +11,18 @@ and a Prometheus endpoint, and turning collection off degrades queries to
 
 ## Status
 
-**Configuration, the process harness, the log path and the metrics path.** The
-agent config, its static checks, the launcher, the log assertions and the
-metrics assertions are here; durability, authentication and the resource
+**Configuration, the process harness, the log path, the metrics path and
+durability.** The agent config, its static checks, the launcher and the log,
+metrics and restart assertions are here; authentication and the resource
 budgets arrive in the later commits of the L2 slice. The launcher proves the
 four processes start, listen and stay alive, that the driver runs with no
 collector at all (empty stderr, lines on disk), that its log file reaches
-VictoriaLogs with the expected fields and stream, and that the counters
-exporter's scrape (the collector's own metrics included) reaches
-VictoriaMetrics. Nothing under `systemd/` or `k8s/` has been run on a machine
-yet, and a static review is not a run.
+VictoriaLogs with the expected fields and stream, that the counters exporter's
+scrape (the collector's own metrics included) reaches VictoriaMetrics, and that
+lines written while the collector is down — a rotation it did not see included
+— all arrive after the restart, with no line replayed. Nothing under
+`systemd/` or `k8s/` has been run on a machine yet, and a static review is not
+a run.
 
 ## Layout
 
@@ -64,6 +66,15 @@ script requires at least one of those names in VictoriaMetrics.
 vmauth's `src_paths` are **exact paths** — no prefix and no glob — so the
 generated auth config names every path the pipeline and a Grafana datasource
 use. A missing one is a 400 `missing route`, not a 404.
+
+The durability half stops the collector, runs the driver again (must still have
+empty stderr), appends five lines, then performs the writer's own rotation —
+the base is renamed to `.1.json` and a new base appears — and appends five
+more. After the restart all ten are in VictoriaLogs and no earlier line is
+replayed. The measurement also settles `start_at`: it governs the **first**
+start only (`beginning` reads a 3-line backlog, `end` reads 0); once a state
+exists, offsets govern and a rotation during downtime is read from the
+beginning under either value.
 
 | override | default | meaning |
 |---|---|---|

@@ -89,7 +89,8 @@ def main() -> int:
 
     filelog = mapping(receivers.get("filelog"), "receivers.filelog")
     check("filelog.storage", filelog.get("storage"), "file_storage")
-    # Provisional until the C3b measurement decides it; see the plan's Q2.
+    # beginning: the first start reads the backlog the applications wrote.
+    # Measured: end skips the same three pre-existing lines (0 vs 3).
     check("filelog.start_at", filelog.get("start_at"), "beginning")
     include = sequence(filelog.get("include"), "filelog.include")
     check("filelog.include is one glob under the log directory", include, ["${env:DEEPMSG_LOG_DIR}/*.json"])

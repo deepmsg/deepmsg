@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # The L2 end-to-end stack: VictoriaLogs, VictoriaMetrics, vmauth and the agent.
 #
-# This commit proves the four processes start, listen and stay alive, and that
-# both paths work: the log path (the driver runs with no collector, then the
-# agent reads that backlog and VictoriaLogs answers), and the metrics path (the
-# counters exporter's scrape reaches VictoriaMetrics, the collector's own
-# metrics included).
+# This commit proves the four processes start, listen and stay alive, that both
+# paths work (the driver's backlog reaches VictoriaLogs; the counters scrape
+# reaches VictoriaMetrics), and that the log path survives the collector going
+# away: lines written while it is down — a rotation it did not see included —
+# all arrive after the restart, with no line replayed.
 #
 # Everything lives under target/observability-e2e/<timestamp>-<pid>/. A failed
 # run keeps it (logs, listeners, process table) and says where it is; a
@@ -210,20 +210,24 @@ grep -q '"event":"driver.stop"' "$WORK/logs/driver-e2e.json" || fail "driver.sto
 echo "e2e: C9: the driver ran with no collector; stderr 0 bytes, start and stop on disk"
 
 # Now the agent, reading that file from its start.
-start otelcol env \
-  DEEPMSG_LOG_DIR="$WORK/logs" \
-  DEEPMSG_OBS_STATE_DIR="$WORK/state" \
-  DEEPMSG_COUNTERS_ENDPOINT="127.0.0.1:$COUNTERS_PORT" \
-  DEEPMSG_OTELCOL_TELEMETRY_ENDPOINT="127.0.0.1:$TELEMETRY_PORT" \
-  DEEPMSG_VL_LOGS_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/insert/opentelemetry/v1/logs" \
-  DEEPMSG_VM_WRITE_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/api/v1/write" \
-  DEEPMSG_OBS_WRITE_TOKEN="$TOKEN" \
-  "$BIN/otelcol-contrib" --config "$REPO/deploy/observability/agent/otelcol.yaml"
+start_agent() {
+  start otelcol env \
+    DEEPMSG_LOG_DIR="$WORK/logs" \
+    DEEPMSG_OBS_STATE_DIR="$WORK/state" \
+    DEEPMSG_COUNTERS_ENDPOINT="127.0.0.1:$COUNTERS_PORT" \
+    DEEPMSG_OTELCOL_TELEMETRY_ENDPOINT="127.0.0.1:$TELEMETRY_PORT" \
+    DEEPMSG_VL_LOGS_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/insert/opentelemetry/v1/logs" \
+    DEEPMSG_VM_WRITE_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/api/v1/write" \
+    DEEPMSG_OBS_WRITE_TOKEN="$TOKEN" \
+    "$BIN/otelcol-contrib" --config "$REPO/deploy/observability/agent/otelcol.yaml"
+}
+
+start_agent
 wait_http otelcol "http://127.0.0.1:$TELEMETRY_PORT/metrics"
 
 logs_query() {
   curl -s -H "Authorization: Bearer $TOKEN" \
-    --data-urlencode "query=$1" --data-urlencode "limit=20" \
+    --data-urlencode "query=$1" --data-urlencode "limit=100" \
     "http://127.0.0.1:$VMAUTH_PORT/select/logsql/query"
 }
 
@@ -341,6 +345,75 @@ until curl -s -H "Authorization: Bearer $TOKEN" \
   sleep 1
 done
 echo "e2e: C8: otelcol_exporter_* metrics are in VictoriaMetrics"
+
+# C3/C3b: the collector goes away, the application keeps writing, and the
+# agent has to come back without losing a line. The rotation is the writer's
+# own move — the base is renamed to `.1.json` and a new base appears — so the
+# collector meets exactly the file it meets at the size limit.
+kill "${PID[otelcol]}" 2>/dev/null || true
+wait "${PID[otelcol]}" || fail "the collector did not stop cleanly"
+unset 'PID[otelcol]'
+echo "e2e: the collector is down"
+
+# The application writes while nothing collects.
+DEEPMSG_LOG_DIR="$WORK/logs" DEEPMSG_NODE_ID=e2e \
+  "$DRIVER_BIN" -Daeron.dir="$WORK/aeron-c3" >"$WORK/driver-c3.out" 2>"$WORK/driver-c3.err" &
+PID[driver-c3]=$!
+wait_for_line "$WORK/driver-c3.out" 'media driver running' 15 ||
+  fail "the driver did not start with the collector down"
+kill -TERM "${PID[driver-c3]}" 2>/dev/null || true
+driver_status=0
+wait "${PID[driver-c3]}" || driver_status=$?
+unset 'PID[driver-c3]'
+[[ $driver_status == 15 ]] || fail "the down-period driver exited with $driver_status"
+[[ $(stat -c%s "$WORK/driver-c3.err") == 0 ]] || fail "the down-period driver wrote to stderr"
+echo "e2e: C3: the driver ran with the collector down; stderr 0 bytes"
+
+# C3: five more lines in the file the collector was already reading.
+for index in 1 2 3 4 5; do
+  printf '{"ts":"%s","level":"info","component":"tool","node_id":"e2e","event":"backpressure.enter","msg":"c3-%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%S.000000000Z)" "$index" >>"$WORK/logs/tool-e2e.json"
+done
+
+# C3b: the writer rotates while the collector is down. `.1.json` keeps the
+# fingerprint the collector stored; the new base is a file it has never seen.
+mv "$WORK/logs/tool-e2e.json" "$WORK/logs/tool-e2e.1.json"
+for index in 1 2 3 4 5; do
+  printf '{"ts":"%s","level":"info","component":"tool","node_id":"e2e","event":"backpressure.enter","msg":"c3b-%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%S.000000000Z)" "$index" >>"$WORK/logs/tool-e2e.json"
+done
+
+start_agent
+wait_http otelcol "http://127.0.0.1:$TELEMETRY_PORT/metrics"
+
+count_rows() {
+  logs_query "$1" | jq -c "select($2)" | wc -l
+}
+
+wait_marker() {
+  local prefix=$1 expected=$2 timeout=${3:-60}
+  local deadline=$((SECONDS + timeout)) count
+  while ((SECONDS < deadline)); do
+    count=$(count_rows 'event:"backpressure.enter"' \
+      ".event == \"backpressure.enter\" and (._msg | startswith(\"$prefix\"))")
+    [[ $count == "$expected" ]] && return 0
+    sleep 1
+  done
+  echo "e2e: $prefix rows: $count (wanted $expected)" >&2
+  return 1
+}
+
+wait_marker c3- 5 60 || fail "C3 lost a line written while the collector was down"
+wait_marker c3b- 5 60 || fail "C3b lost a line written after a rotation"
+echo "e2e: C3/C3b: ten lines written with the collector down all arrived"
+
+# A rotation the collector re-read would duplicate what it already shipped;
+# the same line must still be one row.
+duplicates=$(count_rows 'event:"backpressure.enter"' '._msg == "a synthetic message"')
+[[ $duplicates == 1 ]] || fail "the synthetic line appears $duplicates times"
+starts=$(count_rows 'event:"driver.start"' '.event == "driver.start"')
+[[ $starts == 3 ]] || fail "driver.start appears $starts times, not 3"
+echo "e2e: no replayed lines: the synthetic message once, three driver starts"
 
 for name in victoria-logs victoria-metrics vmauth otelcol; do
   alive "${PID[$name]}" || fail "$name is not alive after readiness"
