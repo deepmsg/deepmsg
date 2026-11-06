@@ -251,9 +251,13 @@ fn render_at(dir: &Path, node_id: &str, now: i64) -> String {
         );
     }
 
-    for ((_, session_id, stream_id), sample) in streams {
-        let labels =
-            format!("node_id=\"{node}\",stream_id=\"{stream_id}\",session_id=\"{session_id}\"");
+    for ((registration_id, session_id, stream_id), sample) in streams {
+        // Two subscriptions on one stream in one session differ only by their
+        // registration ids; without that id on the sample they are one series
+        // and a remote-write backend keeps whichever arrived last.
+        let labels = format!(
+            "node_id=\"{node}\",stream_id=\"{stream_id}\",session_id=\"{session_id}\",registration_id=\"{registration_id}\""
+        );
         if let Some(position) = sample.pub_pos.filter(|value| *value >= 0) {
             families.sample(
                 "deepmsg_publication_position",
@@ -652,12 +656,12 @@ mod tests {
         for expected in [
             "deepmsg_driver_up{node_id=\"node-1\"} 1",
             "deepmsg_driver_heartbeat_age_seconds{node_id=\"node-1\"} 1.500",
-            "deepmsg_publication_position{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\"} 1000",
-            "deepmsg_subscription_position{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\"} 3000",
-            "deepmsg_publication_backlog{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\"} 1000",
-            "deepmsg_receiver_window{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\"} 500",
-            "deepmsg_nak_total{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\",direction=\"received\"} 3",
-            "deepmsg_nak_total{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\",direction=\"sent\"} 4",
+            "deepmsg_publication_position{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\",registration_id=\"42\"} 1000",
+            "deepmsg_subscription_position{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\",registration_id=\"42\"} 3000",
+            "deepmsg_publication_backlog{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\",registration_id=\"42\"} 1000",
+            "deepmsg_receiver_window{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\",registration_id=\"42\"} 500",
+            "deepmsg_nak_total{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\",registration_id=\"42\",direction=\"received\"} 3",
+            "deepmsg_nak_total{node_id=\"node-1\",stream_id=\"1002\",session_id=\"7\",registration_id=\"42\",direction=\"sent\"} 4",
             "deepmsg_nak_total{node_id=\"node-1\",direction=\"sent\"} 11",
             "deepmsg_nak_total{node_id=\"node-1\",direction=\"received\"} 12",
             "deepmsg_loss_total{node_id=\"node-1\"} 13",
