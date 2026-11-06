@@ -15,7 +15,10 @@ and a Prometheus endpoint, and turning collection off degrades queries to
 durability, authentication and the resource budget.** The agent config, its
 static checks, the launcher, the systemd units and the DaemonSet are here. The
 launcher and its assertions have been run; the units and the DaemonSet have
-not. The launcher proves the four processes start, listen and stay alive,
+not. That includes the two exporters' units: they start the same binaries with
+the same flags the launcher does, and `systemd-analyze verify` reads them, but
+no host has run them. The launcher proves the four processes start, listen and
+stay alive,
 that the driver runs with no collector at all (empty stderr, lines on disk),
 that its log file reaches VictoriaLogs with the expected fields and stream,
 that the counters exporter's scrape (the collector's own metrics included)
@@ -31,7 +34,7 @@ has been run on a machine yet, and a static review is not a run.
 agent/otelcol.yaml              the one config, used by systemd and by the DaemonSet
 grafana/grafana.ini             Grafana's own settings; provisioning under grafana/provisioning
 grafana/provisioning/           the datasources (dashboards and alert rules arrive next)
-systemd/                        four units, the environment example
+systemd/                        six units, the environment example
 backends/vmauth.example.yaml    the two-token auth config, exact paths
 k8s/agent-daemonset.yaml        the DaemonSet (static: not run)
 k8s/agent-env.example           its non-secret environment
@@ -109,6 +112,7 @@ checked-in config names it; a second value would be a second config.
 |---|---|
 | application logs | `$DEEPMSG_LOG_DIR/*.json` (the writer keeps `<component>-<node>[.N].json`) |
 | driver counters | `deepmsg-counters-exporter` on `127.0.0.1:9101/metrics` |
+| driver and cluster errors | `deepmsg-errorlog-exporter`, through the `driver.error` / `cluster.error` events it writes into the same log directory |
 | host metrics | the collector's `hostmetrics` receiver (CPU, memory, disk, filesystem, network) |
 | the collector itself | its own `:8888` telemetry, scraped back into the same pipeline |
 
@@ -123,6 +127,8 @@ refuses to start if one is unset.
 | `DEEPMSG_LOG_DIR` | the directory the applications write into | `/var/log/deepmsg` |
 | `DEEPMSG_OBS_STATE_DIR` | the collector's durable state (file offsets, queues) | `/var/lib/deepmsg-otelcol` |
 | `DEEPMSG_NODE_ID` | the agent's metrics resource label (host and collector metrics have no other node identity) | `node-1` |
+| `DEEPMSG_AERON_DIR` | the aeron directory both exporters read: the driver's CnC file and the loss report beside it | `/dev/shm/aeron` |
+| `DEEPMSG_CLUSTER_DIR` | the cluster member's directory the error-log exporter also watches; empty leaves the cluster source off | (empty) |
 | `DEEPMSG_COUNTERS_ENDPOINT` | the counters exporter's host:port | `127.0.0.1:9101` |
 | `DEEPMSG_OTELCOL_TELEMETRY_ENDPOINT` | the collector's own Prometheus endpoint | `127.0.0.1:8888` |
 | `DEEPMSG_VL_LOGS_ENDPOINT` | VictoriaLogs' OTLP/HTTP logs URL (through vmauth in the cluster profile) | `http://127.0.0.1:8427/insert/opentelemetry/v1/logs` |
@@ -188,14 +194,22 @@ install -d -o deepmsg  -g deepmsg  /var/lib/deepmsg-otelcol
 install -d -o victoria -g victoria /var/lib/victoria-logs /var/lib/victoria-metrics
 install -d /etc/deepmsg
 
-# The applications write here; the agent's user must be able to read it.
-# Give both the `deepmsg` group and keep the directory 0750.
+# The applications write here and so does the error-log exporter (its events
+# are `tool-<node>.json`). Give both the `deepmsg` group and keep the directory
+# group-writable: 0770 root:deepmsg when the driver runs as root, or owned by
+# `deepmsg` when it does not.
 
 # Binaries: the same pinned releases the E2E verified, or the cache's links.
 install -m 0755 target/observability-tools/bin/otelcol-contrib \
   target/observability-tools/bin/victoria-logs \
   target/observability-tools/bin/victoria-metrics \
   target/observability-tools/bin/vmauth /usr/local/bin/
+
+# The two exporters are this build's, not a download.
+cargo build --release -p deepmsg-tools --bin deepmsg-counters-exporter \
+  --bin deepmsg-errorlog-exporter
+install -m 0755 target/release/deepmsg-counters-exporter \
+  target/release/deepmsg-errorlog-exporter /usr/local/bin/
 
 # Configs. The two that hold a secret are 0600.
 install -m 0644 agent/otelcol.yaml /etc/deepmsg/otelcol.yaml
@@ -208,8 +222,14 @@ systemctl daemon-reload
 # Log host:
 systemctl enable --now victoria-logs victoria-metrics vmauth
 # Media hosts:
-systemctl enable --now deepmsg-log-agent
+systemctl enable --now deepmsg-log-agent deepmsg-counters-exporter deepmsg-errorlog-exporter
 ```
+
+Both exporters run as `deepmsg` and read the driver's aeron directory, so that
+account needs read access to it — the driver's directory is usually its own
+user's, group-readable is enough. `DEEPMSG_AERON_DIR` in the environment file
+must be the driver's `-Daeron.dir`; `DEEPMSG_CLUSTER_DIR` names the cluster
+member's directory on a host that has one.
 
 First check: `curl -s 127.0.0.1:8888/metrics | grep -c '^otelcol_'` is
 non-zero on the agent host, and a vmauth request without a token is `401`

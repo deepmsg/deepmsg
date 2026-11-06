@@ -257,6 +257,63 @@ def grafana_checks() -> None:
     )
 
 
+def exporter_checks() -> None:
+    """The two exporters' units, and the one variable they cannot run without.
+
+    Neither exporter is part of the agent config: they are separate processes
+    beside the driver. A missing unit is not a config error — it is a pipeline
+    that silently has no `up{job="deepmsg-counters"}` and no `driver.error`,
+    which is why the two files are checked here with everything else.
+    """
+    systemd = HERE.parent / "systemd"
+    units = {
+        "counters": systemd / "deepmsg-counters-exporter.service",
+        "errorlog": systemd / "deepmsg-errorlog-exporter.service",
+    }
+    texts = {}
+    for name, unit in units.items():
+        check(f"{name} exporter unit exists", unit.is_file(), True)
+        if not unit.is_file():
+            continue
+        text = unit.read_text()
+        texts[name] = text
+        check(
+            f"{name} exporter unit uses the environment file",
+            "EnvironmentFile=/etc/deepmsg/observability.env" in text,
+            True,
+        )
+        check(
+            f"{name} exporter unit runs the pinned binary",
+            f"/usr/local/bin/deepmsg-{name}-exporter" in text,
+            True,
+        )
+
+    # The counters exporter's listen address is what the agent scrapes; a drift
+    # between the two is a scrape that answers nothing, forever. The endpoint
+    # line is required first, so a missing line fails rather than skipping the
+    # comparison.
+    environment = systemd / "observability.env.example"
+    check("environment example exists", environment.is_file(), True)
+    text = environment.read_text()
+    ports = re.findall(r"^DEEPMSG_COUNTERS_ENDPOINT=127\.0\.0\.1:(\d+)$", text, re.M)
+    check("environment example names the counters endpoint", len(ports), 1)
+    if ports:
+        check(
+            "counters unit listens where the agent scrapes",
+            f"--listen 127.0.0.1:{ports[0]}" in texts.get("counters", ""),
+            True,
+        )
+    check("environment example names the aeron directory", "DEEPMSG_AERON_DIR=" in text, True)
+
+    # The error-log exporter writes the applications' own log files, so the
+    # directory has to survive ProtectSystem=strict.
+    check(
+        "errorlog unit may write the log directory",
+        "ReadWritePaths=/var/log/deepmsg" in texts.get("errorlog", ""),
+        True,
+    )
+
+
 def main() -> int:
     try:
         text = CONFIG.read_text()
@@ -450,6 +507,7 @@ def main() -> int:
         check(f"{name} is documented in README.md", name in readme, True)
 
     grafana_checks()
+    exporter_checks()
 
     if failures:
         print(f"{CONFIG.relative_to(CONFIG.parents[2])}: {len(failures)} check(s) failed", file=sys.stderr)
