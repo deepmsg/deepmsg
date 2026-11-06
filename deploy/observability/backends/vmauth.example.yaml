@@ -1,5 +1,6 @@
 # /etc/deepmsg/vmauth.yaml — copy this file, replace the placeholders, and
-# chmod 0600 (it holds two bearer tokens).
+# make it 0640 root:vmauth: it holds two bearer tokens, and the unit runs as
+# the vmauth user, which has to be able to read it.
 #
 # src_paths are EXACT paths in vmauth v1.155.0: no prefix and no glob. A path
 # that is not listed answers 400 "missing route", which an exporter only

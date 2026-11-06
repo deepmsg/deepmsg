@@ -8,7 +8,8 @@ Wants=network-online.target
 Type=simple
 User=vmauth
 Group=vmauth
-# /etc/deepmsg/vmauth.yaml is mode 0600: it holds the two bearer tokens.
+# /etc/deepmsg/vmauth.yaml is mode 0640 root:vmauth: it holds the two bearer
+# tokens, and this unit runs as the vmauth user.
 # The cluster profile edits this listen address to the log host's private
 # address, because the agents on the media hosts connect to it.
 ExecStart=/usr/local/bin/vmauth \

@@ -33,7 +33,7 @@ has been run on a machine yet, and a static review is not a run.
 ```
 agent/otelcol.yaml              the one config, used by systemd and by the DaemonSet
 grafana/grafana.ini             Grafana's own settings; provisioning under grafana/provisioning
-grafana/provisioning/           the datasources (dashboards and alert rules arrive next)
+grafana/provisioning/           the datasources, the dashboards and the alert rules
 systemd/                        six units, the environment example
 backends/vmauth.example.yaml    the two-token auth config, exact paths
 k8s/agent-daemonset.yaml        the DaemonSet (static: not run)
@@ -214,10 +214,13 @@ cargo build --release -p deepmsg-tools --bin deepmsg-counters-exporter \
 install -m 0755 target/release/deepmsg-counters-exporter \
   target/release/deepmsg-errorlog-exporter /usr/local/bin/
 
-# Configs. The two that hold a secret are 0600.
+# Configs. The environment file holds the tokens and is read by systemd as
+# root, so 0600 root is right. vmauth's config is read by the vmauth user, so
+# it is 0640 root:vmauth — 0600 root:root would fail the unit at startup with
+# a permission error that looks like a broken config.
 install -m 0644 agent/otelcol.yaml /etc/deepmsg/otelcol.yaml
 install -m 0600 systemd/observability.env.example /etc/deepmsg/observability.env
-install -m 0600 backends/vmauth.example.yaml /etc/deepmsg/vmauth.yaml   # log host only
+install -m 0640 -g vmauth backends/vmauth.example.yaml /etc/deepmsg/vmauth.yaml   # log host only
 
 # Units: the agent on the media hosts, the three backends on the log host.
 install -m 0644 systemd/*.service /etc/systemd/system/
