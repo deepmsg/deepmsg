@@ -107,7 +107,14 @@ def grafana_checks() -> None:
             continue
         for datasource in config.get("datasources", []):
             types.add(datasource.get("type"))
-            check(f"{path.name}: url is vmauth", datasource.get("url"), "http://127.0.0.1:8427")
+            # vmauth has one listen address: the loopback in the single
+            # profile, the log host's private address in the cluster one. A
+            # literal here would be right in exactly one of them.
+            check(
+                f"{path.name}: url is the environment's vmauth",
+                datasource.get("url"),
+                "$__env{DEEPMSG_VMAUTH_URL}",
+            )
             header = datasource.get("secureJsonData", {}).get("httpHeaderValue1", "")
             check(
                 f"{path.name}: token is environment-driven",
@@ -243,6 +250,11 @@ def grafana_checks() -> None:
     check(
         "DEEPMSG_GRAFANA_READ_TOKEN is documented in README.md",
         "DEEPMSG_GRAFANA_READ_TOKEN" in readme,
+        True,
+    )
+    check(
+        "DEEPMSG_VMAUTH_URL is documented in README.md",
+        "DEEPMSG_VMAUTH_URL" in readme,
         True,
     )
     check(

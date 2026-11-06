@@ -157,22 +157,25 @@ what it has read.
 ## Grafana
 
 The dashboards and the alert rules are provisioned from `grafana/provisioning/`;
-those files are the product. Grafana is co-located with vmauth (the log host),
-so both datasources use `http://127.0.0.1:8427` and the **read-only** token —
-a different token from the agent's write token.
+those files are the product. Both datasources use the **read-only** token — a
+different token from the agent's write token — and vmauth's URL is a variable:
+in the single profile it is the loopback, and in the cluster profile vmauth
+listens on the log host's private address (the agents on the media hosts
+connect to it), so Grafana — on that same host — uses the same address.
 
 | variable | meaning |
 |---|---|
 | `DEEPMSG_GRAFANA_READ_TOKEN` | the read token vmauth accepts for Grafana's datasources |
+| `DEEPMSG_VMAUTH_URL` | vmauth's URL for both datasources: the loopback in the single profile, the log host's private address in the cluster profile |
 | `DEEPMSG_GRAFANA_DASHBOARDS_DIR` | the directory the dashboard provider loads | `/etc/deepmsg/grafana/provisioning/dashboards` |
 | `DEEPMSG_GRAFANA_WEBHOOK_URL` | where the alerting contact point posts firing alerts | `http://127.0.0.1:9099/alerts` |
 | `GF_SECURITY_ADMIN_PASSWORD` | Grafana's admin password; read on the first start only |
 | `GF_PATHS_PROVISIONING` | the provisioning tree; the unit sets it to `/etc/deepmsg/grafana/provisioning` |
 
 Anonymous access is off, the admin password is never in the tree, and the
-datasources' token is expanded from the environment (`$__env{…}`). The
-dashboards and the alert rules arrive in the next commits; nothing on this side
-has been run against a live Grafana yet.
+datasources' token and URL are expanded from the environment (`$__env{…}`). The
+dashboards and the alert rules are in this tree; the Grafana end-to-end
+(`grafana/e2e/run.sh`) runs them against a live Grafana on top of the L2 stack.
 
 ## Deploy
 
@@ -255,6 +258,14 @@ systemctl enable --now grafana
 The admin password is read on Grafana's **first** start with an empty data
 directory; changing `GF_SECURITY_ADMIN_PASSWORD` later needs
 `grafana-cli admin reset-admin-password`.
+
+`grafana.ini` listens on the loopback. To serve a browser on another machine
+without a tunnel, change `http_addr` to the host's address **and** set
+`GF_SERVER_ROOT_URL` in the environment file to the URL people open — the
+notification links are built from it. That form is plain HTTP unless
+`protocol=https` and a certificate are configured, so the admin password is the
+only door and the port belongs in a firewall rule for the viewers, not the
+world.
 
 ### Kubernetes (profile B)
 

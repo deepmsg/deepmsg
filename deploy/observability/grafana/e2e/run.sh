@@ -113,6 +113,9 @@ export GF_PATHS_PROVISIONING=$PROVISIONING
 export DEEPMSG_GRAFANA_READ_TOKEN=$TOKEN
 export DEEPMSG_GRAFANA_DASHBOARDS_DIR=$PROVISIONING/dashboards
 export DEEPMSG_GRAFANA_WEBHOOK_URL="http://127.0.0.1:$WEBHOOK_PORT/alerts"
+# The datasources' URL is vmauth's, and the stack's vmauth may be on another
+# port (E2E_VMAUTH_PORT).
+export DEEPMSG_VMAUTH_URL="http://127.0.0.1:$VMAUTH_PORT"
 mkdir -p "$GF_PATHS_DATA" "$GF_PATHS_LOGS"
 
 "$GF_HOME/bin/grafana" server --homepath "$GF_HOME" --config "$GRAFANA_INI" \
