@@ -415,6 +415,92 @@ starts=$(count_rows 'event:"driver.start"' '.event == "driver.start"')
 [[ $starts == 3 ]] || fail "driver.start appears $starts times, not 3"
 echo "e2e: no replayed lines: the synthetic message once, three driver starts"
 
+# C4: vmauth is the only door. Both directions are checked, because a write
+# that needs no token is the one that matters.
+status_without_read=$(curl -s -o /dev/null -w '%{http_code}' \
+  "http://127.0.0.1:$VMAUTH_PORT/api/v1/label/__name__/values")
+[[ $status_without_read == 401 ]] ||
+  fail "vmauth answered $status_without_read for a read with no token"
+status_without_write=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data-binary '' \
+  "http://127.0.0.1:$VMAUTH_PORT/insert/opentelemetry/v1/logs")
+[[ $status_without_write == 401 ]] ||
+  fail "vmauth answered $status_without_write for a write with no token"
+status_with_token=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:$VMAUTH_PORT/api/v1/label/__name__/values")
+[[ $status_with_token == 200 ]] ||
+  fail "vmauth answered $status_with_token for a read with the token"
+echo "e2e: C4: 401 without a token (read and write), 200 with it"
+
+# An absent failure counter and a broken exporter look the same, so the sent
+# counter has to prove the pipeline works before zero means anything.
+sent=$(vm_query 'otelcol_exporter_sent_log_records_total{exporter="otlphttp/victorialogs"}' |
+  jq -r '.data.result[0].value[1] // "0"')
+awk -v sent="$sent" 'BEGIN { exit !(sent > 0) }' ||
+  fail "the log exporter reports $sent sent records"
+failed=$(vm_query 'otelcol_exporter_send_failed_log_records_total{exporter="otlphttp/victorialogs"}' |
+  jq -r '.data.result[0].value[1] // "0"')
+awk -v failed="$failed" 'BEGIN { exit !(failed == 0) }' ||
+  fail "the log exporter reports $failed failed records"
+echo "e2e: C4: the log exporter sent $sent records and failed $failed"
+
+# C5: the host metrics take the same pipeline. The names are read first: the
+# OTel-to-Prometheus translation is not guessed.
+has_name_prefix() {
+  curl -s -H "Authorization: Bearer $TOKEN" \
+    "http://127.0.0.1:$VMAUTH_PORT/api/v1/label/__name__/values" |
+    jq -e --arg prefix "$1" '.data | map(select(startswith($prefix))) | length > 0' \
+      >/dev/null 2>&1
+}
+hostmetrics_deadline=$((SECONDS + 90))
+until has_name_prefix system_network_ && has_name_prefix system_filesystem_; do
+  ((SECONDS < hostmetrics_deadline)) ||
+    fail "hostmetrics names are not in VictoriaMetrics"
+  sleep 1
+done
+host_names=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:$VMAUTH_PORT/api/v1/label/__name__/values" |
+  jq -r '.data[]' | grep -cE '^system_(network|filesystem|disk|cpu|memory)_' || true)
+echo "e2e: C5: $host_names hostmetric names in VictoriaMetrics (network and filesystem present)"
+
+# C7: the resource budget, at 100 lines/s for 15 s. The ticks are the agent's
+# own utime+stime; RSS is a snapshot at the end of the load.
+tick=$(getconf CLK_TCK)
+cpu_ticks() { awk '{print $14 + $15}' "/proc/$1/stat"; }
+rss_mib() { awk -v kb="$(ps -o rss= -p "$1" | tr -d ' ')" 'BEGIN { printf "%.1f", kb / 1024 }'; }
+
+agent_pid=${PID[otelcol]}
+load_file="$WORK/logs/load-e2e.json"
+cpu_before=$(cpu_ticks "$agent_pid")
+wall_before=$(date +%s%N)
+for second in $(seq 1 15); do
+  timestamp=$(date -u +%Y-%m-%dT%H:%M:%S.000000000Z)
+  for index in $(seq 1 100); do
+    printf '{"ts":"%s","level":"info","component":"tool","node_id":"e2e","event":"backpressure.enter","msg":"load-%s-%s"}\n' \
+      "$timestamp" "$second" "$index" >>"$load_file"
+  done
+  sleep 1
+done
+cpu_after=$(cpu_ticks "$agent_pid")
+wall_after=$(date +%s%N)
+
+elapsed=$(awk -v from="$wall_before" -v to="$wall_after" 'BEGIN { printf "%.3f", (to - from) / 1000000000 }')
+cpu_percent=$(awk -v before="$cpu_before" -v after="$cpu_after" \
+  -v tick="$tick" -v elapsed="$elapsed" \
+  'BEGIN { printf "%.2f", (after - before) / tick / elapsed * 100 }')
+agent_rss=$(rss_mib "$agent_pid")
+vl_rss=$(rss_mib "${PID[victoria-logs]}")
+vm_rss=$(rss_mib "${PID[victoria-metrics]}")
+vmauth_rss=$(rss_mib "${PID[vmauth]}")
+echo "e2e: C7: agent ${cpu_percent}% of one core, ${agent_rss} MiB; VL ${vl_rss} MiB; VM ${vm_rss} MiB; vmauth ${vmauth_rss} MiB"
+awk -v value="$agent_rss" 'BEGIN { exit !(value < 256) }' ||
+  fail "the agent's RSS is ${agent_rss} MiB, over the 256 MiB budget"
+awk -v value="$cpu_percent" 'BEGIN { exit !(value < 10) }' ||
+  fail "the agent used ${cpu_percent}% of a core at 100 lines/s, over the 10% budget"
+awk -v value="$vl_rss" 'BEGIN { exit !(value < 512) }' ||
+  fail "VictoriaLogs RSS is ${vl_rss} MiB, over the 512 MiB budget"
+awk -v value="$vm_rss" 'BEGIN { exit !(value < 512) }' ||
+  fail "VictoriaMetrics RSS is ${vm_rss} MiB, over the 512 MiB budget"
+
 for name in victoria-logs victoria-metrics vmauth otelcol; do
   alive "${PID[$name]}" || fail "$name is not alive after readiness"
 done

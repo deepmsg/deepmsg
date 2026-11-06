@@ -11,18 +11,20 @@ and a Prometheus endpoint, and turning collection off degrades queries to
 
 ## Status
 
-**Configuration, the process harness, the log path, the metrics path and
-durability.** The agent config, its static checks, the launcher and the log,
-metrics and restart assertions are here; authentication and the resource
-budgets arrive in the later commits of the L2 slice. The launcher proves the
-four processes start, listen and stay alive, that the driver runs with no
-collector at all (empty stderr, lines on disk), that its log file reaches
-VictoriaLogs with the expected fields and stream, that the counters exporter's
-scrape (the collector's own metrics included) reaches VictoriaMetrics, and that
-lines written while the collector is down — a rotation it did not see included
-— all arrive after the restart, with no line replayed. Nothing under
-`systemd/` or `k8s/` has been run on a machine yet, and a static review is not
-a run.
+**Configuration, the process harness, the log path, the metrics path,
+durability, authentication and the resource budget.** The agent config, its
+static checks, the launcher and the log, metrics, restart, authentication, host
+metric and resource assertions are here. What remains for L2 is the systemd and
+Kubernetes form (the agents and backends are started by the script, not by a
+unit). The launcher proves the four processes start, listen and stay alive,
+that the driver runs with no collector at all (empty stderr, lines on disk),
+that its log file reaches VictoriaLogs with the expected fields and stream,
+that the counters exporter's scrape (the collector's own metrics included)
+reaches VictoriaMetrics, that lines written while the collector is down — a
+rotation it did not see included — all arrive after the restart with no line
+replayed, that vmauth refuses both reads and writes without a token, and that
+the resource budget holds at 100 lines/s. Nothing under `systemd/` or `k8s/`
+has been run on a machine yet, and a static review is not a run.
 
 ## Layout
 
@@ -75,6 +77,15 @@ replayed. The measurement also settles `start_at`: it governs the **first**
 start only (`beginning` reads a 3-line backlog, `end` reads 0); once a state
 exists, offsets govern and a rotation during downtime is read from the
 beginning under either value.
+
+The last third checks the door and the cost. vmauth must answer 401 to a read
+and a write with no token and 200 with it; the log exporter's sent counter must
+be non-zero before its failure counter's zero means anything. The host metric
+names are read from VictoriaMetrics rather than assumed — the OTel-to-
+Prometheus translation is part of what is under test. Finally the script writes
+100 lines/s for 15 s and checks the budget: the agent under 256 MiB and 10% of
+a core (measured: about 226 MiB, 0.4%), the two backends under 512 MiB each
+(measured: VL 26 MiB, VM 101 MiB).
 
 | override | default | meaning |
 |---|---|---|
