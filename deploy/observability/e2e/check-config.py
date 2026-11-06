@@ -141,6 +141,11 @@ def main() -> int:
     # The host metrics and the collector's own metrics.
     hostmetrics = mapping(receivers.get("hostmetrics"), "receivers.hostmetrics")
     check(
+        "hostmetrics.root_path is environment-driven",
+        str(hostmetrics.get("root_path", "")),
+        "${env:DEEPMSG_HOSTMETRICS_ROOT}",
+    )
+    check(
         "hostmetrics.scrapers",
         sorted(mapping(hostmetrics.get("scrapers"), "hostmetrics.scrapers").keys()),
         ["cpu", "disk", "filesystem", "memory", "network"],

@@ -56,6 +56,9 @@ receivers:
 
   hostmetrics:
     collection_interval: 30s
+    # On a host this is `/`; the DaemonSet mounts the host tree at /hostfs and
+    # sets the variable to it, so both forms share one config.
+    root_path: ${env:DEEPMSG_HOSTMETRICS_ROOT}
     scrapers:
       cpu: {}
       memory: {}

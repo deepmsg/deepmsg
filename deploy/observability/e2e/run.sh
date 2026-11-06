@@ -219,6 +219,7 @@ start_agent() {
     DEEPMSG_VL_LOGS_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/insert/opentelemetry/v1/logs" \
     DEEPMSG_VM_WRITE_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/api/v1/write" \
     DEEPMSG_OBS_WRITE_TOKEN="$TOKEN" \
+    DEEPMSG_HOSTMETRICS_ROOT=/ \
     "$BIN/otelcol-contrib" --config "$REPO/deploy/observability/agent/otelcol.yaml"
 }
 
@@ -432,9 +433,17 @@ status_with_token=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Be
 echo "e2e: C4: 401 without a token (read and write), 200 with it"
 
 # An absent failure counter and a broken exporter look the same, so the sent
-# counter has to prove the pipeline works before zero means anything.
-sent=$(vm_query 'otelcol_exporter_sent_log_records_total{exporter="otlphttp/victorialogs"}' |
-  jq -r '.data.result[0].value[1] // "0"')
+# counter has to prove the pipeline works before zero means anything. The
+# agent restarted after the durability half, so its counter starts at zero
+# again; wait for the telemetry scrape to see the first batch.
+sent=0
+sent_deadline=$((SECONDS + 60))
+while ((SECONDS < sent_deadline)); do
+  sent=$(vm_query 'otelcol_exporter_sent_log_records_total{exporter="otlphttp/victorialogs"}' |
+    jq -r '.data.result[0].value[1] // "0"')
+  awk -v sent="$sent" 'BEGIN { exit !(sent > 0) }' && break
+  sleep 1
+done
 awk -v sent="$sent" 'BEGIN { exit !(sent > 0) }' ||
   fail "the log exporter reports $sent sent records"
 failed=$(vm_query 'otelcol_exporter_send_failed_log_records_total{exporter="otlphttp/victorialogs"}' |

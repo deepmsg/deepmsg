@@ -1,0 +1,28 @@
+[Unit]
+Description=vmauth (the only door to the log backends)
+Documentation=https://docs.victoriametrics.com/victoriametrics/vmauth/
+After=network-online.target victoria-logs.service victoria-metrics.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vmauth
+Group=vmauth
+# /etc/deepmsg/vmauth.yaml is mode 0600: it holds the two bearer tokens.
+# The cluster profile edits this listen address to the log host's private
+# address, because the agents on the media hosts connect to it.
+ExecStart=/usr/local/bin/vmauth \
+  -auth.config=/etc/deepmsg/vmauth.yaml \
+  -httpListenAddr=127.0.0.1:8427
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/etc/deepmsg/vmauth.yaml
+
+[Install]
+WantedBy=multi-user.target

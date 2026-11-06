@@ -1,0 +1,96 @@
+# The agent as a DaemonSet, one per node. NOT RUN: no Kubernetes cluster was
+# available for this slice, so this manifest is a static deliverable and is
+# recorded as such in the compatibility gate. Review it against your cluster
+# before applying.
+#
+# Create its inputs first (see deploy/observability/README.md):
+#   kubectl -n deepmsg create configmap deepmsg-observability-agent \
+#     --from-file=otelcol.yaml=deploy/observability/agent/otelcol.yaml
+#   kubectl -n deepmsg create configmap deepmsg-observability-agent-env \
+#     --from-env-file=deploy/observability/k8s/agent-env.example
+#   kubectl -n deepmsg create secret generic deepmsg-observability-agent-token \
+#     --from-literal=DEEPMSG_OBS_WRITE_TOKEN=replace-me
+#
+# hostNetwork makes the collector's 127.0.0.1 the node's loopback, which is
+# where `deepmsg-counters-exporter` listens (:9101) and where its own
+# telemetry (:8888) is scraped back. hostPID plus the /hostfs mount let
+# hostmetrics read the host's /proc, /sys and filesystems; the config's
+# root_path comes from DEEPMSG_HOSTMETRICS_ROOT.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: deepmsg-observability-agent
+  namespace: deepmsg
+  labels:
+    app: deepmsg-observability-agent
+spec:
+  selector:
+    matchLabels:
+      app: deepmsg-observability-agent
+  template:
+    metadata:
+      labels:
+        app: deepmsg-observability-agent
+    spec:
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # A node agent belongs on every node, including tainted ones.
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: collector
+          image: otel/opentelemetry-collector-contrib:0.164.0
+          args: ["--config=/etc/deepmsg/otelcol.yaml"]
+          envFrom:
+            - configMapRef:
+                name: deepmsg-observability-agent-env
+            - secretRef:
+                name: deepmsg-observability-agent-token
+          env:
+            # Overrides the env ConfigMap's value: in a container the host tree
+            # is mounted at /hostfs, not at /.
+            - name: DEEPMSG_HOSTMETRICS_ROOT
+              value: /hostfs
+          volumeMounts:
+            - name: config
+              mountPath: /etc/deepmsg
+              readOnly: true
+            - name: logs
+              mountPath: /var/log/deepmsg
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/deepmsg-otelcol
+            - name: hostfs
+              mountPath: /hostfs
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+      volumes:
+        - name: config
+          configMap:
+            name: deepmsg-observability-agent
+        - name: logs
+          hostPath:
+            path: /var/log/deepmsg
+            type: Directory
+        - name: state
+          hostPath:
+            path: /var/lib/deepmsg-otelcol
+            type: DirectoryOrCreate
+        - name: hostfs
+          hostPath:
+            path: /
+            type: Directory
+        - name: tmp
+          emptyDir: {}

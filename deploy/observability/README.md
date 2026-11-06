@@ -13,10 +13,9 @@ and a Prometheus endpoint, and turning collection off degrades queries to
 
 **Configuration, the process harness, the log path, the metrics path,
 durability, authentication and the resource budget.** The agent config, its
-static checks, the launcher and the log, metrics, restart, authentication, host
-metric and resource assertions are here. What remains for L2 is the systemd and
-Kubernetes form (the agents and backends are started by the script, not by a
-unit). The launcher proves the four processes start, listen and stay alive,
+static checks, the launcher, the systemd units and the DaemonSet are here. The
+launcher and its assertions have been run; the units and the DaemonSet have
+not. The launcher proves the four processes start, listen and stay alive,
 that the driver runs with no collector at all (empty stderr, lines on disk),
 that its log file reaches VictoriaLogs with the expected fields and stream,
 that the counters exporter's scrape (the collector's own metrics included)
@@ -30,14 +29,15 @@ has been run on a machine yet, and a static review is not a run.
 
 ```
 agent/otelcol.yaml              the one config, used by systemd and by the DaemonSet
+systemd/                        four units, the environment example
+backends/vmauth.example.yaml    the two-token auth config, exact paths
+k8s/agent-daemonset.yaml        the DaemonSet (static: not run)
+k8s/agent-env.example           its non-secret environment
 e2e/check-config.py             the properties that fail silently if wrong
 e2e/versions.env                the pinned tags, asset names and SHA256
 e2e/fetch-tools.sh              download + verify into target/observability-tools
 e2e/run.sh                      start the four processes and prove they are alive
 ```
-
-The systemd units, the k8s manifests and the backend configs are added by the
-later commits.
 
 ## End-to-end
 
@@ -125,6 +125,7 @@ refuses to start if one is unset.
 | `DEEPMSG_VL_LOGS_ENDPOINT` | VictoriaLogs' OTLP/HTTP logs URL (through vmauth in the cluster profile) | `http://127.0.0.1:8427/insert/opentelemetry/v1/logs` |
 | `DEEPMSG_VM_WRITE_ENDPOINT` | VictoriaMetrics' remote-write URL (through vmauth) | `http://127.0.0.1:8427/api/v1/write` |
 | `DEEPMSG_OBS_WRITE_TOKEN` | the bearer token vmauth accepts for writes | (secret) |
+| `DEEPMSG_HOSTMETRICS_ROOT` | the host tree `hostmetrics` reads; a container mounts it at `/hostfs`, a host uses `/` | `/` |
 
 `DEEPMSG_NODE_ID` is not read by the agent: every line already carries the
 `node_id` its writer was configured with, and rewriting it here would hide a
@@ -141,6 +142,70 @@ what it has read.
 - **cluster** — the collector runs. Production keeps the backends on a
   dedicated log host, never on a media-driver host; the E2E runs both on one
   machine and says so in its evidence.
+
+## Deploy
+
+Neither form has been run: there was no systemd host or Kubernetes cluster in
+this slice, and a static review is not a run. The launcher's commands are the
+same binaries with the same flags, which is the part that *is* exercised.
+
+### systemd (profile A)
+
+On a media-driver host, install the agent; on the log host, install the three
+backends. The agent's endpoints name the log host's vmauth.
+
+```sh
+# Users and directories, on the host that runs the unit.
+useradd --system --no-create-home deepmsg     # the agent
+useradd --system --no-create-home victoria    # VL and VM
+useradd --system --no-create-home vmauth
+install -d -o deepmsg  -g deepmsg  /var/lib/deepmsg-otelcol
+install -d -o victoria -g victoria /var/lib/victoria-logs /var/lib/victoria-metrics
+install -d /etc/deepmsg
+
+# The applications write here; the agent's user must be able to read it.
+# Give both the `deepmsg` group and keep the directory 0750.
+
+# Binaries: the same pinned releases the E2E verified, or the cache's links.
+install -m 0755 target/observability-tools/bin/otelcol-contrib \
+  target/observability-tools/bin/victoria-logs \
+  target/observability-tools/bin/victoria-metrics \
+  target/observability-tools/bin/vmauth /usr/local/bin/
+
+# Configs. The two that hold a secret are 0600.
+install -m 0644 agent/otelcol.yaml /etc/deepmsg/otelcol.yaml
+install -m 0600 systemd/observability.env.example /etc/deepmsg/observability.env
+install -m 0600 backends/vmauth.example.yaml /etc/deepmsg/vmauth.yaml   # log host only
+
+# Units: the agent on the media hosts, the three backends on the log host.
+install -m 0644 systemd/*.service /etc/systemd/system/
+systemctl daemon-reload
+# Log host:
+systemctl enable --now victoria-logs victoria-metrics vmauth
+# Media hosts:
+systemctl enable --now deepmsg-log-agent
+```
+
+First check: `curl -s 127.0.0.1:8888/metrics | grep -c '^otelcol_'` is
+non-zero on the agent host, and a vmauth request without a token is `401`
+(`curl -s -o /dev/null -w '%{http_code}' 127.0.0.1:8427/api/v1/query`).
+
+### Kubernetes (profile B)
+
+The DaemonSet is `k8s/agent-daemonset.yaml`; its header has the three
+`kubectl create` commands (the config ConfigMap from `agent/otelcol.yaml`, the
+non-secret environment from `k8s/agent-env.example`, and the token Secret).
+Then:
+
+```sh
+kubectl apply -f deploy/observability/k8s/agent-daemonset.yaml
+kubectl -n deepmsg get pods -l app=deepmsg-observability-agent
+```
+
+The backends are **not shipped** as Kubernetes manifests: there was no cluster
+to test them on. Run them on the log host in the systemd form (or with the
+VictoriaMetrics operator) and point `DEEPMSG_VL_LOGS_ENDPOINT` and
+`DEEPMSG_VM_WRITE_ENDPOINT` at that host's vmauth. Grafana is L3.
 
 ## Checks
 
