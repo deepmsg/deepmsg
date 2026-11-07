@@ -257,31 +257,41 @@ fn a_service_joins_and_then_timers_sessions_and_membership_all_work() {
         connect.truncate(length);
     }
 
+    // The connect is offered **once**. Re-offering it while waiting for the
+    // response opened one session per attempt — the request carries no session
+    // id for the module to dedupe on — and the wait below then had to catch a
+    // count that only passed through 1 while those sessions timed out at ten
+    // seconds. It usually caught it (the test took ~10 s); when several timed
+    // out in one pass the count went straight to 0 and the 30 s deadline
+    // expired. One connect is one session, and the response is waited for by
+    // polling, not by sending it again.
+    let mut connect_accepted = false;
     let mut open = false;
     let deadline = Instant::now() + DEADLINE;
     while Instant::now() < deadline && !open {
         client.poll();
-        if !offer(&client, ingress_publication, &connect) {
-            std::thread::sleep(Duration::from_millis(1));
-            continue;
+        if !connect_accepted {
+            connect_accepted = offer(&client, ingress_publication, &connect);
         }
-        client.poll_subscription(egress_subscription, 10, |message| {
-            let payload = message.payload;
-            if payload.len() < MESSAGE_HEADER_LENGTH {
-                return;
-            }
-            let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
-            if header.schema_id() != deepmsg_codec_cluster::SBE_SCHEMA_ID
-                || header.template_id()
-                    != deepmsg_codec_cluster::session_event_codec::SBE_TEMPLATE_ID
-            {
-                return;
-            }
-            let decoder = SessionEventDecoder::default().header(header, 0);
-            if decoder.code() == EventCode::OK {
-                open = true;
-            }
-        });
+        if connect_accepted {
+            client.poll_subscription(egress_subscription, 10, |message| {
+                let payload = message.payload;
+                if payload.len() < MESSAGE_HEADER_LENGTH {
+                    return;
+                }
+                let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
+                if header.schema_id() != deepmsg_codec_cluster::SBE_SCHEMA_ID
+                    || header.template_id()
+                        != deepmsg_codec_cluster::session_event_codec::SBE_TEMPLATE_ID
+                {
+                    return;
+                }
+                let decoder = SessionEventDecoder::default().header(header, 0);
+                if decoder.code() == EventCode::OK {
+                    open = true;
+                }
+            });
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(open, "the session did not open");
