@@ -214,7 +214,7 @@ fn open_log(options: &Options) -> Result<Handle, deepmsg_log::InitError> {
     open(Config {
         dir: options.log_dir.clone(),
         node_id: options.node_id.clone(),
-        component: Component::Tool,
+        component: Component::Tool.as_str(),
         level: Level::Info,
         component_levels: Vec::new(),
         roll: Roll::default(),

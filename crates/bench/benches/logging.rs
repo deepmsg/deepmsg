@@ -65,7 +65,7 @@ fn config(directory: &TempDir, level: Level, node_id: &str) -> Config {
     Config {
         dir: directory.0.clone(),
         node_id: node_id.to_owned(),
-        component: Component::Driver,
+        component: Component::Driver.as_str(),
         level,
         component_levels: Vec::new(),
         roll: Roll::default(),

@@ -17,9 +17,13 @@
 //! - **Off by default.** `Config::from_env` answers `None` when
 //!   `DEEPMSG_LOG_DIR` is unset. A test, a benchmark, or a one-off run must not
 //!   create files or a thread as a side effect.
-//! - **A controlled vocabulary.** [`Event`] and [`Component`] are enums, not
-//!   free strings. A new event is a code change with a test, so queries and
-//!   alerts do not drift with a version.
+//! - **A controlled vocabulary, owned where the names are.** [`Event`] and
+//!   [`Component`] are enums, not free strings: a new built-in is a code change
+//!   with a test, so queries and alerts do not drift with a version. An
+//!   application with its own names implements [`Name`] for its own type and
+//!   keeps its own list and test; this crate's list does not grow once per
+//!   application. Use [`event_named`] (or [`Guard::from_env_with`]) for those
+//!   names.
 //! - **No allocation on the calling thread.** Levels, components and the
 //!   environment are parsed once at startup; an event is encoded into a
 //!   fixed-size record (ADR-0003: "hot paths stay allocation-free").
@@ -46,9 +50,11 @@ mod writer;
 pub use config::{
     Config, DEFAULT_LEVEL, DEFAULT_QUEUE_CAPACITY, DEFAULT_ROLL, InitError, Pinner, Roll,
 };
-pub use event::{Component, Event};
+pub use event::{Component, Event, Name};
 pub use level::{COMPILED_MAX, Level};
-pub use logger::{EventBuilder, Guard, Handle, Logger, event, init, init_from_env, open};
+pub use logger::{
+    EventBuilder, Guard, Handle, Logger, event, event_named, init, init_from_env, open,
+};
 
 #[cfg(test)]
 mod tests {
@@ -102,22 +108,37 @@ mod tests {
 
     #[test]
     fn a_disabled_configuration_does_not_ask_for_a_node_id() {
-        let config = Config::from_values(Component::Driver, None, None, None, None)
-            .expect("a missing directory is not an error");
+        let config = Config::from_values(
+            Component::Driver.as_str(),
+            &Component::ALL_NAMES,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("a missing directory is not an error");
         assert!(config.is_none());
     }
 
     #[test]
     fn an_empty_directory_is_off_too() {
-        let config = Config::from_values(Component::Driver, Some("  "), None, None, None)
-            .expect("an empty directory is off");
+        let config = Config::from_values(
+            Component::Driver.as_str(),
+            &Component::ALL_NAMES,
+            Some("  "),
+            None,
+            None,
+            None,
+        )
+        .expect("an empty directory is off");
         assert!(config.is_none());
     }
 
     #[test]
     fn an_enabled_configuration_defaults_to_info_and_100mb_by_5() {
         let config = Config::from_values(
-            Component::Driver,
+            Component::Driver.as_str(),
+            &Component::ALL_NAMES,
             Some("/var/log/deepmsg"),
             Some("node-1"),
             None,

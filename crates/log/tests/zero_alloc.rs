@@ -105,7 +105,7 @@ fn emitting_does_not_allocate_on_the_calling_thread() {
     let config = Config {
         dir: directory.0.clone(),
         node_id: "node-1".to_owned(),
-        component: Component::Driver,
+        component: Component::Driver.as_str(),
         level: Level::Info,
         component_levels: Vec::new(),
         roll: Roll::default(),
