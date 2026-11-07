@@ -527,7 +527,30 @@ impl AsyncConnect {
         if self.ingress_publication.is_none() {
             let mut chosen = None;
 
+            // The first attempt tries every member, which is the reference's
+            // `awaitPublicationConnected`. A redirect is different: it names
+            // the leader, and a request offered to anybody else only earns
+            // another redirect. The first round stops at the first member
+            // whose publication connects, so `update_members` usually has no
+            // publication to reuse for the leader — without this the same
+            // follower is chosen again, and a three-member connect spends its
+            // whole message timeout redirecting to itself.
+            //
+            // A leader whose own publication failed permanently is the
+            // exception: another member is then asked, and its redirect names
+            // whoever leads now.
+            let leader = self.leader_member_id;
+            let leader_failed = leader.is_some_and(|id| {
+                self.members
+                    .iter()
+                    .any(|member| member.member_id == id && member.exception.is_some())
+            });
+            let only_leader = leader.filter(|_| !leader_failed);
+
             for member in &mut self.members {
+                if only_leader.is_some_and(|id| member.member_id != id) {
+                    continue;
+                }
                 if member.publication.is_none() && member.exception.is_none() {
                     if member.add.is_none() {
                         let channel = member_channel(context, &member.endpoint);
@@ -811,6 +834,12 @@ impl AsyncConnect {
 
         if let Some(old) = reusable {
             self.members[index].publication = old.publication;
+            // The reference carries the pending registration id too
+            // (`newLeader.registrationId = oldLeader.registrationId`,
+            // `AC:2561`): a publication the first round asked for and had not
+            // seen yet is still on its way, and dropping the add would leave
+            // it untracked.
+            self.members[index].add = old.add;
             self.ingress_publication = old.publication.map(|id| ingress_kind(&self.context, id));
         } else {
             if let Some(old) = old_leader {
@@ -1302,6 +1331,102 @@ mod tests {
         assert_eq!(1, adds("localhost:20002"), "a pending add is not re-added");
     }
 
+    /// `shouldFollowTheRedirectToItsLeader`: a redirect replaces the member
+    /// table, and the request is offered to the leader it names — not to the
+    /// first member whose publication connects. The first round stops at that
+    /// first publication, so the leader usually has no publication to reuse;
+    /// re-examining every member would choose the same follower again and the
+    /// connect would spend its whole timeout redirecting to itself.
+    #[test]
+    fn a_redirect_is_answered_by_the_leader_it_names() {
+        let mut context = AeronClusterContext::default()
+            .ingress_channel(Some("aeron:udp"))
+            .ingress_endpoints(Some(
+                "0=localhost:20000,1=localhost:20001,2=localhost:20002",
+            ))
+            .egress_channel(Some("aeron:ipc"));
+        context.is_ingress_exclusive = true;
+
+        let mut client = RecordingClient::new();
+        let mut connect = AsyncConnect::new(context).expect("a connect");
+
+        land_egress(&mut connect, &mut client);
+        connect
+            .poll_with(&mut client)
+            .expect("the state moves to await");
+        connect.poll_with(&mut client).expect("members added");
+        let member0 = client.last_registration_id() - 2;
+        let member1 = member0 + 1;
+
+        // Member 0 — a follower — is the first publication that connects, so
+        // the request lands there and the follower answers with a redirect.
+        client.answer(member0, AddAnswer::Ready);
+        client.connect(member0);
+        connect.poll_with(&mut client).expect("member 0 is chosen");
+        connect.poll_with(&mut client).expect("the request is sent");
+        assert_eq!(ConnectState::PollResponse, connect.state());
+
+        let correlation_id = connect.correlation_id().expect("a request");
+        client.push_egress(session_event_naming(
+            correlation_id,
+            EventCode::REDIRECT,
+            1,
+            b"0=localhost:20000,1=localhost:20001,2=localhost:20002",
+        ));
+        connect.poll_with(&mut client).expect("the redirect");
+        assert_eq!(
+            ConnectState::AwaitPublicationConnected,
+            connect.state(),
+            "calls: {:?}",
+            client.calls()
+        );
+        assert_eq!(Some(1), connect.leader_member_id);
+
+        // The leader's add — the one the first round made and never saw land —
+        // is the only one this round polls.
+        connect
+            .poll_with(&mut client)
+            .expect("the leader's add is polled");
+        let adds = |endpoint: &str| {
+            client
+                .calls()
+                .iter()
+                .filter(|call| call.contains("async_add") && call.contains(endpoint))
+                .count()
+        };
+        assert_eq!(
+            1,
+            adds("localhost:20000"),
+            "the follower is not asked again: {:?}",
+            client.calls()
+        );
+        assert_eq!(
+            1,
+            adds("localhost:20002"),
+            "nor is the other follower: {:?}",
+            client.calls()
+        );
+
+        client.answer(member1, AddAnswer::Ready);
+        client.connect(member1);
+        connect
+            .poll_with(&mut client)
+            .expect("the leader's publication connects");
+        connect
+            .poll_with(&mut client)
+            .expect("the request is sent again");
+
+        assert_eq!(ConnectState::PollResponse, connect.state());
+        assert_eq!(
+            Some(member1),
+            connect
+                .ingress_publication
+                .map(|publication| publication.registration_id()),
+            "the request went to the leader: {:?}",
+            client.calls()
+        );
+    }
+
     /// `shouldRetryMemberIngressPublicationWhenSendChannelEndpointIsClosing`:
     /// `RESOURCE_TEMPORARILY_UNAVAILABLE` is a retry, and the member's
     /// publication is used when it lands.
@@ -1349,6 +1474,16 @@ mod tests {
     }
 
     fn session_event_with(correlation_id: i64, code: EventCode, detail: &[u8]) -> Vec<u8> {
+        session_event_naming(correlation_id, code, 2, detail)
+    }
+
+    /// The same event, with the leader member id the redirect names.
+    fn session_event_naming(
+        correlation_id: i64,
+        code: EventCode,
+        leader_member_id: i32,
+        detail: &[u8],
+    ) -> Vec<u8> {
         let mut buffer = vec![0u8; 256];
         let length = {
             let encoder = SessionEventEncoder::default().wrap(
@@ -1362,7 +1497,7 @@ mod tests {
                 .cluster_session_id(888)
                 .correlation_id(correlation_id)
                 .leadership_term_id(5)
-                .leader_member_id(2)
+                .leader_member_id(leader_member_id)
                 .code(code)
                 .version(PROTOCOL_SEMANTIC_VERSION)
                 .leader_heartbeat_timeout_ns_opt(None)
