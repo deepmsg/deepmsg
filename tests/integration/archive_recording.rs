@@ -80,6 +80,14 @@ const DEDICATED_ARCHIVE: &str = "archive-recording-dedicated";
 /// See [`RECORDING_CHANNEL`].
 const RECORDING_STREAM_ID: i32 = 33;
 
+/// A third port, for the log criterion: the three tests in this binary run at
+/// once and a UDP endpoint is one process's at a time.
+///
+/// `term-length=64k` is what makes the segment length small: the archive takes
+/// `max(configured, term length)` (`ArchiveConductor.java:2006`), so a 64 KiB
+/// setting without a 64 KiB term would still be a 16 MiB segment.
+const RECORDING_CHANNEL_LOG: &str = "aeron:udp?endpoint=localhost:33435|term-length=64k";
+
 /// How many messages the recording is asked to carry: enough to be more than one
 /// frame, so the archive has to read the image on more than one turn.
 const MESSAGE_COUNT: usize = 64;
@@ -107,11 +115,30 @@ const PROPERTIES: [&str; 4] = [
 /// criteria below run at once in one binary and a UDP endpoint belongs to one
 /// process at a time.
 fn a_recording_round_trip(test_name: &str, channel: &str, properties: &[&str]) {
+    a_recording_round_trip_with_env(test_name, channel, properties, &[], MESSAGE_COUNT, 0, None);
+}
+
+/// The same round trip, with the options the log criterion needs: environment
+/// variables for the process, a message shape big enough to roll a segment, and
+/// an optional log file to read after the process has stopped.
+#[allow(clippy::too_many_arguments)]
+fn a_recording_round_trip_with_env(
+    test_name: &str,
+    channel: &str,
+    properties: &[&str],
+    extra_env: &[(&str, &str)],
+    message_count: usize,
+    message_size: usize,
+    log_path: Option<&Path>,
+) {
     let archive_dir = TempDir::new(test_name);
 
-    let Some(mut media_driver) =
-        OwnArchivingMediaDriver::start(test_name, archive_dir.path(), properties)
-    else {
+    let Some(mut media_driver) = OwnArchivingMediaDriver::start_with_env(
+        test_name,
+        archive_dir.path(),
+        properties,
+        extra_env,
+    ) else {
         archiving_driver::announce_skip();
         return;
     };
@@ -167,7 +194,13 @@ fn a_recording_round_trip(test_name: &str, channel: &str, properties: &[&str]) {
     );
 
     // Publish, and read it back so the driver's window keeps moving.
-    let position = publish_and_read(&mut client, publication, reader);
+    let position = publish_and_read(
+        &mut client,
+        publication,
+        reader,
+        message_count,
+        message_size,
+    );
 
     // The recording follows the publication. This is the whole of the slice.
     let recording_id = wait_for_the_counter(&mut client, &aeron_dir, publisher_session, position);
@@ -215,6 +248,25 @@ fn a_recording_round_trip(test_name: &str, channel: &str, properties: &[&str]) {
     wait_for_the_counter_to_go(&mut client, &aeron_dir, publisher_session);
 
     let _ = media_driver.stop();
+
+    if let Some(path) = log_path {
+        let text = std::fs::read_to_string(path).expect("the archive's log file");
+        assert_eq!(
+            1,
+            text.matches("\"event\":\"recording.start\"").count(),
+            "one recording.start for one recording; log: {text}"
+        );
+        assert_eq!(
+            1,
+            text.matches("\"event\":\"recording.stop\"").count(),
+            "one recording.stop for one recording; log: {text}"
+        );
+        assert!(
+            text.contains("\"event\":\"segment.roll\""),
+            "a segment rolled; log: {text}"
+        );
+        assert!(text.contains("\"recording_id\":"));
+    }
 }
 
 #[test]
@@ -239,16 +291,58 @@ fn a_recording_is_made_with_the_recorder_on_its_own_thread() {
     a_recording_round_trip(DEDICATED_ARCHIVE, RECORDING_CHANNEL_DEDICATED, &properties);
 }
 
+/// The archive's lifecycle lines: one `recording.start` and one
+/// `recording.stop` for one recording, and at least one `segment.roll` when the
+/// segment length is small and the recording is larger than it.
+///
+/// The process is the archiving media driver, so this also covers the Guard on
+/// an archive binary: the lines are read after `stop`, which is the only time a
+/// buffered writer is guaranteed to have drained.
+#[test]
+fn a_recording_is_reported_in_the_log() {
+    let logs = deepmsg_tests::temp::TempDir::new("archive-recording-log");
+    let log_dir = logs.path().join("log");
+    let log_dir_text = log_dir.to_str().expect("a UTF-8 temporary path");
+    let mut properties: Vec<&str> = PROPERTIES.to_vec();
+    properties.push("-Daeron.archive.segment.file.length=65536");
+
+    a_recording_round_trip_with_env(
+        "archive-recording-log",
+        RECORDING_CHANNEL_LOG,
+        &properties,
+        &[
+            ("DEEPMSG_LOG_DIR", log_dir_text),
+            ("DEEPMSG_NODE_ID", "archive-log"),
+        ],
+        200,
+        1024,
+        Some(&log_dir.join("archive-archive-log.json")),
+    );
+}
+
 /// Publish every message and read them back, answering with where the
 /// publication got to.
-fn publish_and_read(client: &mut Client, publication: i64, reader: i64) -> i64 {
+fn publish_and_read(
+    client: &mut Client,
+    publication: i64,
+    reader: i64,
+    message_count: usize,
+    message_size: usize,
+) -> i64 {
     let deadline = Instant::now() + DEADLINE;
     let mut offered = 0;
+    let fixed = vec![b'x'; message_size];
 
-    while offered < MESSAGE_COUNT {
-        let message = format!("message {offered}");
+    while offered < message_count {
+        let formatted;
+        let message: &[u8] = if message_size == 0 {
+            formatted = format!("message {offered}");
+            formatted.as_bytes()
+        } else {
+            &fixed
+        };
 
-        match client.offer_exclusive(publication, message.as_bytes()) {
+        match client.offer_exclusive(publication, message) {
             Some(Appended::Ok { .. }) => {
                 offered += 1;
                 read_whatever_there_is(client, reader);
@@ -257,6 +351,24 @@ fn publish_and_read(client: &mut Client, publication: i64, reader: i64) -> i64 {
                 assert!(
                     Instant::now() < deadline,
                     "the publication never linked after {offered} messages"
+                );
+            }
+            // A small term (the log criterion's `term-length=64k`) fills
+            // before the readers have drained it. Read and poll, then try the
+            // same message again; the count only moves on `Ok`.
+            Some(Appended::BackPressured) => {
+                read_whatever_there_is(client, reader);
+                assert!(
+                    Instant::now() < deadline,
+                    "the publication stayed full after {offered} messages"
+                );
+            }
+            // `EndOfLog` / `MidRotation`: the term rotated under this offer;
+            // the next one lands in the new term (the enum's own words).
+            Some(Appended::EndOfLog | Appended::MidRotation) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the publication never left a rotating term after {offered} messages"
                 );
             }
             other => panic!("the message could not be published ({other:?})"),

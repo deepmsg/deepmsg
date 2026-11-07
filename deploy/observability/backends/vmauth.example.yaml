@@ -1,0 +1,42 @@
+# /etc/deepmsg/vmauth.yaml — copy this file, replace the placeholders, and
+# make it 0640 root:vmauth: it holds two bearer tokens, and the unit runs as
+# the vmauth user, which has to be able to read it.
+#
+# src_paths are EXACT paths in vmauth v1.155.0: no prefix and no glob. A path
+# that is not listed answers 400 "missing route", which an exporter only
+# retries; the symptom is `send_failed` growing with nothing in the backend.
+# A missing credential is 401, and both directions are checked in the E2E.
+#
+# Two users, two powers: the agent may write and nothing else; Grafana may
+# read and nothing else. A leaked write token does not become a query key.
+
+users:
+  # The collector on every media-driver host.
+  - bearer_token: "__WRITE_TOKEN__"
+    url_map:
+      - src_paths: ["/insert/opentelemetry/v1/logs"]
+        url_prefix: "http://__VL_HOST__:9428"
+      - src_paths: ["/api/v1/write"]
+        url_prefix: "http://__VM_HOST__:8428"
+
+  # Grafana's datasources.
+  - bearer_token: "__READ_TOKEN__"
+    url_map:
+      - src_paths:
+          - /select/logsql/query
+          - /select/logsql/stats_query
+          - /select/logsql/stats_query_range
+          - /select/logsql/streams
+          - /select/logsql/stream_field_names
+          - /select/logsql/stream_field_values
+          - /select/logsql/field_names
+          - /select/logsql/field_values
+        url_prefix: "http://__VL_HOST__:9428"
+      - src_paths:
+          - /api/v1/query
+          - /api/v1/query_range
+          - /api/v1/series
+          - /api/v1/labels
+          - /api/v1/label/__name__/values
+          - /api/v1/metadata
+        url_prefix: "http://__VM_HOST__:8428"

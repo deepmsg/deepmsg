@@ -681,9 +681,72 @@ fn interface_index(name: &str) -> u32 {
     unsafe { libc::if_nametoindex(name.as_ptr()) }
 }
 
+/// The reference's `aeron_format_date`
+/// (`aeron-client/src/main/c/util/aeron_strutil.c:34-49`): local time in
+/// `%Y-%m-%d %H:%M:%S.mmm%z`, which is the shape the rescued error log's
+/// filename is built from.
+///
+/// A failed `localtime_r` cannot produce that shape, so it falls back to the
+/// raw millisecond count. The call is for a diagnostic file on a host whose
+/// timezone is not readable; refusing to start a driver over it would be worse
+/// than an ugly name.
+pub fn format_date(timestamp_ms: i64) -> String {
+    let seconds = timestamp_ms.div_euclid(1000);
+    let millis = timestamp_ms.rem_euclid(1000);
+    let seconds = libc::time_t::try_from(seconds).unwrap_or(0);
+
+    // SAFETY: `localtime_r` writes one `tm` into the pointer it is given and
+    // reads only the `time_t` beside it; both are live locals owned by this
+    // function.
+    let mut time: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: as above: the output is a live local and the input is a live
+    // `time_t`.
+    let result = unsafe { libc::localtime_r(&seconds, &mut time) };
+    if result.is_null() {
+        return format!("{timestamp_ms}");
+    }
+
+    let offset = time.tm_gmtoff;
+    let (sign, offset) = if offset < 0 {
+        ('-', -offset)
+    } else {
+        ('+', offset)
+    };
+
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}{}{:02}{:02}",
+        time.tm_year + 1900,
+        time.tm_mon + 1,
+        time.tm_mday,
+        time.tm_hour,
+        time.tm_min,
+        time.tm_sec,
+        millis,
+        sign,
+        offset / 3600,
+        (offset % 3600) / 60,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_date_has_the_reference_shape() {
+        let text = format_date(1_700_000_000_123);
+        assert_eq!(28, text.len(), "{text}");
+
+        let bytes = text.as_bytes();
+        assert_eq!(b'-', bytes[4], "{text}");
+        assert_eq!(b'-', bytes[7], "{text}");
+        assert_eq!(b' ', bytes[10], "{text}");
+        assert_eq!(b':', bytes[13], "{text}");
+        assert_eq!(b':', bytes[16], "{text}");
+        assert_eq!(b'.', bytes[19], "{text}");
+        assert!(matches!(bytes[23], b'+' | b'-'), "{text}");
+        assert!(bytes[24..28].iter().all(u8::is_ascii_digit), "{text}");
+    }
 
     #[test]
     fn a_signal_is_recorded_and_the_process_keeps_running() {

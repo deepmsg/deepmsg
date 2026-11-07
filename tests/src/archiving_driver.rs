@@ -125,13 +125,25 @@ impl OwnArchivingMediaDriver {
     /// two configurations: the binary hands the same argv to its driver half
     /// and its archive half, and each reads the names it knows.
     pub fn start(test_name: &str, archive_dir: &Path, extra_properties: &[&str]) -> Option<Self> {
+        Self::start_with_env(test_name, archive_dir, extra_properties, &[])
+    }
+
+    /// [`Self::start`] with environment variables, which is how a test turns
+    /// the application log on (`DEEPMSG_LOG_DIR` and its neighbours).
+    pub fn start_with_env(
+        test_name: &str,
+        archive_dir: &Path,
+        extra_properties: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Option<Self> {
         let binary = locate_own_archiving_media_driver()?;
 
         let archive_dir_property = format!("-Daeron.archive.dir={}", archive_dir.display());
         let mut properties = vec![archive_dir_property.as_str()];
         properties.extend_from_slice(extra_properties);
 
-        let driver = ReferenceDriver::start_with(&binary, test_name, &properties).ok()?;
+        let driver =
+            ReferenceDriver::start_with_env(&binary, test_name, &properties, extra_env).ok()?;
 
         Some(Self {
             driver,

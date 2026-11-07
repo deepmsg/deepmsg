@@ -1,0 +1,37 @@
+[Unit]
+Description=deepmsg error-log exporter (the driver's and the cluster's distinct error logs, as events)
+Documentation=https://github.com/deepmsg/deepmsg
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deepmsg
+Group=deepmsg
+# Every source is read-only: the CnC file, the `<aeron dir>-<datestamp>-error.log`
+# files beside it, and the cluster mark's saved errors. What it writes are the
+# same JSON event files the applications write, into DEEPMSG_LOG_DIR — this is
+# what gives the pipeline `driver.error` and `cluster.error` at all.
+#
+# The flags stay in the environment file: DEEPMSG_AERON_DIR is the directory
+# read, DEEPMSG_LOG_DIR is the directory written, DEEPMSG_NODE_ID is the node
+# every line names, and DEEPMSG_CLUSTER_DIR turns the cluster source on when it
+# is set — empty leaves it off, which is what a host without a cluster wants.
+EnvironmentFile=/etc/deepmsg/observability.env
+ExecStart=/usr/local/bin/deepmsg-errorlog-exporter
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+# The log directory is a write path: the writer rotates, so the exporter
+# renames files there as well as appending. It is the example environment's
+# DEEPMSG_LOG_DIR — change the two together. Everything else the unit reads is
+# read-only, which ProtectSystem=strict already grants.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/log/deepmsg
+
+[Install]
+WantedBy=multi-user.target

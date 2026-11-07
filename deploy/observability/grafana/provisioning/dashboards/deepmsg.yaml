@@ -1,0 +1,16 @@
+# The dashboard provider: the three JSON files in this directory are loaded as
+# a "deepmsg" folder. The path is expanded from the environment so the unit can
+# use /etc/deepmsg/grafana/provisioning/dashboards and the E2E can point at the
+# checked-in tree without a second copy.
+apiVersion: 1
+
+providers:
+  - name: deepmsg
+    orgId: 1
+    folder: deepmsg
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: $__env{DEEPMSG_GRAFANA_DASHBOARDS_DIR}

@@ -1,0 +1,23 @@
+# Grafana provisioning: VictoriaLogs through vmauth, using the VictoriaLogs
+# datasource plugin (`victoriametrics-logs-datasource`, pinned in e2e/versions.env).
+#
+# The plugin's alerting support is what the role-jitter rule depends on; the
+# E2E checks it rather than assuming it. Same vmauth URL and read-only token as
+# the metrics datasource.
+#
+# The URL is an environment variable because vmauth has one listen address:
+# in the single profile it is the loopback, and in the cluster profile vmauth
+# must listen on the log host's private address (the agents on the media hosts
+# connect to it), so Grafana — on that same host — has to use that address too.
+apiVersion: 1
+
+datasources:
+  - name: VictoriaLogs
+    uid: victorialogs
+    type: victoriametrics-logs-datasource
+    access: proxy
+    url: $__env{DEEPMSG_VMAUTH_URL}
+    jsonData:
+      httpHeaderName1: Authorization
+    secureJsonData:
+      httpHeaderValue1: "Bearer $__env{DEEPMSG_GRAFANA_READ_TOKEN}"

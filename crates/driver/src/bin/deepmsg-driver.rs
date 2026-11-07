@@ -59,6 +59,7 @@ use deepmsg_driver::driver::Driver;
 use deepmsg_driver::media::TransportBindings;
 use deepmsg_driver::media::userspace::port_claim::Claim;
 use deepmsg_driver::{dir, sys};
+use deepmsg_log::{Component as LogComponent, Event as LogEvent, Guard, Level as LogLevel};
 
 fn main() -> ExitCode {
     let mut config = match DriverConfig::from_args(std::env::args().skip(1)) {
@@ -76,6 +77,17 @@ fn main() -> ExitCode {
         eprintln!("deepmsg-driver: could not install the signal handler: {error}");
         return ExitCode::FAILURE;
     }
+
+    // Logging comes after the handlers and before the media or the directory:
+    // a failure in either should be the last thing the file says. Off unless
+    // `DEEPMSG_LOG_DIR` is set. The writer can be pinned because this process
+    // owns the platform seam; the CPU is `DEEPMSG_LOG_CPU`, and no CPU means
+    // no pinning.
+    let _logging =
+        match Guard::from_env(LogComponent::Driver, Some(sys::set_current_thread_affinity)) {
+            Ok(guard) => guard,
+            Err(error) => return fail(&format_args!("{error}")),
+        };
 
     // Where the agents should run, before anything touches the file system:
     // the reference applies the cpuset in `aeronmd`'s own order, ahead of the
@@ -129,7 +141,16 @@ fn main() -> ExitCode {
             // `getAdditionalEnvVarsMap` — so `warn_if_dirs_exist` keeps its
             // `false` default and no notice is ever pushed.
             dir::Notice::DirectoryExists { path } => {
-                eprintln!("deepmsg-driver: WARNING: {} exists", path.display());
+                // The reference's own words (`aeron_driver.c:143-149`), without
+                // this build's prefix: a test that parses stderr should see
+                // what it sees from `aeronmd`.
+                eprintln!("WARNING: {} exists", path.display());
+            }
+            // The reference's own warning, and the same stderr: a reclaimed
+            // directory whose driver left errors behind is a diagnostic, not
+            // a failure (`aeron_driver.c:118-119`).
+            dir::Notice::ErrorsSaved { path } => {
+                eprintln!("WARNING: Existing errors saved to: {}", path.display());
             }
         }
     }
@@ -176,6 +197,10 @@ fn main() -> ExitCode {
         }
     };
 
+    deepmsg_log::event(LogLevel::Info, LogComponent::Driver, LogEvent::DriverStart)
+        .field_str("version", env!("CARGO_PKG_VERSION"))
+        .emit();
+
     // stdout, not stderr: this line is written on every healthy start, and the
     // reference's own harness asserts stderr is empty (see the module docs).
     println!(
@@ -204,6 +229,15 @@ fn main() -> ExitCode {
     drop(driver);
     config.transport_bindings = TransportBindings::Default;
     close_the_media(media);
+
+    let reason = if sys::stop_signal().is_some() {
+        "signal"
+    } else {
+        "terminate"
+    };
+    deepmsg_log::event(LogLevel::Info, LogComponent::Driver, LogEvent::DriverStop)
+        .field_str("reason", reason)
+        .emit();
 
     code
 }

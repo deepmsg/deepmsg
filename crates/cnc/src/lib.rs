@@ -41,6 +41,7 @@ pub mod file;
 pub mod layout;
 pub mod loss_report;
 pub mod metadata;
+pub mod position_key;
 pub mod ring;
 
 pub use broadcast::{Received, ToClientsReceiver, ToClientsTransmitter, TransmitError};

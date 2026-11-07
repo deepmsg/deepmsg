@@ -1,0 +1,23 @@
+[package]
+name = "deepmsg-log"
+description = "Application-side log facade: a controlled vocabulary, a fixed schema, and a non-blocking file writer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# A release build removes `Debug` and `Trace` at compile time. This feature puts
+# them back for a diagnostic release build; it is the equivalent of tracing's
+# `release_max_level_info`, without the dependency.
+debug-in-release = []
+
+[dependencies]
+# The clock is the only thing the facade borrows, and it is the project's own
+# epoch-nanosecond reading (`crates/core/src/clock.rs`). There are deliberately
+# no third-party dependencies: see
+# `analysis/observability/deepmsg-l0a-plan-log-crate.md` §5 (Q1).
+deepmsg-core = { path = "../core" }
+
+[lints]
+workspace = true

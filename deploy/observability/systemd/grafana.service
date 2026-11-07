@@ -1,0 +1,30 @@
+[Unit]
+Description=Grafana (deepmsg dashboards and alerts)
+Documentation=https://grafana.com/docs/grafana/latest/
+After=network-online.target vmauth.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=grafana
+Group=grafana
+# Holds the read token, the webhook URL and the admin password (mode 0600).
+EnvironmentFile=/etc/deepmsg/observability.env
+Environment=GF_PATHS_DATA=/var/lib/grafana
+Environment=GF_PATHS_LOGS=/var/log/grafana
+Environment=GF_PATHS_PLUGINS=/var/lib/grafana/plugins
+Environment=GF_PATHS_PROVISIONING=/etc/deepmsg/grafana/provisioning
+ExecStart=/usr/local/bin/grafana server --homepath /usr/share/grafana --config /etc/deepmsg/grafana.ini
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/etc/deepmsg
+ReadWritePaths=/var/lib/grafana /var/log/grafana
+
+[Install]
+WantedBy=multi-user.target

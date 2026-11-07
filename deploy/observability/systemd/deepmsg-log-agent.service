@@ -1,0 +1,29 @@
+[Unit]
+Description=deepmsg node agent (OpenTelemetry Collector)
+Documentation=https://github.com/deepmsg/deepmsg
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deepmsg
+Group=deepmsg
+# Holds DEEPMSG_OBS_WRITE_TOKEN; mode 0600.
+EnvironmentFile=/etc/deepmsg/observability.env
+ExecStart=/usr/local/bin/otelcol-contrib --config /etc/deepmsg/otelcol.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+# The agent reads the applications' logs and the host's /proc and /sys; it
+# writes only its own state. It never needs the network beyond the collector
+# and the backends' URLs.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/var/log/deepmsg
+ReadWritePaths=/var/lib/deepmsg-otelcol
+
+[Install]
+WantedBy=multi-user.target

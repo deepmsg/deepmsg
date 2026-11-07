@@ -1,0 +1,34 @@
+[Unit]
+Description=deepmsg counters exporter (the CnC counters, as Prometheus text)
+Documentation=https://github.com/deepmsg/deepmsg
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deepmsg
+Group=deepmsg
+# Read-only over CnC. A driver that is not up yet answers as no counters
+# rather than as a failure, so this unit does not wait for one — but the
+# agent's 15 s scrape turns the absence into `up == 0`, and then into the
+# metrics-absent alert. That is why this unit belongs on every host the agent
+# runs on, not only on hosts whose driver happens to be running.
+EnvironmentFile=/etc/deepmsg/observability.env
+# The listen address is the agent's DEEPMSG_COUNTERS_ENDPOINT. The directory it
+# reads is DEEPMSG_AERON_DIR — the driver's own CnC file, usually under
+# /dev/shm. DEEPMSG_NODE_ID goes into every counter's label.
+ExecStart=/usr/local/bin/deepmsg-counters-exporter --listen 127.0.0.1:9101
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+# Reads the CnC file and the loss report beside it; writes nothing. The aeron
+# directory must not be under /home (ProtectHome=yes hides it); the /dev/shm
+# trees the drivers use are visible.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

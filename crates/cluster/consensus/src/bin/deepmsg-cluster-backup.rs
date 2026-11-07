@@ -67,6 +67,7 @@ use deepmsg_driver::config::DriverConfig;
 use deepmsg_driver::driver::Driver;
 use deepmsg_driver::idle::Strategy;
 use deepmsg_driver::{cpuset, dir, sys};
+use deepmsg_log::{Component, Guard};
 
 const NAME: &str = "deepmsg-cluster-backup";
 
@@ -103,6 +104,11 @@ fn run() -> Result<(), String> {
         print!("{USAGE}");
         return Ok(());
     }
+
+    // Off unless DEEPMSG_LOG_DIR is set. The driver and the archive live in
+    // this process, so the driver's platform seam can pin the writer.
+    let _logging = Guard::from_env(Component::Cluster, Some(sys::set_current_thread_affinity))
+        .map_err(|error| error.to_string())?;
 
     // One property list for three configurations, because the reference hands
     // the same system properties to all three (`ClusterBackupMediaDriver.main`

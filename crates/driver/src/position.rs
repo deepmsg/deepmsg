@@ -74,51 +74,11 @@ pub mod type_id {
 
 /// The key a stream-position counter carries
 /// (`aeron-client/src/main/c/concurrent/aeron_counters_manager.h:37-47`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StreamPositionKey<'a> {
-    /// The registration id the counter belongs to — a publication's, or a
-    /// subscription's.
-    pub registration_id: i64,
-    /// The session it measures.
-    pub session_id: i32,
-    /// The stream it measures.
-    pub stream_id: i32,
-    /// The channel, as the client sent it, including any parameters.
-    pub channel: &'a [u8],
-}
-
-impl StreamPositionKey<'_> {
-    /// The key's width, and the one the counter manager is told about.
-    pub const LENGTH: usize = 112;
-
-    /// Where the channel field starts: after the two ids and the two lengths.
-    const CHANNEL_OFFSET: usize = 20;
-
-    /// How much of a channel the key can hold.
-    pub const CHANNEL_LENGTH_MAX: usize = Self::LENGTH - Self::CHANNEL_OFFSET;
-
-    /// The key as the bytes a reader would find.
-    ///
-    /// The reference builds this as a designated initialiser
-    /// (`aeron_position.c:41-42`), so everything it does not name is **zero** —
-    /// including the channel's tail past what fits. Writing a shorter array and
-    /// leaving the rest of the buffer alone would put whatever was on the stack
-    /// into a file other processes read.
-    pub fn encode(&self) -> [u8; StreamPositionKey::LENGTH] {
-        let mut out = [0u8; Self::LENGTH];
-        let channel_length = self.channel.len().min(Self::CHANNEL_LENGTH_MAX);
-
-        out[..8].copy_from_slice(&self.registration_id.to_le_bytes());
-        out[8..12].copy_from_slice(&self.session_id.to_le_bytes());
-        out[12..16].copy_from_slice(&self.stream_id.to_le_bytes());
-        #[allow(clippy::cast_possible_truncation)] // bounded by CHANNEL_LENGTH_MAX
-        out[16..20].copy_from_slice(&(channel_length as i32).to_le_bytes());
-        out[Self::CHANNEL_OFFSET..Self::CHANNEL_OFFSET + channel_length]
-            .copy_from_slice(&self.channel[..channel_length]);
-
-        out
-    }
-}
+///
+/// It lives in [`deepmsg_cnc::position_key`] because the counters exporter
+/// reads it without linking the driver; this re-export keeps the driver's
+/// callers on the same name.
+pub use deepmsg_cnc::position_key::StreamPositionKey;
 
 /// The label every one of these counters carries, formatted as the reference
 /// formats it (`aeron_position.c:35-39`): `name: <registration> <session>

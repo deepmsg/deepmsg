@@ -1,0 +1,17 @@
+# Non-secret environment for the agent DaemonSet. The token is a Secret, never
+# a line here.
+#
+#   kubectl -n deepmsg create configmap deepmsg-observability-agent-env \
+#     --from-env-file=deploy/observability/k8s/agent-env.example
+#
+# Replace <log-host> with the log host's private address (the cluster profile)
+# or 127.0.0.1 (the single profile, when the agent and the backends share a
+# host).
+
+DEEPMSG_LOG_DIR=/var/log/deepmsg
+DEEPMSG_OBS_STATE_DIR=/var/lib/deepmsg-otelcol
+DEEPMSG_COUNTERS_ENDPOINT=127.0.0.1:9101
+DEEPMSG_OTELCOL_TELEMETRY_ENDPOINT=127.0.0.1:8888
+DEEPMSG_VL_LOGS_ENDPOINT=http://<log-host>:8427/insert/opentelemetry/v1/logs
+DEEPMSG_VM_WRITE_ENDPOINT=http://<log-host>:8427/api/v1/write
+DEEPMSG_HOSTMETRICS_ROOT=/

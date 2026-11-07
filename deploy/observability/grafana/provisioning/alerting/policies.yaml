@@ -1,0 +1,11 @@
+# One root policy: every alert goes to the webhook. group_by keeps a node's
+# instances together without splitting one event per label.
+apiVersion: 1
+
+policies:
+  - orgId: 1
+    receiver: deepmsg-webhook
+    group_by: [alertname, severity, node_id]
+    group_wait: 10s
+    group_interval: 1m
+    repeat_interval: 4h

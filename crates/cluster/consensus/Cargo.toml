@@ -16,6 +16,8 @@ deepmsg-codec-cluster = { path = "../../codec/cluster" }
 deepmsg-codec-cluster-mark = { path = "../../codec/cluster-mark" }
 deepmsg-codec-cluster-node-state = { path = "../../codec/cluster-node-state" }
 deepmsg-core = { path = "../../core" }
+# The cluster process's file log; off unless DEEPMSG_LOG_DIR is set.
+deepmsg-log = { path = "../../log" }
 deepmsg-driver = { path = "../../driver" }
 
 [lints]

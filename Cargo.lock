@@ -229,6 +229,7 @@ dependencies = [
  "deepmsg-codec",
  "deepmsg-core",
  "deepmsg-driver",
+ "deepmsg-log",
 ]
 
 [[package]]
@@ -239,6 +240,7 @@ dependencies = [
  "deepmsg-archive",
  "deepmsg-client",
  "deepmsg-core",
+ "deepmsg-log",
  "deepmsg-tests",
  "hdrhistogram",
 ]
@@ -265,6 +267,7 @@ dependencies = [
  "deepmsg-codec-cluster-node-state",
  "deepmsg-core",
  "deepmsg-driver",
+ "deepmsg-log",
 ]
 
 [[package]]
@@ -299,6 +302,7 @@ dependencies = [
  "deepmsg-codec-cluster-mark",
  "deepmsg-core",
  "deepmsg-driver",
+ "deepmsg-log",
 ]
 
 [[package]]
@@ -373,6 +377,7 @@ dependencies = [
  "deepmsg-cnc",
  "deepmsg-core",
  "deepmsg-dpdk",
+ "deepmsg-log",
  "libc",
 ]
 
@@ -381,6 +386,13 @@ name = "deepmsg-examples"
 version = "0.1.0"
 dependencies = [
  "deepmsg-client",
+]
+
+[[package]]
+name = "deepmsg-log"
+version = "0.1.0"
+dependencies = [
+ "deepmsg-core",
 ]
 
 [[package]]
@@ -400,6 +412,7 @@ dependencies = [
  "deepmsg-codec-cluster-mark",
  "deepmsg-core",
  "deepmsg-driver",
+ "deepmsg-log",
 ]
 
 [[package]]
@@ -407,8 +420,11 @@ name = "deepmsg-tools"
 version = "0.1.0"
 dependencies = [
  "deepmsg-archive",
+ "deepmsg-cluster-common",
  "deepmsg-cnc",
+ "deepmsg-codec-cluster-mark",
  "deepmsg-core",
+ "deepmsg-log",
  "libc",
 ]
 

@@ -1,0 +1,31 @@
+[Unit]
+Description=VictoriaLogs
+Documentation=https://docs.victoriametrics.com/victorialogs/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=victoria
+Group=victoria
+# Loopback only: vmauth is the door. The cluster profile keeps this and
+# vmauth on the same (log) host, so 127.0.0.1 is still right there.
+# -retention.maxDiskUsagePercent is the hard disk brake; the flag is not
+# -retention.maxDiskSpaceUsage (that name does not exist in these releases).
+ExecStart=/usr/local/bin/victoria-logs \
+  -storageDataPath=/var/lib/victoria-logs \
+  -httpListenAddr=127.0.0.1:9428 \
+  -retentionPeriod=30d \
+  -retention.maxDiskUsagePercent=70
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/victoria-logs
+
+[Install]
+WantedBy=multi-user.target

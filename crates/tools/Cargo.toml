@@ -13,7 +13,14 @@ rust-version.workspace = true
 libc = "0.2"
 deepmsg-core = { path = "../core" }
 deepmsg-cnc = { path = "../cnc" }
+deepmsg-log = { path = "../log" }
 deepmsg-archive = { path = "../archive" }
+
+[dev-dependencies]
+# The cluster test writes its rescued file with the producer itself, so the
+# bytes under test are the ones `save_existing_errors` really writes.
+deepmsg-cluster-common = { path = "../cluster/common" }
+deepmsg-codec-cluster-mark = { path = "../codec/cluster-mark" }
 
 [lints]
 workspace = true
