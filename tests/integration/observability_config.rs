@@ -16,6 +16,14 @@ fn config() -> (PathBuf, String) {
     (path, text)
 }
 
+fn app_config() -> (PathBuf, String) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../deploy/observability/agent/otelcol-app.yaml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    (path, text)
+}
+
 /// How many lines, after trimming, are exactly `needle`.
 fn occurrences(text: &str, needle: &str) -> usize {
     text.lines().filter(|line| line.trim() == needle).count()
@@ -51,6 +59,39 @@ fn the_timestamp_layout_is_a_go_layout_and_not_strptime() {
 fn the_level_reaches_the_severity_field() {
     let (path, text) = config();
     assert_once(&path, &text, "parse_from: attributes.level");
+}
+
+#[test]
+fn the_application_overlay_adds_one_job_and_one_pipeline() {
+    let (path, text) = app_config();
+    assert_once(&path, &text, "- job_name: app-metrics");
+    assert_once(
+        &path,
+        &text,
+        "- targets: [\"${env:DEEPMSG_APP_METRICS_ENDPOINT}\"]",
+    );
+    assert_once(&path, &text, "receivers: [prometheus/app]");
+    assert_once(&path, &text, "metrics/app:");
+    // The identity processors are the base's; the overlay must name them, or
+    // application samples arrive without a node_id and every host's series is
+    // one series.
+    assert_once(
+        &path,
+        &text,
+        "processors: [memory_limiter/app, resource/node_id, transform/node_id, batch]",
+    );
+}
+
+#[test]
+fn the_application_agent_loads_both_configs() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../deploy/observability/systemd/deepmsg-app-agent.service");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    assert!(
+        text.contains("--config /etc/deepmsg/otelcol.yaml --config /etc/deepmsg/otelcol-app.yaml")
+    );
+    assert!(text.contains("EnvironmentFile=/etc/deepmsg/observability.env"));
 }
 
 #[test]

@@ -31,10 +31,11 @@ has been run on a machine yet, and a static review is not a run.
 ## Layout
 
 ```
-agent/otelcol.yaml              the one config, used by systemd and by the DaemonSet
+agent/otelcol.yaml              the base config, used by systemd and by the DaemonSet
+agent/otelcol-app.yaml          the optional overlay: one application metrics endpoint
 grafana/grafana.ini             Grafana's own settings; provisioning under grafana/provisioning
 grafana/provisioning/           the datasources, the dashboards and the alert rules
-systemd/                        six units, the environment example
+systemd/                        eight units, the environment example
 backends/vmauth.example.yaml    the two-token auth config, exact paths
 k8s/agent-daemonset.yaml        the DaemonSet (static: not run)
 k8s/agent-env.example           its non-secret environment
@@ -119,8 +120,10 @@ checked-in config names it; a second value would be a second config.
 ## Environment
 
 The config is entirely environment-driven so that the same file serves a
-laptop, a systemd unit and a DaemonSet. All of these are required; the collector
-refuses to start if one is unset.
+laptop, a systemd unit and a DaemonSet. All of these are required by the base
+agent; the collector refuses to start if one is unset. The last row belongs to
+the optional application-metrics overlay and is required only by
+`deepmsg-app-agent.service`.
 
 | variable | meaning | example |
 |---|---|---|
@@ -131,6 +134,7 @@ refuses to start if one is unset.
 | `DEEPMSG_CLUSTER_DIR` | the cluster member's directory the error-log exporter also watches; empty leaves the cluster source off | (empty) |
 | `DEEPMSG_COUNTERS_ENDPOINT` | the counters exporter's host:port | `127.0.0.1:9101` |
 | `DEEPMSG_OTELCOL_TELEMETRY_ENDPOINT` | the collector's own Prometheus endpoint | `127.0.0.1:8888` |
+| `DEEPMSG_APP_METRICS_ENDPOINT` | the application's own Prometheus endpoint; **only** `deepmsg-app-agent.service` reads it | `127.0.0.1:26100` |
 | `DEEPMSG_VL_LOGS_ENDPOINT` | VictoriaLogs' OTLP/HTTP logs URL (through vmauth in the cluster profile) | `http://127.0.0.1:8427/insert/opentelemetry/v1/logs` |
 | `DEEPMSG_VM_WRITE_ENDPOINT` | VictoriaMetrics' remote-write URL (through vmauth) | `http://127.0.0.1:8427/api/v1/write` |
 | `DEEPMSG_OBS_WRITE_TOKEN` | the bearer token vmauth accepts for writes | (secret) |
@@ -145,6 +149,27 @@ is still visible rather than rewritten.
 `DEEPMSG_OBS_STATE_DIR` must not be inside `DEEPMSG_LOG_DIR`: the log writer
 rotates and deletes files there, and the state is the collector's memory of
 what it has read.
+
+## Application metrics
+
+An application with its own Prometheus endpoint joins the same pipeline through
+`agent/otelcol-app.yaml` and the `deepmsg-app-agent` unit. The unit passes the
+base config and the overlay to **one** collector, so the host keeps one
+process, one state directory, and the base's processors and remote-write
+exporter; the overlay adds a scrape job (`app-metrics`, target
+`DEEPMSG_APP_METRICS_ENDPOINT`), its own small memory limiter, and the
+`metrics/app` pipeline.
+
+- One endpoint per host: the application decides what it exposes. A cluster
+  member points it at its engine, a client host at its gateway.
+- `node_id` is attached by the shared `resource/node_id` and
+  `transform/node_id` processors; the application's own metrics must not carry
+  a `node_id` label.
+- Use `deepmsg-app-agent` **instead of** `deepmsg-log-agent` on that host, not
+  in addition to it: they share the collector state directory, and two
+  processes would each keep their own filelog offsets.
+- The DaemonSet carries the base config only; the overlay is systemd-only for
+  now.
 
 ## Profiles
 
@@ -218,7 +243,7 @@ install -m 0755 target/release/deepmsg-counters-exporter \
 # root, so 0600 root is right. vmauth's config is read by the vmauth user, so
 # it is 0640 root:vmauth — 0600 root:root would fail the unit at startup with
 # a permission error that looks like a broken config.
-install -m 0644 agent/otelcol.yaml /etc/deepmsg/otelcol.yaml
+install -m 0644 agent/otelcol.yaml agent/otelcol-app.yaml /etc/deepmsg/
 install -m 0600 systemd/observability.env.example /etc/deepmsg/observability.env
 install -m 0640 -g vmauth backends/vmauth.example.yaml /etc/deepmsg/vmauth.yaml   # log host only
 
@@ -227,8 +252,11 @@ install -m 0644 systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
 # Log host:
 systemctl enable --now victoria-logs victoria-metrics vmauth
-# Media hosts:
+# Media hosts without application metrics:
 systemctl enable --now deepmsg-log-agent deepmsg-counters-exporter deepmsg-errorlog-exporter
+# A media host WITH application metrics uses deepmsg-app-agent *instead of*
+# deepmsg-log-agent (it loads both configs):
+systemctl enable --now deepmsg-app-agent deepmsg-counters-exporter deepmsg-errorlog-exporter
 ```
 
 Both exporters run as `deepmsg` and read the driver's aeron directory, so that

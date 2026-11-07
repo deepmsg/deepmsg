@@ -105,6 +105,27 @@ python3 "$HERE/check-config.py" || fail "the agent config failed its static chec
 
 mkdir -p "$WORK"/{vl,vm,state,logs,evidence}
 
+# The application overlay is a second file the collector merges with the base
+# (`deepmsg-app-agent.service`). A pair that does not merge fails only on the
+# host that loads it, at startup; validate the pair here with the same env
+# contract. The target need not be listening: validate does not scrape.
+env \
+  DEEPMSG_LOG_DIR="$WORK/logs" \
+  DEEPMSG_OBS_STATE_DIR="$WORK/state" \
+  DEEPMSG_COUNTERS_ENDPOINT="127.0.0.1:$COUNTERS_PORT" \
+  DEEPMSG_OTELCOL_TELEMETRY_ENDPOINT="127.0.0.1:$TELEMETRY_PORT" \
+  DEEPMSG_APP_METRICS_ENDPOINT="127.0.0.1:26100" \
+  DEEPMSG_VL_LOGS_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/insert/opentelemetry/v1/logs" \
+  DEEPMSG_VM_WRITE_ENDPOINT="http://127.0.0.1:$VMAUTH_PORT/api/v1/write" \
+  DEEPMSG_OBS_WRITE_TOKEN="$TOKEN" \
+  DEEPMSG_NODE_ID=e2e \
+  DEEPMSG_HOSTMETRICS_ROOT=/ \
+  "$BIN/otelcol-contrib" validate \
+    --config "$REPO/deploy/observability/agent/otelcol.yaml" \
+    --config "$REPO/deploy/observability/agent/otelcol-app.yaml" ||
+  fail "the base config and the application metrics overlay do not merge"
+echo "e2e: C0: the base config and the application metrics overlay merge"
+
 # vmauth is the only way in: the agent and the E2E both hold one token.
 # src_paths are exact paths (vmauth has no prefix or glob match here), so every
 # path the pipeline and a Grafana datasource use is named.
