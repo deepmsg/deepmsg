@@ -348,6 +348,77 @@ fn an_existing_error_log_is_rescued_before_being_cleared() {
 }
 
 #[test]
+fn adopting_a_mark_file_rescues_the_previous_error_log() {
+    let dir = scratch("rescue-on-adopt");
+    let path = dir.join(mark::FILENAME);
+    let old = create(&dir, ClusterComponentType::CONSENSUS_MODULE);
+    {
+        let buffer = old.error_buffer().unwrap();
+        buffer.copy_in(0, b"previous death").unwrap();
+    }
+    old.signal_terminated().unwrap();
+    drop(old);
+
+    let adopted = ClusterMarkFile::create(
+        &path,
+        ClusterComponentType::CONSENSUS_MODULE,
+        ERROR_BUFFER,
+        PAGE,
+        NOW,
+        2,
+    )
+    .unwrap();
+
+    let saved = dir.join(format!("CONSENSUS_MODULE-{NOW}-error.log"));
+    assert!(saved.exists(), "the previous error log was not rescued");
+    let bytes = std::fs::read(&saved).unwrap();
+    assert_eq!(ERROR_BUFFER, bytes.len());
+    assert_eq!(b"previous death", &bytes[..14]);
+
+    // The new owner starts from an empty buffer: a second rescue writes
+    // nothing.
+    assert!(
+        adopted
+            .save_existing_errors("again", NOW)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn adopting_a_clean_mark_file_writes_no_rescue_file() {
+    let dir = scratch("rescue-clean");
+    let path = dir.join(mark::FILENAME);
+    let old = create(&dir, ClusterComponentType::CONTAINER);
+    old.signal_terminated().unwrap();
+    drop(old);
+
+    ClusterMarkFile::create(
+        &path,
+        ClusterComponentType::CONTAINER,
+        ERROR_BUFFER,
+        PAGE,
+        NOW,
+        2,
+    )
+    .unwrap();
+
+    let rescued: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with("-error.log"))
+        })
+        .collect();
+    assert!(
+        rescued.is_empty(),
+        "a clean error buffer must not produce a rescue file: {rescued:?}"
+    );
+}
+
+#[test]
 fn the_link_points_at_the_mark_files_directory_or_is_absent() {
     let dir = scratch("link");
     let outside = scratch("link-outside");
