@@ -6,12 +6,37 @@
 //! Adding a member is a code change with a test; the vocabulary is the list
 //! below and nowhere else.
 //!
+//! The list below is the **infrastructure's** vocabulary. An application with
+//! its own components and events implements [`Name`] for its own type and keeps
+//! its own `ALL` list and tests in its own crate. That keeps this crate's list
+//! from growing once per application while leaving the stability discipline
+//! (one list, one test, no renames under a dashboard) where the names live.
+//!
 //! The initial members are the ones the pipeline plan names. The event track
 //! (L0b) grows this list as components start reporting; `LogDropped` is here
 //! from the start because the writer thread emits it itself when its queue is
 //! full, and an event that the logger emits must be in the logger's vocabulary.
 
 use std::fmt;
+
+/// A name a log line can carry: a component or an event.
+///
+/// The primitive is a `&'static str` because the record is encoded on the
+/// caller's thread without allocating. Implement this for an application-owned
+/// enum to add names without touching this crate:
+///
+/// ```ignore
+/// enum EngineEvent { Start, Role }
+/// impl deepmsg_log::Name for EngineEvent {
+///     fn as_str(&self) -> &'static str {
+///         match self { EngineEvent::Start => "engine.start", EngineEvent::Role => "engine.role" }
+///     }
+/// }
+/// ```
+pub trait Name {
+    /// The lowercase, dot-separated name written to the log.
+    fn as_str(&self) -> &'static str;
+}
 
 /// Which part of the process is speaking.
 ///
@@ -43,6 +68,16 @@ impl Component {
         Component::Tool,
     ];
 
+    /// The built-in names, for a caller that accepts only these in
+    /// `DEEPMSG_LOG_LEVEL` and `Config::from_env_with`.
+    pub const ALL_NAMES: [&'static str; 5] = [
+        Component::Driver.as_str(),
+        Component::Archive.as_str(),
+        Component::Cluster.as_str(),
+        Component::Client.as_str(),
+        Component::Tool.as_str(),
+    ];
+
     /// The lowercase name used in the environment, the filename and the log.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -69,6 +104,12 @@ impl Component {
 impl fmt::Display for Component {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+impl Name for Component {
+    fn as_str(&self) -> &'static str {
+        Component::as_str(*self)
     }
 }
 
@@ -155,9 +196,15 @@ impl fmt::Display for Event {
     }
 }
 
+impl Name for Event {
+    fn as_str(&self) -> &'static str {
+        Event::as_str(*self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Component, Event};
+    use super::{Component, Event, Name};
 
     #[test]
     fn component_names_are_the_environment_names() {
@@ -184,5 +231,32 @@ mod tests {
         assert_eq!("log.dropped", Event::LogDropped.as_str());
         assert_eq!("driver.error", Event::DriverError.as_str());
         assert_eq!("cluster.error", Event::ClusterError.as_str());
+    }
+
+    #[test]
+    fn an_application_owns_the_names_it_brings() {
+        // This is the whole contract for another crate: its own type, its own
+        // `ALL`, its own test — no member added to either enum above.
+        #[derive(Clone, Copy)]
+        enum EngineEvent {
+            Start,
+            Role,
+        }
+
+        impl Name for EngineEvent {
+            fn as_str(&self) -> &'static str {
+                match self {
+                    EngineEvent::Start => "engine.start",
+                    EngineEvent::Role => "engine.role",
+                }
+            }
+        }
+
+        assert_eq!("engine.start", EngineEvent::Start.as_str());
+        assert_eq!("engine.role", EngineEvent::Role.as_str());
+        assert_eq!(
+            ["driver", "archive", "cluster", "client", "tool"],
+            Component::ALL_NAMES
+        );
     }
 }

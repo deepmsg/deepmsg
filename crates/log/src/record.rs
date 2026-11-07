@@ -85,13 +85,26 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    /// Start a record. The five fixed fields are written here.
+    /// Start a record from the built-in vocabulary. The five fixed fields are
+    /// written here.
     pub fn begin(
         nanos: i64,
         level: Level,
         component: Component,
         node_id: &str,
         event: Event,
+    ) -> Self {
+        Self::begin_named(nanos, level, component.as_str(), node_id, event.as_str())
+    }
+
+    /// Start a record from names, which may come from an application's own
+    /// [`crate::Name`] implementations.
+    pub fn begin_named(
+        nanos: i64,
+        level: Level,
+        component: &'static str,
+        node_id: &str,
+        event: &'static str,
     ) -> Self {
         let mut encoder = Self {
             bytes: [0; RECORD_CAPACITY],
@@ -108,15 +121,15 @@ impl Encoder {
         encoder.push_fixed("\",\"level\":\"");
         encoder.push_fixed(level.as_str());
         encoder.push_fixed("\",\"component\":\"");
-        encoder.push_fixed(component.as_str());
+        encoder.push_fixed(component);
         encoder.push_fixed("\",\"node_id\":");
 
-        let suffix_length = ",\"event\":\"".len() + event.as_str().len() + 1;
+        let suffix_length = ",\"event\":\"".len() + event.len() + 1;
         let node_limit = BODY_LIMIT - suffix_length;
         encoder.push_value_string(node_id, node_limit);
 
         encoder.push_fixed(",\"event\":\"");
-        encoder.push_fixed(event.as_str());
+        encoder.push_fixed(event);
         encoder.push_fixed("\"");
 
         encoder

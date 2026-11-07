@@ -118,7 +118,7 @@ fn the_cluster_reports_its_roles_its_election_and_a_snapshot() {
     let config = Config {
         dir: log_dir.clone(),
         node_id: "cluster-log".to_owned(),
-        component: Component::Cluster,
+        component: Component::Cluster.as_str(),
         level: Level::Info,
         component_levels: Vec::new(),
         roll: Roll::default(),

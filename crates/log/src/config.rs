@@ -21,7 +21,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::event::Component;
+use crate::event::{Component, Name};
 use crate::level::Level;
 
 /// The level used when `DEEPMSG_LOG_LEVEL` is unset.
@@ -143,12 +143,13 @@ pub struct Config {
     pub dir: PathBuf,
     /// Written into every line and used as the `node_id` stream field.
     pub node_id: String,
-    /// This process's component.
-    pub component: Component,
+    /// This process's component name. It is the filename's prefix and the
+    /// default `component` field; an event may name a different one.
+    pub component: &'static str,
     /// The global level.
     pub level: Level,
     /// Per-component overrides; later duplicates win.
-    pub component_levels: Vec<(Component, Level)>,
+    pub component_levels: Vec<(&'static str, Level)>,
     /// Size and count of files.
     pub roll: Roll,
     /// Records the queue holds before dropping.
@@ -169,6 +170,20 @@ impl Config {
     /// error rather than a silently disabled logger, because the operator
     /// asked for something this process cannot honour.
     pub fn from_env(component: Component) -> Result<Option<Self>, InitError> {
+        Self::from_env_with(component, &Component::ALL_NAMES)
+    }
+
+    /// Read the environment with an application-supplied vocabulary.
+    ///
+    /// `component` is this process's default name; `known_components` is the
+    /// list a `DEEPMSG_LOG_LEVEL=name=level` token may use. Pass
+    /// `&Component::ALL_NAMES` to accept only the built-in names; an
+    /// application adds its own names (and their case-insensitive spellings
+    /// are matched against this list, never guessed).
+    pub fn from_env_with(
+        component: impl Name,
+        known_components: &'static [&'static str],
+    ) -> Result<Option<Self>, InitError> {
         let dir = env_value("DEEPMSG_LOG_DIR")?;
         // Off is off: an unrelated variable that happens to be malformed must
         // not turn a deliberately silent process into a failed one.
@@ -182,7 +197,8 @@ impl Config {
         let cpu = env_value("DEEPMSG_LOG_CPU")?;
 
         let Some(mut config) = Self::from_values(
-            component,
+            component.as_str(),
+            known_components,
             Some(&dir),
             node_id.as_deref(),
             level.as_deref(),
@@ -197,7 +213,8 @@ impl Config {
 
     /// The pure half of [`Config::from_env`].
     pub(crate) fn from_values(
-        component: Component,
+        component: &'static str,
+        known_components: &'static [&'static str],
         dir: Option<&str>,
         node_id: Option<&str>,
         level: Option<&str>,
@@ -212,7 +229,8 @@ impl Config {
             return Err(InitError::EmptyNodeId);
         }
 
-        let (level, component_levels) = parse_level_directives(level.unwrap_or(DEFAULT_LEVEL))?;
+        let (level, component_levels) =
+            parse_level_directives(level.unwrap_or(DEFAULT_LEVEL), known_components)?;
         let roll = Roll::parse(roll.unwrap_or(DEFAULT_ROLL))?;
 
         Ok(Some(Self {
@@ -255,17 +273,24 @@ pub(crate) fn parse_cpu(value: Option<&str>) -> Result<Option<i32>, InitError> {
     Ok(Some(cpu))
 }
 
+/// A parsed `DEEPMSG_LOG_LEVEL`: the global level and the per-component
+/// overrides, in the order they were first named.
+pub(crate) type LevelDirectives = (Level, Vec<(&'static str, Level)>);
+
 /// Parse `info`, or `driver=debug,cluster=info`, into a global level and overrides.
 ///
 /// Grammar: comma-separated tokens; a token without `=` sets the global level,
 /// a token with `=` sets one component's level. Later tokens win. An empty
 /// token between commas is ignored; every other token must parse, so a typo is
-/// an error rather than an override nobody notices is missing.
+/// an error rather than an override nobody notices is missing. A component
+/// name must be in `known_components`; the built-ins pass
+/// `Component::ALL_NAMES`, and an application passes its own list.
 pub(crate) fn parse_level_directives(
     value: &str,
-) -> Result<(Level, Vec<(Component, Level)>), InitError> {
+    known_components: &'static [&'static str],
+) -> Result<LevelDirectives, InitError> {
     let mut global = Level::default();
-    let mut overrides: Vec<(Component, Level)> = Vec::new();
+    let mut overrides: Vec<(&'static str, Level)> = Vec::new();
 
     for token in value.split(',') {
         let token = token.trim();
@@ -275,8 +300,11 @@ pub(crate) fn parse_level_directives(
 
         if let Some((component, level)) = token.split_once('=') {
             let component_name = component.trim();
-            let component =
-                Component::parse(component_name).ok_or_else(|| InitError::UnknownComponent {
+            let component = known_components
+                .iter()
+                .copied()
+                .find(|known| known.eq_ignore_ascii_case(component_name))
+                .ok_or_else(|| InitError::UnknownComponent {
                     value: component_name.to_owned(),
                 })?;
             let level_name = level.trim();
@@ -405,8 +433,13 @@ mod tests {
     use super::{
         Config, DEFAULT_QUEUE_CAPACITY, InitError, Roll, parse_cpu, parse_level_directives,
     };
-    use crate::event::Component;
+    use crate::event::{Component, Name};
     use crate::level::Level;
+
+    /// The plain form every existing test and caller uses: the built-in names.
+    fn levels(value: &str) -> Result<super::LevelDirectives, InitError> {
+        parse_level_directives(value, &Component::ALL_NAMES)
+    }
 
     #[test]
     fn the_default_roll_is_100_mib_over_5_files() {
@@ -463,30 +496,26 @@ mod tests {
 
     #[test]
     fn a_bare_level_sets_the_global_level() {
-        let (global, overrides) = parse_level_directives("debug").unwrap();
+        let (global, overrides) = levels("debug").unwrap();
         assert_eq!(Level::Debug, global);
         assert!(overrides.is_empty());
     }
 
     #[test]
     fn component_directives_override_without_moving_the_global() {
-        let (global, overrides) =
-            parse_level_directives("info,driver=debug,cluster=error").unwrap();
+        let (global, overrides) = levels("info,driver=debug,cluster=error").unwrap();
         assert_eq!(Level::Info, global);
         assert_eq!(
-            vec![
-                (Component::Driver, Level::Debug),
-                (Component::Cluster, Level::Error)
-            ],
+            vec![("driver", Level::Debug), ("cluster", Level::Error)],
             overrides
         );
     }
 
     #[test]
     fn later_directives_win_and_empty_tokens_are_ignored() {
-        let (_, overrides) = parse_level_directives("driver=debug,,driver=error,").unwrap();
-        assert_eq!(vec![(Component::Driver, Level::Error)], overrides);
-        let (global, _) = parse_level_directives("warn,,info").unwrap();
+        let (_, overrides) = levels("driver=debug,,driver=error,").unwrap();
+        assert_eq!(vec![("driver", Level::Error)], overrides);
+        let (global, _) = levels("warn,,info").unwrap();
         assert_eq!(Level::Info, global);
     }
 
@@ -496,19 +525,19 @@ mod tests {
             Err(InitError::UnknownComponent {
                 value: "mediadriver".to_owned()
             }),
-            parse_level_directives("mediadriver=debug")
+            levels("mediadriver=debug")
         );
         assert_eq!(
             Err(InitError::InvalidLevel {
                 value: "verbose".to_owned()
             }),
-            parse_level_directives("driver=verbose")
+            levels("driver=verbose")
         );
         assert_eq!(
             Err(InitError::InvalidLevel {
                 value: "verbose".to_owned()
             }),
-            parse_level_directives("verbose")
+            levels("verbose")
         );
     }
 
@@ -516,20 +545,35 @@ mod tests {
     fn an_enabled_configuration_needs_a_node_id() {
         assert_eq!(
             Err(InitError::MissingNodeId),
-            Config::from_values(Component::Driver, Some("/tmp/logs"), None, None, None)
-                .map(|config| config.map(|_| ()))
+            Config::from_values(
+                Component::Driver.as_str(),
+                &Component::ALL_NAMES,
+                Some("/tmp/logs"),
+                None,
+                None,
+                None,
+            )
+            .map(|config| config.map(|_| ()))
         );
         assert_eq!(
             Err(InitError::EmptyNodeId),
-            Config::from_values(Component::Driver, Some("/tmp/logs"), Some("  "), None, None)
-                .map(|config| config.map(|_| ()))
+            Config::from_values(
+                Component::Driver.as_str(),
+                &Component::ALL_NAMES,
+                Some("/tmp/logs"),
+                Some("  "),
+                None,
+                None,
+            )
+            .map(|config| config.map(|_| ()))
         );
     }
 
     #[test]
     fn an_enabled_configuration_carries_the_defaults() {
         let config = Config::from_values(
-            Component::Cluster,
+            Component::Cluster.as_str(),
+            &Component::ALL_NAMES,
             Some("/tmp/logs"),
             Some("node-7"),
             Some("driver=debug"),
@@ -538,12 +582,9 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(Component::Cluster, config.component);
+        assert_eq!("cluster", config.component);
         assert_eq!(Level::Info, config.level);
-        assert_eq!(
-            vec![(Component::Driver, Level::Debug)],
-            config.component_levels
-        );
+        assert_eq!(vec![("driver", Level::Debug)], config.component_levels);
         assert_eq!(
             Roll {
                 bytes: 10 * 1024 * 1024,
@@ -555,6 +596,49 @@ mod tests {
         assert_eq!(None, config.cpu);
         assert!(config.pinner.is_none());
         assert_eq!("node-7", config.node_id);
+    }
+
+    #[test]
+    fn an_application_vocabulary_is_the_list_it_passes() {
+        struct Engine;
+
+        impl Name for Engine {
+            fn as_str(&self) -> &'static str {
+                "engine"
+            }
+        }
+
+        static ENGINE_NAMES: [&str; 2] = ["engine", "gateway"];
+
+        let config = Config::from_values(
+            Engine.as_str(),
+            &ENGINE_NAMES,
+            Some("/tmp/logs"),
+            Some("node-7"),
+            Some("engine=debug"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!("engine", config.component);
+        assert_eq!(vec![("engine", Level::Debug)], config.component_levels);
+
+        // The list the application passed decides, not a guess: a name outside
+        // it is still an error, so a typo in the unit is not silently ignored.
+        assert_eq!(
+            Err(InitError::UnknownComponent {
+                value: "marketdata".to_owned()
+            }),
+            Config::from_values(
+                Engine.as_str(),
+                &ENGINE_NAMES,
+                Some("/tmp/logs"),
+                Some("node-7"),
+                Some("marketdata=debug"),
+                None,
+            )
+            .map(|config| config.map(|_| ()))
+        );
     }
 
     #[test]

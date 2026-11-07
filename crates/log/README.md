@@ -50,6 +50,50 @@ A full queue is a **counted drop**, never a block. The writer reports the count
 as its own `log.dropped` event, so the loss is queryable next to everything else.
 `handle.dropped_lines()` is the same number for an in-process reader.
 
+## Application vocabulary
+
+`Component` and `Event` are the **infrastructure's** controlled vocabulary. An
+application with its own components and events does not add members here; it
+implements `Name` for its own types and keeps its own list and test:
+
+```rust
+use deepmsg_log::{Guard, Level, Name};
+
+#[derive(Clone, Copy)]
+enum Engine { Container }
+
+impl Name for Engine {
+    fn as_str(&self) -> &'static str { "engine" }
+}
+
+#[derive(Clone, Copy)]
+enum EngineEvent { Start, Role }
+
+impl Name for EngineEvent {
+    fn as_str(&self) -> &'static str {
+        match self {
+            EngineEvent::Start => "engine.start",
+            EngineEvent::Role => "engine.role",
+        }
+    }
+}
+
+// The application's list is what `DEEPMSG_LOG_LEVEL=engine=debug` may name.
+static COMPONENTS: [&str; 1] = ["engine"];
+
+let _guard = Guard::from_env_with(Engine::Container, &COMPONENTS, None)?;
+deepmsg_log::event_named(Level::Info, Engine::Container, EngineEvent::Start)
+    .field_str("symbol", "AAPL")
+    .emit();
+```
+
+`Name::as_str` returns `&'static str`, so the encoder stays a string writer and
+the same event cost applies. The rule that keeps dashboards stable travels with
+the names: keep one `ALL` list and one "no duplicates" test in the application's
+crate, and treat a rename as a dashboard change. `Config::from_env_with` and
+`Guard::from_env_with` are the configuration half; `event_named` (and
+`Handle::event_named` / `Logger::event_named`) are the emission half.
+
 ## The line
 
 One JSON object per line, fields flat (not nested under `fields`), fixed order:
@@ -59,7 +103,8 @@ One JSON object per line, fields flat (not nested under `fields`), fixed order:
 ```
 
 - `ts` is RFC3339Nano UTC (nine fractional digits, `Z`).
-- `event` is a controlled vocabulary (`Event`), not free text.
+- `event` is a controlled name (`Event`, or an application's `Name`), not free
+  text.
 - `component` and `node_id` are the VictoriaLogs stream fields; `level`,
   `role` and `event` are ordinary query fields.
 - `truncated: true` appears only when a value did not fit the 512-byte record.

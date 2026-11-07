@@ -26,7 +26,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::config::{Pinner, Roll};
-use crate::event::{Component, Event};
+use crate::event::Event;
 use crate::level::Level;
 use crate::record::{Encoder, Record};
 
@@ -41,7 +41,7 @@ const READ_BATCH: usize = 1024;
 
 /// What the writer needs to encode its own `log.dropped` event.
 pub(crate) struct ReportConfig {
-    pub(crate) component: Component,
+    pub(crate) component: &'static str,
     pub(crate) node_id: String,
     pub(crate) clock: fn() -> i64,
 }
@@ -333,12 +333,12 @@ fn report_dropped(
     }
 
     let delta = current - *last_reported;
-    let record = Encoder::begin(
+    let record = Encoder::begin_named(
         (report.clock)(),
         Level::Warn,
         report.component,
         &report.node_id,
-        Event::LogDropped,
+        Event::LogDropped.as_str(),
     )
     .field_u64("dropped", delta)
     .finish();
@@ -403,7 +403,7 @@ mod tests {
 
     fn report() -> ReportConfig {
         ReportConfig {
-            component: Component::Driver,
+            component: Component::Driver.as_str(),
             node_id: "n".to_owned(),
             clock: frozen,
         }

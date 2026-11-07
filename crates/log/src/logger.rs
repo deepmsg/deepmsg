@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::config::{Config, InitError, Pinner};
-use crate::event::{Component, Event};
+use crate::event::{Component, Event, Name};
 use crate::level::{COMPILED_MAX, Level};
 use crate::queue::Queue;
 use crate::record::Encoder;
@@ -34,12 +34,12 @@ const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 struct Info {
     node_id: String,
     level: Level,
-    component_levels: Vec<(Component, Level)>,
+    component_levels: Vec<(&'static str, Level)>,
     clock: fn() -> i64,
 }
 
 impl Info {
-    fn enabled(&self, level: Level, component: Component) -> bool {
+    fn enabled(&self, level: Level, component: &'static str) -> bool {
         let ceiling = self
             .component_levels
             .iter()
@@ -62,13 +62,37 @@ pub struct Logger {
 impl Logger {
     /// Build an event for this logger, or a no-op builder if the level is off.
     pub fn event(&self, level: Level, component: Component, event: Event) -> EventBuilder {
+        self.event_str(level, component.as_str(), event.as_str())
+    }
+
+    /// Build an event whose component and event come from an application's
+    /// own [`Name`] implementations.
+    ///
+    /// The names are turned into `&'static str` here, at the boundary, so the
+    /// encoder below is the same one the built-in vocabulary uses and no code
+    /// is monomorphised per application type pair.
+    pub fn event_named(
+        &self,
+        level: Level,
+        component: impl Name,
+        event: impl Name,
+    ) -> EventBuilder {
+        self.event_str(level, component.as_str(), event.as_str())
+    }
+
+    fn event_str(
+        &self,
+        level: Level,
+        component: &'static str,
+        event: &'static str,
+    ) -> EventBuilder {
         if !self.info.enabled(level, component) {
             return EventBuilder::disabled();
         }
 
         EventBuilder {
             logger: Some(self.clone()),
-            encoder: Some(Encoder::begin(
+            encoder: Some(Encoder::begin_named(
                 (self.info.clock)(),
                 level,
                 component,
@@ -106,6 +130,17 @@ impl Handle {
     /// Build an event for this instance.
     pub fn event(&self, level: Level, component: Component, event: Event) -> EventBuilder {
         self.logger.event(level, component, event)
+    }
+
+    /// Build an event whose component and event come from an application's
+    /// own [`Name`] implementations.
+    pub fn event_named(
+        &self,
+        level: Level,
+        component: impl Name,
+        event: impl Name,
+    ) -> EventBuilder {
+        self.logger.event_named(level, component, event)
     }
 
     /// Records the queue refused.
@@ -168,7 +203,27 @@ impl Guard {
     /// `pinner` is the binary's platform seam; it is set on the configuration
     /// before `open`, so a `DEEPMSG_LOG_CPU` without one is refused here.
     pub fn from_env(component: Component, pinner: Option<Pinner>) -> Result<Self, InitError> {
-        Ok(Self(init_from_env_with(component, pinner)?))
+        Ok(Self(init_from_env_with(
+            component,
+            &Component::ALL_NAMES,
+            pinner,
+        )?))
+    }
+
+    /// Configure from the environment with an application-supplied vocabulary.
+    ///
+    /// `known_components` is the list `DEEPMSG_LOG_LEVEL=name=level` may use;
+    /// see [`Config::from_env_with`].
+    pub fn from_env_with(
+        component: impl Name,
+        known_components: &'static [&'static str],
+        pinner: Option<Pinner>,
+    ) -> Result<Self, InitError> {
+        Ok(Self(init_from_env_with(
+            component,
+            known_components,
+            pinner,
+        )?))
     }
 
     /// Wrap an already-open handle.
@@ -258,14 +313,15 @@ pub fn open(config: Config) -> Result<Handle, InitError> {
 /// `Ok(None)` means `DEEPMSG_LOG_DIR` was unset or empty: logging is off, and
 /// nothing was created.
 pub fn init_from_env(component: Component) -> Result<Option<Handle>, InitError> {
-    init_from_env_with(component, None)
+    init_from_env_with(component, &Component::ALL_NAMES, None)
 }
 
 fn init_from_env_with(
-    component: Component,
+    component: impl Name,
+    known_components: &'static [&'static str],
     pinner: Option<Pinner>,
 ) -> Result<Option<Handle>, InitError> {
-    let Some(mut config) = Config::from_env(component)? else {
+    let Some(mut config) = Config::from_env_with(component, known_components)? else {
         return Ok(None);
     };
     config.pinner = pinner;
@@ -291,6 +347,17 @@ pub fn init(config: Config) -> Result<Handle, InitError> {
 pub fn event(level: Level, component: Component, event: Event) -> EventBuilder {
     match LOGGER.get() {
         Some(logger) => logger.event(level, component, event),
+        None => EventBuilder::disabled(),
+    }
+}
+
+/// Build an event for the process's installed logger, with names from an
+/// application's own [`Name`] implementations.
+///
+/// With no logger installed this is a no-op builder, exactly like [`event`].
+pub fn event_named(level: Level, component: impl Name, event: impl Name) -> EventBuilder {
+    match LOGGER.get() {
+        Some(logger) => logger.event_named(level, component, event),
         None => EventBuilder::disabled(),
     }
 }
@@ -353,7 +420,7 @@ impl EventBuilder {
 fn file_path(config: &Config) -> PathBuf {
     config.dir.join(format!(
         "{}-{}.json",
-        config.component.as_str(),
+        config.component,
         safe_node_id(&config.node_id)
     ))
 }
@@ -384,7 +451,7 @@ mod tests {
 
     use super::{Guard, Handle, Logger, open};
     use crate::config::{Config, InitError, Roll};
-    use crate::event::{Component, Event};
+    use crate::event::{Component, Event, Name};
     use crate::level::Level;
     use crate::queue::Queue;
     use crate::record::Record;
@@ -422,7 +489,7 @@ mod tests {
         Config {
             dir: directory.to_path_buf(),
             node_id: "node-1".to_owned(),
-            component: Component::Driver,
+            component: Component::Driver.as_str(),
             level,
             component_levels: Vec::new(),
             roll: Roll::default(),
@@ -454,6 +521,47 @@ mod tests {
         assert!(text.starts_with("{\"ts\":\"1970-01-01T00:00:00.000000000Z\""));
         assert!(text.contains("\"msg\":\"hello\""));
         assert!(text.contains("\"term\":7"));
+
+        handle.shutdown();
+    }
+
+    #[test]
+    fn an_application_name_reaches_the_file() {
+        struct Engine;
+        impl Name for Engine {
+            fn as_str(&self) -> &'static str {
+                "engine"
+            }
+        }
+
+        enum EngineEvent {
+            Start,
+        }
+        impl Name for EngineEvent {
+            fn as_str(&self) -> &'static str {
+                match self {
+                    EngineEvent::Start => "engine.start",
+                }
+            }
+        }
+
+        let directory = TempDir::new();
+        let mut settings = config(directory.path(), Level::Info);
+        settings.component = Engine.as_str();
+        let handle = open(settings).unwrap();
+
+        handle
+            .event_named(Level::Info, Engine, EngineEvent::Start)
+            .field_str("symbol", "AAPL")
+            .emit();
+
+        handle.flush();
+        let text =
+            fs::read_to_string(directory.path().join("engine-node-1.json")).expect("log file");
+        assert_eq!(1, text.lines().count());
+        assert!(text.contains("\"component\":\"engine\""));
+        assert!(text.contains("\"event\":\"engine.start\""));
+        assert!(text.contains("\"symbol\":\"AAPL\""));
 
         handle.shutdown();
     }
