@@ -213,6 +213,9 @@ if [ "$list_only" = 1 ]; then
     echo "results         $out"
     if preflight; then
         echo "prerequisites: ok"
+        # The plan is the whole answer. Without this exit the script fell
+        # through and ran the batch that --list was only asked to describe.
+        exit 0
     else
         echo "prerequisites: NOT met (see above); nothing was run." >&2
         exit 2
