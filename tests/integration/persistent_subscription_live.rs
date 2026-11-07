@@ -742,7 +742,20 @@ fn reason(
 /// An archive of ours, running.
 fn rig(test_name: &str) -> Option<(OwnArchivingMediaDriver, TempDir)> {
     let archive_dir = TempDir::new(test_name);
-    let properties: Vec<&str> = archive::PROPERTIES.to_vec();
+    // The source half keeps a publication open but is not polled while the
+    // subscription works (the reference's PersistentPublication is driven by
+    // its own loop). The driver reaps a client silent for 10 s and takes its
+    // publication with it, which closes the live image the subscription is
+    // waiting for; on a loaded runner the gap can reach that. The test is not
+    // about client liveness, so give it room.
+    let properties: Vec<&str> = archive::PROPERTIES
+        .iter()
+        .copied()
+        .chain([
+            "-Daeron.client.liveness.timeout=120s",
+            "-Daeron.publication.unblock.timeout=130s",
+        ])
+        .collect();
 
     let Some(mut media_driver) =
         OwnArchivingMediaDriver::start(test_name, archive_dir.path(), &properties)
