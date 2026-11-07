@@ -26,6 +26,7 @@ import yaml
 
 HERE = Path(__file__).resolve().parent
 CONFIG = HERE.parent / "agent" / "otelcol.yaml"
+APP_CONFIG = HERE.parent / "agent" / "otelcol-app.yaml"
 README = HERE.parent / "README.md"
 
 GO_LAYOUT = "2006-01-02T15:04:05.999999999Z07:00"
@@ -326,6 +327,112 @@ def exporter_checks() -> None:
     )
 
 
+def app_config_checks(base: dict) -> None:
+    """The application-metrics overlay: one scrape job and one pipeline.
+
+    A host with application metrics runs the base config and this file through
+    one collector (`deepmsg-app-agent.service`). The collector merges maps, so
+    the overlay must add only names it owns; the base's processors and exporter
+    are reused by name and are checked to still exist. A pipeline missing
+    `transform/node_id` is silent: the samples arrive without the host identity.
+    """
+    try:
+        config = yaml.safe_load(APP_CONFIG.read_text())
+    except FileNotFoundError:
+        failures.append(f"missing {APP_CONFIG}")
+        return
+    except yaml.YAMLError as error:
+        failures.append(f"{APP_CONFIG}: not valid YAML: {error}")
+        return
+    if not isinstance(config, dict):
+        failures.append(f"{APP_CONFIG}: not a mapping")
+        return
+
+    receivers = mapping(config.get("receivers"), "app.receivers")
+    prometheus = mapping(receivers.get("prometheus/app"), "app.receivers.prometheus/app")
+    prometheus_config = mapping(prometheus.get("config"), "app.prometheus/app.config")
+    scrape_configs = sequence(prometheus_config.get("scrape_configs"), "app.scrape_configs")
+    check("app scrape job count", len(scrape_configs), 1)
+    if scrape_configs:
+        job = mapping(scrape_configs[0], "app.scrape_configs[0]")
+        check("app scrape job name", job.get("job_name"), "app-metrics")
+        check("app scrape interval", job.get("scrape_interval"), "15s")
+        static = sequence(job.get("static_configs"), "app.static_configs")
+        targets = sequence(
+            mapping(static[0], "app.static_configs[0]").get("targets") if static else None,
+            "app.targets",
+        )
+        check("app scrape target", targets, ["${env:DEEPMSG_APP_METRICS_ENDPOINT}"])
+
+    processors = mapping(config.get("processors"), "app.processors")
+    limiter = mapping(processors.get("memory_limiter/app"), "app.processors.memory_limiter/app")
+    check("app memory check interval", limiter.get("check_interval"), "1s")
+    check("app memory limit", limiter.get("limit_mib"), 64)
+
+    service = mapping(config.get("service"), "app.service")
+    pipelines = mapping(service.get("pipelines"), "app.service.pipelines")
+    pipeline = mapping(pipelines.get("metrics/app"), "app.pipelines.metrics/app")
+    check("app.metrics/app.receivers", pipeline.get("receivers"), ["prometheus/app"])
+    check(
+        "app.metrics/app.processors",
+        pipeline.get("processors"),
+        ["memory_limiter/app", "resource/node_id", "transform/node_id", "batch"],
+    )
+    check(
+        "app.metrics/app.exporters",
+        pipeline.get("exporters"),
+        ["prometheusremotewrite/victoriametrics"],
+    )
+
+    # What the overlay reuses must still exist in the base: a rename there would
+    # otherwise fail only when the second config is loaded on a host.
+    base_processors = mapping(base.get("processors"), "processors")
+    for name in ("resource/node_id", "transform/node_id", "batch"):
+        check(f"app pipeline processor {name} exists in the base", name in base_processors, True)
+    base_exporters = mapping(base.get("exporters"), "exporters")
+    check(
+        "app pipeline exporter exists in the base",
+        "prometheusremotewrite/victoriametrics" in base_exporters,
+        True,
+    )
+
+
+def app_agent_unit_checks() -> None:
+    """The unit that loads both configs, and the variable it cannot start without."""
+    systemd = HERE.parent / "systemd"
+    unit = systemd / "deepmsg-app-agent.service"
+    check("app agent unit exists", unit.is_file(), True)
+    if not unit.is_file():
+        return
+    text = unit.read_text()
+    check(
+        "app agent unit uses the environment file",
+        "EnvironmentFile=/etc/deepmsg/observability.env" in text,
+        True,
+    )
+    check(
+        "app agent unit loads both configs",
+        "--config /etc/deepmsg/otelcol.yaml --config /etc/deepmsg/otelcol-app.yaml" in text,
+        True,
+    )
+    check(
+        "app agent unit may read the log directory",
+        "ReadOnlyPaths=/var/log/deepmsg" in text,
+        True,
+    )
+    check(
+        "app agent unit may write the collector state",
+        "ReadWritePaths=/var/lib/deepmsg-otelcol" in text,
+        True,
+    )
+    environment = systemd / "observability.env.example"
+    check(
+        "environment example names the app metrics endpoint",
+        "DEEPMSG_APP_METRICS_ENDPOINT=" in environment.read_text(),
+        True,
+    )
+
+
 def main() -> int:
     try:
         text = CONFIG.read_text()
@@ -533,10 +640,17 @@ def main() -> int:
     except FileNotFoundError:
         failures.append(f"missing {README}")
         readme = ""
-    referenced = sorted(set(re.findall(r"\$\{env:([A-Z0-9_]+)\}", text)))
+    try:
+        app_text = APP_CONFIG.read_text()
+    except FileNotFoundError:
+        failures.append(f"missing {APP_CONFIG}")
+        app_text = ""
+    referenced = sorted(set(re.findall(r"\$\{env:([A-Z0-9_]+)\}", text + app_text)))
     for name in referenced:
         check(f"{name} is documented in README.md", name in readme, True)
 
+    app_config_checks(config)
+    app_agent_unit_checks()
     grafana_checks()
     exporter_checks()
 

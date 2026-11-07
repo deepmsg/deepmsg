@@ -1,0 +1,37 @@
+# The application-metrics overlay.
+#
+# The base config is the whole pipeline for a host with no application
+# metrics. A host that runs an application with its own Prometheus endpoint
+# uses `deepmsg-app-agent.service`, which passes both files to the collector:
+# the collector merges maps and replaces lists, so this file adds one receiver
+# and one pipeline and leaves the base's receivers, processors, exporters,
+# extensions and telemetry alone.
+#
+# One endpoint per host: the application decides what it exposes. A cluster
+# member points it at its engine; a client host at its gateway. The samples go
+# through the same `resource/node_id` and `transform/node_id` processors as the
+# host metrics, so the host's identity is attached once, by the agent.
+
+receivers:
+  prometheus/app:
+    config:
+      scrape_configs:
+        - job_name: app-metrics
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["${env:DEEPMSG_APP_METRICS_ENDPOINT}"]
+
+processors:
+  # The base limiter bounds the log/host pipeline; a pipeline gets its own
+  # processor instance, so the application pipeline carries its own, smaller
+  # bound rather than silently doubling the base one.
+  memory_limiter/app:
+    check_interval: 1s
+    limit_mib: 64
+
+service:
+  pipelines:
+    metrics/app:
+      receivers: [prometheus/app]
+      processors: [memory_limiter/app, resource/node_id, transform/node_id, batch]
+      exporters: [prometheusremotewrite/victoriametrics]

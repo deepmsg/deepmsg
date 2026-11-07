@@ -1,0 +1,34 @@
+[Unit]
+Description=deepmsg node agent (base pipeline + application metrics)
+Documentation=https://github.com/deepmsg/deepmsg
+After=network-online.target
+Wants=network-online.target
+# Use this unit instead of deepmsg-log-agent on a host whose application
+# exposes metrics. An unset endpoint fails the collector's config, so a host
+# without one keeps the base unit (and its base config) instead.
+ConditionEnvironment=DEEPMSG_APP_METRICS_ENDPOINT
+
+[Service]
+Type=simple
+User=deepmsg
+Group=deepmsg
+# Holds DEEPMSG_OBS_WRITE_TOKEN; mode 0600.
+EnvironmentFile=/etc/deepmsg/observability.env
+ExecStart=/usr/local/bin/otelcol-contrib --config /etc/deepmsg/otelcol.yaml --config /etc/deepmsg/otelcol-app.yaml
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+# The same hardening as the base agent: it reads the applications' logs and the
+# host's /proc and /sys, and writes only its own state. Do not run this unit and
+# deepmsg-log-agent on the same host: they share the state directory, and two
+# collectors would each keep their own filelog offsets.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/var/log/deepmsg
+ReadWritePaths=/var/lib/deepmsg-otelcol
+
+[Install]
+WantedBy=multi-user.target
