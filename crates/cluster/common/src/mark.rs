@@ -300,7 +300,7 @@ impl ClusterMarkFile {
         now_ms: i64,
     ) -> Result<(MappedFile, i64), ClusterMarkError> {
         let existing = MappedFile::open_readwrite(path)?;
-        let candidate_term_id = {
+        let (candidate_term_id, existing_error_length) = {
             let buffer = existing
                 .region(0, HEADER_LENGTH)
                 .ok_or_else(|| io::Error::other("mark file too short to hold a header"))?;
@@ -352,9 +352,30 @@ impl ClusterMarkFile {
                 return Err(ClusterMarkError::Active { pid });
             }
 
-            buffer.load_i64(CANDIDATE_TERM_ID).unwrap_or(-1)
+            let existing_error_length =
+                usize::try_from(buffer.load_i32(ERROR_BUFFER_LENGTH_FIELD).unwrap_or(0))
+                    .map_err(|_| ClusterMarkError::Uninitialised)?;
+
+            (
+                buffer.load_i64(CANDIDATE_TERM_ID).unwrap_or(-1),
+                existing_error_length,
+            )
         };
-        Ok((existing, candidate_term_id))
+
+        // The reference rescues what the previous owner left in the error
+        // buffer and clears it before the new header is written
+        // (`ClusterMarkFile.java:197-201`). Only a non-zero buffer produces a
+        // file; the file is a copy of the buffer's own bytes, which is what
+        // `deepmsg-errorlog-exporter` reads.
+        let adopted = Self {
+            mapping: existing,
+            path: path.to_path_buf(),
+            error_buffer_length: existing_error_length,
+        };
+        adopted.save_existing_errors(&required.to_string(), now_ms)?;
+        adopted.clear_error_buffer();
+
+        Ok((adopted.mapping, candidate_term_id))
     }
 
     /// Whether the file's own timestamp says a process is alive within
