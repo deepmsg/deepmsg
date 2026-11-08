@@ -15,7 +15,7 @@ Every check below goes through vmauth with the **read** token
 | [`driver-metrics-absent`](#driver-metrics-absent) | P1 | `absent(deepmsg_driver_heartbeat_age_seconds) or (up{job="deepmsg-counters"} == bool 0)` | 30s |
 | [`cluster-role-jitter`](#cluster-role-jitter) | P1 | LogsQL `event:"role.change" \| stats by (node_id) count() as changes`, `>= 3` | 0s |
 | [`loss-rate`](#loss-rate) | P2 | `rate(deepmsg_loss_total[5m]) > 0` | 5m |
-| [`disk-watermark`](#disk-watermark) | P2 | `system_filesystem_utilization_ratio > 0.8` | 5m |
+| [`disk-watermark`](#disk-watermark) | P2 | `system_filesystem_usage_bytes{state="used"} / (used + free) > 0.8` | 5m |
 | [`log-export-dropped`](#log-export-dropped) | P3 | `otelcol_exporter_queue_size >= bool 10000` | 1m |
 | [`commit-lag`](#commit-lag) | — | **not provisioned**: no append-position counter | — |
 
@@ -118,7 +118,10 @@ window (`deepmsg_receiver_window`).
 <a id="disk-watermark"></a>
 ## Disk above eighty percent (P2)
 
-**What it means:** a filesystem on a deepmsg host is over 80% used.
+**What it means:** a filesystem on a deepmsg host is over 80% used. The
+collector (v0.164.0) no longer emits `system.filesystem.utilization` — its
+`filesystem` scraper publishes `system_filesystem_usage_bytes` per state — so
+the ratio is computed on the query: `used / (used + free)`.
 
 **First checks:**
 

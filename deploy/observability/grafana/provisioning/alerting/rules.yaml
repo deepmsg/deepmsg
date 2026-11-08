@@ -171,7 +171,9 @@ groups:
             datasourceUid: victoriametrics
             model:
               editorMode: code
-              expr: system_filesystem_utilization_ratio
+              # The collector (0.164.0) no longer emits
+              # system.filesystem.utilization; the ratio is used/(used+free).
+              expr: system_filesystem_usage_bytes{state="used"} / ignoring(state) (system_filesystem_usage_bytes{state="used"} + ignoring(state) system_filesystem_usage_bytes{state="free"})
               instant: true
               range: false
               refId: A
