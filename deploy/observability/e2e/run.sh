@@ -152,6 +152,7 @@ users:
           - /api/v1/series
           - /api/v1/labels
           - /api/v1/label/__name__/values
+          - /api/v1/label/node_id/values
           - /api/v1/metadata
         url_prefix: "http://127.0.0.1:$VM_PORT"
 YAML
@@ -469,6 +470,16 @@ status_with_token=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Be
 [[ $status_with_token == 200 ]] ||
   fail "vmauth answered $status_with_token for a read with the token"
 echo "e2e: C4: 401 without a token (read and write), 200 with it"
+
+# The dashboards' `$node` variable is `label_values(deepmsg_driver_up,
+# node_id)`, which Grafana sends to /api/v1/label/node_id/values; an exact-path
+# table missing it leaves every panel scoped to an empty variable.
+status_label_values=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+  --get --data-urlencode 'match[]=deepmsg_driver_up' \
+  "http://127.0.0.1:$VMAUTH_PORT/api/v1/label/node_id/values")
+[[ $status_label_values == 200 ]] ||
+  fail "the node_id label-values path answered $status_label_values"
+echo "e2e: C4: the dashboard's label_values path (/api/v1/label/node_id/values) is routed"
 
 # An absent failure counter and a broken exporter look the same, so the sent
 # counter has to prove the pipeline works before zero means anything. The

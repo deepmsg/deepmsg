@@ -39,5 +39,6 @@ users:
           - /api/v1/series
           - /api/v1/labels
           - /api/v1/label/__name__/values
+          - /api/v1/label/node_id/values
           - /api/v1/metadata
         url_prefix: "http://__VM_HOST__:8428"
