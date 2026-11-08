@@ -136,6 +136,7 @@ users:
       - src_paths:
           - /insert/opentelemetry/v1/logs
           - /select/logsql/query
+          - /select/logsql/hits
           - /select/logsql/stats_query
           - /select/logsql/stats_query_range
           - /select/logsql/streams
@@ -151,6 +152,7 @@ users:
           - /api/v1/series
           - /api/v1/labels
           - /api/v1/label/__name__/values
+          - /api/v1/label/node_id/values
           - /api/v1/metadata
         url_prefix: "http://127.0.0.1:$VM_PORT"
 YAML
@@ -300,6 +302,19 @@ wait_logs 'event:"backpressure.enter"' \
   'any(.[]; .event == "backpressure.enter" and ._msg == "a synthetic message")' 30 ||
   fail "a line with msg did not reach _msg"
 echo "e2e: C1: a line with msg reaches _msg as text"
+
+# The log-volume panel asks /select/logsql/hits; a path missing from vmauth's
+# exact table answers 400 there, which Grafana shows as "Failed to load log
+# volume for this query" rather than as a broken query.
+now=$(date +%s)
+hits=$(curl -s -G -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode 'query=*' --data-urlencode 'field=level' --data-urlencode 'step=1m' \
+  --data-urlencode "start=$(((now - 600) * 1000000000))" \
+  --data-urlencode "end=$((now * 1000000000))" \
+  "http://127.0.0.1:$VMAUTH_PORT/select/logsql/hits") || fail "the hits query failed"
+printf '%s' "$hits" | jq -e '.hits | length > 0' >/dev/null 2>&1 ||
+  fail "the log-volume query (/select/logsql/hits) answered nothing: $hits"
+echo "e2e: C1: the log-volume query answers through vmauth"
 
 # C2/C8: a live driver, the counters exporter, the agent's scrape, and
 # VictoriaMetrics answering. A second driver on its own directory keeps a
@@ -455,6 +470,16 @@ status_with_token=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Be
 [[ $status_with_token == 200 ]] ||
   fail "vmauth answered $status_with_token for a read with the token"
 echo "e2e: C4: 401 without a token (read and write), 200 with it"
+
+# The dashboards' `$node` variable is `label_values(deepmsg_driver_up,
+# node_id)`, which Grafana sends to /api/v1/label/node_id/values; an exact-path
+# table missing it leaves every panel scoped to an empty variable.
+status_label_values=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" \
+  --get --data-urlencode 'match[]=deepmsg_driver_up' \
+  "http://127.0.0.1:$VMAUTH_PORT/api/v1/label/node_id/values")
+[[ $status_label_values == 200 ]] ||
+  fail "the node_id label-values path answered $status_label_values"
+echo "e2e: C4: the dashboard's label_values path (/api/v1/label/node_id/values) is routed"
 
 # An absent failure counter and a broken exporter look the same, so the sent
 # counter has to prove the pipeline works before zero means anything. The

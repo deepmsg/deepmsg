@@ -73,7 +73,7 @@
         {
           "datasource": {"type": "prometheus", "uid": "victoriametrics"},
           "editorMode": "code",
-          "expr": "system_filesystem_utilization_ratio{node_id=~\"$node\"} > 0",
+          "expr": "system_filesystem_usage_bytes{node_id=~\"$node\", state=\"used\"} / ignoring(state) (system_filesystem_usage_bytes{node_id=~\"$node\", state=\"used\"} + ignoring(state) system_filesystem_usage_bytes{node_id=~\"$node\", state=\"free\"}) > 0",
           "legendFormat": "{{mountpoint}}",
           "range": true,
           "refId": "A"

@@ -171,7 +171,9 @@ groups:
             datasourceUid: victoriametrics
             model:
               editorMode: code
-              expr: system_filesystem_utilization_ratio
+              # The collector (0.164.0) no longer emits
+              # system.filesystem.utilization; the ratio is used/(used+free).
+              expr: system_filesystem_usage_bytes{state="used"} / ignoring(state) (system_filesystem_usage_bytes{state="used"} + ignoring(state) system_filesystem_usage_bytes{state="free"})
               instant: true
               range: false
               refId: A
@@ -199,7 +201,7 @@ groups:
         isPaused: false
 
       - uid: log-export-dropped
-        title: Log export failing or queue full
+        title: Log export queue at the cap
         condition: C
         data:
           - refId: A
@@ -207,7 +209,10 @@ groups:
             datasourceUid: victoriametrics
             model:
               editorMode: code
-              expr: (otelcol_exporter_send_failed_log_records_total > bool 0) or (otelcol_exporter_queue_size >= bool 10000)
+              # The collector (v0.164.0) exposes no send-failure counter —
+              # `otelcol_exporter_send_failed_*` does not exist — so the queue
+              # size is the signal: a full persistent queue drops records.
+              expr: otelcol_exporter_queue_size >= bool 10000
               instant: true
               range: false
               refId: A
@@ -228,7 +233,7 @@ groups:
         execErrState: Error
         for: 1m
         annotations:
-          summary: The collector is dropping log records or its queue is at the cap.
+          summary: The collector's log queue is at its cap and records are being dropped.
           runbook_url: https://github.com/deepmsg/deepmsg/blob/main/deploy/observability/grafana/runbook.md#log-export-dropped
         labels:
           severity: P3
