@@ -4,9 +4,11 @@ Documentation=https://github.com/deepmsg/deepmsg
 After=network-online.target
 Wants=network-online.target
 # Use this unit instead of deepmsg-log-agent on a host whose application
-# exposes metrics. An unset endpoint fails the collector's config, so a host
-# without one keeps the base unit (and its base config) instead.
-ConditionEnvironment=DEEPMSG_APP_METRICS_ENDPOINT
+# exposes metrics. The deployer enables it only on such a host; an unset
+# endpoint fails the collector's config, which is the failure we want there.
+# ★ Do not add a ConditionEnvironment= for the endpoint: systemd evaluates
+# conditions before it loads EnvironmentFile=, so the unit is skipped with
+# "condition unmet" on a host whose env file does set it (measured 2026-11-08).
 
 [Service]
 Type=simple

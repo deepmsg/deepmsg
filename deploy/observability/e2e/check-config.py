@@ -367,7 +367,7 @@ def app_config_checks(base: dict) -> None:
     processors = mapping(config.get("processors"), "app.processors")
     limiter = mapping(processors.get("memory_limiter/app"), "app.processors.memory_limiter/app")
     check("app memory check interval", limiter.get("check_interval"), "1s")
-    check("app memory limit", limiter.get("limit_mib"), 64)
+    check("app memory limit", limiter.get("limit_mib"), 128)
 
     service = mapping(config.get("service"), "app.service")
     pipelines = mapping(service.get("pipelines"), "app.service.pipelines")
