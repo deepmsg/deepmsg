@@ -157,8 +157,9 @@ An application with its own Prometheus endpoint joins the same pipeline through
 base config and the overlay to **one** collector, so the host keeps one
 process, one state directory, and the base's processors and remote-write
 exporter; the overlay adds a scrape job (`app-metrics`, target
-`DEEPMSG_APP_METRICS_ENDPOINT`), its own small memory limiter, and the
-`metrics/app` pipeline.
+`DEEPMSG_APP_METRICS_ENDPOINT`), its own memory limiter (128 MiB: the limiter
+measures the whole collector, and a bare collector already sits at ~50 MiB),
+and the `metrics/app` pipeline.
 
 - One endpoint per host: the application decides what it exposes. A cluster
   member points it at its engine, a client host at its gateway.

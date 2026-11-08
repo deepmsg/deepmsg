@@ -23,11 +23,14 @@ receivers:
 
 processors:
   # The base limiter bounds the log/host pipeline; a pipeline gets its own
-  # processor instance, so the application pipeline carries its own, smaller
-  # bound rather than silently doubling the base one.
+  # processor instance, so the application pipeline carries its own bound.
+  # ★ The limiter measures the whole collector process, not this pipeline: a
+  # bare collector already sits at ~50 MiB, so a 64 MiB limit (soft limit ≈51)
+  # refused every app scrape on the four-host rig (2026-11-08). 128 MiB leaves
+  # headroom and still bounds the pipeline.
   memory_limiter/app:
     check_interval: 1s
-    limit_mib: 64
+    limit_mib: 128
 
 service:
   pipelines:
