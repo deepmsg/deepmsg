@@ -24,6 +24,7 @@ users:
     url_map:
       - src_paths:
           - /select/logsql/query
+          - /select/logsql/hits
           - /select/logsql/stats_query
           - /select/logsql/stats_query_range
           - /select/logsql/streams

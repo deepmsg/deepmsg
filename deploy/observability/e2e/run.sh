@@ -136,6 +136,7 @@ users:
       - src_paths:
           - /insert/opentelemetry/v1/logs
           - /select/logsql/query
+          - /select/logsql/hits
           - /select/logsql/stats_query
           - /select/logsql/stats_query_range
           - /select/logsql/streams
@@ -300,6 +301,19 @@ wait_logs 'event:"backpressure.enter"' \
   'any(.[]; .event == "backpressure.enter" and ._msg == "a synthetic message")' 30 ||
   fail "a line with msg did not reach _msg"
 echo "e2e: C1: a line with msg reaches _msg as text"
+
+# The log-volume panel asks /select/logsql/hits; a path missing from vmauth's
+# exact table answers 400 there, which Grafana shows as "Failed to load log
+# volume for this query" rather than as a broken query.
+now=$(date +%s)
+hits=$(curl -s -G -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode 'query=*' --data-urlencode 'field=level' --data-urlencode 'step=1m' \
+  --data-urlencode "start=$(((now - 600) * 1000000000))" \
+  --data-urlencode "end=$((now * 1000000000))" \
+  "http://127.0.0.1:$VMAUTH_PORT/select/logsql/hits") || fail "the hits query failed"
+printf '%s' "$hits" | jq -e '.hits | length > 0' >/dev/null 2>&1 ||
+  fail "the log-volume query (/select/logsql/hits) answered nothing: $hits"
+echo "e2e: C1: the log-volume query answers through vmauth"
 
 # C2/C8: a live driver, the counters exporter, the agent's scrape, and
 # VictoriaMetrics answering. A second driver on its own directory keeps a

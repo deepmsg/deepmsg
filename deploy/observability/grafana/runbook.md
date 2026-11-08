@@ -16,7 +16,7 @@ Every check below goes through vmauth with the **read** token
 | [`cluster-role-jitter`](#cluster-role-jitter) | P1 | LogsQL `event:"role.change" \| stats by (node_id) count() as changes`, `>= 3` | 0s |
 | [`loss-rate`](#loss-rate) | P2 | `rate(deepmsg_loss_total[5m]) > 0` | 5m |
 | [`disk-watermark`](#disk-watermark) | P2 | `system_filesystem_utilization_ratio > 0.8` | 5m |
-| [`log-export-dropped`](#log-export-dropped) | P3 | `(send_failed_log_records > bool 0) or (queue_size >= bool 10000)` | 1m |
+| [`log-export-dropped`](#log-export-dropped) | P3 | `otelcol_exporter_queue_size >= bool 10000` | 1m |
 | [`commit-lag`](#commit-lag) | — | **not provisioned**: no append-position counter | — |
 
 Both checks below are the same ones the E2E uses:
@@ -132,14 +132,15 @@ old rotated logs and segments. Never delete the current segment or a recording
 an archive is still writing.
 
 <a id="log-export-dropped"></a>
-## Log export failing or queue full (P3)
+## Log export queue at the cap (P3)
 
-**What it means:** the collector is dropping log records, or its persistent
-queue is at the cap.
+**What it means:** the collector's persistent queue is at its cap, so new log
+records are being dropped. The collector (v0.164.0) exposes no send-failure
+counter — `otelcol_exporter_send_failed_*` does not exist — so the queue size
+is the only signal.
 
-**First checks:** the collector's own metrics in VictoriaMetrics
-(`otelcol_exporter_send_failed_log_records_total`,
-`otelcol_exporter_queue_size`), then vmauth and the backends:
+**First checks:** the collector's own metric in VictoriaMetrics
+(`otelcol_exporter_queue_size`), then vmauth and the backends:
 
 ```sh
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8427/select/logsql/query
