@@ -11,6 +11,13 @@
 #                [--no-track-history] [--no-counters] [--no-irq-snapshots]
 #                [--layout legacy|spread] [--driver-cpuset LIST|none]
 #
+# One environment variable is not a switch because it is a property of the
+# batch, not of a cell: `BENCH_APPOINTED_LEADER=<member id>` pins the cluster's
+# leader for every cell and every arm (`aeron.cluster.appointed.leader.id`).
+# Without it the leader is elected per cell, and since the arms are separate
+# cells every arm ratio is then also a comparison of the members the leaders
+# landed on. Each cell prints `leader member <i> (roles ...)` either way.
+#
 # Two switches for the 2026-11-04 layout study, both recorded in RUN-INFO:
 #
 #   --layout legacy   the layout every reading before 2026-11-04 was taken with:
@@ -128,6 +135,19 @@ path_port=${BENCH_PATH_PORT:-61411}
 # is told apart from one that is merely slow. Empty keeps every arm on its
 # default (the reference's is 10 s, `ConsensusModule.java:739`).
 session_timeout=${BENCH_CLUSTER_SESSION_TIMEOUT:-}
+# ★ Which member leads, pinned. `-1` (the default) keeps the reference's
+# behaviour -- an election -- and then the leader lands wherever it lands. That
+# is not noise: the arms are separate cells, so an elected leader makes every
+# arm ratio a comparison of the arms *and* of whichever member won that cell's
+# election. The 2026-11-04 three-member study measured the leader's host alone
+# at +15.3% (p50 bands .19 156 / .20 168 / .15 182 us) and called the unpinned
+# arm comparison a design flaw.
+#
+# The value is a member id (0 = the first `--member`, ...). Both consensus
+# modules honour `aeron.cluster.appointed.leader.id`; it disables failover, so
+# pin it only in a batch that injects no faults. Each cell prints the roles it
+# ended with, and RUN-INFO says which value was used.
+appointed_leader=${BENCH_APPOINTED_LEADER:--1}
 keep_recordings=0
 # A1 and A2 (2026-11-04): the time series the client's own histogram logger
 # writes (`.hdr.csv`, one row per second) and the members' counters taken before
@@ -522,6 +542,11 @@ if [ "$list_only" = 1 ]; then
     fi
     echo "cores           driver pins 1,2,3; node side $NODE_CPUS"
     echo "layout          $layout; service core $CONTAINER_CPU; driver process mask ${driver_cpuset:-every core}"
+    if [ "${appointed_leader:--1}" -ge 0 ]; then
+        echo "leader          appointed member $appointed_leader, every cell and every arm"
+    else
+        echo "leader          elected per cell; the arms are separate cells"
+    fi
     echo "instruments     history $track_history_flag; member counters $([ "$counters" -eq 1 ] && echo on || echo off); irq snapshots $([ "$irq_samples" -eq 1 ] && echo on || echo off)"
     echo "results         $out"
     echo
@@ -581,6 +606,13 @@ bench_fingerprint "$out/fingerprint.txt" >/dev/null
     echo "                archive $ARCHIVE_CPUS, consensus module $CM_CPU, container $CONTAINER_CPU"
     echo "layout          $layout; the node JVM floats over $NODE_CPUS, the service is"
     echo "                pinned to $CONTAINER_CPU; the driver's process mask is ${driver_cpuset:-every core}"
+    if [ "${appointed_leader:--1}" -ge 0 ]; then
+        echo "leader          appointed member $appointed_leader (aeron.cluster.appointed.leader.id);"
+        echo "                every cell, every arm -- the host is not allowed to be an arm"
+    else
+        echo "leader          elected (aeron.cluster.appointed.leader.id=-1); each cell's leader"
+        echo "                is whatever its election produced, and the arms are separate cells"
+    fi
     echo "instruments     track.history=$track_history_flag (the client's .hdr.csv is the time series);"
     echo "                member counters $([ "$counters" -eq 1 ] && echo on || echo off) (run-N/member<i>/counters.txt)"
     echo "                irq snapshots $([ "$irq_samples" -eq 1 ] && echo on || echo off) (run-N/member<i>/irq-before|after.txt)"
@@ -676,6 +708,7 @@ _member_props() { # <i> <run-dir> <arm> <sync-archive> <sync-cluster>
         echo "bench_archive=$BENCH_ARCHIVE"
         echo "bench_cluster_node=$BENCH_CLUSTER_NODE"
         echo "bench_cluster_container=$BENCH_CLUSTER_CONTAINER"
+        echo "appointed_leader=$appointed_leader"
         echo "driver_conductor_cpu=1"
         echo "driver_sender_cpu=2"
         echo "driver_receiver_cpu=3"
@@ -791,6 +824,28 @@ _member_counters() { # <i> <run-dir>
     fi
     ssh -n -o BatchMode=yes "$host" "bash $mdir/member-node.sh counters $mdir" >/dev/null 2>&1 || true
     scp -q "$host:$mdir/counters.txt" "$dir/member$i/counters.txt" 2>/dev/null || true
+}
+
+# Who led the cell, straight out of the counters just collected. `Cluster.Role`
+# is FOLLOWER=0 / CANDIDATE=1 / LEADER=2 (`Cluster.java:40-45`). It is printed,
+# never asserted, and `?` is what a member with no counters looks like: a cell
+# whose roles cannot be read is a cell the reader must not attribute.
+_cell_leader() { # <run-dir>
+    local dir=$1 i role leader=-1 roles=""
+    for ((i = 0; i < member_count; i++)); do
+        role="?"
+        if [ -f "$dir/member$i/counters.txt" ]; then
+            role=$(awk '/Cluster node role/ { print $3; exit }' "$dir/member$i/counters.txt")
+            role=${role:-?}
+            if [ "$role" = "2" ]; then leader=$i; fi
+        fi
+        roles+="${roles:+,}$role"
+    done
+    if [ "$leader" -ge 0 ]; then
+        echo "  leader member $leader (roles $roles)"
+    else
+        echo "  leader unknown (roles $roles)"
+    fi
 }
 
 # A4: `/proc/interrupts` and `/proc/net/softnet_stat` before and after the
@@ -1153,6 +1208,7 @@ _cell() {
         for ((i = 0; i < member_count; i++)); do
             _member_counters "$i" "$dir" || true
         done
+        _cell_leader "$dir"
     fi
 
     _stop_all
