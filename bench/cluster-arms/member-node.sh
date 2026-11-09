@@ -205,10 +205,26 @@ _archive_common_defines() {
         "-Daeron.archive.replayer.cycle.threshold=1ms"
 }
 
+# The leader is a property both consensus modules honour: the reference's
+# `aeron.cluster.appointed.leader.id` (`ConsensusModule.java:451`) and ours
+# (`crates/cluster/consensus/src/config.rs:181`). `-1` is the default and means
+# "elect", so an empty or absent value changes nothing. Anything else pins the
+# leader, which is what a batch needs when its arms are separate cells: without
+# it each cell's leader lands wherever it lands, and the arm ratio is really a
+# ratio of arms *and* hosts (measured at +15.3%, 2026-11-04).
+_appoint_define() {
+    if [ "${appointed_leader:--1}" -ge 0 ] 2>/dev/null; then
+        printf '%s\n' "-Daeron.cluster.appointed.leader.id=$appointed_leader"
+    fi
+}
+
 start_node_java() { # j, j-d
     local logfile=$dir/node.log
     local -a defines=()
     while IFS= read -r line; do defines+=("$line"); done < <(_cluster_common_defines)
+    local appoint
+    appoint=$(_appoint_define)
+    if [ -n "$appoint" ]; then defines+=("$appoint"); fi
     JVM_OPTS="${defines[*]} \
 -Daeron.cluster.idle.strategy=noop \
 -Daeron.cluster.control.channel=$control \
@@ -262,6 +278,9 @@ start_consensus_deepmsg() {
     local logfile=$dir/module.log
     local -a defines=()
     while IFS= read -r line; do defines+=("$line"); done < <(_cluster_common_defines)
+    local appoint
+    appoint=$(_appoint_define)
+    if [ -n "$appoint" ]; then defines+=("$appoint"); fi
     taskset -c "$cm_cpu" "$bench_cluster_node" \
         "${defines[@]}" \
         "-Daeron.cluster.control.channel=$control" \
