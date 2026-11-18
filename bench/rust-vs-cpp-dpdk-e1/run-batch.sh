@@ -57,6 +57,10 @@ ROUNDS=${E1_ROUNDS:-"1-R:R 2-C:C 3-C:C 4-R:R"}
 LINK_WAIT=${E1_LINK_WAIT:-25}
 
 OUT=${E1_OUT:-/home/gavin/data/trader/analysis/dpdk/e1-out/$(date +%Y-%m-%d-%H%M%S)}
+# Set by `driver_start_arm` when `E1_PERF=1`: perf attaches to the two driver
+# processes, not to the rig and the node.
+RIG_DRIVER_PID=""
+NODE_DRIVER_PID=""
 
 CNC_TOOL=${E1_CNC_TOOL:-$RUST_BIN/cnc-dump}
 DEVBIND=${E1_DEVBIND:-/usr/bin/dpdk-devbind.py}
@@ -227,6 +231,15 @@ driver_start_arm() { # $1 = arm, $2 = side, $3 = log, $4 = settings file (record
     media_env "$side"
     sudo -E "$(command -v taskset)" -c "$cores" "$binary" "${args[@]}" >"$log" 2>&1 &
     unset_media_env
+    # The real process is the binary (taskset execs); the newest one of this
+    # arm's comm is the side just started.
+    sleep 0.3
+    if [ "$arm" = R ]; then
+        pid=$(pgrep -n -x deepmsg-driver 2>/dev/null || true)
+    else
+        pid=$(pgrep -n -x deepmsg-media-d 2>/dev/null || true)
+    fi
+    if [ "$side" = rig ]; then RIG_DRIVER_PID=$pid; else NODE_DRIVER_PID=$pid; fi
 }
 
 await_cnc() { # $1 = directory
@@ -252,6 +265,7 @@ kill_side() {
     sudo pkill -9 -x deepmsg-media-d 2>/dev/null || true
     sudo pkill -9 -x echo-node 2>/dev/null || true
     sudo pkill -9 -x loadtest-rig 2>/dev/null || true
+    sudo pkill -9 -x perf 2>/dev/null || true
     sleep 0.5
     sudo rm -rf "$RIG_DIR" "$NODE_DIR" 2>/dev/null || true
 }
@@ -292,6 +306,20 @@ run_cell() { # $1 = round tag, $2 = arm, $3 = rate:length
     # driver, and a client that cannot write it only says so as a mapping error
     # (measured here: the C arm's node died with `Permission denied` on
     # `publications/2.logbuffer` before this).
+    if [ "${E1_PERF:-0}" = "1" ]; then
+        # The two drivers, not the clients: cycles per frame and the symbols
+        # the time is in, on the side that owns the media.
+        # Shorter than the cell: the first attempt used +20 s, so `kill_side`
+        # SIGKILLed `perf stat` before it wrote its report (an empty file, and
+        # the evidence came from `perf record` instead).
+        local window=$((WARMUP + ITERATIONS - 5))
+        sudo perf stat -p "$RIG_DRIVER_PID" -p "$NODE_DRIVER_PID" \
+            -e cycles,instructions,cache-references,cache-misses -o "$cell/perf-stat.txt" \
+            -- sleep "$window" 2>>"$cell/perf-stat.err" &
+        sudo perf record -F 199 -p "$RIG_DRIVER_PID" -o "$cell/perf.data" \
+            -- sleep "$((window - 5))" 2>>"$cell/perf-record.err" &
+        sleep 1
+    fi
     sudo -E taskset -c "$NODE_CPU" "$RUST_BIN/echo-node" \
         "-Daeron.dir=$NODE_DIR" \
         "-Dio.aeron.benchmarks.output.directory=$cell" \
