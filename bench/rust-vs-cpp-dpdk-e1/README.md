@@ -36,6 +36,9 @@ kernel interface — the cable is the only path between the two ends.
 Same machine, same two ports of one X540 and the same cable, the same six of
 eight cores on both arms, `SHARED` threading and `spin` idle on every agent,
 the same MTU and initial window, and the same clients (this tree's, both arms).
+**Both drivers are Release**: the C++ `dpdk` preset is Debug, and the preflight
+refuses a C arm whose `file` says `with debug_info` — the first E1 session
+measured the build type and said nothing about the media.
 The media's environment is the same for both drivers — `AERON_UDP_CHANNEL_
 TRANSPORT_BINDINGS_MEDIA=dpdk` plus `DEEPMSG_DPDK_PORT/IPV4_ADDRESS/EAL_ARGS`;
 both drivers read `AERON_` and `DEEPMSG_` (`apps/deepmsg-media-driver/main.cpp`).

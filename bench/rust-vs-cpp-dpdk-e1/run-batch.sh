@@ -123,6 +123,14 @@ preflight() {
         [ -x "$binary" ] || { echo "  missing: $binary"; status=1; }
     done
     [ -x "$DEVBIND" ] || { echo "  missing: $DEVBIND"; status=1; }
+    # A Debug arm against a Release arm measures the build type. The first E1
+    # session did exactly that (the `dpdk` preset is Debug, `-g` without -O):
+    # the C arm read 34-38 us flat and the table said nothing about the media.
+    # `file` is the guard because the difference is what the binary carries.
+    if file "$CPP_DRIVER" | grep -q "with debug_info"; then
+        echo "  the C arm is a Debug build: $CPP_DRIVER"
+        status=1
+    fi
     [ -n "$dpdk_version" ] && [ "$dpdk_version" != none ] || { echo "  pkg-config libdpdk not found"; status=1; }
     local huge
     huge=$(awk '/HugePages_Free/ {print $2}' /proc/meminfo)
@@ -131,7 +139,7 @@ preflight() {
         [ -d "/sys/bus/pci/devices/$pci" ] || { echo "  no $pci"; status=1; }
     done
     local stray
-    stray=$(pgrep -af "deepmsg-(media-)?driver|loadtest-rig|echo-node" 2>/dev/null | grep -v "pgrep" || true)
+    stray=$(pgrep -ax "deepmsg-driver|deepmsg-media-d|echo-node|loadtest-rig" 2>/dev/null || true)
     [ -z "$stray" ] || { echo "  stray processes: $stray"; status=1; }
     return "$status"
 }
@@ -236,13 +244,14 @@ keep_counters() { # $1 = directory, $2 = file
 }
 
 kill_side() {
-    # By path, not by name: `comm` is 15 characters, so `pkill -x
-    # deepmsg-media-driver` matches nothing and leaves the port bound — measured
-    # here as two drivers surviving a cell and a `dpdk-devbind` stuck in `D`.
-    sudo pkill -9 -f "$CPP_DRIVER" 2>/dev/null || true
-    sudo pkill -9 -f "$ROOT/target/release/deepmsg-driver" 2>/dev/null || true
-    sudo pkill -9 -f "$RUST_BIN/echo-node" 2>/dev/null || true
-    sudo pkill -9 -f "$RUST_BIN/loadtest-rig" 2>/dev/null || true
+    # By `comm`, not by path: a `-f` pattern naming the driver also matches the
+    # shell whose command line carries `E1_CPP_DRIVER=<path>` — measured here as
+    # the batch's own wrapper being SIGKILLed by its first cell's cleanup. And
+    # the name is 15 characters, so the C++ arm's comm is `deepmsg-media-d`.
+    sudo pkill -9 -x deepmsg-driver 2>/dev/null || true
+    sudo pkill -9 -x deepmsg-media-d 2>/dev/null || true
+    sudo pkill -9 -x echo-node 2>/dev/null || true
+    sudo pkill -9 -x loadtest-rig 2>/dev/null || true
     sleep 0.5
     sudo rm -rf "$RIG_DIR" "$NODE_DIR" 2>/dev/null || true
 }
