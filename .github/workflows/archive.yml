@@ -152,6 +152,20 @@ jobs:
           path: ../aeron/cppbuild/archive-suite
           key: aeron-${{ env.AERON_COMMIT }}-cppbuild-v1
 
+      # The suite's CMake runs `<shim> -version` before anything is built
+      # (`aeron-system-tests/CMakeLists.txt:1`, `find_package(Java 17 REQUIRED)`),
+      # and the shim answers java's questions from a configuration beside it —
+      # which the runner writes before a *run*, not before a configure. The job
+      # passed while the build directory came back from the cache; a fresh one
+      # (the first run after the cache expires) stops at `Could NOT find Java`.
+      # `transparent` forwards a `-version` to the real java, which is all the
+      # configure asks; the run step below rewrites this file for its own mode.
+      - name: Give the shim a configuration before the configure
+        run: |
+          printf 'java=%s\nmode=transparent\nlog=%s\n' \
+            "$(command -v java)" "${{ runner.temp }}/shim-configure.log" \
+            > "${{ github.workspace }}/target/debug/archive-shim.conf"
+
       - name: Configure and build the reference's archive tests
         working-directory: ../aeron
         run: |
