@@ -1,7 +1,7 @@
 # The run batches
 
-Five batches live here. All of them measure this build against the reference's
-and all drive the reference's own benchmark harness (`aeron-io/benchmarks`): four
+Six batches live here. All of them measure this build against the reference's
+and all drive the reference's own benchmark harness (`aeron-io/benchmarks`): five
 are this tree's own runners, and `cluster-4host/` drives the harness's own cluster
 orchestration across four machines. All write their results into `bench/out/` —
 which is ignored, because what belongs in the tree is the table and the command
@@ -14,6 +14,7 @@ that produced it, not the histogram files.
 | `archive-vs-java/` | what is this build's **archive** worth, and what is the driver under it worth? | yes, and each ratio says which: `r-attach/j` is the archive, `r-java/r-attach` is the driver, `r-rust/j` is the whole stack and attributes nothing |
 | `cluster-arms/` | what are this build's **driver**, **archive** and **consensus module and container** worth inside a single-member cluster? | yes, and each ratio says which: `j-d/j` is the driver, `r-a/r` the archive, `r-a/j-d` the consensus module and the container, `r/j` the whole stack |
 | `cluster-4host/` | what is this build's **driver** worth when a whole reference cluster — three members on three hosts, the client on a fourth — runs on top of it? | yes — only the media driver changes; the consensus module, archive and service are the reference's |
+| `rust-vs-cpp-dpdk-e1/` | two **DPDK media** implementations over one cable: what are this build's driver and media worth against the C++ transcription of them? | **no** — the driver and the media differ together; the client and the node are this build's on both arms |
 
 Two of these batches have **two shapes**: `rust-vs-java` and `upstream-c-drivers`
 run both halves of a cell on one machine by default (loopback), and with
@@ -40,6 +41,12 @@ missing.
 git clone https://github.com/deepmsg/benchmarks ../benchmarks-deepmsg
 git -C ../benchmarks-deepmsg checkout 1b11bfc
 git -C ../benchmarks-deepmsg ./gradlew :benchmarks-all:shadowJar
+
+# the C++ media arm (this build's DPDK media, transcribed) — Release, with DPDK
+git clone https://github.com/deepmsg/deepmsg-cpp ../deepmsg-cpp
+cmake -S ../deepmsg-cpp -B ../deepmsg-cpp/build/release-dpdk \
+    -DCMAKE_BUILD_TYPE=Release -DAXC_WITH_DPDK=ON -DAXC_BUILD_TESTS=OFF
+cmake --build ../deepmsg-cpp/build/release-dpdk --target deepmsg-media-driver
 
 # the upstream work the C driver arms are built from
 git clone https://github.com/deepmsg/aeron ../aeron-deepmsg
@@ -77,6 +84,10 @@ bench/upstream-c-drivers/run-batch.sh            # ~80 minutes with the defaults
 
 # the two stacks
 bench/rust-vs-java/run-batch.sh                  # ~40 minutes with the defaults
+
+# the two DPDK media, one cable (two drivers per cell; the ports go to vfio)
+E1_CPP_DRIVER=../deepmsg-cpp/build/release-dpdk/apps/deepmsg-media-driver/deepmsg-media-driver \
+    bench/rust-vs-cpp-dpdk-e1/run-batch.sh --quick   # plumbing, one machine, ~3 minutes
 
 # a single-member cluster, four arms
 bench/cluster-arms/patches/install.sh --apply    # the media-driver launcher, in the harness
