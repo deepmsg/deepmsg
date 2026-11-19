@@ -14,19 +14,31 @@
 # kernel interface to set up: the clients are CnC clients of their side's driver,
 # and the cable is the only path between the two ends.
 #
-#     ./run-batch.sh --list      the plan, the prerequisites, nothing run
-#     ./run-batch.sh --quick     one cell per arm, five iterations, ~3 minutes
-#     ./run-batch.sh             four rounds R C C R, four tiers each
+#     ./run-batch.sh --list              the plan, the prerequisites, nothing run
+#     ./run-batch.sh --quick             one cell per arm, five iterations, ~3 minutes
+#     ./run-batch.sh [--out DIR]         four rounds R C C R, four tiers each
 #
-# The reading rules are the session's own (analysis/dpdk/deepmsg-dpdk-d6-plan.md):
-# one session, arms alternating, the floor measured as each arm against itself,
-# p50 with the tails, never the mean.
+# The C++ arm is given, not built: `E1_CPP_DRIVER` names `deepmsg-cpp`'s
+# `deepmsg-media-driver`, and it has to be a **Release** build with
+# `AXC_WITH_DPDK=ON` (the `dpdk` preset is Debug, and the preflight refuses a
+# binary that carries debug info). `E1_RUST_DIR` / `E1_RUST_BIN` name this
+# tree and its release directory when the defaults do not fit.
+#
+# The reading rules are the bench batches' own (`bench/README.md`): one session,
+# arms alternating, the floor measured as each arm against itself, p50 with the
+# tails, never the mean.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-ROOT=${E1_RUST_DIR:-/home/gavin/data/trader/deepmsg-wt-e1}
+BENCH_DIR=$(dirname "$here")
+# shellcheck source=../lib/checkouts.sh
+. "$BENCH_DIR/lib/checkouts.sh"
+# shellcheck source=../lib/fingerprint.sh
+. "$BENCH_DIR/lib/fingerprint.sh"
+
+ROOT=${E1_RUST_DIR:-$(cd "$here/../.." && pwd)}
 RUST_BIN=${E1_RUST_BIN:-$ROOT/target/release}
-CPP_DRIVER=${E1_CPP_DRIVER:-/home/gavin/data/trader/pr68-wt/build/dpdk/apps/deepmsg-media-driver/deepmsg-media-driver}
+CPP_DRIVER=${E1_CPP_DRIVER:-}
 
 RIG_PCI=${E1_RIG_PCI:-0000:03:00.0}
 NODE_PCI=${E1_NODE_PCI:-0000:03:00.1}
@@ -56,7 +68,7 @@ WARMUP_RATE=${E1_WARMUP_RATE:-25K}
 ROUNDS=${E1_ROUNDS:-"1-R:R 2-C:C 3-C:C 4-R:R"}
 LINK_WAIT=${E1_LINK_WAIT:-25}
 
-OUT=${E1_OUT:-/home/gavin/data/trader/analysis/dpdk/e1-out/$(date +%Y-%m-%d-%H%M%S)}
+OUT=${E1_OUT:-$BENCH_OUT_DIR/rust-vs-cpp-dpdk-e1/$(date +%Y-%m-%d)-$(hostname -s)}
 # Set by `driver_start_arm` when `E1_PERF=1`: perf attaches to the two driver
 # processes, not to the rig and the node.
 RIG_DRIVER_PID=""
@@ -66,12 +78,13 @@ CNC_TOOL=${E1_CNC_TOOL:-$RUST_BIN/cnc-dump}
 DEVBIND=${E1_DEVBIND:-/usr/bin/dpdk-devbind.py}
 
 mode=full
-for argument in "$@"; do
-    case "$argument" in
-        --list) mode=list ;;
-        --quick) mode=quick ;;
-        --help | -h) sed -n '2,28p' "$0"; exit 0 ;;
-        *) echo "unknown option '$argument'" >&2; exit 2 ;;
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --out) OUT=${2:?--out needs a directory}; shift 2 ;;
+        --list) mode=list; shift ;;
+        --quick) mode=quick; shift ;;
+        --help | -h) sed -n '2,29p' "$0"; exit 0 ;;
+        *) echo "unknown option '$1'" >&2; exit 2 ;;
     esac
 done
 
@@ -89,17 +102,17 @@ rustc_version=$(rustc --version)
 dpdk_version=$(pkg-config --modversion libdpdk 2>/dev/null || echo "none")
 driver_digest() { sha256sum "$1" | cut -d' ' -f1; }
 
+# The machine and the checkouts are `bench_fingerprint`'s (the same file every
+# batch writes); what this batch was — the arms, the grid, the cores, the ports
+# and the binaries — is `RUN-INFO.txt`, which is the file a reader needs beside
+# the table.
 write_fingerprint() {
     mkdir -p "$OUT"
+    bench_fingerprint "$OUT/fingerprint.txt" >/dev/null
     {
         echo "label          : E1 Rust DPDK media vs C++ DPDK media"
         echo "collected      : $(date -Iseconds)"
-        echo "host           : $(hostname) $(hostname -I 2>/dev/null | tr ' ' '\n' | head -2 | tr '\n' ' ')"
-        echo "kernel         : $(uname -r)"
-        echo "cpu            : $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //') cores: $(nproc)"
         echo "dpdk           : $dpdk_version"
-        echo "rustc          : $rustc_version"
-        echo "cc             : $cc_version"
         echo "rig            : $RIG_PCI ($RIG_ADDRESS/$PREFIX)"
         echo "node           : $NODE_PCI ($NODE_ADDRESS/$PREFIX)"
         echo "cores          : driver-rig=$RIG_DRIVER_CORES (pin $RIG_DRIVER_CPU) driver-node=$NODE_DRIVER_CORES (pin $NODE_DRIVER_CPU) rig=$RIG_CPU node=$NODE_CPU"
@@ -114,19 +127,27 @@ write_fingerprint() {
         echo "  $(driver_digest "$ROOT/target/release/deepmsg-driver")  deepmsg-driver (R arm)"
         echo "  $(driver_digest "$CPP_DRIVER")  deepmsg-media-driver (C arm)"
         echo "rust driver rev: $(git -C "$ROOT" log --oneline -1 2>/dev/null || echo unknown)"
-        echo "cpp driver rev : $(git -C /home/gavin/data/trader/pr68-wt log --oneline -1 2>/dev/null || echo unknown)"
-    } >"$OUT/fingerprint.txt"
-    cp "$OUT/fingerprint.txt" "$OUT/RUN-INFO.txt"
+        cpp_root=$(git -C "$(dirname "$CPP_DRIVER")" rev-parse --show-toplevel 2>/dev/null || true)
+        echo "cpp driver rev : $(git -C "${cpp_root:-.}" log --oneline -1 2>/dev/null || echo unknown)"
+    } >"$OUT/RUN-INFO.txt"
 }
 
 # --- preflight ----------------------------------------------------------------
 
 preflight() {
     local status=0
-    for binary in "$RUST_BIN/loadtest-rig" "$RUST_BIN/echo-node" "$CNC_TOOL" "$ROOT/target/release/deepmsg-driver" "$CPP_DRIVER"; do
+    for binary in "$RUST_BIN/loadtest-rig" "$RUST_BIN/echo-node" "$CNC_TOOL" "$ROOT/target/release/deepmsg-driver"; do
         [ -x "$binary" ] || { echo "  missing: $binary"; status=1; }
     done
+    if [ -n "$CPP_DRIVER" ] && [ ! -x "$CPP_DRIVER" ]; then
+        echo "  missing: $CPP_DRIVER"
+        status=1
+    fi
     [ -x "$DEVBIND" ] || { echo "  missing: $DEVBIND"; status=1; }
+    if [ -z "$CPP_DRIVER" ]; then
+        echo "  E1_CPP_DRIVER is not set (deepmsg-cpp's Release+DPDK deepmsg-media-driver)"
+        status=1
+    fi
     # A Debug arm against a Release arm measures the build type. The first E1
     # session did exactly that (the `dpdk` preset is Debug, `-g` without -O):
     # the C arm read 34-38 us flat and the table said nothing about the media.

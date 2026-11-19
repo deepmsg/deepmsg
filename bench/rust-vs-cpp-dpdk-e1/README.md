@@ -25,7 +25,12 @@ kernel interface — the cable is the only path between the two ends.
                     `--quick` runs one cell per arm; the default runs the D6
                     grid (25K:1344 / 101K:1344 / 301K:288 / 501K:32) in four
                     rounds, **R C C R**, so each arm has two and its floor is
-                    itself. 60 s + 30 s warmup per cell.
+                    itself. 60 s + 30 s warmup per cell. `--out DIR` moves the
+                    results; `E1_PERF=1` attaches `perf stat`/`perf record` to
+                    the two driver processes (read them with perf-report.sh).
+
+    perf-report.sh  cycles per message and the top symbols, per cell, from an
+                    `E1_PERF=1` run.
 
     analyse.sh      the table. Each arm's two rounds are averaged; the ratio is
                     read only when it is outside both arms' floors (each arm's
