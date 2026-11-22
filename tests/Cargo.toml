@@ -81,6 +81,10 @@ name = "cluster_three_nodes"
 path = "integration/cluster_three_nodes.rs"
 
 [[test]]
+name = "cluster_blackout_client"
+path = "integration/cluster_blackout_client.rs"
+
+[[test]]
 name = "cluster_follower_path"
 path = "integration/cluster_follower_path.rs"
 

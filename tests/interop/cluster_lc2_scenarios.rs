@@ -123,12 +123,26 @@ fn the_leader(counters: &[NodeCounters]) -> Option<i32> {
 /// One `java` invocation on a driver of its own: the probe is the fork's, the
 /// three channel arguments are this direction's (see the module note).
 fn java_client_echoes(ports: &Ports, count: u32) -> String {
-    java_client_echoes_at(ports, count, 0)
+    java_client_echoes_at(ports, count, 0, 0)
 }
 
 /// The same, with `pause_millis` between messages — how a case keeps the
-/// client running while the cluster is made to lose a member.
-fn java_client_echoes_at(ports: &Ports, count: u32, pause_millis: u32) -> String {
+/// client running while the cluster is made to lose a member — and an
+/// optional application-level `retry_millis`: an echo that has not come back
+/// after that long gets its message offered again.
+///
+/// The retry is load-bearing for a case whose client offers **through** a
+/// leadership change: a message offered just as the network goes dark is
+/// accepted by the client's own publication (whose receiver liveness is
+/// seconds) and no member ever hears it. The reference's client has no
+/// sequence numbers on the wire, so the only signal is the missing echo. See
+/// `ClusterEchoClientProbe.java`'s `retryMillis`.
+fn java_client_echoes_at(
+    ports: &Ports,
+    count: u32,
+    pause_millis: u32,
+    retry_millis: u32,
+) -> String {
     let Some(source) = aeron_tests::java("ClusterEchoClientProbe.java") else {
         announce_skip();
         return String::new();
@@ -153,8 +167,16 @@ fn java_client_echoes_at(ports: &Ports, count: u32, pause_millis: u32) -> String
     let endpoints = ports.client_ingress_endpoints();
     let egress = ports.client_egress_wildcard_channel();
     let count = count.to_string();
-    let timeout = (30 + count.parse::<u32>().unwrap_or(0) * pause_millis / 1000).to_string();
+    // A retrying client may spend a leadership change's worth of extra time
+    // between two messages; the deadline has to pay for it. A blackout's
+    // recovery is ~30 s (measured), and the runs here have come within a
+    // second of a 90 s deadline — twice that is the margin a repeated gate
+    // needs.
+    let retry_allowance = if retry_millis == 0 { 0 } else { 120 };
+    let timeout = (30 + count.parse::<u32>().unwrap_or(0) * pause_millis / 1000 + retry_allowance)
+        .to_string();
     let pause = pause_millis.to_string();
+    let retry = retry_millis.to_string();
 
     let (stdout, stderr) = java::run_probe_capturing_stderr(
         &jar,
@@ -169,20 +191,24 @@ fn java_client_echoes_at(ports: &Ports, count: u32, pause_millis: u32) -> String
             &endpoints,
             &egress,
             &pause,
+            &retry,
         ],
     );
 
     // What the client's own driver last said, for the failure message: the
     // probe's reading is a count, and a count that is short says nothing about
-    // why.
+    // why. Its counters answer the other half — whether the ingress
+    // publication sent anything, and whether the cluster answered.
     let driver_log = client_driver.log_tail(60);
+    let driver_counters = NodeCounters::open(client_driver.aeron_dir()).system_counters();
 
     // The probe exits 0 whatever it read, so the reading is the answer and
     // **stderr is the explanation**: what Aeron said about the ingress
     // publication, the session and the new-leader events is the only place a
     // failed connection says anything at all.
     format!(
-        "{stdout}\n--- client stderr ---\n{}\n--- client driver ---\n{driver_log}",
+        "{stdout}\n--- client stderr ---\n{}\n--- client driver ---\n{driver_log}\n\
+         --- client driver counters ---\n{driver_counters}",
         stderr.trim()
     )
 }
@@ -206,6 +232,41 @@ fn await_leader(counters: &[NodeCounters], faults: &Faults) -> i32 {
             .map(|id| counters[id as usize].role())
             .collect::<Vec<_>>()
     );
+}
+
+/// What every member's counters and driver last said.
+///
+/// A blackout case's failure is a *state*, not an error: the client reports
+/// `OFFER_FAILED` and nothing else, and the difference between "the election
+/// never closed", "the container never took the new log" and "the ingress
+/// never came back" is in these numbers and in the driver's own log. Printing
+/// them with the reading is what makes the failure diagnosable without a
+/// second run (`records/P3-6c.md` §4).
+fn members_state(nodes: &[Node], counters: &[NodeCounters]) -> String {
+    use deepmsg_cluster_common::counters::CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID as MODULE_STATE;
+
+    let mut out = String::new();
+    for (id, (node, counters)) in nodes.iter().zip(counters).enumerate() {
+        out.push_str(&format!(
+            "\n--- node {id} ---\n\
+             role={:?} module_state={:?} election={:?} term={:?} commit={:?} \
+             append={:?} snapshots={:?}\n\
+             --- system counters ---\n{}\n\
+             --- driver log (tail) ---\n{}\n\
+             --- endpoints ---\n{}\n",
+            counters.role(),
+            counters.value(MODULE_STATE),
+            counters.election_state(),
+            counters.leadership_term_id(),
+            counters.commit_position(),
+            counters.append_position(),
+            counters.snapshot_count(),
+            counters.system_counters(),
+            node.driver_log_tail(40),
+            counters.receive_endpoint_counters().join("\n"),
+        ));
+    }
+    out
 }
 
 /// **A Java client echoes five messages through a cluster of our members.**
@@ -337,7 +398,7 @@ fn a_consensus_partition_heals_and_the_cluster_elects_again() {
     // Two messages 40 s apart: the first is answered before the window, the
     // pause spans it, and the second is offered after it — same client, same
     // session.
-    let reading = java_client_echoes_at(&ports, 2, 40_000);
+    let reading = java_client_echoes_at(&ports, 2, 40_000, 0);
     faults.check();
     let driver_logs = nodes
         .iter()
@@ -393,24 +454,32 @@ fn a_consensus_partition_heals_and_the_cluster_elects_again() {
     }
 }
 
-/// **A full receive blackout leaves every container holding its old log
-/// image.** Ignored: this is the measurement that says why the case above is
-/// the consensus stream's, not a criterion anyone passes.
+/// **A full receive blackout: every member loses every frame, the term
+/// changes, the containers take the new `JoinLog`, and the client reads every
+/// echo across it.**
 ///
 /// Every member stops hearing **everything** — log, consensus, ingress — for
 /// the same window, and the client offers throughout it (one message every
-/// 100 ms). Measured state after the window, with the defects the diagnosis
-/// found fixed: the cluster elects, the followers form log images, and then
-/// every container sits on an image that cannot drain —
-/// `position` 7008, its only reader at 6816 because the commit position is
-/// 6816 — so `JoinLog` is never taken and the consensus module spins in
-/// `awaitServicesReady`. See `records/P3-6c.md` §4.
+/// 100 ms). What used to block this: the leader's log carried an uncommitted
+/// tail above the commit position, the container's only reader stopped at the
+/// commit position, `is_drained` could never be true, the old image held the
+/// member's fixed log port for its whole liveness, and the next term's
+/// subscription met `Address already in use` on every attempt
+/// (`records/P3-6c.md` §4).
+///
+/// Two things make it pass, and both are part of the contract:
+///
+/// * the term's log publication is **revoked** when the term ends
+///   (`LogPublisher::disconnect`), so an image ends without a drain and its
+///   receive endpoint comes back — a deliberate deviation, recorded in
+///   `docs/compat.md`;
+/// * a message offered just as the network goes dark was accepted by the
+///   client's own publication and heard by no member. The reference client has
+///   no sequence numbers on the wire, so the probe is a **correct
+///   application**: an echo that does not come back gets the message offered
+///   again (`retryMillis`). Nothing about the server is masked — a cluster
+///   that does not recover fails the `RECEIVED 300` assertion.
 #[test]
-#[ignore = "P3-6c: a full receive blackout leaves the leader's log ahead of \
-            its commit position, and the container's old image then never \
-            drains (from 6912/7008 to 6816, measured) — the new term's \
-            JoinLog is never taken and the module waits in \
-            awaitServicesReady. See records/P3-6c.md."]
 fn a_full_receive_blackout_leaves_the_container_holding_its_log_image() {
     let _serial = serial();
     let ports = Ports::new();
@@ -418,7 +487,6 @@ fn a_full_receive_blackout_leaves_the_container_holding_its_log_image() {
     let session_timeout = "-Daeron.cluster.session.timeout=60s";
     let properties = &|_id: i32| -> Vec<String> {
         vec![
-            "-Daeron.image.liveness.timeout=1000ms".to_owned(),
             "-Ddeepmsg.debug.receive.data.loss.from.millis=8000".to_owned(),
             "-Ddeepmsg.debug.receive.data.loss.until.millis=14000".to_owned(),
             "-Ddeepmsg.debug.receive.data.loss.drop.heartbeats=true".to_owned(),
@@ -431,13 +499,22 @@ fn a_full_receive_blackout_leaves_the_container_holding_its_log_image() {
         return;
     };
 
+    let started = Instant::now();
     await_leader(&counters, &faults);
+    eprintln!(
+        "[{:?}] lc2: cluster up{}",
+        started.elapsed(),
+        members_state(&nodes, &counters)
+    );
 
-    let reading = java_client_echoes_at(&ports, 300, 100);
+    let reading = java_client_echoes_at(&ports, 300, 100, 3_000);
+    eprintln!("[{:?}] lc2: client returned", started.elapsed());
     faults.check();
     assert!(
         reading.contains("RECEIVED 300"),
-        "the reference's client read every echo across the partition: {reading}"
+        "the reference's client read every echo across the partition: {reading}{}\nfaults: {:?}",
+        members_state(&nodes, &counters),
+        faults.snapshot()
     );
 
     for node in &mut nodes {
