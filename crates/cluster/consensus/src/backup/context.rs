@@ -24,6 +24,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use deepmsg_archive::client::context::ArchiveContext;
 use deepmsg_archive::server::config::ThreadNaming;
 use deepmsg_cluster_common::config::Properties;
 use deepmsg_cluster_common::mark::{self, ClusterMarkFile};
@@ -35,8 +36,12 @@ use super::{ReplayStart, SourceType};
 use crate::backup::agent::{
     AERON_CLUSTER_BACKUP_THREAD_NAME, AERON_CLUSTER_BACKUP_THREAD_NAME_CLASSIC,
 };
-use crate::config::ConfigProblem;
+use crate::config::{
+    CONSENSUS_MODULE_STREAM_ID_DEFAULT, ConfigProblem, INGRESS_STREAM_ID_DEFAULT,
+    SERVICE_STREAM_ID_DEFAULT,
+};
 use crate::error::ClusterError;
+use crate::persist::recording_log::CONSENSUS_MODULE_SERVICE_ID;
 
 /// `aeron.thread.naming` (`CommonContext.java:534`) — the same name the
 /// consensus module reads (`config.rs:THREAD_NAMING_PROP_NAME`).
@@ -591,6 +596,51 @@ impl ClusterBackupContext {
 
         self.mark_file = Some(mark_file);
         self.is_concluded = true;
+        Ok(())
+    }
+
+    /// `ClusterBackup.concludeMarkFile` (`ClusterBackup.java:2070-2090`): the
+    /// header fields and var-data `create` leaves for after the **local**
+    /// archive context is known.
+    ///
+    /// The archive stream id is the local archive's control request stream id
+    /// (`archiveContext.controlRequestStreamId()`, `:2076`), which the agent
+    /// resolves — not the remote cluster archive's. The rest are the reference's
+    /// backup constants: member `-1`, the consensus module's service id, the
+    /// cluster's id, and null control/ingress/service/authenticator strings.
+    ///
+    /// # Errors
+    ///
+    /// When the context has not created the mark file, or the var-data does not
+    /// fit it.
+    pub(crate) fn conclude_mark_file(
+        &self,
+        local_archive_context: &ArchiveContext,
+    ) -> Result<(), ClusterError> {
+        let Some(mark_file) = self.mark_file.as_ref() else {
+            return Err(ClusterError::Cluster(
+                "the backup's mark file has not been created".to_owned(),
+            ));
+        };
+
+        mark_file.set_stream_ids(
+            local_archive_context.control_request_stream_id,
+            SERVICE_STREAM_ID_DEFAULT,
+            CONSENSUS_MODULE_STREAM_ID_DEFAULT,
+            INGRESS_STREAM_ID_DEFAULT,
+        );
+        mark_file.set_member_id(-1);
+        mark_file.set_service_id(CONSENSUS_MODULE_SERVICE_ID);
+        mark_file.set_cluster_id(self.config.cluster_id);
+
+        let aeron_dir = self.config.aeron_dir.to_string_lossy().into_owned();
+        mark_file
+            .write_var_data(&[aeron_dir.as_str(), "", "", "", "", ""])
+            .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+        mark_file
+            .signal_ready(self.now_ms)
+            .map_err(|error| ClusterError::Cluster(error.to_string()))?;
+
         Ok(())
     }
 }
