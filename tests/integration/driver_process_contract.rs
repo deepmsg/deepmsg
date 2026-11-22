@@ -699,10 +699,13 @@ fn the_settings_that_name_code_stop_the_driver_with_a_reason() {
         // compiles in is a name it `dlsym`s, and its context init fails when
         // that finds nothing (`aeron_symbol_table.c:80-92`). This build has the
         // table and not the `dlsym`.
-        ("AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA", "dpdk"),
+        (
+            "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA",
+            "nonexistent_media",
+        ),
         (
             "AERON_CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA",
-            "aeron_udp_channel_transport_bindings_dpdk",
+            "aeron_udp_channel_transport_bindings_nonexistent",
         ),
     ] {
         let Some(mut fixture) = Fixture::start("refused-code", &[(name, value)]) else {

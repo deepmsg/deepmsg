@@ -46,6 +46,7 @@ use deepmsg_archive::client::replay_merge::{
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::archive::{self, Archive};
+use deepmsg_tests::ports::port;
 
 /// The connect's correlation id, which its answer echoes. Its own, because every
 /// test file picks one.
@@ -69,11 +70,15 @@ const STREAM_ID: i32 = 3437;
 /// live half on a dynamic channel (`ReplayMergeTest.java:81-88`) for the same
 /// reason: the subscriber binds its own port and talks to the publication's
 /// control address.
-const LIVE_CONTROL_ENDPOINT: &str = "127.0.0.1:33800";
+fn live_control_endpoint() -> String {
+    format!("127.0.0.1:{}", port(0))
+}
 
 /// The port the subscription binds as its **live destination**, and the address
 /// it sends its status messages from.
-const LIVE_ENDPOINT: &str = "127.0.0.1:33803";
+fn live_endpoint() -> String {
+    format!("127.0.0.1:{}", port(1))
+}
 
 /// Where the archive's replay is published, and equally the address the
 /// subscription is given as its **replay destination**.
@@ -84,22 +89,29 @@ const LIVE_ENDPOINT: &str = "127.0.0.1:33803";
 /// subscription that names no endpoint. The reference's other path — a
 /// destination that named a port — is the one taken here, and it is the same
 /// merge (`ReplayMerge.java:144-152`).
-const REPLAY_ENDPOINT: &str = "127.0.0.1:33801";
+fn replay_endpoint() -> String {
+    format!("127.0.0.1:{}", port(2))
+}
 
 /// The port the archive's recording subscription — and the reader beside it —
 /// binds. The merge never names it: a subscriber of a dynamic publication is
 /// reached by its own socket, and the merge's live destination names one of its
-/// own ([`LIVE_ENDPOINT`]).
-const RECORDING_ENDPOINT: &str = "127.0.0.1:33802";
+/// own ([`live_endpoint`]).
+fn recording_endpoint() -> String {
+    format!("127.0.0.1:{}", port(3))
+}
 
-/// The live publication, which binds [`LIVE_CONTROL_ENDPOINT`] and sends to
+/// The live publication, which binds [`live_control_endpoint`] and sends to
 /// whoever talks to it.
 ///
 /// The term length is pinned on the channel *and* on the driver below, because
 /// the archive's replay publishes at the **recording's** geometry and the two
 /// sources have to agree on it to be one image.
 fn live_channel() -> String {
-    format!("aeron:udp?control={LIVE_CONTROL_ENDPOINT}|control-mode=dynamic|term-length=64k")
+    format!(
+        "aeron:udp?control={}|control-mode=dynamic|term-length=64k",
+        live_control_endpoint()
+    )
 }
 
 /// The channel the archive records, and the channel a reader reads.
@@ -109,14 +121,20 @@ fn live_channel() -> String {
 /// (`aeron_udp_channel.c:465-487`).
 fn recording_channel() -> String {
     format!(
-        "aeron:udp?endpoint={RECORDING_ENDPOINT}|control={LIVE_CONTROL_ENDPOINT}|term-length=64k"
+        "aeron:udp?endpoint={}|control={}|term-length=64k",
+        recording_endpoint(),
+        live_control_endpoint()
     )
 }
 
 /// The **live destination** the merge adds: the subscriber's own socket, and the
 /// publication's control address to talk to.
 fn live_destination() -> String {
-    format!("aeron:udp?endpoint={LIVE_ENDPOINT}|control={LIVE_CONTROL_ENDPOINT}")
+    format!(
+        "aeron:udp?endpoint={}|control={}",
+        live_endpoint(),
+        live_control_endpoint()
+    )
 }
 
 /// The subscription the merge moves from one destination to the other.
@@ -270,7 +288,7 @@ fn a_replay_merges_into_the_live_stream_without_a_gap() {
     // second image rather than a second transport of the same one.
     let mut merge = ReplayMerge::new(
         &format!("aeron:udp?session-id={session_id}"),
-        &format!("aeron:udp?endpoint={REPLAY_ENDPOINT}"),
+        &format!("aeron:udp?endpoint={}", replay_endpoint()),
         &live_destination(),
         recording_id,
         0,

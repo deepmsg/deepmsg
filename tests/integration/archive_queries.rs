@@ -77,6 +77,7 @@ use deepmsg_codec::archive::{ReadBuf, WriteBuf};
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::archive::{self, DEADLINE, Session};
 use deepmsg_tests::archiving_driver::{self, OwnArchivingMediaDriver};
+use deepmsg_tests::ports::port;
 use deepmsg_tests::temp::TempDir;
 
 /// The connect's correlation id, which its answer echoes.
@@ -87,17 +88,20 @@ const CONNECT_CORRELATION_ID: i64 = 0x5ed1_0003;
 const STREAM_ID: i32 = 33;
 
 /// The two channels recorded, and what the uri filter is asked for. Their ports
-/// are this test's own rather than the C suite's 3333 and 3334: those tests are
-/// run by hand and these by `cargo test`, and two drivers on one host must not
-/// pick the same one.
-const CHANNEL_A: &str = "aeron:udp?endpoint=localhost:33433";
-/// See [`CHANNEL_A`].
-const CHANNEL_B: &str = "aeron:udp?endpoint=localhost:33434";
+/// are this process's slot (`deepmsg_tests::ports`), not the C suite's fixed
+/// 3333/3334: those tests are run by hand and these by `cargo test`, and two
+/// drivers on one host must not pick the same one.
+fn channel_a() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(0))
+}
+/// See [`channel_a`].
+fn channel_b() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(1))
+}
 
-/// A fragment of both channels, and one of the second alone.
-const BOTH_CHANNELS: &str = "3343";
-/// See [`BOTH_CHANNELS`].
-const SECOND_CHANNEL: &str = "33434";
+/// Both recordings are on `localhost`, and there are no others in this test's
+/// archive; a fragment of the channel that both match.
+const BOTH_CHANNELS: &str = "aeron:udp?endpoint=localhost:";
 
 /// How many messages each recording is asked to carry: enough that the
 /// publication has a position, which is what makes the recording a live one
@@ -151,15 +155,15 @@ fn a_page_of_recordings_is_walked_from_a_cursor() {
 
     // Two recordings, on one stream and two channels — what the reference's own
     // two cases build (`aeron_archive_test.cpp:2394-2465`).
-    let first_session = record(&mut session, &mut client, CHANNEL_A, 1);
-    let second_session = record(&mut session, &mut client, CHANNEL_B, 2);
+    let first_session = record(&mut session, &mut client, &channel_a(), 1);
+    let second_session = record(&mut session, &mut client, &channel_b(), 2);
 
     let all = |from: i64, count: i32| {
         move |correlation_id: i64| {
             list_recordings_request(control_session_id, correlation_id, from, count)
         }
     };
-    let for_uri = |count: i32, stream_id: i32, fragment: &'static str| {
+    let for_uri = |count: i32, stream_id: i32, fragment: String| {
         move |correlation_id: i64| {
             list_recordings_for_uri_request(
                 control_session_id,
@@ -167,7 +171,7 @@ fn a_page_of_recordings_is_walked_from_a_cursor() {
                 i64::MIN,
                 count,
                 stream_id,
-                fragment,
+                &fragment,
             )
         }
     };
@@ -244,7 +248,7 @@ fn a_page_of_recordings_is_walked_from_a_cursor() {
         &mut client,
         1,
         true,
-        for_uri(10, STREAM_ID, SECOND_CHANNEL),
+        for_uri(10, STREAM_ID, channel_b()),
     );
     assert_eq!(
         vec![ids[1]],
@@ -261,7 +265,7 @@ fn a_page_of_recordings_is_walked_from_a_cursor() {
         &mut client,
         2,
         true,
-        for_uri(10, STREAM_ID, BOTH_CHANNELS),
+        for_uri(10, STREAM_ID, BOTH_CHANNELS.to_owned()),
     );
     assert_eq!(2, page.len());
     assert_eq!(
@@ -276,7 +280,7 @@ fn a_page_of_recordings_is_walked_from_a_cursor() {
         &mut client,
         0,
         true,
-        for_uri(10, STREAM_ID, "no-match"),
+        for_uri(10, STREAM_ID, "no-match".to_owned()),
     );
     assert!(page.is_empty());
     assert_eq!(
@@ -291,7 +295,7 @@ fn a_page_of_recordings_is_walked_from_a_cursor() {
         &mut client,
         0,
         true,
-        for_uri(10, STREAM_ID + 1, BOTH_CHANNELS),
+        for_uri(10, STREAM_ID + 1, BOTH_CHANNELS.to_owned()),
     );
     assert!(page.is_empty(), "the stream has to hold too");
     assert_eq!(

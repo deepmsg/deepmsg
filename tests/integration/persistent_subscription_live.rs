@@ -564,8 +564,13 @@ fn the_subscription_goes_back_to_replaying_when_the_publisher_stops() {
     assert_eq!(1, heard.live_joined, "{test_name}");
     drop(heard);
 
+    assert!(
+        !subscription.has_failed(),
+        "{}",
+        subscription.failure_reason().unwrap_or("")
+    );
     match subscription.state() {
-        State::SendListRecordingRequest | State::AwaitListRecordingResponse | State::Failed => {}
+        State::SendListRecordingRequest | State::AwaitListRecordingResponse => {}
         other => panic!("{test_name}: left the live stream into {other:?}"),
     }
 }

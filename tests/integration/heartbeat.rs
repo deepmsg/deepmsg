@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
 use deepmsg_tests::driver::{self, OwnDriver};
+use deepmsg_tests::ports::port;
 
 /// The stream every test here asks on.
 const STREAM_ID: i32 = 1001;
@@ -40,7 +41,9 @@ const DELAY_MS: u64 = 4_000;
 const WINDOW_MS: u64 = 2_500;
 
 /// A channel that needs no nameserver at all.
-const CHANNEL: &str = "aeron:udp?endpoint=127.0.0.1:40123";
+fn channel() -> String {
+    format!("aeron:udp?endpoint=127.0.0.1:{}", port(0))
+}
 
 #[test]
 fn the_heartbeat_advances_while_a_channel_is_being_parsed() {
@@ -62,7 +65,7 @@ fn the_heartbeat_advances_while_a_channel_is_being_parsed() {
     let add = std::thread::spawn(move || {
         let mut client = Client::connect(&dir).expect("connect to our driver");
         let started = Instant::now();
-        let publication = client.add_publication(CHANNEL, STREAM_ID, DEFAULT_TIMEOUT);
+        let publication = client.add_publication(&channel(), STREAM_ID, DEFAULT_TIMEOUT);
         (publication.is_ok(), started.elapsed())
     });
 
