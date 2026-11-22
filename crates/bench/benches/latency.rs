@@ -69,6 +69,7 @@ use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
 use deepmsg_core::clock::monotonic_nano_time;
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::driver::{OWN_DRIVER_ENV, ReferenceDriver};
+use deepmsg_tests::ports::port;
 use deepmsg_tests::samples::{self, Sample};
 
 /// The ping stream, the reference's own default (`samples_configuration.h:24`).
@@ -234,13 +235,20 @@ fn ours(pairing: &Pairing, driver: &mut Driver) -> Result<Row, String> {
         )
     })?;
 
+    // One payload for the whole run, allocated before the measured loop: the
+    // reference's own `Ping` allocates once and overwrites the stamp
+    // (`aeron-samples/src/main/c/cping.c:109`), and a `vec![0; length]` per
+    // round trip would put the allocator and its zeroing inside the interval
+    // the stamp opens.
+    let mut payload = vec![0_u8; pairing.length];
+
     for _ in 0..pairing.warmup {
-        round_trip(&mut client, publication, subscription, pairing)?;
+        round_trip(&mut client, publication, subscription, &mut payload)?;
     }
 
     let mut samples = histogram();
     for _ in 0..pairing.messages {
-        let elapsed_ns = round_trip(&mut client, publication, subscription, pairing)?;
+        let elapsed_ns = round_trip(&mut client, publication, subscription, &mut payload)?;
         samples
             .record(elapsed_ns)
             .map_err(|error| format!("a sample fell outside the histogram's bounds: {error}"))?;
@@ -439,10 +447,25 @@ fn reference_java(args: &Args, pairing: &Pairing, driver: &mut Driver) -> Result
 
 /// The scripts the Java pair is launched through, and their output files.
 struct JavaScripts {
+    stdin: PathBuf,
     ping: PathBuf,
     ping_output: PathBuf,
     pong: PathBuf,
     pong_output: PathBuf,
+}
+
+impl Drop for JavaScripts {
+    fn drop(&mut self) {
+        for path in [
+            &self.stdin,
+            &self.ping,
+            &self.ping_output,
+            &self.pong,
+            &self.pong_output,
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 impl JavaScripts {
@@ -488,6 +511,7 @@ impl JavaScripts {
         )?;
 
         Ok(Self {
+            stdin,
             ping_output: base.with_extension("ping.out"),
             pong_output: base.with_extension("pong.out"),
             ping,
@@ -583,9 +607,13 @@ const JVM_OPENS: &str = "--add-opens java.base/jdk.internal.misc=ALL-UNNAMED \
 /// Three jars from the checkout's own build output, and two from the Gradle
 /// cache the build resolved them from: `agrona`, which every Aeron Java program
 /// uses, and `HdrHistogram`, which is what the samples' percentile table comes
-/// from.
+/// from. The checkout is `DEEPMSG_REF_AERON_DIR` when it is set, and the
+/// sibling `../../../aeron` otherwise.
 fn java_classpath() -> Result<String, String> {
-    let reference = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../aeron");
+    let reference = match std::env::var("DEEPMSG_REF_AERON_DIR") {
+        Ok(directory) if !directory.is_empty() => PathBuf::from(directory),
+        _ => Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../aeron"),
+    };
     let mut jars = Vec::new();
 
     for name in ["aeron-client", "aeron-driver", "aeron-samples"] {
@@ -1004,16 +1032,19 @@ fn offer(client: &Client, publication: i64, payload: &[u8]) -> Result<(), String
 /// The stamp is written into the payload and read back off the reply, so what
 /// arrives is the answer to what went out: with only the arrival timed, a reply
 /// to an *earlier* message would be recorded as a very fast one.
+///
+/// `payload` is the run's one buffer, written in place: the bytes after the
+/// stamp are already the zeroes `Pairing::payload` would have built.
 fn round_trip(
     client: &mut Client,
     publication: i64,
     subscription: i64,
-    pairing: &Pairing,
+    payload: &mut [u8],
 ) -> Result<u64, String> {
     let stamp = monotonic_nano_time();
-    let payload = pairing.payload(stamp);
+    payload[..8].copy_from_slice(&stamp.to_le_bytes());
 
-    offer(client, publication, &payload)?;
+    offer(client, publication, payload)?;
 
     let deadline = Instant::now() + ROUND_TRIP_TIMEOUT;
     let mut replied = false;
@@ -1159,11 +1190,24 @@ struct Driver {
     process: ReferenceDriver,
     binary: PathBuf,
     which: WhichDriver,
+    /// The Java driver's wrapper script, if this run wrote one. Dropped with
+    /// the driver, so a failed start does not leave the script behind either.
+    _script: Option<ScriptGuard>,
+}
+
+/// Removes the Java driver's wrapper script when the run is over.
+struct ScriptGuard(PathBuf);
+
+impl Drop for ScriptGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 impl Driver {
     /// Start the driver the caller asked for.
     fn start(args: &Args) -> Result<Self, String> {
+        let mut script = None;
         let binary = match args.driver {
             WhichDriver::Own => resolve_own_driver(args.driver_binary.as_deref())?,
             WhichDriver::Reference => {
@@ -1172,7 +1216,11 @@ impl Driver {
             // The Java driver is launched by class name, so what the spawner is
             // given is a script that puts the property arguments where a JVM
             // wants them — before the class name, not after it.
-            WhichDriver::ReferenceJava => java_driver_script(&java_classpath()?)?,
+            WhichDriver::ReferenceJava => {
+                let path = java_driver_script(&java_classpath()?)?;
+                script = Some(ScriptGuard(path.clone()));
+                path
+            }
         };
 
         // The reference driver is not spawned by name on its own: it is the
@@ -1185,6 +1233,7 @@ impl Driver {
             process,
             binary,
             which: args.driver,
+            _script: script,
         })
     }
 
@@ -1297,19 +1346,19 @@ struct Pairing {
 impl Pairing {
     /// The same scenario on a different pair of ports.
     ///
-    /// Ports come from a range derived from this process's id rather than fixed
-    /// ones, the same way `tests/interop/udp_transport.rs` picks its own: two
-    /// runs on one machine collide only if something else chose exactly this
-    /// range, and nothing has to be cleaned up between runs.
+    /// Ports come from this process's single-driver slot, the same window the
+    /// test suite uses (`tests/src/ports.rs`): two runs on one machine collide
+    /// only if they draw the same slot, and nothing has to be cleaned up
+    /// between runs.
     fn at(&self, index: usize) -> Self {
-        let base = 20_000 + (std::process::id() % 20_000) as u16;
-        let first = base.saturating_add((index * 2) as u16);
+        let first = port((index * 2) as u16);
+        let second = port((index * 2 + 1) as u16);
 
         Self {
             channel: self.channel,
             length: self.length,
             ping_uri: self.channel.uri(first),
-            pong_uri: self.channel.uri(first.saturating_add(1)),
+            pong_uri: self.channel.uri(second),
             // Streams vary per row for the reason the constant's own note
             // gives: an IPC row's channel is always `aeron:ipc`.
             ping_stream_id: PING_STREAM_ID + (index * 2) as i32,

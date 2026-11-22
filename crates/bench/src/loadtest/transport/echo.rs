@@ -21,12 +21,11 @@
 //! the measured thread's own clock.
 //!
 //! [`Conductor::Inline`] is the rig's own shape, exactly as it was before the
-//! switch existed, and is what an unset switch gives. [`Conductor::InlineGated`]
-//! is the shape the A/B asks for: the duty cycle runs at most once an interval,
-//! which is what a `receive()` costs when the driver half of the cycle is not
-//! run on every turn.
+//! switch existed, and is what a literal `0` gives. [`Conductor::InlineGated`]
+//! is the default (one millisecond) and the shape the A/B asks for: the duty
+//! cycle runs at most once an interval, which is what a `receive()` costs when
+//! the driver half of the cycle is not run on every turn.
 
-use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use deepmsg_client::client::{Client, DEFAULT_TIMEOUT};
@@ -38,42 +37,19 @@ use crate::loadtest::recorder::Recorder;
 use crate::loadtest::transceiver::{Clock, MessageTransceiver, SystemClock, TransceiverError};
 use crate::loadtest::transport::sender::{Kind, MessageSender, PublicationOutbound};
 use crate::loadtest::transport::util::{
-    ChannelSettings, MIN_MESSAGE_LENGTH, TIMESTAMP_OFFSET, await_connected,
+    ChannelSettings, Gate, MIN_MESSAGE_LENGTH, TIMESTAMP_OFFSET, await_connected,
 };
 
-/// How often the inline duty cycle runs, when it is not on every `receive()`.
-///
-/// The rig's duty cycle is [`Client::poll`] on the measured thread (see the
-/// module documentation), and every run but the A/B runs it on every turn: that
-/// is [`PollGate::Every`], the default, and the shape the rig has always had.
-/// [`PollGate::EveryInterval`] is the shape the A/B's "after" arm asks for, read
-/// from an environment variable in the binary rather than from a setting — see
-/// `loadtest-rig.rs` — so an unset or mistyped switch leaves the rig as it was.
-///
-/// The duty cycle is **not free to skip**: `Client::poll` carries
-/// `check_liveness`, the driver's replies and `expire_pending`
-/// (`crates/client/src/client.rs:970-986`). What the gate does *not* touch is
-/// the subscription read ([`EchoTransceiver::receive`]'s `poll_messages`), which
-/// is where a reply is actually taken off the term — so the gate does not make a
-/// run lose a message; it makes it run the driver half of the cycle less often.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PollGate {
-    /// `Client::poll` on every `receive()`: the rig's own shape, and what an
-    /// unset switch gives.
-    Every,
-    /// At most one `Client::poll` per `interval` nanoseconds of the measured
-    /// thread's own monotonic clock, checked on every `receive()`. The interval
-    /// is always > 0.
-    EveryInterval(u64),
-}
+pub use crate::loadtest::transport::util::PollGate;
 
 /// Where the client's duty cycle runs.
 ///
-/// `Inline` is the rig's own, and the default; `InlineGated` runs the same duty
-/// cycle at most once an interval. The gate is on the clock and not on a turn
-/// count, because an interval is a property of the run where a turn count is a
-/// property of how fast the machine turns — which is what makes the two arms of
-/// an A/B comparable across an iteration rate.
+/// `Inline` is the rig's own, and what a literal `0` asks for; `InlineGated` is
+/// the default and runs the same duty cycle at most once an interval. The gate
+/// is on the clock and not on a turn count, because an interval is a property of
+/// the run where a turn count is a property of how fast the machine turns —
+/// which is what makes the two arms of an A/B comparable across an iteration
+/// rate.
 // A `Client` is several hundred bytes and `Inline` holds one by value, so the
 // variants differ by an order of magnitude. Boxing it to even them out would put
 // an indirection on the path the switch promises to leave exactly as it was, and
@@ -91,17 +67,14 @@ enum Conductor {
     /// asking is what a `receive()` costs when the driver half of the duty cycle
     /// runs once an interval rather than once a turn.
     ///
-    /// [`Conductor::Inline`] is what an unset switch — every run but the A/B —
-    /// uses, and its `receive` arm is left byte for byte as it was.
+    /// [`Conductor::Inline`] is what a literal `0` — the rig's old shape —
+    /// uses, and its `receive` arm is left byte for byte as it was. An unset
+    /// switch gives this variant at one millisecond.
     InlineGated {
         /// The client, polled at most once an interval.
         client: Client,
-        /// The interval, in nanoseconds. Always > 0.
-        interval: u64,
-        /// When the next `poll` is due, on the measured thread's monotonic
-        /// clock. A plain `Cell`, on purpose: one thread's own reading, and the
-        /// transceiver is never shared.
-        due: Cell<i64>,
+        /// The interval and the clock reading it remembers.
+        gate: Gate,
     },
 }
 
@@ -144,9 +117,10 @@ impl EchoTransceiver {
     /// false and goes through `aeron.dir` instead.
     ///
     /// `gate` selects [`Conductor`], and only matters for the inline shape:
-    /// [`PollGate::Every`] — the default — is [`Conductor::Inline`] and the path
-    /// this rig has always run, and [`PollGate::EveryInterval`] is
-    /// [`Conductor::InlineGated`], the A/B's "after" arm. It is the scene of a
+    /// [`PollGate::Every`] — what a literal `0` asks for — is
+    /// [`Conductor::Inline`] and the path this rig has always run, and
+    /// [`PollGate::EveryInterval`] is [`Conductor::InlineGated`], which is what
+    /// an unset switch gives at one millisecond. It is the scene of a
     /// measurement (how much of a `receive()` the duty cycle is) and not a
     /// setting a run should carry.
     ///
@@ -178,14 +152,13 @@ impl EchoTransceiver {
 
         let conductor = match gate {
             PollGate::Every => Conductor::Inline(client),
-            PollGate::EveryInterval(interval) => Conductor::InlineGated {
+            // Poll on the first call, for the same reason the reference polls
+            // immediately: `due` in the past is what the first `receive` sees,
+            // and every later one is an interval away from the reading it was
+            // set from.
+            PollGate::EveryInterval(_) => Conductor::InlineGated {
                 client,
-                interval,
-                // Poll on the first call, for the same reason the reference
-                // polls immediately: `due` in the past is what the first
-                // `receive` sees, and every later one is an interval away from
-                // the reading it was set from.
-                due: Cell::new(0),
+                gate: Gate::new(gate),
             },
         };
 
@@ -383,16 +356,9 @@ impl<C: Clock> MessageTransceiver<C> for EchoTransceiver {
             // §2.1) to answer a question about an interval of a millisecond.
             // What it costs is that the answer is at most one turn stale, which
             // on that interval is 127-180 ns out of 1_000_000.
-            Conductor::InlineGated {
-                client,
-                interval,
-                due,
-            } => {
-                let now = recorder.last_nano_time();
-                if now >= due.get() {
+            Conductor::InlineGated { client, gate } => {
+                if gate.is_due(recorder.last_nano_time()) {
                     client.poll();
-                    let interval = i64::try_from(*interval).unwrap_or(i64::MAX);
-                    due.set(now.saturating_add(interval));
                 }
                 poll_messages(
                     client,

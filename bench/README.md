@@ -110,6 +110,21 @@ results:
   the channels, the settings the drivers were actually given.
 - the histograms themselves, one per cell, in the harness's own layout.
 
+## The rig's client-poll switch
+
+`loadtest-rig`'s client conductor runs on the measured thread, so how often the
+duty cycle runs is part of the shape being measured.
+`DEEPMSG_RIG_CLIENT_POLL_MIN_NS` names it:
+
+| value | shape |
+|---|---|
+| unset or empty | once a millisecond — the default, and the shape the reference's rig has because its conductor is on a thread of its own |
+| `0` | `Client::poll` on every `receive()`, the rig's shape before the switch existed |
+| `N > 0` | at most once every `N` nanoseconds of the measured thread's clock |
+| anything else | refused at startup: a mistyped value that silently measured the other arm is the failure this switch exists to prevent |
+
+Record a run's value with the rest of its settings in `RUN-INFO.txt`.
+
 ## The interrupt layout
 
 A reading from a machine with a sleeping core is not a reading of the driver:

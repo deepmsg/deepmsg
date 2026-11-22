@@ -493,6 +493,11 @@ fn empty_poll(c: &mut Criterion) {
         b.iter(|| {
             // Rewound by hand: the poll advances the reader's position, and a
             // second read of a frame nobody put back is not a read.
+            //
+            // What this measures is the client's read under an L1-exclusive
+            // hit: one image, one frame, and nothing else touching the term.
+            // It is the floor `latency.rs`'s cross-process round trip sits
+            // above, not a number to compare with it.
             one_image.set_position(0);
             let read = one_image.poll(FRAGMENT_LIMIT, |_| {});
             assert_eq!(1, read, "the frame is there to be read");

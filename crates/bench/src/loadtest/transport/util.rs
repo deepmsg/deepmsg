@@ -5,6 +5,7 @@
 //! — the module of the reference's whose settings are read from wherever they
 //! are needed rather than gathered into its `Configuration`.
 
+use std::cell::Cell;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -67,6 +68,81 @@ pub const DEFAULT_RECORD_STREAM: i32 = 99999;
 
 /// How long to wait for a publication and a subscription to find each other.
 pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the inline client duty cycle runs, when it is not on every turn.
+///
+/// The rig's duty cycle is [`Client::poll`] on the measured thread (see the
+/// transceivers' module documentation). An unset switch gives
+/// [`PollGate::EveryInterval`] at one millisecond — the shape the reference's rig
+/// has, because its conductor is on a thread of its own — and a literal `0` asks
+/// for [`PollGate::Every`], the shape the rig ran before the switch existed.
+/// See `loadtest-rig.rs` for the switch's four shapes.
+///
+/// The duty cycle is **not free to skip**: `Client::poll` carries
+/// `check_liveness`, the driver's replies and `expire_pending`
+/// (`crates/client/src/client.rs:970-986`). What the gate does *not* touch is
+/// the subscription read, which is where a reply is actually taken off the term
+/// — so the gate does not make a run lose a message; it makes it run the driver
+/// half of the cycle less often.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollGate {
+    /// `Client::poll` on every `receive()`: the rig's own shape.
+    Every,
+    /// At most one `Client::poll` per `interval` nanoseconds of the measured
+    /// thread's own monotonic clock, checked on every `receive()`. The interval
+    /// is always > 0.
+    EveryInterval(u64),
+}
+
+/// A [`PollGate`] and the one thread's clock reading it remembers.
+///
+/// The state is a [`Cell`] on purpose: it is one measured thread's own reading,
+/// and a transceiver is never shared across threads.
+#[derive(Debug)]
+pub struct Gate {
+    /// `None` for [`PollGate::Every`], otherwise the interval in nanoseconds.
+    interval: Option<i64>,
+    /// When the next poll is due, on the measured thread's monotonic clock.
+    due: Cell<i64>,
+}
+
+impl Gate {
+    /// The gate `gate` selects, due at the first reading.
+    #[must_use]
+    pub fn new(gate: PollGate) -> Self {
+        Self {
+            interval: match gate {
+                PollGate::Every => None,
+                PollGate::EveryInterval(interval) => {
+                    Some(i64::try_from(interval).unwrap_or(i64::MAX))
+                }
+            },
+            // Zero is in the past on a monotonic clock, so the first turn polls
+            // — the reference polls immediately too.
+            due: Cell::new(0),
+        }
+    }
+
+    /// Whether the duty cycle is due at `now`, moving `due` an interval on when
+    /// it is.
+    ///
+    /// [`PollGate::Every`] is due on every turn. A gated run is due on the first
+    /// turn and then at most once an interval.
+    #[must_use]
+    pub fn is_due(&self, now: i64) -> bool {
+        match self.interval {
+            None => true,
+            Some(interval) => {
+                if now >= self.due.get() {
+                    self.due.set(now.saturating_add(interval));
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
 
 /// The settings `AeronUtil` reads, spelled out as `Configuration`'s are.
 pub mod property {
@@ -608,5 +684,24 @@ mod tests {
     #[test]
     fn a_connection_that_is_already_there_is_not_waited_for() {
         assert!(await_connected(|| true, Duration::from_secs(60), &SystemClock).is_ok());
+    }
+
+    #[test]
+    fn a_gate_polls_on_the_first_turn_and_then_once_an_interval() {
+        let gate = Gate::new(PollGate::EveryInterval(1_000_000));
+
+        assert!(gate.is_due(0), "the first reading is due");
+        assert!(!gate.is_due(999_999), "the interval has not gone by");
+        assert!(gate.is_due(1_000_000), "the interval is up");
+        assert!(!gate.is_due(1_500_000), "the due moved on when it fired");
+        assert!(gate.is_due(2_000_000));
+    }
+
+    #[test]
+    fn an_every_gate_polls_on_every_turn() {
+        let gate = Gate::new(PollGate::Every);
+
+        assert!(gate.is_due(0));
+        assert!(gate.is_due(1));
     }
 }

@@ -697,11 +697,27 @@ pub fn summary_from_hdr_table(output: &str) -> Result<Summary, String> {
         ));
     }
 
+    // The classic table ends with `#[Mean = ..., StdDeviation = ...]`
+    // (`hdr_histogram.c:1249-1252`), scaled by the same 1000 the rows are
+    // (`:1292-1298`). That is the exact arithmetic mean; the row difference
+    // below is only an estimate, so the footer wins when it is there.
+    let footer_mean = output.lines().find_map(|line| {
+        let rest = line.trim_start().strip_prefix("#[Mean")?;
+        rest.split(|character: char| character == ',' || character.is_whitespace())
+            .find_map(|token| token.parse::<f64>().ok())
+            .map(|mean_us| mean_us * 1000.0)
+    });
+
     // The lowest value whose cumulative count has reached the quantile — the
     // definition of a percentile, applied to the counts the table gives.
     let at = |quantile: f64| -> u64 {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let target = (total as f64 * quantile) as u64;
+        // `hdr_value_at_percentile` is `(percentile / 100 * total) + 0.5`,
+        // truncated (`hdr_histogram.c:772-777`) — not `ceil`: 500.2 is 500.
+        // The truncation this replaced answered 499 for a hundred samples at
+        // p99.9, which is p99.
+        let target = ((total as f64 * quantile) + 0.5) as u64;
+        let target = target.clamp(1, total);
 
         samples
             .iter()
@@ -709,18 +725,31 @@ pub fn summary_from_hdr_table(output: &str) -> Result<Summary, String> {
             .map_or(0, |(value, _)| *value)
     };
 
-    // The table's counts are cumulative, so each row's own weight is what it
-    // adds to the row before it.
-    let mut mean = 0.0;
-    let mut previous = 0_u64;
-    for (value, count) in &samples {
-        mean += *value as f64 * count.saturating_sub(previous) as f64;
-        previous = *count;
-    }
+    let mean = if let Some(mean) = footer_mean {
+        mean
+    } else {
+        eprintln!(
+            "the reference's output has no `#[Mean ...]` footer; the mean is a \
+             row-difference estimate"
+        );
+
+        // The table's counts are cumulative, so each row's own weight is what
+        // it adds to the row before it. The row's value is the top of its
+        // bucket, so this over-estimates — which is why the footer wins when
+        // there is one.
+        let mut sum = 0.0;
+        let mut previous = 0_u64;
+        for (value, count) in &samples {
+            sum += *value as f64 * count.saturating_sub(previous) as f64;
+            previous = *count;
+        }
+
+        sum / total as f64
+    };
 
     Ok(Summary {
         count: total,
-        mean: mean / total as f64,
+        mean,
         p50: at(0.50),
         p90: at(0.90),
         p99: at(0.99),
@@ -958,6 +987,47 @@ mod tests {
         // not be for a table with more rows.
         assert_eq!(8_000, summary.p99_9);
         assert_eq!(8_000, summary.max);
+    }
+
+    #[test]
+    fn a_hundred_samples_put_the_p99_9_on_the_hundredth() {
+        // With a hundred samples the reference's `(0.999 * 100) + 0.5` is 100,
+        // so p99.9 is the last sample. Truncating before the 0.5 gave 99, which
+        // is p99.
+        let table = "\
+       Value     Percentile TotalCount 1/(1-Percentile)
+
+       4.000 0.000000000000      1
+       5.000 0.900000000000     90  10.00
+       6.000 0.990000000000     99  100.00
+       7.000 1.000000000000    100
+";
+
+        let summary = summary_from_hdr_table(table).expect("a table");
+
+        assert_eq!(100, summary.count);
+        assert_eq!(7_000, summary.p99_9);
+        assert_eq!(6_000, summary.p99);
+    }
+
+    #[test]
+    fn the_footer_mean_is_the_mean_the_reference_reported() {
+        // `hdr_percentiles_print`'s classic format, footer included. The rows
+        // are deliberately uneven: the row-difference estimate is not 5.123.
+        let table = "\
+       Value     Percentile TotalCount 1/(1-Percentile)
+
+       5.000 0.000000000000      1
+       6.000 0.900000000000     90  10.00
+       7.000 1.000000000000    100
+#[Mean    =        5.123, StdDeviation   =        0.456]
+#[Max     =        7.000, Total count    =          100]
+#[Buckets =           10, SubBuckets     =          2048]
+";
+
+        let summary = summary_from_hdr_table(table).expect("a table");
+
+        assert_eq!(5_123.0, summary.mean);
     }
 
     #[test]
