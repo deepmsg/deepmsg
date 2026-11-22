@@ -394,6 +394,11 @@ impl OwnDriver {
         self.0.aeron_dir()
     }
 
+    /// The driver process's id, for a test that has to signal it.
+    pub fn pid(&self) -> u32 {
+        self.0.pid()
+    }
+
     /// Wait for the CnC file to be published and readable.
     pub fn await_cnc(&mut self, timeout: Duration) -> Result<CncFile, DriverError> {
         self.0.await_cnc(timeout)
