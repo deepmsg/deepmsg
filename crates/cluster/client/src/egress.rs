@@ -14,7 +14,7 @@
 //! stream and not the session: it holds the session id it cares about, drops
 //! everything addressed to another session, and hands the rest to its
 //! listener — which is exactly what `EgressAdapterTest`'s ten cases pin down.
-//! [`crate::cluster::AeronCluster`] reads the same decode and adds the
+//! [`crate::cluster::ClusterClient`] reads the same decode and adds the
 //! session's own reactions (`SessionEvent.CLOSED`, a new leader, the egress
 //! image). The parse is shared so there is one answer to "what is this
 //! message"; the reactions are not, because the session's are its own.

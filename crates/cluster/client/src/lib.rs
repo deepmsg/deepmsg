@@ -19,7 +19,7 @@
 //! # Shaped like the archive's client
 //!
 //! A `Client` is always the caller's here, and every poll method takes it:
-//! `AsyncConnect::poll(&mut Client)`, `AeronCluster::poll_egress(&mut Client)`.
+//! `AsyncConnect::poll(&mut Client)`, `ClusterClient::poll_egress(&mut Client)`.
 //! Nothing in this crate owns a client, starts a thread, or waits on one — the
 //! caller drives the client and the connect a turn at a time, exactly as
 //! `crates/archive/src/client` does. That is what lets one `Client` carry
@@ -40,9 +40,9 @@ pub(crate) mod sbe;
 pub(crate) mod test_client;
 
 pub use async_connect::{AsyncConnect, ConnectState, Polled, connect};
-pub use cluster::{AeronCluster, IngressPublication, SessionClaim, SessionState};
+pub use cluster::{ClusterClient, IngressPublication, SessionClaim, SessionState};
 pub use context::{
-    AeronClusterContext, CLIENT_NAME_PROP_NAME, CredentialsSupplier, EGRESS_CHANNEL_PROP_NAME,
+    CLIENT_NAME_PROP_NAME, ClusterClientContext, CredentialsSupplier, EGRESS_CHANNEL_PROP_NAME,
     EGRESS_STREAM_ID_DEFAULT, EGRESS_STREAM_ID_PROP_NAME, INGRESS_CHANNEL_PROP_NAME,
     INGRESS_ENDPOINTS_PROP_NAME, INGRESS_STREAM_ID_DEFAULT, INGRESS_STREAM_ID_PROP_NAME,
     MAX_CLIENT_NAME_LENGTH, MESSAGE_TIMEOUT_DEFAULT_NS, MESSAGE_TIMEOUT_PROP_NAME, NanoClock,

@@ -13,7 +13,7 @@
 //!
 //! Same reason as LC-1's scenarios: a client of a cluster reachable only over
 //! UDP is a deployment, and a client sharing a member's driver would not be.
-//! [`Session`] starts the driver and connects our `AeronCluster` through it.
+//! [`Session`] starts the driver and connects our `ClusterClient` through it.
 //!
 //! # The window
 //!

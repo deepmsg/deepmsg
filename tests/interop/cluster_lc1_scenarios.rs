@@ -1,7 +1,7 @@
 //! LC-1: our cluster client against a Java cluster, over UDP, on its own driver.
 //!
 //! The three-node scenarios of the client spec's §5, each of which puts our
-//! `AeronCluster` where a deployed client would be: a driver of its own (not a
+//! `ClusterClient` where a deployed client would be: a driver of its own (not a
 //! member's), an ingress channel that names one endpoint or all of them, and an
 //! egress subscription the cluster answers on.
 //!

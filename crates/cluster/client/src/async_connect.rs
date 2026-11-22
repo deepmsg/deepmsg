@@ -5,7 +5,7 @@
 //! — has the driver answered the egress add, has the ingress publication met
 //! its subscriber, has an answer come back — and moves on exactly one step when
 //! it has. A caller drives it a turn at a time; nothing here blocks, and
-//! nothing here drives the [`Client`] (see [`crate::AeronCluster::connect`]
+//! nothing here drives the [`Client`] (see [`crate::ClusterClient::connect`]
 //! for the loop that does).
 //!
 //! # One deadline, taken once
@@ -38,7 +38,7 @@
 //!
 //! A failed or abandoned connect gives back what it drew ([`AsyncConnect::close`]);
 //! a successful one hands the publication, the subscription and the identity of
-//! the session to [`crate::AeronCluster`], which owns them from then on.
+//! the session to [`crate::ClusterClient`], which owns them from then on.
 
 use std::time::{Duration, Instant};
 
@@ -52,8 +52,8 @@ use deepmsg_core::uri::ChannelUri;
 use deepmsg_core::version::{BUILD_IDENTITY, COMPAT_VERSION_TEXT};
 
 use crate::client_ops::ClientOps;
-use crate::cluster::{AeronCluster, IngressPublication};
-use crate::context::{AeronClusterContext, PROTOCOL_SEMANTIC_VERSION};
+use crate::cluster::{ClusterClient, IngressPublication};
+use crate::context::{ClusterClientContext, PROTOCOL_SEMANTIC_VERSION};
 use crate::egress_poller::EgressPoller;
 use crate::error::ClusterClientError;
 
@@ -134,7 +134,7 @@ pub enum Polled {
     ///
     /// Boxed because the other arm carries nothing and a connect returns this
     /// on every turn.
-    Done(Box<AeronCluster>),
+    Done(Box<ClusterClient>),
 }
 
 /// One member's ingress, while a connect is choosing between them
@@ -177,7 +177,7 @@ impl MemberIngress {
 
 /// A connect in progress.
 pub struct AsyncConnect {
-    context: AeronClusterContext,
+    context: ClusterClientContext,
     state: ConnectState,
     /// **Taken once**, in [`AsyncConnect::new`] (`AC:2198-2205`).
     deadline: Instant,
@@ -219,7 +219,7 @@ impl AsyncConnect {
     ///
     /// [`ClusterClientError::Configuration`] when `ingressEndpoints` is not the
     /// `<memberId>=<endpoint>,…` form (`AC:735-756`).
-    pub fn new(context: AeronClusterContext) -> Result<Self, ClusterClientError> {
+    pub fn new(context: ClusterClientContext) -> Result<Self, ClusterClientError> {
         let members = parse_ingress_endpoints(context.ingress_endpoints.as_deref())?;
         let timeout = Duration::from_nanos(u64::try_from(context.message_timeout_ns).unwrap_or(0));
 
@@ -250,7 +250,7 @@ impl AsyncConnect {
     /// (`AC:2198`), with the same audience: tests.
     #[cfg(test)]
     pub(crate) fn with_deadline(
-        context: AeronClusterContext,
+        context: ClusterClientContext,
         deadline: Instant,
     ) -> Result<Self, ClusterClientError> {
         let mut connect = Self::new(context)?;
@@ -858,7 +858,7 @@ impl AsyncConnect {
     }
 
     /// `concludeConnect` (`AC:2572-2598`).
-    fn conclude_connect(&mut self, client: &mut impl ClientOps) -> AeronCluster {
+    fn conclude_connect(&mut self, client: &mut impl ClientOps) -> ClusterClient {
         if self.context.new_leader_timeout_ns.is_none() {
             let heartbeat = self
                 .leader_heartbeat_timeout_ns
@@ -890,7 +890,7 @@ impl AsyncConnect {
 
         self.state = ConnectState::Done;
 
-        AeronCluster::new(
+        ClusterClient::new(
             std::mem::take(&mut self.context),
             ingress,
             egress_subscription,
@@ -941,9 +941,9 @@ impl AsyncConnect {
 ///
 /// Whatever the connect fails with.
 pub fn connect(
-    mut context: AeronClusterContext,
+    mut context: ClusterClientContext,
     client: &mut Client,
-) -> Result<AeronCluster, ClusterClientError> {
+) -> Result<ClusterClient, ClusterClientError> {
     context.conclude()?;
     let mut async_connect = AsyncConnect::new(context)?;
 
@@ -998,7 +998,7 @@ pub(crate) fn parse_ingress_endpoints(
 
 /// The channel a member's ingress publication is added on (`AC:2617-2627`):
 /// a UDP ingress channel has its `endpoint` replaced with the member's.
-pub(crate) fn member_channel(context: &AeronClusterContext, endpoint: &str) -> String {
+pub(crate) fn member_channel(context: &ClusterClientContext, endpoint: &str) -> String {
     let Some(channel) = context.ingress_channel.as_deref() else {
         return String::new();
     };
@@ -1018,7 +1018,7 @@ pub(crate) fn member_channel(context: &AeronClusterContext, endpoint: &str) -> S
 /// `asyncAddIngressPublication` (`AC:795-805`).
 pub(crate) fn async_add_ingress(
     client: &mut impl ClientOps,
-    context: &AeronClusterContext,
+    context: &ClusterClientContext,
     channel: &str,
 ) -> Result<AsyncAdd, ClusterClientError> {
     let result = if context.is_ingress_exclusive {
@@ -1040,7 +1040,7 @@ pub(crate) fn async_add_ingress(
 
 /// The kind an ingress publication is (`AC:795-805`).
 pub(crate) fn ingress_kind(
-    context: &AeronClusterContext,
+    context: &ClusterClientContext,
     registration_id: i64,
 ) -> IngressPublication {
     if context.is_ingress_exclusive {
@@ -1103,8 +1103,8 @@ mod tests {
     use super::*;
     use crate::test_client::{AddAnswer, RecordingClient};
 
-    fn context() -> AeronClusterContext {
-        AeronClusterContext::default()
+    fn context() -> ClusterClientContext {
+        ClusterClientContext::default()
             .ingress_channel(Some("aeron:ipc"))
             .egress_channel(Some("aeron:ipc"))
     }
@@ -1271,7 +1271,7 @@ mod tests {
     /// that connects wins.
     #[test]
     fn member_publications_are_added_once_each_and_the_first_connected_one_wins() {
-        let mut context = AeronClusterContext::default()
+        let mut context = ClusterClientContext::default()
             .ingress_channel(Some("aeron:udp"))
             .ingress_endpoints(Some(
                 "0=localhost:20000,1=localhost:20001,2=localhost:20002",
@@ -1339,7 +1339,7 @@ mod tests {
     /// connect would spend its whole timeout redirecting to itself.
     #[test]
     fn a_redirect_is_answered_by_the_leader_it_names() {
-        let mut context = AeronClusterContext::default()
+        let mut context = ClusterClientContext::default()
             .ingress_channel(Some("aeron:udp"))
             .ingress_endpoints(Some(
                 "0=localhost:20000,1=localhost:20001,2=localhost:20002",
@@ -1432,7 +1432,7 @@ mod tests {
     /// publication is used when it lands.
     #[test]
     fn a_temporarily_unavailable_member_add_is_retried() {
-        let context = AeronClusterContext::default()
+        let context = ClusterClientContext::default()
             .ingress_channel(Some("aeron:udp"))
             .ingress_endpoints(Some("0=localhost:20000"))
             .egress_channel(Some("aeron:ipc"));

@@ -2,7 +2,7 @@
 //! closes.
 //!
 //! `cluster_lc1_connect` proved the connect. This proves the two directions and
-//! the end of the session: our `AeronCluster` offers a message on the ingress,
+//! the end of the session: our `ClusterClient` offers a message on the ingress,
 //! the reference's consensus module sequences it, our `echo` business answers
 //! it, and the answer comes back on the egress and reaches a listener. Then
 //! `close` sends a `SessionCloseRequest`, and the business is asked to close the
@@ -28,7 +28,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use deepmsg_client::fragment_assembler::MessageHeader;
-use deepmsg_cluster_client::{AeronCluster, AeronClusterContext, EgressListener};
+use deepmsg_cluster_client::{ClusterClient, ClusterClientContext, EgressListener};
 use deepmsg_codec_cluster::close_reason::CloseReason;
 use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_tests::cluster::{MemberSpec, Options, TestCluster};
@@ -88,14 +88,14 @@ fn our_client_offers_a_message_and_closes_the_session() {
     let received = Rc::new(RefCell::new(Received::default()));
     let mut client = cluster.client();
 
-    let context = AeronClusterContext::default()
+    let context = ClusterClientContext::default()
         .ingress_channel(Some("aeron:ipc"))
         .egress_channel(Some("aeron:ipc"))
         .client_name("deepmsg-lc1-echo")
         .message_timeout_ns(i64::try_from(DEADLINE.as_nanos()).expect("a timeout that fits an i64"))
         .egress_listener(Box::new(SharedListener(Rc::clone(&received))));
 
-    let mut session = AeronCluster::connect(context, &mut client).unwrap_or_else(|error| {
+    let mut session = ClusterClient::connect(context, &mut client).unwrap_or_else(|error| {
         panic!(
             "our client did not connect: {error}\nnode log:\n{}",
             cluster.node_log(0)
