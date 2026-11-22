@@ -335,6 +335,11 @@ impl ClusterBackupAgent {
             .take()
             .unwrap_or_else(|| default_cluster_archive_context(config));
 
+        // `concludeMarkFile` runs after both archive contexts exist
+        // (`ClusterBackup.java:2070-2090`), and the local one is what names the
+        // mark file's `archiveStreamId`.
+        ctx.conclude_mark_file(&local_archive_context)?;
+
         let source_type = config.source_type()?;
         let role_name = config.role_name();
 
