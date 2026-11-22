@@ -645,7 +645,55 @@ fn decoder(bytes: &[u8]) -> Result<MarkFileHeaderDecoder<'_>, ArchiveMarkError> 
         });
     }
 
+    // The generated reader panics where the reference's buffer throws: the
+    // header's fixed block and its four variable-length strings must fit before
+    // one of them is sliced.
+    if !header_fields_fit(bytes, &message_header) {
+        return Err(ArchiveMarkError::NotAMarkFile {
+            path: PathBuf::new(),
+        });
+    }
+
     Ok(MarkFileHeaderDecoder::default().header(message_header, 0))
+}
+
+/// The mark header's fixed block and its four variable-length fields.
+///
+/// The block grew at schema versions 1 (`headerLength`, `errorBufferLength`)
+/// and 2 (`archiveId`); the four strings arrived with the first version. A
+/// file written by an older build is still one this reader may open.
+fn header_fields_fit(bytes: &[u8], header: &MessageHeaderDecoder<ReadBuf<'_>>) -> bool {
+    let fixed = match header.version() {
+        0 => 40,
+        1 => 48,
+        _ => 56,
+    };
+    if bytes.len() < MESSAGE_HEADER_LENGTH + fixed {
+        return false;
+    }
+
+    let mut at = MESSAGE_HEADER_LENGTH + usize::from(header.block_length());
+    for _ in 0..4 {
+        let Some(prefix_end) = at.checked_add(4) else {
+            return false;
+        };
+        let Some(prefix) = bytes.get(at..prefix_end) else {
+            return false;
+        };
+        let length = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
+        let Ok(length) = usize::try_from(length) else {
+            return false;
+        };
+        let Some(next) = prefix_end.checked_add(length) else {
+            return false;
+        };
+        if next > bytes.len() {
+            return false;
+        }
+        at = next;
+    }
+
+    true
 }
 
 /// The two fields this module needs before it can hand out any others: the

@@ -22,18 +22,11 @@
 use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::{Action, ControlledHandler, Message};
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
-use deepmsg_codec::archive::control_response_codec::{
-    ControlResponseDecoder, SBE_BLOCK_LENGTH as CONTROL_RESPONSE_BLOCK_LENGTH,
-};
-use deepmsg_codec::archive::recording_signal_event_codec::{
-    RecordingSignalEventDecoder, SBE_BLOCK_LENGTH as RECORDING_SIGNAL_EVENT_BLOCK_LENGTH,
-};
-use deepmsg_codec::archive::recording_subscription_descriptor_codec::{
-    RecordingSubscriptionDescriptorDecoder,
-    SBE_BLOCK_LENGTH as SUBSCRIPTION_DESCRIPTOR_BLOCK_LENGTH,
-};
+use deepmsg_codec::archive::control_response_codec::ControlResponseDecoder;
+use deepmsg_codec::archive::recording_signal_event_codec::RecordingSignalEventDecoder;
+use deepmsg_codec::archive::recording_subscription_descriptor_codec::RecordingSubscriptionDescriptorDecoder;
 
-use crate::client::poller::{ControlResponseError, holds, sbe_header};
+use crate::client::poller::{ControlResponseError, sbe_header};
 
 /// `AERON_ARCHIVE_RECORDING_SUBSCRIPTION_DESCRIPTOR_POLLER_FRAGMENT_LIMIT_DEFAULT`
 /// (`:24` of the poller's header, not of the client).
@@ -221,13 +214,15 @@ impl ControlledHandler for RecordingSubscriptionDescriptorPoller {
             return Action::Break;
         }
 
+        // The generated decoders panic past the end where the reference's
+        // buffer throws; the shared table bounds every response template.
+        if crate::sbe::message_fits(payload).is_err() {
+            self.error_on_message = true;
+            return Action::Break;
+        }
+
         match header.template_id() {
             CONTROL_RESPONSE_TEMPLATE_ID => {
-                if !holds(payload, CONTROL_RESPONSE_BLOCK_LENGTH) {
-                    self.error_on_message = true;
-                    return Action::Break;
-                }
-
                 let response = ControlResponseDecoder::default().header(header, 0);
 
                 if response.control_session_id() != self.control_session_id {
@@ -256,11 +251,6 @@ impl ControlledHandler for RecordingSubscriptionDescriptorPoller {
                 Action::Continue
             }
             RECORDING_SUBSCRIPTION_DESCRIPTOR_TEMPLATE_ID => {
-                if !holds(payload, SUBSCRIPTION_DESCRIPTOR_BLOCK_LENGTH) {
-                    self.error_on_message = true;
-                    return Action::Break;
-                }
-
                 let mut descriptor =
                     RecordingSubscriptionDescriptorDecoder::default().header(header, 0);
 
@@ -297,11 +287,6 @@ impl ControlledHandler for RecordingSubscriptionDescriptorPoller {
                 Action::Continue
             }
             RECORDING_SIGNAL_EVENT_TEMPLATE_ID => {
-                if !holds(payload, RECORDING_SIGNAL_EVENT_BLOCK_LENGTH) {
-                    self.error_on_message = true;
-                    return Action::Break;
-                }
-
                 let signal = RecordingSignalEventDecoder::default().header(header, 0);
 
                 if signal.control_session_id() == self.control_session_id {

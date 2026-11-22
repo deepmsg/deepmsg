@@ -184,38 +184,6 @@ impl deepmsg_client::fragment_assembler::ControlledHandler for RecordingEventsAd
 /// # Errors
 ///
 /// [`EventsReadError`] as [`RecordingEventsAdapter::poll`].
-/// Whether `count` variable-length fields fit in `payload`, each a `u32`
-/// length and that many bytes, starting at `at`.
-///
-/// The same rule `client::poller` and `server::control_adapter` apply: the
-/// generated decoder reads the prefix and then slices by it without a bound.
-fn variable_data_fits(payload: &[u8], at: usize, count: usize) -> bool {
-    let mut at = at;
-    for _ in 0..count {
-        let Some(prefix_end) = at.checked_add(4) else {
-            return false;
-        };
-        let Some(prefix) = payload.get(at..prefix_end) else {
-            return false;
-        };
-        let Ok(length) = <[u8; 4]>::try_from(prefix) else {
-            return false;
-        };
-        let Ok(length) = usize::try_from(u32::from_le_bytes(length)) else {
-            return false;
-        };
-        let Some(next) = prefix_end.checked_add(length) else {
-            return false;
-        };
-        if next > payload.len() {
-            return false;
-        }
-        at = next;
-    }
-
-    true
-}
-
 pub fn dispatch(
     payload: &[u8],
     listener: &mut dyn RecordingEventsListener,
@@ -240,25 +208,11 @@ pub fn dispatch(
     let version = header.version();
     let template_id = header.template_id();
 
-    // The generated decoders read fixed fields at the schema's offsets and
-    // variable-length fields through a length prefix they do not bound. The
-    // reference's Java throws where this build panics, so a message must hold
-    // the template's fixed part, and `STARTED`'s two strings must fit too.
+    // The generated decoders panic past the end where the reference's buffer
+    // throws; the shared table bounds every response-side template before a
+    // decoder runs. A template this module does not read is `Ok(false)`.
     // Fuzz target `10_archive_poller_events` found the short forms.
-    let fixed_length = match template_id {
-        template::STARTED => deepmsg_codec::archive::recording_started_codec::SBE_BLOCK_LENGTH,
-        template::PROGRESS => deepmsg_codec::archive::recording_progress_codec::SBE_BLOCK_LENGTH,
-        template::STOPPED => deepmsg_codec::archive::recording_stopped_codec::SBE_BLOCK_LENGTH,
-        _ => return Ok(false),
-    };
-    if payload.len() < ENCODED_LENGTH + usize::from(fixed_length) {
-        return Err(EventsReadError::ShortMessage {
-            length: payload.len(),
-        });
-    }
-    if template_id == template::STARTED
-        && !variable_data_fits(payload, ENCODED_LENGTH + usize::from(block_length), 2)
-    {
+    if crate::sbe::message_fits(payload).is_err() {
         return Err(EventsReadError::ShortMessage {
             length: payload.len(),
         });

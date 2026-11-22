@@ -49,19 +49,13 @@
 
 use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::{Action, ControlledHandler, Message};
-use deepmsg_codec::archive::challenge_codec::{
-    ChallengeDecoder, SBE_BLOCK_LENGTH as CHALLENGE_BLOCK_LENGTH,
-};
+use deepmsg_codec::archive::ReadBuf;
+use deepmsg_codec::archive::challenge_codec::ChallengeDecoder;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
-use deepmsg_codec::archive::control_response_codec::{
-    ControlResponseDecoder, SBE_BLOCK_LENGTH as CONTROL_RESPONSE_BLOCK_LENGTH,
-};
+use deepmsg_codec::archive::control_response_codec::ControlResponseDecoder;
 use deepmsg_codec::archive::message_header_codec::{self, MessageHeaderDecoder};
 use deepmsg_codec::archive::recording_signal::RecordingSignal;
-use deepmsg_codec::archive::recording_signal_event_codec::{
-    RecordingSignalEventDecoder, SBE_BLOCK_LENGTH as RECORDING_SIGNAL_EVENT_BLOCK_LENGTH,
-};
-use deepmsg_codec::archive::{ReadBuf, SBE_SCHEMA_ID};
+use deepmsg_codec::archive::recording_signal_event_codec::RecordingSignalEventDecoder;
 
 /// `AERON_ARCHIVE_CONTROL_RESPONSE_POLLER_FRAGMENT_LIMIT_DEFAULT` (`:22`): how
 /// many messages one poll may step over before it gives up and reports none.
@@ -381,37 +375,19 @@ impl ControlledHandler for ControlResponsePoller {
 
         // The reference's `messageHeader_wrap` and the schema-id check
         // (`:167-190`). Both fail the *poll*, not the message: the scan carries
-        // on and `poll` reports it (`:112-116`).
-        let Some(header) = sbe_header(payload) else {
-            self.error_on_message = true;
-            return Action::Break;
-        };
-
-        if header.schema_id() != SBE_SCHEMA_ID {
+        // on and `poll` reports it (`:112-116`). The shared table also bounds
+        // every template's fixed block and variable fields before a decoder
+        // reads them — the generated reader panics where the reference's
+        // buffer throws.
+        if crate::sbe::message_fits(payload).is_err() {
             self.error_on_message = true;
             return Action::Break;
         }
 
+        let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
+
         match header.template_id() {
             CONTROL_RESPONSE_TEMPLATE_ID => {
-                if !holds(payload, CONTROL_RESPONSE_BLOCK_LENGTH) {
-                    self.error_on_message = true;
-                    return Action::Break;
-                }
-
-                // The fixed block is there; the one variable field starts at
-                // the decoder's own limit (the acting block length, which the
-                // message chooses). A length that runs past the payload is a
-                // slice panic inside the generated reader.
-                if !variable_data_fits(
-                    payload,
-                    message_header_codec::ENCODED_LENGTH + usize::from(header.block_length()),
-                    1,
-                ) {
-                    self.error_on_message = true;
-                    return Action::Break;
-                }
-
                 let mut response = ControlResponseDecoder::default().header(header, 0);
 
                 self.control_session_id = response.control_session_id();
@@ -433,20 +409,6 @@ impl ControlledHandler for ControlResponsePoller {
                 Action::Break
             }
             CHALLENGE_TEMPLATE_ID => {
-                if !holds(payload, CHALLENGE_BLOCK_LENGTH) {
-                    self.error_on_message = true;
-                    return Action::Break;
-                }
-
-                if !variable_data_fits(
-                    payload,
-                    message_header_codec::ENCODED_LENGTH + usize::from(header.block_length()),
-                    1,
-                ) {
-                    self.error_on_message = true;
-                    return Action::Break;
-                }
-
                 let mut challenge = ChallengeDecoder::default().header(header, 0);
 
                 self.control_session_id = challenge.control_session_id();
@@ -472,11 +434,6 @@ impl ControlledHandler for ControlResponsePoller {
                 Action::Break
             }
             RECORDING_SIGNAL_EVENT_TEMPLATE_ID => {
-                if !holds(payload, RECORDING_SIGNAL_EVENT_BLOCK_LENGTH) {
-                    self.error_on_message = true;
-                    return Action::Break;
-                }
-
                 let signal = RecordingSignalEventDecoder::default().header(header, 0);
 
                 self.control_session_id = signal.control_session_id();
@@ -510,54 +467,6 @@ pub(crate) fn sbe_header(payload: &[u8]) -> Option<MessageHeaderDecoder<ReadBuf<
     }
 
     Some(MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0))
-}
-
-/// Whether a payload is long enough for a template's fixed part.
-///
-/// The same bound as [`sbe_header`], one level down: the reference passes a
-/// length to every `…_wrap_for_decode` too (`:207-213`), and the generated Rust
-/// decoder has no such argument.
-///
-/// **What is not checked** is the variable-length fields. A `ControlResponse`
-/// whose `errorMessage` claims a length past the end of the message still
-/// panics in the generated slice read — the same class of hazard
-/// [`crate::client::proxy`]'s module note records for the encoders. Guarding it
-/// would mean re-deriving the var-data offsets by hand, which is exactly the
-/// arithmetic the generated code exists to do; a message like that has to come
-/// from a source that is already lying, and the alternative is a client that
-/// reports rather than a client that misreads.
-pub(crate) fn holds(payload: &[u8], block_length: u16) -> bool {
-    payload.len() >= message_header_codec::ENCODED_LENGTH + usize::from(block_length)
-}
-
-/// Whether `count` variable-length fields fit in `payload`, each a `u32`
-/// length and that many bytes, starting at `at` — an offset the message
-/// declared. The generated reader slices by those lengths without a bound.
-fn variable_data_fits(payload: &[u8], at: usize, count: usize) -> bool {
-    let mut at = at;
-    for _ in 0..count {
-        let Some(prefix_end) = at.checked_add(4) else {
-            return false;
-        };
-        let Some(prefix) = payload.get(at..prefix_end) else {
-            return false;
-        };
-        let Ok(length) = <[u8; 4]>::try_from(prefix) else {
-            return false;
-        };
-        let Ok(length) = usize::try_from(u32::from_le_bytes(length)) else {
-            return false;
-        };
-        let Some(next) = prefix_end.checked_add(length) else {
-            return false;
-        };
-        if next > payload.len() {
-            return false;
-        }
-        at = next;
-    }
-
-    true
 }
 
 /// Why a poll did not read what it was looking at.
