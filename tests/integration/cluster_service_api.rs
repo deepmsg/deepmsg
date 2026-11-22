@@ -23,6 +23,7 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use deepmsg_codec_cluster::close_reason::CloseReason;
 use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_tests::cluster::{API_MARKET_STREAM_ID, SNAPSHOT_MARKET_MARKER};
 use deepmsg_tests::cluster_harness::{
@@ -50,18 +51,16 @@ fn ports() -> Ports {
 /// One member running the API business, or `None` when this machine cannot
 /// stand a driver up.
 fn start(faults: &Faults) -> Option<Node> {
+    start_with("api-service", faults)
+}
+
+/// The same, with the business a case needs.
+fn start_with(service: &'static str, faults: &Faults) -> Option<Node> {
     let ports = ports();
     let member_string = members_of(&ports, 1);
     let (launched_tx, launched_rx) = mpsc::channel();
 
-    let node = Node::start_with_service(
-        0,
-        &ports,
-        &member_string,
-        faults,
-        &launched_tx,
-        "api-service",
-    )?;
+    let node = Node::start_with_service(0, &ports, &member_string, faults, &launched_tx, service)?;
     await_launched(faults, &launched_rx, 1);
 
     Some(node)
@@ -224,6 +223,11 @@ fn every_door_of_the_containers_api_answers() {
         "SERVICE_ACTION", close.detail,
         "a session a business closed says so, not CLIENT_ACTION \
          (`SessionManager.java:459`, `:469`)"
+    );
+    assert_eq!(
+        vec![CloseReason::SERVICE_ACTION],
+        state.close_reasons(),
+        "the business's own close reaches the service as SERVICE_ACTION"
     );
 
     assert!(state.faults().is_empty(), "{:?}", state.faults());
@@ -530,4 +534,55 @@ fn poll_payloads_for(
     }
 
     payloads
+}
+
+/// A client's own close is `CLIENT_ACTION` and is not answered with an egress
+/// `CLOSED` event (`SessionManager.java:291-309`).
+///
+/// The harness's `close_session` sends the same `SessionCloseRequest` the
+/// product client does but leaves the egress subscription in place, so an event
+/// the cluster sent would still be readable here — the check is not vacuous.
+#[test]
+fn a_client_close_is_a_client_action_with_no_closed_event() {
+    let _serial = serial();
+    let faults = Faults::default();
+    let Some(node) = start_with("test-service", &faults) else {
+        announce_skip();
+        return;
+    };
+    let state = node.service_state().expect("the test business is running");
+
+    let ports = ports();
+    let mut client = match ClientSide::start(&ports, 0) {
+        Some(client) => client,
+        None => {
+            announce_skip();
+            return;
+        }
+    };
+    let session = client.connect_session(&faults);
+
+    client.close_session(&session, &faults);
+
+    wait_until("the service to see the client's close", &faults, || {
+        state.close_reasons() == vec![CloseReason::CLIENT_ACTION]
+    });
+    assert_eq!(
+        vec![CloseReason::CLIENT_ACTION],
+        state.close_reasons(),
+        "a client's own close is CLIENT_ACTION, not SERVICE_ACTION"
+    );
+
+    // The subscription is still the client's, so a CLOSED event the cluster
+    // sent would be sitting in its term. Give it a budget to arrive.
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        let (events, _) = client.poll_egress();
+        assert!(
+            !events.iter().any(|event| event.code == EventCode::CLOSED),
+            "a client's own close is not answered with CLOSED: {events:?}"
+        );
+    }
+
+    assert!(faults.snapshot().is_empty(), "{:?}", faults.snapshot());
 }

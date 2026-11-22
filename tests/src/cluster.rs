@@ -2530,6 +2530,8 @@ pub struct ApiState {
     pub snapshot_records: AtomicUsize,
     /// `ClientSession::close` answers.
     pub closes: AtomicUsize,
+    /// The reasons `on_session_close` was called with, in order.
+    pub close_reasons: Mutex<Vec<CloseReason>>,
     /// The service messages the business offered and later read back, in the
     /// order they came: `(what it offered, what the log delivered)`.
     pub service_messages: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
@@ -2553,6 +2555,15 @@ impl ApiState {
             .clone()
             .into_iter()
             .collect()
+    }
+
+    /// The reasons the business's `on_session_close` was called with, in order.
+    #[must_use]
+    pub fn close_reasons(&self) -> Vec<CloseReason> {
+        self.close_reasons
+            .lock()
+            .expect("the close reasons lock")
+            .clone()
     }
 }
 
@@ -2667,8 +2678,13 @@ impl ClusteredService for ApiService {
         _cluster: &mut deepmsg_cluster_service::Cluster<'_>,
         _session: SessionId,
         _timestamp: i64,
-        _reason: CloseReason,
+        reason: CloseReason,
     ) -> Result<(), ContainerError> {
+        self.state
+            .close_reasons
+            .lock()
+            .expect("the close reasons lock")
+            .push(reason);
         Ok(())
     }
 
