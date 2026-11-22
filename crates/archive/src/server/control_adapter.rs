@@ -1115,21 +1115,234 @@ fn variable_data_fits(payload: &[u8], at: usize, count: usize) -> bool {
     true
 }
 
-/// The switch, and the two gates in front of most of it.
-fn dispatch<C: ControlPlane, A: AuthorisationService>(
-    message: Message<'_>,
-    image: ImageId,
-    sessions: &mut HashMap<i64, ImageId>,
-    control: &mut C,
-    authorisation: &A,
-    now_ms: i64,
-) -> Result<(), ControlError> {
-    let payload = message.payload;
+/// The version `AuthConnectRequest.clientInfo` arrived in
+/// (`schemas/aeron-archive-codecs.xml`, `sinceVersion="12"`).
+const AUTH_CONNECT_CLIENT_INFO_VERSION: u16 = 12;
 
+/// Every template `dispatch` answers, in schema-id order.
+///
+/// This is the contract between the adapter and fuzz target
+/// `07_sbe_archive_codecs`: the target decodes exactly these templates, and
+/// `fuzz/tests/template_coverage.rs` fails if the two lists differ.
+pub const CONTROL_REQUEST_TEMPLATES: &[u16] = &[
+    close_session_request_codec::SBE_TEMPLATE_ID,
+    start_recording_request_codec::SBE_TEMPLATE_ID,
+    stop_recording_request_codec::SBE_TEMPLATE_ID,
+    replay_request_codec::SBE_TEMPLATE_ID,
+    stop_replay_request_codec::SBE_TEMPLATE_ID,
+    list_recordings_request_codec::SBE_TEMPLATE_ID,
+    list_recordings_for_uri_request_codec::SBE_TEMPLATE_ID,
+    list_recording_request_codec::SBE_TEMPLATE_ID,
+    recording_position_request_codec::SBE_TEMPLATE_ID,
+    truncate_recording_request_codec::SBE_TEMPLATE_ID,
+    stop_recording_subscription_request_codec::SBE_TEMPLATE_ID,
+    stop_position_request_codec::SBE_TEMPLATE_ID,
+    find_last_matching_recording_request_codec::SBE_TEMPLATE_ID,
+    list_recording_subscriptions_request_codec::SBE_TEMPLATE_ID,
+    bounded_replay_request_codec::SBE_TEMPLATE_ID,
+    stop_all_replays_request_codec::SBE_TEMPLATE_ID,
+    stop_replication_request_codec::SBE_TEMPLATE_ID,
+    start_position_request_codec::SBE_TEMPLATE_ID,
+    detach_segments_request_codec::SBE_TEMPLATE_ID,
+    delete_detached_segments_request_codec::SBE_TEMPLATE_ID,
+    purge_segments_request_codec::SBE_TEMPLATE_ID,
+    attach_segments_request_codec::SBE_TEMPLATE_ID,
+    auth_connect_request_codec::SBE_TEMPLATE_ID,
+    challenge_response_codec::SBE_TEMPLATE_ID,
+    keep_alive_request_codec::SBE_TEMPLATE_ID,
+    start_recording_request_2_codec::SBE_TEMPLATE_ID,
+    extend_recording_request_2_codec::SBE_TEMPLATE_ID,
+    stop_recording_by_identity_request_codec::SBE_TEMPLATE_ID,
+    replicate_request_2_codec::SBE_TEMPLATE_ID,
+    max_recorded_position_request_codec::SBE_TEMPLATE_ID,
+    archive_id_request_codec::SBE_TEMPLATE_ID,
+    purge_recording_request_codec::SBE_TEMPLATE_ID,
+    replay_token_request_codec::SBE_TEMPLATE_ID,
+    update_channel_request_codec::SBE_TEMPLATE_ID,
+];
+
+/// The fixed block length the generated decoder will read for `template_id`,
+/// and how many variable-length fields it will walk, given the version the
+/// message declares.
+///
+/// Block lengths are the schema's current ones except for the three templates
+/// that grew **fixed** fields (`ReplayRequest`, `BoundedReplayRequest` and
+/// `ReplicateRequest2`). The decoder reads a versioned field only when
+/// `acting_version >= sinceVersion`, so an older client's request legitimately
+/// carries a shorter fixed block; requiring the current block from every
+/// version would turn `token()` and `when_present()` into dead code.
+///
+/// `None` means this build does not dispatch the template, so nothing is
+/// decoded for it.
+fn request_bounds(template_id: u16, acting_version: u16) -> Option<(u16, u16)> {
+    let bounds = match template_id {
+        close_session_request_codec::SBE_TEMPLATE_ID => {
+            (close_session_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        start_recording_request_codec::SBE_TEMPLATE_ID => {
+            (start_recording_request_codec::SBE_BLOCK_LENGTH, 1)
+        }
+        stop_recording_request_codec::SBE_TEMPLATE_ID => {
+            (stop_recording_request_codec::SBE_BLOCK_LENGTH, 1)
+        }
+        // `fileIoMaxLength` (i32) arrived in v7 and `replayToken` (i64) in
+        // v10, so the fixed block is 12 bytes shorter before v7.
+        replay_request_codec::SBE_TEMPLATE_ID => (
+            replay_block_length(replay_request_codec::SBE_BLOCK_LENGTH, acting_version),
+            1,
+        ),
+        stop_replay_request_codec::SBE_TEMPLATE_ID => {
+            (stop_replay_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        list_recordings_request_codec::SBE_TEMPLATE_ID => {
+            (list_recordings_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        list_recordings_for_uri_request_codec::SBE_TEMPLATE_ID => {
+            (list_recordings_for_uri_request_codec::SBE_BLOCK_LENGTH, 1)
+        }
+        list_recording_request_codec::SBE_TEMPLATE_ID => {
+            (list_recording_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        recording_position_request_codec::SBE_TEMPLATE_ID => {
+            (recording_position_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        truncate_recording_request_codec::SBE_TEMPLATE_ID => {
+            (truncate_recording_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        stop_recording_subscription_request_codec::SBE_TEMPLATE_ID => (
+            stop_recording_subscription_request_codec::SBE_BLOCK_LENGTH,
+            0,
+        ),
+        stop_position_request_codec::SBE_TEMPLATE_ID => {
+            (stop_position_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        find_last_matching_recording_request_codec::SBE_TEMPLATE_ID => (
+            find_last_matching_recording_request_codec::SBE_BLOCK_LENGTH,
+            1,
+        ),
+        list_recording_subscriptions_request_codec::SBE_TEMPLATE_ID => (
+            list_recording_subscriptions_request_codec::SBE_BLOCK_LENGTH,
+            1,
+        ),
+        // The same two fields as `ReplayRequest`, appended at the same versions.
+        bounded_replay_request_codec::SBE_TEMPLATE_ID => (
+            replay_block_length(
+                bounded_replay_request_codec::SBE_BLOCK_LENGTH,
+                acting_version,
+            ),
+            1,
+        ),
+        stop_all_replays_request_codec::SBE_TEMPLATE_ID => {
+            (stop_all_replays_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        start_position_request_codec::SBE_TEMPLATE_ID => {
+            (start_position_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        stop_replication_request_codec::SBE_TEMPLATE_ID => {
+            (stop_replication_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        detach_segments_request_codec::SBE_TEMPLATE_ID => {
+            (detach_segments_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        delete_detached_segments_request_codec::SBE_TEMPLATE_ID => {
+            (delete_detached_segments_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        purge_segments_request_codec::SBE_TEMPLATE_ID => {
+            (purge_segments_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        attach_segments_request_codec::SBE_TEMPLATE_ID => {
+            (attach_segments_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        auth_connect_request_codec::SBE_TEMPLATE_ID => (
+            auth_connect_request_codec::SBE_BLOCK_LENGTH,
+            if acting_version < AUTH_CONNECT_CLIENT_INFO_VERSION {
+                2
+            } else {
+                3
+            },
+        ),
+        challenge_response_codec::SBE_TEMPLATE_ID => {
+            (challenge_response_codec::SBE_BLOCK_LENGTH, 1)
+        }
+        keep_alive_request_codec::SBE_TEMPLATE_ID => {
+            (keep_alive_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        start_recording_request_2_codec::SBE_TEMPLATE_ID => {
+            (start_recording_request_2_codec::SBE_BLOCK_LENGTH, 1)
+        }
+        extend_recording_request_2_codec::SBE_TEMPLATE_ID => {
+            (extend_recording_request_2_codec::SBE_BLOCK_LENGTH, 1)
+        }
+        stop_recording_by_identity_request_codec::SBE_TEMPLATE_ID => (
+            stop_recording_by_identity_request_codec::SBE_BLOCK_LENGTH,
+            0,
+        ),
+        // `fileIoMaxLength` arrived in v7 and `replicationSessionId` in v8;
+        // `encodedCredentials` and `srcResponseChannel` are variable-length
+        // fields that arrived in v8 and v10.
+        replicate_request_2_codec::SBE_TEMPLATE_ID => (
+            if acting_version >= REPLICATE_SESSION_ID_VERSION {
+                replicate_request_2_codec::SBE_BLOCK_LENGTH
+            } else if acting_version >= REPLICATE_FILE_IO_MAX_LENGTH_VERSION {
+                replicate_request_2_codec::SBE_BLOCK_LENGTH - 4
+            } else {
+                replicate_request_2_codec::SBE_BLOCK_LENGTH - 8
+            },
+            if acting_version >= REPLAY_TOKEN_VERSION {
+                5
+            } else if acting_version >= REPLICATE_SESSION_ID_VERSION {
+                4
+            } else {
+                3
+            },
+        ),
+        max_recorded_position_request_codec::SBE_TEMPLATE_ID => {
+            (max_recorded_position_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        archive_id_request_codec::SBE_TEMPLATE_ID => {
+            (archive_id_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        purge_recording_request_codec::SBE_TEMPLATE_ID => {
+            (purge_recording_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        replay_token_request_codec::SBE_TEMPLATE_ID => {
+            (replay_token_request_codec::SBE_BLOCK_LENGTH, 0)
+        }
+        update_channel_request_codec::SBE_TEMPLATE_ID => {
+            (update_channel_request_codec::SBE_BLOCK_LENGTH, 1)
+        }
+        _ => return None,
+    };
+
+    Some(bounds)
+}
+
+/// A replay template's fixed block length at `acting_version`.
+///
+/// Both replay templates end with `fileIoMaxLength` (i32, v7) and
+/// `replayToken` (i64, v10), so the current block is 12 bytes longer than the
+/// one a request older than both carries, and 8 bytes longer than a v7-v9 one.
+fn replay_block_length(current: u16, acting_version: u16) -> u16 {
+    if acting_version >= REPLAY_TOKEN_VERSION {
+        current
+    } else if acting_version >= REPLICATE_FILE_IO_MAX_LENGTH_VERSION {
+        current - 8
+    } else {
+        current - 12
+    }
+}
+
+/// The bounds the reference's buffer enforces by throwing
+/// (`ControlSessionAdapter.java:126-140`), checked before any generated decoder
+/// reads a field — this build's reader panics where the reference's buffer
+/// throws.
+///
+/// Every control request `dispatch` can decode goes through this function, and
+/// fuzz target `07_sbe_archive_codecs` calls the same one, so the two cannot
+/// drift apart.
+pub fn control_request_bounds(payload: &[u8]) -> Result<(), ControlError> {
     // The reference reads the header without looking at the length first and
-    // lets its buffer throw for a message too short to hold one. This build's
-    // generated reader panics on an index past the end instead of reporting it,
-    // so the length is checked here, before anything is read.
+    // lets its buffer throw for a message too short to hold one.
     if payload.len() < message_header_codec::ENCODED_LENGTH {
         return Err(ControlError::ShortMessage {
             length: payload.len(),
@@ -1146,34 +1359,14 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
         });
     }
 
-    let template_id = header.template_id();
-
-    // The generated decoders read fixed fields at the schema's offsets and
-    // variable-length fields through length prefixes they do not bounds-check;
-    // the reference's Java throws where this build panics. The guard below is
-    // the reference's own bound, one level up: the message must hold the
-    // template's fixed part, and every variable-length field it declares must
-    // fit. Fuzz target `07_sbe_archive_codecs` mirrors this exact check.
-    let fixed_block_length = match template_id {
-        auth_connect_request_codec::SBE_TEMPLATE_ID => auth_connect_request_codec::SBE_BLOCK_LENGTH,
-        challenge_response_codec::SBE_TEMPLATE_ID => challenge_response_codec::SBE_BLOCK_LENGTH,
-        keep_alive_request_codec::SBE_TEMPLATE_ID => keep_alive_request_codec::SBE_BLOCK_LENGTH,
-        max_recorded_position_request_codec::SBE_TEMPLATE_ID => {
-            max_recorded_position_request_codec::SBE_BLOCK_LENGTH
-        }
-        start_position_request_codec::SBE_TEMPLATE_ID => {
-            start_position_request_codec::SBE_BLOCK_LENGTH
-        }
-        recording_position_request_codec::SBE_TEMPLATE_ID => {
-            recording_position_request_codec::SBE_BLOCK_LENGTH
-        }
-        stop_position_request_codec::SBE_TEMPLATE_ID => {
-            stop_position_request_codec::SBE_BLOCK_LENGTH
-        }
-        // The rest of the templates get the same treatment in the second pass;
-        // until then the short-message guard above is all they have.
-        _ => 0,
+    // A template this build does not dispatch reaches no decoder; the switch's
+    // default arm only logs it.
+    let Some((fixed_block_length, variable_fields)) =
+        request_bounds(header.template_id(), header.version())
+    else {
+        return Ok(());
     };
+
     if payload.len() < message_header_codec::ENCODED_LENGTH + usize::from(fixed_block_length) {
         return Err(ControlError::ShortMessage {
             length: payload.len(),
@@ -1183,23 +1376,33 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
     // The variable-length fields are walked from the decoder's own limit, which
     // `header()` takes from the message's acting block length, not from the
     // schema's — so the walk starts where the decoder's will.
-    let variable_fields = match template_id {
-        auth_connect_request_codec::SBE_TEMPLATE_ID => {
-            // `client_info` arrived in schema version 12
-            // (`client_info_decoder`'s own `acting_version() < 12` test).
-            if header.version() < 12 { 2 } else { 3 }
-        }
-        challenge_response_codec::SBE_TEMPLATE_ID => 1,
-        _ => 0,
-    };
     if variable_fields > 0 {
         let at = message_header_codec::ENCODED_LENGTH + usize::from(header.block_length());
-        if !variable_data_fits(payload, at, variable_fields) {
+        if !variable_data_fits(payload, at, usize::from(variable_fields)) {
             return Err(ControlError::ShortMessage {
                 length: payload.len(),
             });
         }
     }
+
+    Ok(())
+}
+
+/// The switch, and the two gates in front of most of it.
+fn dispatch<C: ControlPlane, A: AuthorisationService>(
+    message: Message<'_>,
+    image: ImageId,
+    sessions: &mut HashMap<i64, ImageId>,
+    control: &mut C,
+    authorisation: &A,
+    now_ms: i64,
+) -> Result<(), ControlError> {
+    let payload = message.payload;
+
+    control_request_bounds(payload)?;
+
+    let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
+    let template_id = header.template_id();
 
     match template_id {
         // The only request that makes a session (`ControlSessionAdapter.java:766`).
@@ -4270,6 +4473,174 @@ mod tests {
         payload.extend_from_slice(&12_u16.to_le_bytes());
         payload.extend_from_slice(&[0_u8; 16]);
         payload.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let error = adapter
+            .on_message(&mut control, IMAGE, message(&payload), 0)
+            .expect_err("refused");
+
+        assert_eq!(
+            ControlError::ShortMessage {
+                length: payload.len()
+            },
+            error
+        );
+        assert!(control.calls.is_empty());
+    }
+
+    /// A control message with `block` fixed bytes and `variables` empty
+    /// variable-length fields, all zero.
+    ///
+    /// The declared block length is the template's own, so the variable fields
+    /// start where the decoder's limit will.
+    fn control_request(template_id: u16, version: u16, block: u16, variables: u16) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&block.to_le_bytes());
+        payload.extend_from_slice(&template_id.to_le_bytes());
+        payload.extend_from_slice(&SBE_SCHEMA_ID.to_le_bytes());
+        payload.extend_from_slice(&version.to_le_bytes());
+        payload.resize(BODY + usize::from(block), 0);
+        for _ in 0..variables {
+            payload.extend_from_slice(&0_u32.to_le_bytes());
+        }
+
+        payload
+    }
+
+    /// The versions every version-gated template's block length changes at,
+    /// plus both ends of the schema's range.
+    const VERSIONS: [u16; 8] = [0, 6, 7, 8, 9, 10, 12, 14];
+
+    /// Every template `dispatch` answers is accepted at its own block length
+    /// and variable-field count, at every version boundary. This is the
+    /// table-driven half of the guard: it would fail if a template were
+    /// dispatched without an entry in `request_bounds`.
+    #[test]
+    fn every_dispatched_template_is_bounded() {
+        for &template_id in CONTROL_REQUEST_TEMPLATES {
+            for version in VERSIONS {
+                let Some((block, variables)) = request_bounds(template_id, version) else {
+                    panic!("template {template_id} is dispatched but has no bounds");
+                };
+
+                let payload = control_request(template_id, version, block, variables);
+
+                assert_eq!(
+                    Ok(()),
+                    control_request_bounds(&payload),
+                    "template {template_id} version {version}"
+                );
+            }
+        }
+    }
+
+    /// One byte short of the fixed block is refused, for every template and
+    /// version. The previous slice's guard covered seven templates; the fuzz
+    /// suite found the panic through the other twenty-seven.
+    #[test]
+    fn a_control_request_one_byte_short_of_its_fixed_block_is_refused() {
+        for &template_id in CONTROL_REQUEST_TEMPLATES {
+            for version in VERSIONS {
+                let (block, _) = request_bounds(template_id, version).expect("dispatched");
+                let mut payload = control_request(template_id, version, block, 0);
+                payload.pop();
+
+                assert_eq!(
+                    Err(ControlError::ShortMessage {
+                        length: payload.len()
+                    }),
+                    control_request_bounds(&payload),
+                    "template {template_id} version {version}"
+                );
+            }
+        }
+    }
+
+    /// A variable-length field whose `u32` length runs past the payload is
+    /// refused for every template that declares one.
+    #[test]
+    fn a_control_request_variable_field_past_the_end_is_refused() {
+        for &template_id in CONTROL_REQUEST_TEMPLATES {
+            for version in VERSIONS {
+                let (block, variables) = request_bounds(template_id, version).expect("dispatched");
+                if variables == 0 {
+                    continue;
+                }
+
+                let mut payload = control_request(template_id, version, block, 0);
+                payload.extend_from_slice(&u32::MAX.to_le_bytes());
+
+                assert_eq!(
+                    Err(ControlError::ShortMessage {
+                        length: payload.len()
+                    }),
+                    control_request_bounds(&payload),
+                    "template {template_id} version {version}"
+                );
+            }
+        }
+    }
+
+    /// The three templates the schema grew fields on keep accepting a request
+    /// from before those fields: their fixed block is shorter, not malformed.
+    /// Without this the version-aware arms could silently collapse back to the
+    /// current block and reject every older client.
+    #[test]
+    fn an_older_request_carries_a_shorter_fixed_block() {
+        let replay = replay_request_codec::SBE_TEMPLATE_ID;
+        assert_eq!(Some((44, 1)), request_bounds(replay, 6));
+        assert_eq!(Some((48, 1)), request_bounds(replay, 7));
+        assert_eq!(Some((48, 1)), request_bounds(replay, 9));
+        assert_eq!(Some((56, 1)), request_bounds(replay, 10));
+
+        let bounded = bounded_replay_request_codec::SBE_TEMPLATE_ID;
+        assert_eq!(Some((48, 1)), request_bounds(bounded, 6));
+        assert_eq!(Some((52, 1)), request_bounds(bounded, 7));
+        assert_eq!(Some((60, 1)), request_bounds(bounded, 10));
+
+        let replicate = replicate_request_2_codec::SBE_TEMPLATE_ID;
+        assert_eq!(Some((60, 3)), request_bounds(replicate, 6));
+        assert_eq!(Some((64, 3)), request_bounds(replicate, 7));
+        assert_eq!(Some((68, 4)), request_bounds(replicate, 8));
+        assert_eq!(Some((68, 5)), request_bounds(replicate, 10));
+
+        // And the guard does accept the short-block form.
+        let payload = control_request(replay, 6, 44, 1);
+        assert_eq!(Ok(()), control_request_bounds(&payload));
+    }
+
+    /// The list is the target's contract: no duplicate ids, and nothing in it
+    /// lacks a guard entry. A template this build does not dispatch has none.
+    #[test]
+    fn the_dispatched_template_list_matches_the_guard_table() {
+        assert_eq!(34, CONTROL_REQUEST_TEMPLATES.len());
+
+        let mut sorted = CONTROL_REQUEST_TEMPLATES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(CONTROL_REQUEST_TEMPLATES.len(), sorted.len());
+
+        for &template_id in CONTROL_REQUEST_TEMPLATES {
+            assert!(request_bounds(template_id, 14).is_some());
+        }
+
+        // `Ping` is in the schema but reaches no decoder here.
+        assert_eq!(None, request_bounds(106, 14));
+    }
+
+    /// The guard runs before the decoder, not inside it: a request from a
+    /// template the first pass did not cover is refused as an error rather
+    /// than a slice panic.
+    #[test]
+    fn a_newly_guarded_request_is_refused_before_its_decoder_runs() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+
+        let mut payload = control_request(
+            list_recordings_request_codec::SBE_TEMPLATE_ID,
+            14,
+            list_recordings_request_codec::SBE_BLOCK_LENGTH,
+            0,
+        );
+        payload.pop();
 
         let error = adapter
             .on_message(&mut control, IMAGE, message(&payload), 0)
