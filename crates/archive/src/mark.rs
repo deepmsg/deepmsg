@@ -227,7 +227,9 @@ impl MarkFile {
     /// rather than by the generic layer.
     pub fn is_active(&self, now_ms: i64, timeout_ms: i64) -> bool {
         match self.timestamp() {
-            Some(timestamp) => now_ms - timestamp <= timeout_ms,
+            // Saturating for the same reason the cluster's check does: a
+            // timestamp of `i64::MIN` would wrap the difference into "fresh".
+            Some(timestamp) => now_ms.saturating_sub(timestamp) <= timeout_ms,
             None => false,
         }
     }
@@ -590,5 +592,19 @@ pub(crate) mod tests {
         // And going back to the same directory removes it again.
         ensure_mark_file_link(&dir.0, &here, "archive-mark.lnk").expect("remove");
         assert!(!link.exists());
+    }
+
+    /// Found by fuzz target 13 (`13_mark_files`): the same wrapped subtraction
+    /// as the cluster's mark file, on a timestamp of `i64::MIN`.
+    #[test]
+    fn a_timestamp_of_i64_min_is_not_active() {
+        let dir = TempDir::new();
+        let path = dir.file("mark");
+        let mut bytes = vec![0_u8; LENGTH];
+        bytes[TIMESTAMP_OFFSET..TIMESTAMP_OFFSET + 8].copy_from_slice(&i64::MIN.to_le_bytes());
+        std::fs::write(&path, &bytes).expect("write");
+
+        let mark = MarkFile::open(&path, VERSION_OFFSET, TIMESTAMP_OFFSET).expect("open");
+        assert!(!mark.is_active(0, 10_000));
     }
 }

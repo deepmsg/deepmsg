@@ -66,3 +66,26 @@ fn f10_a_cluster_group_header_past_the_end_is_refused() {
 
     assert!(deepmsg_cluster_common::sbe::message_fits(&CRASH).is_err());
 }
+
+/// Found by `13_mark_files`: an activity timestamp of `i64::MIN` (the bytes at
+/// offset 16) wrapped `now_ms - timestamp` into a fresh reading. The production
+/// regressions are `cluster/common/src/mark.rs`'s
+/// `a_min_timestamp_on_an_existing_file_is_not_alive` and `archive/src/mark.rs`'s
+/// `a_timestamp_of_i64_min_is_not_active`.
+#[test]
+fn f11_a_min_mark_timestamp_is_not_alive() {
+    const CRASH: [u8; 32] = [
+        75, 248, 200, 0, 110, 0, 9, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 255, 255,
+        255, 255, 255, 255, 255, 255,
+    ];
+
+    let path = std::env::temp_dir().join(format!("deepmsg-f11-{}.dat", std::process::id()));
+    let mut bytes = vec![0_u8; 8 * 1024];
+    bytes[..CRASH.len()].copy_from_slice(&CRASH);
+    std::fs::write(&path, &bytes).expect("write");
+
+    assert!(!deepmsg_cluster_common::mark::ClusterMarkFile::is_active(
+        &path, 0, 10_000
+    ));
+    let _ = std::fs::remove_file(&path);
+}

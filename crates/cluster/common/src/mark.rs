@@ -347,7 +347,12 @@ impl ClusterMarkFile {
                 .unwrap_or(VERSION_FAILED as i64);
             // A live process leaves a fresh timestamp. `-1` means "stopped on
             // purpose" and `i64::MAX` means "still initialising"; neither is alive.
-            let alive = timestamp != -1 && timestamp != i64::MAX && (now_ms - timestamp) < 10_000;
+            // The subtraction saturates: a file whose timestamp is `i64::MIN`
+            // is nonsense, not a live process, and a wrapped difference would
+            // read as one (and panic in a debug build).
+            let alive = timestamp != -1
+                && timestamp != i64::MAX
+                && now_ms.saturating_sub(timestamp) < 10_000;
             if alive {
                 return Err(ClusterMarkError::Active { pid });
             }
@@ -390,7 +395,7 @@ impl ClusterMarkFile {
         let timestamp = buffer
             .load_i64(ACTIVITY_TIMESTAMP_OFFSET)
             .unwrap_or(i64::MIN);
-        timestamp != -1 && timestamp != i64::MAX && (now_ms - timestamp) <= timeout_ms
+        timestamp != -1 && timestamp != i64::MAX && now_ms.saturating_sub(timestamp) <= timeout_ms
     }
 
     /// The file this is.
@@ -901,5 +906,34 @@ mod tests {
             })
         ));
         let _ = std::fs::remove_file(&container_path);
+    }
+
+    /// Found by fuzz target 13 (`13_mark_files`): an existing file whose
+    /// activity timestamp is `i64::MIN` wrapped `now_ms - timestamp` into a
+    /// fresh reading (and panicked in a debug build).
+    #[test]
+    fn a_min_timestamp_on_an_existing_file_is_not_alive() {
+        let path = scratch_path("timestamp-min");
+        let mut bytes = vec![0_u8; HEADER_LENGTH];
+        bytes[2..4].copy_from_slice(&200_u16.to_le_bytes());
+        bytes[4..6].copy_from_slice(&110_u16.to_le_bytes());
+        bytes[COMPONENT_TYPE..COMPONENT_TYPE + 4]
+            .copy_from_slice(&(ClusterComponentType::CONSENSUS_MODULE as i32).to_le_bytes());
+        bytes[ACTIVITY_TIMESTAMP_OFFSET..ACTIVITY_TIMESTAMP_OFFSET + 8]
+            .copy_from_slice(&i64::MIN.to_le_bytes());
+        std::fs::write(&path, &bytes).expect("write");
+
+        assert!(!ClusterMarkFile::is_active(&path, 0, 10_000));
+
+        let adopted = ClusterMarkFile::create(
+            &path,
+            ClusterComponentType::CONSENSUS_MODULE,
+            ERROR_BUFFER_MIN_LENGTH,
+            PAGE_MIN_SIZE,
+            0,
+            0,
+        );
+        assert!(adopted.is_ok(), "adoption after a nonsense timestamp");
+        let _ = std::fs::remove_file(&path);
     }
 }
