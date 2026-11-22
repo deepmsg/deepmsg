@@ -142,6 +142,7 @@ dependencies = [
  "deepmsg-cluster-common",
  "deepmsg-cnc",
  "deepmsg-codec",
+ "deepmsg-codec-cluster-mark",
  "deepmsg-core",
  "deepmsg-driver",
  "libfuzzer-sys",

@@ -227,6 +227,36 @@ archive_response r059-challenge 59 20 1
 archive_response r101-recording-started 101 24 2
 archive_response r102-recording-progress 102 24 0
 archive_response r103-recording-stopped 103 24 0
+
+# The two mark-file headers: schema id, template 200, the current fixed block,
+# a semantic version (the block's first field), and one zero-length prefix per
+# variable field.
+mark_header() {
+    target=$1 name=$2 schema=$3 block=$4 vars=$5 version=$6 semver=$7
+    path="$root/corpus/$target/$name"
+    mkdir -p "$(dirname "$path")"
+    if [ -e "$path" ]; then return 0; fi
+
+    byte() { printf "\\$(printf '%03o' "$1")"; }
+
+    {
+        byte $((block & 255)); byte $((block >> 8))
+        byte 200; byte 0
+        byte $((schema & 255)); byte $((schema >> 8))
+        byte $((version & 255)); byte $((version >> 8))
+        byte $((semver & 255)); byte $(((semver >> 8) & 255))
+        byte $(((semver >> 16) & 255)); byte $(((semver >> 24) & 255))
+    } > "$path"
+
+    i=4
+    while [ "$i" -lt "$block" ]; do printf '\000' >> "$path"; i=$((i + 1)); done
+    i=0
+    while [ "$i" -lt "$vars" ]; do printf '\000\000\000\000' >> "$path"; i=$((i + 1)); done
+}
+
+mark_header 13_mark_files cluster-mark 110 76 6 1 256
+mark_header 13_mark_files archive-mark 100 56 4 2 196864
+
 # A DATA frame header (32 bytes total) with no payload behind it.
 crafted 05_udp_protocol_frames 01-data-header \
     '\040\000\000\000\000\300\001\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000'
