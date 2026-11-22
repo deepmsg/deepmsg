@@ -1530,7 +1530,6 @@ fn two_failed_leaders_come_back_together() {
 /// one of the three-member ones: two away leave three, and three is a quorum, so
 /// the commits keep landing while the members are gone.
 #[test]
-#[ignore = "P3-6c §6.8, narrowed: the distinct client driver names fixed the shared-directory trap, and a_member_three_terms_behind now runs; this case still stops at the old client's publication. After the fresh client proves the cluster, the old client's offers advance its publication (544 -> 640) but the leader's commit stays at 1024, with connected=true and no CLOSED event. That is the old client's idle publication/image, not the harness name, and needs its own fix."]
 fn two_fresh_members_come_back_to_a_five_member_cluster() {
     let _serial = serial();
     let ports = Ports::new();
@@ -1563,71 +1562,88 @@ fn two_fresh_members_come_back_to_a_five_member_cluster() {
     }
 
     // ---- two of them go, and the other three carry on ---------------------
-    for member in &away {
-        nodes[*member as usize].stop();
-    }
-    // A session opened before the stops is the question, not the instrument: a
-    // fresh client proves the cluster takes messages at all with three of five.
+    //
+    // A member stop takes about thirty seconds and the session timeout is ten:
+    // the older client's session has to be kept alive **while** the members go,
+    // not only once the fresh client has proved the cluster. The keep-alive
+    // thread owns the client for this block; the main thread stops members and
+    // drives the fresh one.
+    let mut skipped = false;
     {
-        let Some(mut fresh) = ClientSide::start_at(&ports, leader, 1) else {
-            announce_skip();
-            return;
-        };
-        let fresh_session = open_session(&mut fresh, &faults);
-        let before = counters[leader as usize]
-            .commit_position()
-            .expect("the leader's commit");
-        let mut last_keep_alive = Instant::now();
-        fresh.send(
-            &fresh_session,
-            b"a fresh client with three of five",
-            &faults,
-        );
-        wait_with_state(
-            "a fresh client's message to commit with three of five",
-            &faults,
-            CATCHUP_DEADLINE,
-            || {
-                // The older client is not the instrument here, but its driver
-                // still reaps an idle ingress publication's image after ten
-                // seconds; poll it and send it a session keep-alive while the
-                // fresh one proves the cluster.
-                client.poll_events();
-                if last_keep_alive.elapsed() >= Duration::from_secs(1) {
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let _keep_alive = scope.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    client.poll_events();
                     client.send_keep_alive(&session, &faults);
-                    last_keep_alive = Instant::now();
+                    std::thread::sleep(Duration::from_secs(1));
                 }
-                fresh.poll_events();
-                counters[leader as usize]
-                    .commit_position()
-                    .is_some_and(|position| position > before)
-            },
-            || {
-                format!(
-                    "roles {:?}, appends {:?}, commits {:?}, terms {:?}, election {:?}; \
-                     fresh client {}",
-                    (0..FIVE)
-                        .map(|id| counters[id as usize].role())
-                        .collect::<Vec<_>>(),
-                    (0..FIVE)
-                        .map(|id| counters[id as usize].append_position())
-                        .collect::<Vec<_>>(),
-                    (0..FIVE)
-                        .map(|id| counters[id as usize].commit_position())
-                        .collect::<Vec<_>>(),
-                    (0..FIVE)
-                        .map(|id| counters[id as usize].leadership_term_id())
-                        .collect::<Vec<_>>(),
-                    (0..FIVE)
-                        .map(|id| counters[id as usize].election_state())
-                        .collect::<Vec<_>>(),
-                    "<read after the loop>",
-                )
-            },
-        );
-        last = counters[leader as usize]
-            .commit_position()
-            .expect("a commit");
+            });
+
+            for member in &away {
+                nodes[*member as usize].stop();
+            }
+
+            // A session opened before the stops is the question, not the
+            // instrument: a fresh client proves the cluster takes messages at
+            // all with three of five.
+            let Some(mut fresh) = ClientSide::start_at(&ports, leader, 1) else {
+                stop.store(true, std::sync::atomic::Ordering::Release);
+                skipped = true;
+                return;
+            };
+            let fresh_session = open_session(&mut fresh, &faults);
+            let before = counters[leader as usize]
+                .commit_position()
+                .expect("the leader's commit");
+            fresh.send(
+                &fresh_session,
+                b"a fresh client with three of five",
+                &faults,
+            );
+            wait_with_state(
+                "a fresh client's message to commit with three of five",
+                &faults,
+                CATCHUP_DEADLINE,
+                || {
+                    fresh.poll_events();
+                    counters[leader as usize]
+                        .commit_position()
+                        .is_some_and(|position| position > before)
+                },
+                || {
+                    format!(
+                        "roles {:?}, appends {:?}, commits {:?}, terms {:?}, election {:?}; \
+                         fresh client {}",
+                        (0..FIVE)
+                            .map(|id| counters[id as usize].role())
+                            .collect::<Vec<_>>(),
+                        (0..FIVE)
+                            .map(|id| counters[id as usize].append_position())
+                            .collect::<Vec<_>>(),
+                        (0..FIVE)
+                            .map(|id| counters[id as usize].commit_position())
+                            .collect::<Vec<_>>(),
+                        (0..FIVE)
+                            .map(|id| counters[id as usize].leadership_term_id())
+                            .collect::<Vec<_>>(),
+                        (0..FIVE)
+                            .map(|id| counters[id as usize].election_state())
+                            .collect::<Vec<_>>(),
+                        "<read after the loop>",
+                    )
+                },
+            );
+            last = counters[leader as usize]
+                .commit_position()
+                .expect("a commit");
+
+            stop.store(true, std::sync::atomic::Ordering::Release);
+        });
+    }
+    if skipped {
+        announce_skip();
+        return;
     }
     for index in 0..5u8 {
         let before_send = client.ingress_publication_state();
