@@ -27,9 +27,9 @@ use deepmsg_codec_cluster::close_reason::CloseReason;
 use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_tests::cluster::{API_MARKET_STREAM_ID, SNAPSHOT_MARKET_MARKER};
 use deepmsg_tests::cluster_harness::{
-    CLUSTER_ID, ClientSide, Faults, Node, NodeCounters, Ports, SessionEvent, announce_skip,
-    await_launched, await_snapshot_count, ingress_message, members_of, offer_message,
-    take_snapshot, wait_until,
+    CLUSTER_ID, ClientSide, ELECTION_CLOSED, Faults, MEMBER_COUNT, Node, NodeCounters, Ports,
+    ROLE_LEADER, SessionEvent, announce_skip, await_launched, await_snapshot_count,
+    ingress_message, members_of, offer_message, take_snapshot, wait_until,
 };
 
 /// The harness's port blocks are per process and `cargo test` runs threads in
@@ -41,11 +41,21 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// This binary's port base. One process, so one `Ports::new()` and 64-port
+/// steps between the cases that run here.
+fn base() -> u16 {
+    static BASE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *BASE.get_or_init(|| Ports::new().base())
+}
+
 /// A port block of this case's own.
 fn ports() -> Ports {
-    static BASE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
-    let base = *BASE.get_or_init(|| Ports::new().base());
-    Ports::with_base(base + 64 * 7)
+    Ports::with_base(base() + 64 * 7)
+}
+
+/// The block the three-member case takes, beside the single-member one.
+fn three_ports() -> Ports {
+    Ports::with_base(base() + 64 * 8)
 }
 
 /// One member running the API business, or `None` when this machine cannot
@@ -64,6 +74,30 @@ fn start_with(service: &'static str, faults: &Faults) -> Option<Node> {
     await_launched(faults, &launched_rx, 1);
 
     Some(node)
+}
+
+/// Three members running the API business, or `None` when this machine cannot
+/// stand the drivers up.
+fn start_three(faults: &Faults) -> Option<Vec<Node>> {
+    let ports = three_ports();
+    let member_string = members_of(&ports, MEMBER_COUNT);
+    let (launched_tx, launched_rx) = mpsc::channel();
+
+    let mut nodes = Vec::new();
+    for id in 0..MEMBER_COUNT {
+        let node = Node::start_with_service(
+            id,
+            &ports,
+            &member_string,
+            faults,
+            &launched_tx,
+            "api-service",
+        )?;
+        nodes.push(node);
+    }
+    await_launched(faults, &launched_rx, MEMBER_COUNT);
+
+    Some(nodes)
 }
 
 /// `Cluster.context()`: the facts a business reads about its own container.
@@ -585,4 +619,85 @@ fn a_client_close_is_a_client_action_with_no_closed_event() {
     }
 
     assert!(faults.snapshot().is_empty(), "{:?}", faults.snapshot());
+}
+
+/// A business's close reaches every member: the followers mark the session
+/// closing and do not append to a log publication they do not have
+/// (`SessionManager.java:454-459`).
+///
+/// Before the split, the follower's `poll_service_control` called the manager's
+/// append path with `LogPublisher.publication == None`, and the duty cycle
+/// failed with "log publication has not been created". The fault harness turns
+/// that into a panic at `faults.check()`.
+#[test]
+fn every_member_survives_a_business_close() {
+    let _serial = serial();
+    let faults = Faults::default();
+    let Some(nodes) = start_three(&faults) else {
+        announce_skip();
+        return;
+    };
+    let counters: Vec<NodeCounters> = nodes
+        .iter()
+        .map(|node| NodeCounters::open(node.aeron_dir()))
+        .collect();
+
+    wait_until("every member's election to close", &faults, || {
+        counters
+            .iter()
+            .all(|counter| counter.election_state() == Some(ELECTION_CLOSED))
+    });
+    let leader = counters
+        .iter()
+        .position(|counter| counter.role() == Some(ROLE_LEADER))
+        .and_then(|index| i32::try_from(index).ok())
+        .expect("a leader");
+
+    let ports = three_ports();
+    let mut client = match ClientSide::start(&ports, leader) {
+        Some(client) => client,
+        None => {
+            announce_skip();
+            return;
+        }
+    };
+    let session = client.connect_session(&faults);
+
+    // `x` makes every member's api-service call `ClientSession::close()`; the
+    // leader appends, the followers only mark the session closing.
+    client.send(&session, b"x", &faults);
+
+    // The service close tells the client, so the CLOSED event is the signal
+    // that the business ran on the leader.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut closed = false;
+    while Instant::now() < deadline && !closed {
+        faults.check();
+        let (events, _) = client.poll_egress();
+        closed = events.iter().any(|event| event.code == EventCode::CLOSED);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(closed, "the business's close reached the client");
+    faults.check();
+
+    // A new session's message still commits on every member: the followers did
+    // not die on the close, and their logs are still moving.
+    let session = client.connect_session(&faults);
+    let before: Vec<i64> = counters
+        .iter()
+        .map(|counter| counter.commit_position().unwrap_or(0))
+        .collect();
+    client.send(&session, b"z", &faults);
+    wait_until(
+        "every member to commit the new session's message",
+        &faults,
+        || {
+            counters.iter().zip(&before).all(|(counter, before)| {
+                counter
+                    .commit_position()
+                    .is_some_and(|position| position > *before)
+            })
+        },
+    );
+    faults.check();
 }
