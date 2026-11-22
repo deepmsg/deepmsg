@@ -1379,4 +1379,39 @@ mod tests {
             "a broadcast is for every port"
         );
     }
+
+    /// A short frame is padded to Ethernet's 60-byte minimum, and the padding
+    /// is not part of the UDP payload: the parser takes the IPv4 total length
+    /// and the UDP length, and the checksums are over the unpadded bytes.
+    ///
+    /// The two sizes are the ones that pad: `42 + n < 60` is `n < 18`, so 16
+    /// leaves two zero bytes and 4 leaves fourteen.
+    #[test]
+    fn ethernet_padding_is_not_part_of_the_datagram() {
+        for n in [16usize, 4] {
+            let payload: Vec<u8> = (0..n).map(|index| b'a' + index as u8).collect();
+            let mut frame = vec![0u8; IPV4_UDP_HEADER_LENGTH + n];
+            frame[IPV4_UDP_HEADER_LENGTH..].copy_from_slice(&payload);
+
+            let written =
+                write_ipv4_udp_here(&mut frame, &golden_udp_write(n, 11)).expect("a frame");
+            assert_eq!(IPV4_UDP_HEADER_LENGTH + n, written, "the unpadded length");
+            assert!(written < 60, "a frame short enough to be padded");
+
+            frame.resize(60, 0);
+            let received = read(&frame, Checksums::Software).expect("the padded frame parses");
+            let Received::Udp { ipv4, datagram } = received else {
+                panic!("a UDP datagram, not {received:?}");
+            };
+
+            assert_eq!(n, datagram.payload.len(), "the padding is not delivered");
+            assert_eq!(&payload, datagram.payload);
+            assert_eq!(8 + n, datagram.length, "the UDP length omits the padding");
+            assert_eq!(
+                IPV4_HEADER_LENGTH + 8 + n,
+                ipv4.total_length,
+                "the IPv4 total length omits the padding"
+            );
+        }
+    }
 }

@@ -1293,9 +1293,7 @@ impl ArchiveProxy {
     /// The four handshake requests use this one. `length` is what the encoder
     /// says, **not** counting the header, which is added here.
     fn offer_once(&self, client: &Client, length: usize) -> Result<(), ProxyError> {
-        let end = message_header_codec::ENCODED_LENGTH + length;
-
-        match client.offer_exclusive(self.request_publication, &self.buffer[..end]) {
+        match client.offer_exclusive(self.request_publication, &self.buffer[..length]) {
             Some(Appended::Ok { .. }) => Ok(()),
             Some(result) => Err(ProxyError::Offer(result)),
             // This client holds no publication under that registration id, so
