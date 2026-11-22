@@ -60,6 +60,9 @@ use deepmsg_codec_cluster::challenge_codec::ChallengeDecoder;
 use deepmsg_codec_cluster::challenge_response_codec::ChallengeResponseEncoder;
 use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH as MESSAGE_HEADER_LENGTH;
+use deepmsg_codec_cluster::session_close_request_codec::{
+    SBE_BLOCK_LENGTH as SESSION_CLOSE_REQUEST_BLOCK_LENGTH, SessionCloseRequestEncoder,
+};
 use deepmsg_codec_cluster::session_connect_request_codec::SessionConnectRequestEncoder;
 use deepmsg_codec_cluster::session_event_codec::SessionEventDecoder;
 use deepmsg_codec_cluster::session_keep_alive_codec::{
@@ -2491,6 +2494,26 @@ impl ClientSide {
             payload,
         );
         offer_message(self, faults, &message);
+    }
+
+    /// Send `SessionCloseRequest` — the message `ClusterSession::close` offers
+    /// (`AeronCluster.java:1129-1160`).
+    ///
+    /// Unlike the product client, this leaves the egress subscription in place:
+    /// a case can keep reading it after the close, which is what makes "the
+    /// cluster does not answer a client's own close with an event"
+    /// observable at all.
+    pub fn close_session(&self, session: &SessionEvent, faults: &Faults) {
+        let length = MESSAGE_HEADER_LENGTH + usize::from(SESSION_CLOSE_REQUEST_BLOCK_LENGTH);
+        let mut buffer = vec![0_u8; length];
+        let encoder = SessionCloseRequestEncoder::default()
+            .wrap(WriteBuf::new(&mut buffer), MESSAGE_HEADER_LENGTH);
+        let mut header = encoder.header(0);
+        let mut close = header.parent().expect("the encoder the header wrapped");
+        close
+            .leadership_term_id(session.leadership_term_id)
+            .cluster_session_id(session.cluster_session_id);
+        offer_message(self, faults, &buffer[..length]);
     }
 
     /// Send `count` messages and wait until as many replies have arrived — the

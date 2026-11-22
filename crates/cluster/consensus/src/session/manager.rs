@@ -317,35 +317,85 @@ impl SessionManager {
         Ok(())
     }
 
-    /// `onSessionClose` (`SessionManager.java:291-309`).
+    /// `onSessionClose` (`SessionManager.java:291-309`): the client closed.
+    ///
+    /// The reason is **CLIENT_ACTION**, and the client is **not** told — a
+    /// client that asked to close knows, and the reference sends no egress
+    /// event for this path (`:291-309` has no `sendEvent`). The service still
+    /// sees the `SessionCloseEvent` because it is appended to the log.
     ///
     /// # Errors
     ///
     /// [`ClusterError`] from the close append.
-    pub fn on_session_close(
+    pub fn on_client_session_close(
         &mut self,
         leadership_term_id: i64,
         cluster_session_id: i64,
         ctx: &mut SessionContext<'_>,
     ) -> Result<(), ClusterError> {
-        let Some(index) = self
-            .sessions
-            .iter()
-            .position(|session| session.id() == cluster_session_id)
-        else {
+        let Some(index) = self.session_index(cluster_session_id) else {
             return Ok(());
         };
         if !self.sessions[index].is_open() {
             return Ok(());
         }
 
-        // `onServiceCloseSession` (`SessionManager.java:454-476`): the reason is
-        // **SERVICE_ACTION**, not the client's own, and the client is told —
-        // `egressPublisher.sendEvent(..., EventCode.CLOSED, SERVICE_ACTION)`
-        // (`:469`). Without that event a business that closes a session has no
-        // way to know it happened, which is what `ClientSession.close` is for.
+        self.sessions[index].closing(CloseReason::CLIENT_ACTION);
+
+        self.append_close(index, leadership_term_id, false, ctx)
+    }
+
+    /// `onServiceCloseSession` (`SessionManager.java:454-480`): the business
+    /// asked for the session to close.
+    ///
+    /// The reason is **SERVICE_ACTION**, and the client is told — but only on
+    /// an active leader (`:458`, `:469`). A follower marks the session closing
+    /// and waits for the leader's `SessionCloseEvent` to be replayed; it must
+    /// not append to a log publication it does not have.
+    ///
+    /// # Errors
+    ///
+    /// [`ClusterError`] from the close append, on an active leader.
+    pub fn on_service_close_session(
+        &mut self,
+        leadership_term_id: i64,
+        cluster_session_id: i64,
+        is_active_leader: bool,
+        ctx: &mut SessionContext<'_>,
+    ) -> Result<(), ClusterError> {
+        let Some(index) = self.session_index(cluster_session_id) else {
+            return Ok(());
+        };
+
         self.sessions[index].closing(CloseReason::SERVICE_ACTION);
 
+        if !is_active_leader {
+            return Ok(());
+        }
+
+        self.append_close(index, leadership_term_id, true, ctx)
+    }
+
+    /// The index of a session the manager still holds.
+    fn session_index(&self, cluster_session_id: i64) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|session| session.id() == cluster_session_id)
+    }
+
+    /// Append the `SessionCloseEvent` both close paths share, and remove the
+    /// session once it is in the log.
+    ///
+    /// `send_event` is the one difference the reference draws between the two
+    /// paths: a business close tells the client (`SessionManager.java:469`), a
+    /// client's own close does not.
+    fn append_close(
+        &mut self,
+        index: usize,
+        leadership_term_id: i64,
+        send_event: bool,
+        ctx: &mut SessionContext<'_>,
+    ) -> Result<(), ClusterError> {
         let timestamp = ctx.clock.time();
         let appended = {
             let session = &mut self.sessions[index];
@@ -358,8 +408,10 @@ impl SessionManager {
             )?;
 
             if appended {
-                let detail = close_reason_name(session.close_reason());
-                egress_session_event(ctx, session, EventCode::CLOSED, &detail)?;
+                if send_event {
+                    let detail = close_reason_name(session.close_reason());
+                    egress_session_event(ctx, session, EventCode::CLOSED, &detail)?;
+                }
                 session.set_closed_log_position(ctx.log_publisher.position());
             }
 
