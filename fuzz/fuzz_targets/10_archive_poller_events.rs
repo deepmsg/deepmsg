@@ -8,15 +8,26 @@
 //! leave the slot usable — the next good message still has to land. The golden
 //! control response is the witness for that second half.
 
+use deepmsg_archive::client::descriptor_poller::RecordingDescriptorPoller;
 use deepmsg_archive::client::poller::ControlResponsePoller;
 use deepmsg_archive::client::recording_events::{RecordingEventsListener, dispatch};
-use deepmsg_client::fragment_assembler::{ControlledHandler, Message, MessageHeader};
+use deepmsg_archive::client::subscription_descriptor_poller::RecordingSubscriptionDescriptorPoller;
+use deepmsg_client::fragment_assembler::{Action, ControlledHandler, Message, MessageHeader};
 use libfuzzer_sys::fuzz_target;
 
 /// A control response the reference's generator wrote — the bytes a poller has
 /// to accept, whatever the fuzzer just fed it.
 const CONTROL_RESPONSE_OK: &[u8] =
     include_bytes!("../../tests/fixtures/sbe/101-001-control-response-ok.bin");
+
+/// The golden control response with its code replaced by `code` — the two
+/// pollers' "there are no more" markers (`RECORDING_UNKNOWN` is 2,
+/// `SUBSCRIPTION_UNKNOWN` is 3).
+fn golden_ending(code: i32) -> Vec<u8> {
+    let mut response = CONTROL_RESPONSE_OK.to_vec();
+    response[32..36].copy_from_slice(&code.to_le_bytes());
+    response
+}
 
 fn message(payload: &[u8]) -> Message<'_> {
     Message {
@@ -72,6 +83,28 @@ fuzz_target!(|data: &[u8]| {
     let _ = poller.on_message(message(CONTROL_RESPONSE_OK));
     assert!(
         poller.is_control_response(),
+        "a good response after arbitrary bytes did not decode"
+    );
+
+    // The two descriptor pollers decode the same response family. Whatever the
+    // fuzz message did, a reset plus a "there are no more" response still ends
+    // the dispatch. The fixture's session is 56 and its correlation 59; only
+    // the code differs between the two pollers' end markers.
+    let mut descriptors = RecordingDescriptorPoller::new(1, 56, 10, |_| {});
+    let _ = descriptors.on_message(message(data));
+    descriptors.reset(59, 10);
+    assert_eq!(
+        Action::Break,
+        descriptors.on_message(message(&golden_ending(2))),
+        "a good response after arbitrary bytes did not decode"
+    );
+
+    let mut subscriptions = RecordingSubscriptionDescriptorPoller::new(1, 56, 10, |_| {});
+    let _ = subscriptions.on_message(message(data));
+    subscriptions.reset(59, 10);
+    assert_eq!(
+        Action::Break,
+        subscriptions.on_message(message(&golden_ending(3))),
         "a good response after arbitrary bytes did not decode"
     );
 

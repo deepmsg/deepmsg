@@ -12,6 +12,7 @@
 //! have their own helper (`with_two_read_only`).
 
 pub mod archive_control;
+pub mod cluster_messages;
 
 use core::cell::RefCell;
 

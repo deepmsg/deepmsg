@@ -132,6 +132,69 @@ sbe_request v07-replicate-2-before-session-id 66 64 3 7
 sbe_request v11-auth-connect-before-client-info 58 16 2 11
 # Schema 111, template 78 (backup response), block length 60, version 0.
 crafted 08_sbe_cluster_codecs 01-backup-response-header '\074\000\116\000\157\000\000\000'
+
+# One well-formed message per cluster template a production entry point
+# decodes: header, the template's current fixed block, and one zero-length
+# prefix per variable-length field. Group-bearing templates get their header
+# only; the fuzzer walks the group from there.
+cluster_message() {
+    name=$1 tid=$2 block=$3 vars=$4
+    path="$root/corpus/08_sbe_cluster_codecs/$name"
+    mkdir -p "$(dirname "$path")"
+    if [ -e "$path" ]; then return 0; fi
+
+    byte() { printf "\\$(printf '%03o' "$1")"; }
+
+    {
+        byte $((block & 255)); byte $((block >> 8))
+        byte $((tid & 255)); byte $((tid >> 8))
+        byte 111; byte 0
+        byte 17; byte 0
+    } > "$path"
+
+    i=0
+    while [ "$i" -lt "$block" ]; do printf '\000' >> "$path"; i=$((i + 1)); done
+    i=0
+    while [ "$i" -lt "$vars" ]; do printf '\000\000\000\000' >> "$path"; i=$((i + 1)); done
+}
+
+cluster_message c001-session-message-header 1 24 0
+cluster_message c002-session-event 2 44 1
+cluster_message c003-session-connect 3 16 3
+cluster_message c004-session-close 4 16 0
+cluster_message c005-session-keep-alive 5 16 0
+cluster_message c006-new-leader-event 6 20 1
+cluster_message c007-challenge 7 16 1
+cluster_message c008-challenge-response 8 16 1
+cluster_message c026-admin-request 26 28 1
+cluster_message c027-admin-response 27 24 2
+cluster_message c030-close-session 30 8 0
+cluster_message c031-schedule-timer 31 16 0
+cluster_message c032-cancel-timer 32 8 0
+cluster_message c033-service-ack 33 36 0
+cluster_message c034-cluster-members-query 34 12 0
+cluster_message c041-cluster-members-response 41 12 2
+cluster_message c043-cluster-members-extended 43 24 0
+cluster_message c050-canvass-position 50 32 0
+cluster_message c051-request-vote 51 32 0
+cluster_message c052-vote 52 36 0
+cluster_message c053-new-leadership-term 53 96 0
+cluster_message c054-append-position 54 21 0
+cluster_message c055-commit-position 55 20 0
+cluster_message c056-catchup-position 56 20 1
+cluster_message c057-stop-catchup 57 12 0
+cluster_message c075-termination-position 75 16 0
+cluster_message c076-termination-ack 76 20 0
+cluster_message c077-backup-query 77 24 2
+cluster_message c078-backup-response 78 60 0
+cluster_message c079-heartbeat-request 79 12 2
+cluster_message c081-standby-snapshot 81 16 0
+cluster_message c100-snapshot-marker 100 40 0
+cluster_message c102-client-session 102 12 2
+cluster_message c103-cluster-session 103 40 1
+cluster_message c104-timer 104 16 0
+cluster_message c105-consensus-module 105 28 0
+cluster_message c107-pending-message-tracker 107 24 0
 # A DATA frame header (32 bytes total) with no payload behind it.
 crafted 05_udp_protocol_frames 01-data-header \
     '\040\000\000\000\000\300\001\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000'

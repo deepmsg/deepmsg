@@ -51,3 +51,18 @@ fn f3_a_backup_response_with_only_a_header_stays_behind_the_guard() {
         deepmsg_codec::cluster::backup_response_codec::SBE_BLOCK_LENGTH
     ));
 }
+
+/// Found by `08_sbe_cluster_codecs` while the second batch's guard was being
+/// written: template 43 declared a 49-byte acting block, so the decoder read
+/// the `activeMembers` group header at offset 57 in a 39-byte payload. The
+/// production regression is
+/// `crates/cluster/common/src/sbe.rs::a_group_header_past_the_payload_is_refused`.
+#[test]
+fn f10_a_cluster_group_header_past_the_end_is_refused() {
+    const CRASH: [u8; 39] = [
+        49, 0, 43, 0, 111, 0, 17, 0, 0, 0, 255, 255, 0, 0, 0, 247, 0, 0, 0, 0, 0, 247, 254, 255,
+        255, 255, 255, 255, 255, 247, 0, 0, 0, 57, 0, 0, 0, 0, 0,
+    ];
+
+    assert!(deepmsg_cluster_common::sbe::message_fits(&CRASH).is_err());
+}
