@@ -311,8 +311,12 @@ fn a_truncated_ingress_message_is_an_error_the_duty_cycle_reports() {
         }
     }
     let error = error.expect("the truncated message is reported");
+    // The shared bounds table refuses the message before the template's own
+    // `SESSION_HEADER_LENGTH` check runs, so the error names the fixed block
+    // rather than the header. Either is the reference's thrown decoder
+    // exception, hoisted one frame earlier.
     assert!(
-        error.to_string().contains("SessionMessageHeader"),
+        error.to_string().contains("cluster message fixed block"),
         "{error}"
     );
 
