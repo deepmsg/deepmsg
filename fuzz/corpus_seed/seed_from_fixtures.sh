@@ -63,6 +63,73 @@ crafted() {
 crafted 07_sbe_archive_codecs 01-keep-alive-header '\020\000\075\000\145\000\014\000'
 # Schema 101, template 58 (auth-connect), block length 16, version 12.
 crafted 07_sbe_archive_codecs 02-auth-connect-header '\020\000\072\000\145\000\014\000'
+
+# One well-formed request per control template the adapter dispatches: an
+# eight-byte header, the template's fixed block, and one zero-length prefix
+# for each variable-length field. These are valid messages, so the fuzzer
+# starts from the decode path rather than from the guard's rejection.
+sbe_request() {
+    name=$1 tid=$2 block=$3 vars=$4 version=${5:-14}
+    path="$root/corpus/07_sbe_archive_codecs/$name"
+    mkdir -p "$(dirname "$path")"
+    if [ -e "$path" ]; then return 0; fi
+
+    byte() { printf "\\$(printf '%03o' "$1")"; }
+
+    {
+        byte $((block & 255)); byte $((block >> 8))
+        byte $((tid & 255)); byte $((tid >> 8))
+        byte 101; byte 0
+        byte $((version & 255)); byte $((version >> 8))
+    } > "$path"
+
+    i=0
+    while [ "$i" -lt "$block" ]; do printf '\000' >> "$path"; i=$((i + 1)); done
+    i=0
+    while [ "$i" -lt "$vars" ]; do printf '\000\000\000\000' >> "$path"; i=$((i + 1)); done
+}
+
+sbe_request t003-close-session 3 8 0
+sbe_request t004-start-recording 4 24 1
+sbe_request t005-stop-recording 5 20 1
+sbe_request t006-replay 6 56 1
+sbe_request t007-stop-replay 7 24 0
+sbe_request t008-list-recordings 8 28 0
+sbe_request t009-list-recordings-for-uri 9 32 1
+sbe_request t010-list-recording 10 24 0
+sbe_request t012-recording-position 12 24 0
+sbe_request t013-truncate-recording 13 32 0
+sbe_request t014-stop-recording-subscription 14 24 0
+sbe_request t015-stop-position 15 24 0
+sbe_request t016-find-last-matching 16 32 1
+sbe_request t017-list-recording-subscriptions 17 32 1
+sbe_request t018-bounded-replay 18 60 1
+sbe_request t019-stop-all-replays 19 24 0
+sbe_request t051-stop-replication 51 24 0
+sbe_request t052-start-position 52 24 0
+sbe_request t053-detach-segments 53 32 0
+sbe_request t054-delete-detached-segments 54 24 0
+sbe_request t055-purge-segments 55 32 0
+sbe_request t056-attach-segments 56 24 0
+sbe_request t058-auth-connect 58 16 3
+sbe_request t060-challenge-response 60 16 1
+sbe_request t061-keep-alive 61 16 0
+sbe_request t063-start-recording-2 63 28 1
+sbe_request t064-extend-recording-2 64 36 1
+sbe_request t065-stop-recording-by-identity 65 24 0
+sbe_request t066-replicate-2 66 68 5
+sbe_request t067-max-recorded-position 67 24 0
+sbe_request t068-archive-id 68 16 0
+sbe_request t104-purge-recording 104 24 0
+sbe_request t105-replay-token 105 24 0
+sbe_request t107-update-channel 107 24 1
+
+# The same templates at the versions before their fields arrived: the fixed
+# block is shorter, and the guard must still accept them.
+sbe_request v06-replay-short-block 6 44 1 6
+sbe_request v09-bounded-replay-short-block 18 52 1 9
+sbe_request v07-replicate-2-before-session-id 66 64 3 7
+sbe_request v11-auth-connect-before-client-info 58 16 2 11
 # Schema 111, template 78 (backup response), block length 60, version 0.
 crafted 08_sbe_cluster_codecs 01-backup-response-header '\074\000\116\000\157\000\000\000'
 # A DATA frame header (32 bytes total) with no payload behind it.

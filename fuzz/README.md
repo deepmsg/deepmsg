@@ -17,7 +17,7 @@ The design and the per-target contracts are in
 | `04_cnc_command_decode` | every control command decoder, plus encode→decode |
 | `05_udp_protocol_frames` | UDP frames off a socket, resolution walk included |
 | `06_userspace_packet` | Ethernet / IPv4 / UDP / ARP / ICMP bytes off a DPDK port |
-| `07_sbe_archive_codecs` | the archive control requests (first batch: seven templates) |
+| `07_sbe_archive_codecs` | every archive control request `dispatch` answers (34 templates) |
 | `08_sbe_cluster_codecs` | `BackupResponse` (nested group), `SessionEvent`, the length guard |
 | `09_archive_catalog_segment` | `archive.catalog` and a `.rec` segment (slow tier) |
 | `10_archive_poller_events` | the client pollers and `RecordingEvents` dispatch |
