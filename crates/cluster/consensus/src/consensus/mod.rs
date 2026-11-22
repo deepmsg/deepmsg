@@ -149,6 +149,10 @@ pub fn decode_consensus_message(payload: &[u8]) -> Result<Option<ConsensusMessag
         )));
     }
 
+    // The generated decoders panic past the end where the reference's buffer
+    // throws; this is that throw, in front of every arm below.
+    deepmsg_cluster_common::sbe::fits(payload, &header)?;
+
     let template_id = header.template_id();
     let message = match template_id {
         deepmsg_codec_cluster::canvass_position_codec::SBE_TEMPLATE_ID => {

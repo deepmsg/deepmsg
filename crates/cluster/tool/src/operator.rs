@@ -1121,15 +1121,82 @@ impl ClusterTool {
     }
 }
 
+/// The `activeMembers` group of `ClusterMembersExtendedResponse`.
+///
+/// The group's own header says how long an entry's fixed block is and how many
+/// entries follow; each entry then carries five endpoint strings. The decoder's
+/// `advance` only moves a cursor, and its field reads past the end panic, so
+/// the header, every entry's block and every variable field are checked before
+/// the walk. `SBE_BLOCK_LENGTH` is 24 and the entry block is 28
+/// (`cluster_members_extended_response_codec.rs`, group token `encodedLength=28`).
+fn extended_members_group_fits(payload: &[u8], header: &MessageHeaderDecoder<ReadBuf<'_>>) -> bool {
+    const ENTRY_BLOCK: usize = 28;
+    const ENTRY_VARIABLES: usize = 5;
+
+    // The group starts at the *acting* block length the message declares, not
+    // at the schema's: that is where the decoder's limit is.
+    let at_group = MESSAGE_HEADER_LENGTH + usize::from(header.block_length());
+    let Some(group_header) = payload.get(at_group..at_group + 4) else {
+        return false;
+    };
+    let block_length = usize::from(u16::from_le_bytes([group_header[0], group_header[1]]));
+    let count = usize::from(u16::from_le_bytes([group_header[2], group_header[3]]));
+    if block_length < ENTRY_BLOCK {
+        return false;
+    }
+
+    let mut at = at_group + 4;
+    for _ in 0..count {
+        let Some(next) = at.checked_add(block_length) else {
+            return false;
+        };
+        if next > payload.len() {
+            return false;
+        }
+        at = next;
+
+        for _ in 0..ENTRY_VARIABLES {
+            let Some(prefix_end) = at.checked_add(4) else {
+                return false;
+            };
+            let Some(prefix) = payload.get(at..prefix_end) else {
+                return false;
+            };
+            let length = usize::try_from(u32::from_le_bytes([
+                prefix[0], prefix[1], prefix[2], prefix[3],
+            ]))
+            .unwrap_or(usize::MAX);
+            let Some(next) = prefix_end.checked_add(length) else {
+                return false;
+            };
+            if next > payload.len() {
+                return false;
+            }
+            at = next;
+        }
+    }
+
+    true
+}
+
 /// One message from the services' stream, if it is the answer to
 /// `correlation_id` (`ClusterControlAdapter.Listener`).
 fn decode_members_response(payload: &[u8], correlation_id: i64) -> Option<ClusterMembership> {
     if payload.len() < MESSAGE_HEADER_LENGTH {
         return None;
     }
+    // The generated decoders panic past the end where the reference's buffer
+    // throws; this is that throw, before either decoder runs.
+    if deepmsg_cluster_common::sbe::message_fits(payload).is_err() {
+        return None;
+    }
     let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
 
     if header.template_id() == EXTENDED_MEMBERS_RESPONSE_TEMPLATE_ID {
+        if !extended_members_group_fits(payload, &header) {
+            return None;
+        }
+
         let decoder = ClusterMembersExtendedResponseDecoder::default().header(header, 0);
         if decoder.correlation_id() != correlation_id {
             return None;

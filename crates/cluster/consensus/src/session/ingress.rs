@@ -356,6 +356,10 @@ pub fn dispatch_message(
         ));
     }
 
+    // The generated decoders panic past the end where the reference's buffer
+    // throws; this is that throw, in front of every arm below.
+    deepmsg_cluster_common::sbe::fits(payload, &header)?;
+
     match template_id {
         deepmsg_codec_cluster::session_message_header_codec::SBE_TEMPLATE_ID => {
             at_least(payload, SESSION_HEADER_LENGTH, "SessionMessageHeader")?;
@@ -588,5 +592,27 @@ mod tests {
     #[test]
     fn a_continued_ingress_message_is_consumed() {
         assert_eq!(Action::Continue, dispatched(Action::Continue));
+    }
+
+    /// The generated reader panics past the end where the reference's buffer
+    /// throws; the shared table refuses the message first.
+    #[test]
+    fn a_connect_shorter_than_its_fixed_block_is_refused() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&16_u16.to_le_bytes());
+        payload.extend_from_slice(&3_u16.to_le_bytes());
+        payload.extend_from_slice(&SBE_SCHEMA_ID.to_le_bytes());
+        payload.extend_from_slice(&17_u16.to_le_bytes());
+        payload.extend_from_slice(&[0_u8; 4]);
+
+        let mut handler = Answers {
+            action: Action::Continue,
+            seen: Vec::new(),
+        };
+        let images = deepmsg_cluster_common::collections::HashMap::default();
+
+        let error = dispatch_message(&payload, 1, &images, &mut handler)
+            .expect_err("a short connect is refused");
+        assert!(error.to_string().contains("fixed block"), "{error}");
     }
 }

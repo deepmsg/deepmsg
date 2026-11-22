@@ -454,6 +454,10 @@ impl Dispatch<'_> {
             )));
         }
 
+        // The generated decoders panic past the end where the reference's
+        // buffer throws; this is that throw, in front of every arm below.
+        deepmsg_cluster_common::sbe::fits(payload, &header)?;
+
         match header.template_id() {
             100 => {
                 let marker = SnapshotMarkerDecoder::default().header(header, 0);
