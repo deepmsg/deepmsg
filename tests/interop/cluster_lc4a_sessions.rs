@@ -64,7 +64,9 @@ fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
 
 #[test]
 fn a_session_opens_closes_and_times_out() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(mut cluster) = start("lc4a-sessions") else {
         eprintln!("SKIPPED: the reference jar, java, or the fork's Java probes");
         return;

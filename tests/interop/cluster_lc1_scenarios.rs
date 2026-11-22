@@ -130,7 +130,7 @@ fn a_client_connects_on_one_ingress_channel_and_echoes() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let base = next_port_base();
-    let Some(cluster) = start("lc1-one-channel", base, MEMBERS, "test-service", &[]) else {
+    let Some(mut cluster) = start("lc1-one-channel", base, MEMBERS, "test-service", &[]) else {
         skip();
         return;
     };
@@ -159,6 +159,7 @@ fn a_client_connects_on_one_ingress_channel_and_echoes() {
 
     send_and_await_echo(&mut session, 1, Instant::now() + DEADLINE);
     session.session.close(&mut session.client);
+    cluster.shutdown();
 }
 
 /// The client connects with `ingressEndpoints`, which is the member table
@@ -171,7 +172,7 @@ fn a_client_connects_with_an_ingress_endpoint_list() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let base = next_port_base();
-    let Some(cluster) = start("lc1-endpoints", base, MEMBERS, "test-service", &[]) else {
+    let Some(mut cluster) = start("lc1-endpoints", base, MEMBERS, "test-service", &[]) else {
         skip();
         return;
     };
@@ -193,6 +194,7 @@ fn a_client_connects_with_an_ingress_endpoint_list() {
     assert_eq!(leader, session.session.leader_member_id());
     send_and_await_echo(&mut session, 2, Instant::now() + DEADLINE);
     session.session.close(&mut session.client);
+    cluster.shutdown();
 }
 
 /// A client pointed at a **follower** is redirected to the leader, and the
@@ -205,7 +207,7 @@ fn a_client_pointed_at_a_follower_is_redirected_to_the_leader() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let base = next_port_base();
-    let Some(cluster) = start("lc1-redirect", base, MEMBERS, "test-service", &[]) else {
+    let Some(mut cluster) = start("lc1-redirect", base, MEMBERS, "test-service", &[]) else {
         skip();
         return;
     };
@@ -237,6 +239,7 @@ fn a_client_pointed_at_a_follower_is_redirected_to_the_leader() {
 
     send_and_await_echo(&mut session, 3, Instant::now() + DEADLINE);
     session.session.close(&mut session.client);
+    cluster.shutdown();
 }
 
 /// Messages sent before the leader dies and after the new one is up all arrive,
@@ -359,6 +362,7 @@ fn a_client_follows_the_new_leader_without_losing_or_repeating_a_message() {
         service.out_of_sequence(),
         "no message was a gap or a repeat of one already sequenced"
     );
+    cluster.shutdown();
 }
 
 /// A session that sends nothing times out, and the client is told so.
@@ -370,7 +374,7 @@ fn a_client_whose_session_times_out_is_closed() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let base = next_port_base();
-    let Some(cluster) = start(
+    let Some(mut cluster) = start(
         "lc1-session-timeout",
         base,
         MEMBERS,
@@ -429,6 +433,7 @@ fn a_client_whose_session_times_out_is_closed() {
         "the business is told the session ended for TIMEOUT: {:?}",
         service.close_reasons()
     );
+    cluster.shutdown();
 }
 
 /// Wait for `condition`, polling it, until `deadline`.
@@ -453,7 +458,7 @@ fn a_client_asks_for_a_snapshot() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let base = next_port_base();
-    let Some(cluster) = start(
+    let Some(mut cluster) = start(
         "lc1-snapshot",
         base,
         MEMBERS,
@@ -521,6 +526,7 @@ fn a_client_asks_for_a_snapshot() {
         taken(leader),
         cluster.node_log(leader)
     );
+    cluster.shutdown();
 }
 
 /// The cluster asks the client to prove itself, and the session opens only
@@ -540,7 +546,7 @@ fn a_client_answers_a_challenge_before_the_session_opens() {
     let base = next_port_base();
 
     let member = MemberSpec::test_container(0, "test-service");
-    let Some(cluster) = TestCluster::start(
+    let Some(mut cluster) = TestCluster::start(
         "lc1-challenge",
         &[member],
         Options {
@@ -585,6 +591,7 @@ fn a_client_answers_a_challenge_before_the_session_opens() {
         "the cluster challenged and accepted the answer\n{}",
         cluster.node_log(leader)
     );
+    cluster.shutdown();
 }
 
 /// What the client sends when the cluster asks it to prove itself.

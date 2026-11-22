@@ -128,37 +128,49 @@ fn timers(test_name: &str, member: MemberSpec) {
 
 #[test]
 fn a_java_cluster_echoes_through_our_container_in_process() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     echoes("lc4a-echo-in-process", arms()[0].1);
 }
 
 #[test]
 fn a_java_cluster_echoes_through_our_container_external() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     echoes("lc4a-echo-external", arms()[1].1);
 }
 
 #[test]
 fn the_reference_container_echoes_the_same_way() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     echoes("lc4a-echo-java", arms()[2].1);
 }
 
 #[test]
 fn timers_schedule_cancel_and_expire_in_process() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     timers("lc4a-timers-in-process", arms()[0].1);
 }
 
 #[test]
 fn timers_schedule_cancel_and_expire_external() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     timers("lc4a-timers-external", arms()[1].1);
 }
 
 #[test]
 fn the_reference_container_schedules_and_cancels_the_same_way() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     timers("lc4a-timers-java", arms()[2].1);
 }
 
@@ -173,7 +185,9 @@ fn our_container_allocates_the_cycle_time_counters() {
         CLUSTER_CLUSTERED_SERVICE_MAX_CYCLE_TIME_TYPE_ID,
     };
 
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for (arm, member) in [arms()[0], arms()[1]] {
         let Some(mut cluster) = start("lc4a-cycle-counters", member) else {
             eprintln!("SKIPPED: the reference jar, java, or the fork's Java probes");
@@ -213,7 +227,9 @@ fn our_container_allocates_the_cycle_time_counters() {
 /// in this process, and its own binary is covered by its unit test.
 #[test]
 fn the_in_process_container_thread_is_named() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(mut cluster) = start("lc4a-container-name", arms()[0].1) else {
         eprintln!("SKIPPED: the reference jar, java, or the fork's Java probes");
         return;

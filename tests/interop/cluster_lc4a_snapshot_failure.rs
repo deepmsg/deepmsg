@@ -73,7 +73,9 @@ fn echo(cluster: &TestCluster, aeron_dir: &str, expected: usize) -> String {
 
 #[test]
 fn a_snapshot_that_fails_ends_that_service_and_the_cluster_carries_on() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(mut cluster) = start("lc4a-snapshot-failure") else {
         eprintln!("SKIPPED: the reference jar, java, or the fork's Java probes");
         return;

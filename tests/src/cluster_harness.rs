@@ -2262,7 +2262,16 @@ impl ClientSide {
     /// one the cluster may still hold open.
     pub fn start_at(ports: &Ports, leader_id: i32, egress_offset: u16) -> Option<Self> {
         let ports = &ports.with_egress_offset(egress_offset);
-        let driver = OwnDriver::start(&format!("cluster-harness-client-{}", ports.base()))?;
+        // The driver's directory is named by the *client*, not by the port
+        // block: `with_egress_offset` keeps `base`, so two clients named only
+        // by `base` remove each other's shared memory on start. The offset is
+        // what makes them two directories.
+        let driver_name = if egress_offset == 0 {
+            format!("cluster-harness-client-{}", ports.base())
+        } else {
+            format!("cluster-harness-client-{}-{egress_offset}", ports.base())
+        };
+        let driver = OwnDriver::start(&driver_name)?;
         let mut client = Client::connect(driver.aeron_dir()).expect("the test client connects");
 
         let egress_channel = ports.client_egress_channel();
