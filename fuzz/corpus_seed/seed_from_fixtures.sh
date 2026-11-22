@@ -195,6 +195,38 @@ cluster_message c103-cluster-session 103 40 1
 cluster_message c104-timer 104 16 0
 cluster_message c105-consensus-module 105 28 0
 cluster_message c107-pending-message-tracker 107 24 0
+
+# One well-formed message per archive response template the client pollers
+# decode: header, fixed block, one zero-length prefix per variable field.
+archive_response() {
+    name=$1 tid=$2 block=$3 vars=$4
+    path="$root/corpus/10_archive_poller_events/$name"
+    mkdir -p "$(dirname "$path")"
+    if [ -e "$path" ]; then return 0; fi
+
+    byte() { printf "\\$(printf '%03o' "$1")"; }
+
+    {
+        byte $((block & 255)); byte $((block >> 8))
+        byte $((tid & 255)); byte $((tid >> 8))
+        byte 101; byte 0
+        byte 14; byte 0
+    } > "$path"
+
+    i=0
+    while [ "$i" -lt "$block" ]; do printf '\000' >> "$path"; i=$((i + 1)); done
+    i=0
+    while [ "$i" -lt "$vars" ]; do printf '\000\000\000\000' >> "$path"; i=$((i + 1)); done
+}
+
+archive_response r001-control-response 1 32 1
+archive_response r024-recording-signal-event 24 44 0
+archive_response r022-recording-descriptor 22 80 3
+archive_response r023-subscription-descriptor 23 28 1
+archive_response r059-challenge 59 20 1
+archive_response r101-recording-started 101 24 2
+archive_response r102-recording-progress 102 24 0
+archive_response r103-recording-stopped 103 24 0
 # A DATA frame header (32 bytes total) with no payload behind it.
 crafted 05_udp_protocol_frames 01-data-header \
     '\040\000\000\000\000\300\001\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000'
