@@ -122,6 +122,25 @@ impl<'a> Fragment<'a> {
         }
     }
 
+    /// The same, for the fuzz suite, which lives in another crate and can
+    /// neither write a term through `Image::poll` nor use a `#[cfg(test)]`
+    /// constructor. The caller must hand over a frame the **scanner accepted**
+    /// (`Step::Data`), which is what production does; the `fuzz-hooks` feature
+    /// is off in every workspace build.
+    #[cfg(feature = "fuzz-hooks")]
+    #[doc(hidden)]
+    pub const fn new_for_fuzz(
+        frame: Frame<'a, ReadOnly>,
+        position: i64,
+        image_registration_id: i64,
+    ) -> Self {
+        Self {
+            frame,
+            position,
+            image_registration_id,
+        }
+    }
+
     /// Where this fragment begins in the stream.
     pub const fn position(&self) -> i64 {
         self.position

@@ -153,11 +153,22 @@ impl ChannelUri {
     ///
     /// # Errors
     ///
-    /// [`UriError`] if there is no `aeron:` scheme, or a parameter has no `=`.
+    /// [`UriError`] if there is no `aeron:` scheme, a prefix does not end in
+    /// `:`, or a parameter has no `=`.
     pub fn parse(uri: &str) -> Result<Self, UriError> {
         let (prefix, rest) = match uri.find(SCHEME) {
             Some(0) => (None, uri),
-            Some(at) => (Some(uri[..at - 1].to_owned()), &uri[at..]),
+            Some(at) => {
+                // The prefix is the text before a `:`, and that colon is the
+                // separator the reference requires (`ChannelUri.java:384-394`
+                // accepts exactly `aeron-spy:`). Taking `at - 1` instead slices
+                // a byte off whatever is there: for `"éaeron:ipc"` that byte is
+                // inside `é`, which panics on a non-char-boundary. `at` is a
+                // boundary because the scheme starts with ASCII, so the cut
+                // below is safe and an unterminated prefix is an error.
+                let prefix = uri[..at].strip_suffix(':').ok_or(UriError::InvalidScheme)?;
+                (Some(prefix.to_owned()), &uri[at..])
+            }
             None => return Err(UriError::InvalidScheme),
         };
 
@@ -1091,6 +1102,29 @@ mod tests {
             Err(UriError::InvalidScheme),
             ChannelUri::parse("udp?endpoint=localhost:1")
         );
+    }
+
+    /// A prefix is text before a `:`; without the colon there is no prefix.
+    ///
+    /// This is the fuzz target `01_channel_uri`'s first find: the parser used
+    /// to cut one **byte** before the scheme, and `é` is two bytes, so
+    /// `"éaeron:ipc"` sliced a character in half and panicked.
+    #[test]
+    fn a_prefix_without_a_separator_is_refused() {
+        assert_eq!(
+            Err(UriError::InvalidScheme),
+            ChannelUri::parse("éaeron:ipc")
+        );
+    }
+
+    /// The same text with the separator is a prefix, not a refusal: the fix
+    /// must not become "ASCII prefixes only".
+    #[test]
+    fn a_multibyte_prefix_with_a_separator_is_kept() {
+        let uri = ChannelUri::parse("é:aeron:ipc").expect("readable");
+
+        assert_eq!(Some("é"), uri.prefix());
+        assert_eq!("ipc", uri.media());
     }
 
     /// The number that matters most: a control channel is an ordinary channel

@@ -1850,6 +1850,50 @@ fn write_counter(client: &Client, counter: Counter, value: i64) {
     }
 }
 
+/// Whether `count` variable-length fields fit in `payload`, each a `u32`
+/// length and that many bytes, starting at `at`.
+///
+/// The generated decoder reads a length prefix and then slices by it without a
+/// bound; this is the bound, applied to offsets the message itself declared.
+fn variable_data_fits(payload: &[u8], at: usize, count: usize) -> bool {
+    let mut at = at;
+    for _ in 0..count {
+        let Some(prefix_end) = at.checked_add(4) else {
+            return false;
+        };
+        let Some(prefix) = payload.get(at..prefix_end) else {
+            return false;
+        };
+        let Ok(length) = <[u8; 4]>::try_from(prefix) else {
+            return false;
+        };
+        let Ok(length) = usize::try_from(u32::from_le_bytes(length)) else {
+            return false;
+        };
+        let Some(next) = prefix_end.checked_add(length) else {
+            return false;
+        };
+        if next > payload.len() {
+            return false;
+        }
+        at = next;
+    }
+
+    true
+}
+
+/// Whether the payload holds a template's fixed part, at the **schema's**
+/// block length: the generated decoder reads fields up to that offset whatever
+/// the message's acting block length says.
+fn fixed_part_fits(payload: &[u8], schema_block_length: u16) -> bool {
+    payload.len()
+        >= deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH
+            + usize::from(schema_block_length)
+}
+/// The schema's block length for one `snapshots` group entry: six fields
+/// (`i64`×5, `i32`), which is what the generated decoder reads.
+const SNAPSHOT_BLOCK_LENGTH: usize = 44;
+
 /// Decode one fragment off the consensus subscription (`onFragment`, `:368-427`).
 fn decode_backup_message(payload: &[u8]) -> Option<BackupMessage> {
     if payload.len() < deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH {
@@ -1863,9 +1907,21 @@ fn decode_backup_message(payload: &[u8]) -> Option<BackupMessage> {
 
     match header.template_id() {
         deepmsg_codec_cluster::backup_response_codec::SBE_TEMPLATE_ID => Some(
-            BackupMessage::Response(decode_backup_response(payload, header)),
+            BackupMessage::Response(decode_backup_response(payload, header)?),
         ),
         deepmsg_codec_cluster::challenge_codec::SBE_TEMPLATE_ID => {
+            if !fixed_part_fits(
+                payload,
+                deepmsg_codec_cluster::challenge_codec::SBE_BLOCK_LENGTH,
+            ) || !variable_data_fits(
+                payload,
+                deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH
+                    + usize::from(header.block_length()),
+                1,
+            ) {
+                return None;
+            }
+
             let mut decoder = ChallengeDecoder::default().header(header, 0);
             let cluster_session_id = decoder.cluster_session_id();
             let coordinates = decoder.encoded_challenge_decoder();
@@ -1876,6 +1932,18 @@ fn decode_backup_message(payload: &[u8]) -> Option<BackupMessage> {
             })
         }
         deepmsg_codec_cluster::session_event_codec::SBE_TEMPLATE_ID => {
+            if !fixed_part_fits(
+                payload,
+                deepmsg_codec_cluster::session_event_codec::SBE_BLOCK_LENGTH,
+            ) || !variable_data_fits(
+                payload,
+                deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH
+                    + usize::from(header.block_length()),
+                1,
+            ) {
+                return None;
+            }
+
             let mut decoder = SessionEventDecoder::default().header(header, 0);
             let correlation_id = decoder.correlation_id();
             let event_code = decoder.code();
@@ -1894,7 +1962,42 @@ fn decode_backup_message(payload: &[u8]) -> Option<BackupMessage> {
 fn decode_backup_response(
     payload: &[u8],
     header: MessageHeaderDecoder<ReadBuf<'_>>,
-) -> BackupResponseMessage {
+) -> Option<BackupResponseMessage> {
+    const HEADER_LENGTH: usize = deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH;
+
+    if !fixed_part_fits(
+        payload,
+        deepmsg_codec_cluster::backup_response_codec::SBE_BLOCK_LENGTH,
+    ) {
+        return None;
+    }
+
+    // The group header sits at the decoder's own limit, which `header()` takes
+    // from the message's acting block length; the group's block length and
+    // count are the message's, which is why neither is trusted.
+    let group_at = HEADER_LENGTH + usize::from(header.block_length());
+    let group_header_end = group_at.checked_add(4)?;
+    let group_header = payload.get(group_at..group_header_end)?;
+    let block_length = usize::from(u16::from_le_bytes([group_header[0], group_header[1]]));
+    let count = usize::from(u16::from_le_bytes([group_header[2], group_header[3]]));
+
+    // A block shorter than the schema's own is a field read past its entry; a
+    // zero-length block never advances, which is the decoder's infinite loop.
+    if block_length < SNAPSHOT_BLOCK_LENGTH {
+        return None;
+    }
+
+    let mut at = group_header_end;
+    for _ in 0..count {
+        at = at.checked_add(block_length)?;
+        if at > payload.len() {
+            return None;
+        }
+    }
+    if !variable_data_fits(payload, at, 1) {
+        return None;
+    }
+
     let decoder = BackupResponseDecoder::default().header(header, 0);
     let member_id = decoder.member_id();
     // `BackupResponseEncoder.memberIdNullValue()`: an SBE `int` null.
@@ -1925,8 +2028,7 @@ fn decode_backup_response(
     let cluster_members =
         String::from_utf8_lossy(decoder.cluster_members_slice(coordinates)).into_owned();
 
-    let _ = payload;
-    BackupResponseMessage {
+    Some(BackupResponseMessage {
         correlation_id: decoder.correlation_id(),
         log_recording_id: decoder.log_recording_id(),
         log_leadership_term_id: decoder.log_leadership_term_id(),
@@ -1938,7 +2040,7 @@ fn decode_backup_response(
         member_id,
         snapshots,
         cluster_members,
-    }
+    })
 }
 
 /// The order [`ClusterBackupAgent::run_termination_hooks`] runs in, as a free
@@ -1958,6 +2060,48 @@ mod tests {
 
     use super::*;
     use crate::persist::recording_log::Entry;
+
+    /// An SBE header for a `BackupResponse`, at the schema's block length,
+    /// followed by `body` bytes.
+    fn backup_response_with(body: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            &deepmsg_codec_cluster::backup_response_codec::SBE_BLOCK_LENGTH.to_le_bytes(),
+        );
+        payload.extend_from_slice(
+            &deepmsg_codec_cluster::backup_response_codec::SBE_TEMPLATE_ID.to_le_bytes(),
+        );
+        payload.extend_from_slice(&SBE_SCHEMA_ID.to_le_bytes());
+        payload.extend_from_slice(&0_u16.to_le_bytes());
+        payload.extend_from_slice(body);
+        payload
+    }
+
+    /// A backup response's header alone: the fixed block is not there, and the
+    /// generated decoder reads fields at the schema's offsets. Fuzz target
+    /// `08_sbe_cluster_codecs` found it with exactly these eight bytes.
+    #[test]
+    fn a_backup_response_with_only_a_header_is_refused() {
+        assert!(decode_backup_message(&backup_response_with(&[])).is_none());
+    }
+
+    /// A group whose wire block length is zero never advances, and one whose
+    /// entries are not all present reads past the payload. Both are refused
+    /// before the generated decoder runs.
+    #[test]
+    fn a_snapshot_group_that_cannot_advance_is_refused() {
+        let mut body = vec![0_u8; 60];
+
+        body.extend_from_slice(&0_u16.to_le_bytes()); // block length
+        body.extend_from_slice(&1_u16.to_le_bytes()); // count
+        assert!(decode_backup_message(&backup_response_with(&body)).is_none());
+
+        body.truncate(60);
+        body.extend_from_slice(&44_u16.to_le_bytes()); // block length
+        body.extend_from_slice(&2_u16.to_le_bytes()); // count, one entry short
+        body.extend_from_slice(&[0_u8; 44]);
+        assert!(decode_backup_message(&backup_response_with(&body)).is_none());
+    }
 
     fn term_entry(recording_id: i64) -> Entry {
         Entry {

@@ -1082,6 +1082,39 @@ impl<A: AuthorisationService> ControlAdapter<A> {
     }
 }
 
+/// Whether `count` variable-length fields fit in `payload`, each a `u32`
+/// length followed by that many bytes, starting at `at`.
+///
+/// `at` is an offset the message declared, which is why nothing here trusts it:
+/// every step is a `get` or a `checked_add`, and the first one that does not
+/// fit answers `false`.
+fn variable_data_fits(payload: &[u8], at: usize, count: usize) -> bool {
+    let mut at = at;
+    for _ in 0..count {
+        let Some(prefix_end) = at.checked_add(4) else {
+            return false;
+        };
+        let Some(prefix) = payload.get(at..prefix_end) else {
+            return false;
+        };
+        let Ok(length) = <[u8; 4]>::try_from(prefix) else {
+            return false;
+        };
+        let Ok(length) = usize::try_from(u32::from_le_bytes(length)) else {
+            return false;
+        };
+        let Some(next) = prefix_end.checked_add(length) else {
+            return false;
+        };
+        if next > payload.len() {
+            return false;
+        }
+        at = next;
+    }
+
+    true
+}
+
 /// The switch, and the two gates in front of most of it.
 fn dispatch<C: ControlPlane, A: AuthorisationService>(
     message: Message<'_>,
@@ -1114,6 +1147,59 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
     }
 
     let template_id = header.template_id();
+
+    // The generated decoders read fixed fields at the schema's offsets and
+    // variable-length fields through length prefixes they do not bounds-check;
+    // the reference's Java throws where this build panics. The guard below is
+    // the reference's own bound, one level up: the message must hold the
+    // template's fixed part, and every variable-length field it declares must
+    // fit. Fuzz target `07_sbe_archive_codecs` mirrors this exact check.
+    let fixed_block_length = match template_id {
+        auth_connect_request_codec::SBE_TEMPLATE_ID => auth_connect_request_codec::SBE_BLOCK_LENGTH,
+        challenge_response_codec::SBE_TEMPLATE_ID => challenge_response_codec::SBE_BLOCK_LENGTH,
+        keep_alive_request_codec::SBE_TEMPLATE_ID => keep_alive_request_codec::SBE_BLOCK_LENGTH,
+        max_recorded_position_request_codec::SBE_TEMPLATE_ID => {
+            max_recorded_position_request_codec::SBE_BLOCK_LENGTH
+        }
+        start_position_request_codec::SBE_TEMPLATE_ID => {
+            start_position_request_codec::SBE_BLOCK_LENGTH
+        }
+        recording_position_request_codec::SBE_TEMPLATE_ID => {
+            recording_position_request_codec::SBE_BLOCK_LENGTH
+        }
+        stop_position_request_codec::SBE_TEMPLATE_ID => {
+            stop_position_request_codec::SBE_BLOCK_LENGTH
+        }
+        // The rest of the templates get the same treatment in the second pass;
+        // until then the short-message guard above is all they have.
+        _ => 0,
+    };
+    if payload.len() < message_header_codec::ENCODED_LENGTH + usize::from(fixed_block_length) {
+        return Err(ControlError::ShortMessage {
+            length: payload.len(),
+        });
+    }
+
+    // The variable-length fields are walked from the decoder's own limit, which
+    // `header()` takes from the message's acting block length, not from the
+    // schema's — so the walk starts where the decoder's will.
+    let variable_fields = match template_id {
+        auth_connect_request_codec::SBE_TEMPLATE_ID => {
+            // `client_info` arrived in schema version 12
+            // (`client_info_decoder`'s own `acting_version() < 12` test).
+            if header.version() < 12 { 2 } else { 3 }
+        }
+        challenge_response_codec::SBE_TEMPLATE_ID => 1,
+        _ => 0,
+    };
+    if variable_fields > 0 {
+        let at = message_header_codec::ENCODED_LENGTH + usize::from(header.block_length());
+        if !variable_data_fits(payload, at, variable_fields) {
+            return Err(ControlError::ShortMessage {
+                length: payload.len(),
+            });
+        }
+    }
 
     match template_id {
         // The only request that makes a session (`ControlSessionAdapter.java:766`).
@@ -4140,6 +4226,62 @@ mod tests {
             .expect_err("refused");
 
         assert_eq!(ControlError::ShortMessage { length: 3 }, error);
+    }
+
+    /// A header alone is not a request: the generated decoder reads the fixed
+    /// fields at the schema's offsets, and with nothing behind the header that
+    /// is a slice panic rather than an error. The fuzz target
+    /// `07_sbe_archive_codecs` found it with exactly these eight bytes.
+    #[test]
+    fn a_request_with_only_a_header_is_refused() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&keep_alive_request_codec::SBE_BLOCK_LENGTH.to_le_bytes());
+        payload.extend_from_slice(&keep_alive_request_codec::SBE_TEMPLATE_ID.to_le_bytes());
+        payload.extend_from_slice(&SBE_SCHEMA_ID.to_le_bytes());
+        payload.extend_from_slice(&12_u16.to_le_bytes());
+        assert_eq!(8, payload.len());
+
+        let error = adapter
+            .on_message(&mut control, IMAGE, message(&payload), 0)
+            .expect_err("refused");
+
+        assert_eq!(
+            ControlError::ShortMessage {
+                length: payload.len()
+            },
+            error
+        );
+        assert!(control.calls.is_empty());
+    }
+
+    /// A variable-length field whose `u32` length runs past the payload is the
+    /// second half of the same defect: the fixed block is there, but the
+    /// channel/credentials/client-info walk would index beyond the message.
+    #[test]
+    fn a_variable_length_field_past_the_end_is_refused() {
+        let (mut adapter, mut control) = adapter_with(AllowAll);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&auth_connect_request_codec::SBE_BLOCK_LENGTH.to_le_bytes());
+        payload.extend_from_slice(&auth_connect_request_codec::SBE_TEMPLATE_ID.to_le_bytes());
+        payload.extend_from_slice(&SBE_SCHEMA_ID.to_le_bytes());
+        payload.extend_from_slice(&12_u16.to_le_bytes());
+        payload.extend_from_slice(&[0_u8; 16]);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        let error = adapter
+            .on_message(&mut control, IMAGE, message(&payload), 0)
+            .expect_err("refused");
+
+        assert_eq!(
+            ControlError::ShortMessage {
+                length: payload.len()
+            },
+            error
+        );
+        assert!(control.calls.is_empty());
     }
 
     /// A request this slice does not answer is named rather than dropped in

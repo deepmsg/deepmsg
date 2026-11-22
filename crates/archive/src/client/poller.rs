@@ -399,6 +399,19 @@ impl ControlledHandler for ControlResponsePoller {
                     return Action::Break;
                 }
 
+                // The fixed block is there; the one variable field starts at
+                // the decoder's own limit (the acting block length, which the
+                // message chooses). A length that runs past the payload is a
+                // slice panic inside the generated reader.
+                if !variable_data_fits(
+                    payload,
+                    message_header_codec::ENCODED_LENGTH + usize::from(header.block_length()),
+                    1,
+                ) {
+                    self.error_on_message = true;
+                    return Action::Break;
+                }
+
                 let mut response = ControlResponseDecoder::default().header(header, 0);
 
                 self.control_session_id = response.control_session_id();
@@ -421,6 +434,15 @@ impl ControlledHandler for ControlResponsePoller {
             }
             CHALLENGE_TEMPLATE_ID => {
                 if !holds(payload, CHALLENGE_BLOCK_LENGTH) {
+                    self.error_on_message = true;
+                    return Action::Break;
+                }
+
+                if !variable_data_fits(
+                    payload,
+                    message_header_codec::ENCODED_LENGTH + usize::from(header.block_length()),
+                    1,
+                ) {
                     self.error_on_message = true;
                     return Action::Break;
                 }
@@ -506,6 +528,36 @@ pub(crate) fn sbe_header(payload: &[u8]) -> Option<MessageHeaderDecoder<ReadBuf<
 /// reports rather than a client that misreads.
 pub(crate) fn holds(payload: &[u8], block_length: u16) -> bool {
     payload.len() >= message_header_codec::ENCODED_LENGTH + usize::from(block_length)
+}
+
+/// Whether `count` variable-length fields fit in `payload`, each a `u32`
+/// length and that many bytes, starting at `at` — an offset the message
+/// declared. The generated reader slices by those lengths without a bound.
+fn variable_data_fits(payload: &[u8], at: usize, count: usize) -> bool {
+    let mut at = at;
+    for _ in 0..count {
+        let Some(prefix_end) = at.checked_add(4) else {
+            return false;
+        };
+        let Some(prefix) = payload.get(at..prefix_end) else {
+            return false;
+        };
+        let Ok(length) = <[u8; 4]>::try_from(prefix) else {
+            return false;
+        };
+        let Ok(length) = usize::try_from(u32::from_le_bytes(length)) else {
+            return false;
+        };
+        let Some(next) = prefix_end.checked_add(length) else {
+            return false;
+        };
+        if next > payload.len() {
+            return false;
+        }
+        at = next;
+    }
+
+    true
 }
 
 /// Why a poll did not read what it was looking at.

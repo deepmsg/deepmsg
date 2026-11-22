@@ -282,6 +282,13 @@ impl<'a> ToDriverRing<'a> {
         let mask = self.capacity - 1;
         let capacity = self.capacity as i64;
 
+        // Both counters live in shared memory this producer may not have
+        // written. A `tail - head` that overflows, or a room figure that goes
+        // negative past `i64`, is a corrupted trailer, not a full ring — and
+        // `Full` is the answer that writes nothing.
+        let room =
+            |tail: i64, head: i64| -> Option<i64> { capacity.checked_sub(tail.checked_sub(head)?) };
+
         let mut head = self
             .buffer
             .load_i64_acquire(
@@ -299,7 +306,7 @@ impl<'a> ToDriverRing<'a> {
                 )
                 .ok_or(ClaimError::Invalid)?;
 
-            if required as i64 > capacity - (tail - head) {
+            if required as i64 > room(tail, head).ok_or(ClaimError::Full)? {
                 head = self
                     .buffer
                     .load_i64_acquire(
@@ -308,7 +315,7 @@ impl<'a> ToDriverRing<'a> {
                     )
                     .ok_or(ClaimError::Invalid)?;
 
-                if required as i64 > capacity - (tail - head) {
+                if required as i64 > room(tail, head).ok_or(ClaimError::Full)? {
                     return Err(ClaimError::Full);
                 }
 
@@ -356,7 +363,9 @@ impl<'a> ToDriverRing<'a> {
                 padding = to_buffer_end;
             }
 
-            let new_tail = tail + (required + padding) as i64;
+            let Some(new_tail) = tail.checked_add((required + padding) as i64) else {
+                return Err(ClaimError::Full);
+            };
             let swapped = self
                 .buffer
                 .compare_exchange_i64(
@@ -1505,5 +1514,27 @@ mod tests {
             ring.consumer_heartbeat(),
             "the two halves agree about which trailer field this is"
         );
+    }
+
+    /// A head counter another process could have left anything in. With
+    /// `head = i64::MIN`, `tail - head` overflows; that must be an error, not
+    /// an arithmetic panic. Fuzz target `03_cnc_rings_and_logs` found it.
+    #[test]
+    fn a_head_counter_that_overflows_tail_minus_head_is_refused() {
+        let mut region = region();
+        let ring =
+            ToDriverRing::new(AtomicBuffer::from_slice_mut(&mut region.0).expect("aligned region"))
+                .expect("ring");
+
+        for field in [
+            layout::MPSC_HEAD_CACHE_POSITION_OFFSET,
+            layout::MPSC_HEAD_POSITION_OFFSET,
+        ] {
+            ring.buffer
+                .store_i64_release(ring.descriptor_offset(field).expect("in range"), i64::MIN)
+                .expect("in range");
+        }
+
+        assert!(ring.write(1, b"x").is_err());
     }
 }

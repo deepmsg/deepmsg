@@ -1339,6 +1339,12 @@ impl Catalog {
         }
 
         let body = self.read_at(offset + DESCRIPTOR_HEADER_LENGTH, length as usize)?;
+        // The block, then three length-prefixed strings: stripped channel,
+        // original channel and source identity. A prefix that runs past the
+        // body is a truncated record, and the slice below would panic.
+        if !variable_data_fits(&body, usize::from(DESCRIPTOR_BLOCK_LENGTH), 3) {
+            return Err(CatalogError::Malformed { offset, length });
+        }
         let mut descriptor = decode_descriptor(&body)?;
 
         // The three strings are a sequence in the body, each one's length
@@ -1562,7 +1568,20 @@ fn encode_record(recording: &Recording, alignment: usize) -> Result<Vec<u8>, Cat
     Ok(frame)
 }
 
+/// Decode the file's header.
+///
+/// The generated decoder reads fixed fields at the schema's offsets, so a file
+/// shorter than the block is a slice panic rather than an error. A catalog
+/// written by a crash, or truncated by hand, is exactly that file; fuzz target
+/// `09_archive_catalog_segment` found it.
 fn decode_header(bytes: &[u8]) -> Result<CatalogHeaderDecoder<'_>, CatalogError> {
+    if bytes.len() < HEADER_LENGTH {
+        return Err(CatalogError::Malformed {
+            offset: 0,
+            length: i32::try_from(bytes.len()).unwrap_or(i32::MAX),
+        });
+    }
+
     Ok(CatalogHeaderDecoder::default().wrap(
         ReadBuf::new(bytes),
         0,
@@ -1574,6 +1593,13 @@ fn decode_header(bytes: &[u8]) -> Result<CatalogHeaderDecoder<'_>, CatalogError>
 fn decode_record_header(
     bytes: &[u8],
 ) -> Result<RecordingDescriptorHeaderDecoder<'_>, CatalogError> {
+    if bytes.len() < usize::from(DESCRIPTOR_HEADER_BLOCK_LENGTH) {
+        return Err(CatalogError::Malformed {
+            offset: 0,
+            length: i32::try_from(bytes.len()).unwrap_or(i32::MAX),
+        });
+    }
+
     Ok(RecordingDescriptorHeaderDecoder::default().wrap(
         ReadBuf::new(bytes),
         0,
@@ -1587,12 +1613,56 @@ fn decode_descriptor(bytes: &[u8]) -> Result<RecordingDescriptorDecoder<'_>, Cat
     // the three strings, and a decoder told the block is all of it looks for the
     // strings where they are not — past the end of the body rather than at a
     // wrong answer. `recording_descriptor_codec`'s own `SBE_BLOCK_LENGTH`.
+    //
+    // A body shorter than that block is a truncated record, and the generated
+    // reader would index past its end; fuzz target `09_archive_catalog_segment`
+    // found it.
+    if bytes.len() < usize::from(DESCRIPTOR_BLOCK_LENGTH) {
+        return Err(CatalogError::Malformed {
+            offset: 0,
+            length: i32::try_from(bytes.len()).unwrap_or(i32::MAX),
+        });
+    }
+
     Ok(RecordingDescriptorDecoder::default().wrap(
         ReadBuf::new(bytes),
         0,
         DESCRIPTOR_BLOCK_LENGTH,
         deepmsg_codec::archive::SBE_SCHEMA_VERSION,
     ))
+}
+
+/// Whether `count` variable-length fields fit in `payload`, each a `u32`
+/// length and that many bytes, starting at `at`.
+///
+/// The descriptor's three strings are read through length prefixes the record
+/// carries, so nothing here trusts them: every step is a `get` or a
+/// `checked_add`.
+fn variable_data_fits(payload: &[u8], at: usize, count: usize) -> bool {
+    let mut at = at;
+    for _ in 0..count {
+        let Some(prefix_end) = at.checked_add(4) else {
+            return false;
+        };
+        let Some(prefix) = payload.get(at..prefix_end) else {
+            return false;
+        };
+        let Ok(length) = <[u8; 4]>::try_from(prefix) else {
+            return false;
+        };
+        let Ok(length) = usize::try_from(u32::from_le_bytes(length)) else {
+            return false;
+        };
+        let Some(next) = prefix_end.checked_add(length) else {
+            return false;
+        };
+        if next > payload.len() {
+            return false;
+        }
+        at = next;
+    }
+
+    true
 }
 
 /// A header string, as text: the format says US-ASCII, and a byte outside it is

@@ -244,6 +244,15 @@ pub fn scan_for_availability(
             break;
         }
 
+        // A writer cannot have produced a frame past the descriptor's maximum,
+        // and `align_up` adds the alignment to what it is given — a corrupt
+        // header near `i32::MAX` would overflow it. The scanner
+        // (`Scanner::advance`) applies the same bound and stops here for the
+        // same reason.
+        if frame_length > descriptor::MAX_MESSAGE_LENGTH + DATA_HEADER_LENGTH as i32 {
+            break;
+        }
+
         let mut aligned = align_up(frame_length, descriptor::FRAME_ALIGNMENT);
 
         // A padding frame is sent as its header alone: the tail is not data,
@@ -253,7 +262,10 @@ pub fn scan_for_availability(
             aligned = DATA_HEADER_LENGTH as i32;
         }
 
-        available += aligned;
+        let Some(next_available) = available.checked_add(aligned) else {
+            break;
+        };
+        available = next_available;
 
         if available > limit {
             // A frame that does not fit the datagram: unless it is the only
@@ -598,6 +610,25 @@ mod tests {
             Availability::Limited { frame_length: -96 },
             scan_for_availability(&view, TERM_LENGTH - 96, 95, 1408),
             "one that would run past it is not"
+        );
+    }
+
+    /// A header claiming a length no writer could have produced. Aligning it
+    /// used to add the alignment to `i32::MAX` and overflow; the answer is
+    /// "nothing to send". Fuzz target `02_logbuffer_scan` found it.
+    #[test]
+    fn an_impossible_frame_length_does_not_overflow_the_align() {
+        let mut bytes = term();
+        {
+            let view = AtomicBuffer::from_slice_mut(&mut bytes.0).expect("aligned");
+            view.store_i32_release(FRAME_LENGTH_OFFSET, i32::MAX)
+                .expect("in range");
+        }
+
+        let view = AtomicBuffer::from_slice(&bytes.0).expect("aligned");
+        assert_eq!(
+            Availability::Empty,
+            scan_for_availability(&view, 0, TERM_LENGTH as i32, TERM_LENGTH as i32)
         );
     }
 }
