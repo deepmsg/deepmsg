@@ -27,6 +27,7 @@ use deepmsg_cluster_common::config::Properties;
 use deepmsg_cluster_common::counters::{
     CLUSTER_BACKUP_LIVE_LOG_POSITION_TYPE_ID, CLUSTER_BACKUP_STATE_TYPE_ID,
 };
+use deepmsg_cluster_tool::{ClusterTool, ToolProperties};
 use deepmsg_driver::idle::Strategy;
 use deepmsg_tests::archive;
 use deepmsg_tests::archiving_driver::OwnArchivingMediaDriver;
@@ -161,6 +162,46 @@ fn a_backup_copies_the_cluster_log_into_its_own_directory() {
     assert!(
         live_position.is_some_and(|position| position > 0),
         "the backup's live log position moved: {live_position:?}"
+    );
+
+    // The mark file a running operator reads: `describe` must name a BACKUP,
+    // and `backup-query` must be able to read the deadline counter. Both are
+    // the reference's checks on a real backup, not a hand-written fixture
+    // (`ClusterBackup.java:2070-2090`).
+    let tool = ClusterTool::new(ToolProperties {
+        timeout_ms: 5_000,
+        ..ToolProperties::default()
+    });
+    let mut out = Vec::new();
+    assert_eq!(
+        0,
+        tool.describe(backup_cluster_dir.path(), &mut out),
+        "describe is wrapped in ignoreFailures and always returns SUCCESS"
+    );
+    let described = String::from_utf8(out).expect("describe writes UTF-8");
+    assert!(
+        described.contains("componentType=BACKUP"),
+        "the backup's mark file describes a BACKUP: {described}"
+    );
+    assert!(
+        described.contains("archiveStreamId=10"),
+        "the mark file names the local archive's control stream: {described}"
+    );
+    assert!(
+        described.contains("memberId=-1") && described.contains("serviceId=-1"),
+        "a backup is member -1 and service -1: {described}"
+    );
+    assert!(
+        described.contains(&format!("clusterId={CLUSTER_ID}")),
+        "the mark file names the cluster: {described}"
+    );
+
+    let mut out = Vec::new();
+    assert_eq!(
+        0,
+        tool.backup_query(backup_cluster_dir.path(), &mut out, None),
+        "backup-query reads the deadline counter: {}",
+        String::from_utf8_lossy(&out)
     );
 
     // And the directory a consensus module would be started from says so: a

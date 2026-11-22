@@ -763,6 +763,35 @@ impl PublicationWriter<'_> {
     }
 }
 
+/// How a [`Client`] connects, and what it does when the driver goes.
+///
+/// `driver_timeout_ms` is the reference's `driver_timeout_ms`
+/// (`aeron-client/src/main/c/aeron_context.c:35`): how stale the driver's
+/// heartbeat may be before this client treats it as gone. It is separate from
+/// `connect_timeout` because a test can shorten the liveness window without
+/// shortening the connect wait.
+pub struct ClientOptions {
+    /// How long [`Client::connect_with_options`] waits for a driver that is
+    /// starting.
+    pub connect_timeout: Duration,
+    /// How stale the driver heartbeat may be before the client terminates.
+    pub driver_timeout_ms: i64,
+    /// Called once when the client discovers the driver is gone, in addition to
+    /// [`Client::error`] carrying the reason. ADR-0003's error callback.
+    #[allow(clippy::type_complexity)]
+    pub error_handler: Option<Box<dyn FnMut(&ClientError) + Send>>,
+}
+
+impl Default for ClientOptions {
+    fn default() -> Self {
+        Self {
+            connect_timeout: CONNECT_TIMEOUT,
+            driver_timeout_ms: DRIVER_TIMEOUT_MS,
+            error_handler: None,
+        }
+    }
+}
+
 /// A client connected to a running driver.
 pub struct Client {
     cnc: CncFile,
@@ -834,6 +863,12 @@ pub struct Client {
     /// cleared: everything it would do afterwards is work for a driver that is
     /// not there.
     terminated: Option<ClientError>,
+    /// How stale the driver's heartbeat may be before this client terminates
+    /// ([`ClientOptions::driver_timeout_ms`]).
+    driver_timeout_ms: i64,
+    /// ADR-0003's error callback, run once when the driver goes.
+    #[allow(clippy::type_complexity)]
+    error_handler: Option<Box<dyn FnMut(&ClientError) + Send>>,
     /// Set once by [`Client::close`], and never cleared.
     ///
     /// It makes the close idempotent, and keeps [`Drop`] from sending a second
@@ -851,7 +886,7 @@ impl Client {
     /// [`ConnectError`] if the CnC file cannot be opened read-write or either
     /// ring is unusable.
     pub fn connect(aeron_dir: &Path) -> Result<Self, ConnectError> {
-        Self::connect_with_timeout(aeron_dir, CONNECT_TIMEOUT)
+        Self::connect_with_options(aeron_dir, ClientOptions::default())
     }
 
     /// Connect, waiting at most `timeout` for a driver that is starting — or for
@@ -867,7 +902,27 @@ impl Client {
     /// As [`Client::connect`], including the timeout expiring — which is
     /// [`ConnectError::NoLiveDriver`] once a CnC file has been found.
     pub fn connect_with_timeout(aeron_dir: &Path, timeout: Duration) -> Result<Self, ConnectError> {
-        let deadline = Instant::now() + timeout;
+        Self::connect_with_options(
+            aeron_dir,
+            ClientOptions {
+                connect_timeout: timeout,
+                driver_timeout_ms: i64::try_from(timeout.as_millis()).unwrap_or(DRIVER_TIMEOUT_MS),
+                ..ClientOptions::default()
+            },
+        )
+    }
+
+    /// The same, with the liveness window and the error callback named
+    /// separately.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::connect_with_timeout`].
+    pub fn connect_with_options(
+        aeron_dir: &Path,
+        mut options: ClientOptions,
+    ) -> Result<Self, ConnectError> {
+        let deadline = Instant::now() + options.connect_timeout;
 
         loop {
             // The reference's four steps, in its order
@@ -875,7 +930,8 @@ impl Client {
             // three are `open_writable`'s — file, mapping, version — and they are
             // why a client that arrives while a driver is creating its 46 MB file
             // waits rather than failing.
-            let cnc = CncFile::open_writable(aeron_dir, timeout).map_err(ConnectError::Cnc)?;
+            let cnc = CncFile::open_writable(aeron_dir, options.connect_timeout)
+                .map_err(ConnectError::Cnc)?;
 
             // The fourth is the heartbeat, and it is what tells a driver that is
             // starting from a **file** a driver left behind. A heartbeat older
@@ -887,8 +943,8 @@ impl Client {
             // because what replaces a dead driver is a new file at the same path,
             // and holding the old mapping is waiting for an inode nothing will
             // ever write to again.
-            if wait_for_a_live_driver(&cnc, timeout, deadline) {
-                return Self::from_cnc(cnc);
+            if wait_for_a_live_driver(&cnc, options.connect_timeout, deadline) {
+                return Self::from_cnc(cnc, &mut options);
             }
 
             // Dropped before the sleep, so that the next look is a new mapping of
@@ -897,7 +953,7 @@ impl Client {
 
             if Instant::now() >= deadline {
                 return Err(ConnectError::NoLiveDriver {
-                    timeout_ms: timeout.as_millis() as u64,
+                    timeout_ms: options.connect_timeout.as_millis() as u64,
                 });
             }
 
@@ -906,7 +962,7 @@ impl Client {
     }
 
     /// The rest of a connection, once the file's four steps have all answered.
-    fn from_cnc(cnc: CncFile) -> Result<Self, ConnectError> {
+    fn from_cnc(cnc: CncFile, options: &mut ClientOptions) -> Result<Self, ConnectError> {
         // The client id comes from the ring's shared counter, exactly as the
         // reference's does. Two consecutive values are not needed here — that
         // is the terminate path's habit — but one is, and this is where the
@@ -942,6 +998,8 @@ impl Client {
             close_handler_panics: 0,
             orphan_images: 0,
             terminated: None,
+            driver_timeout_ms: options.driver_timeout_ms,
+            error_handler: options.error_handler.take(),
             closed: false,
         })
     }
@@ -3784,10 +3842,10 @@ impl Client {
             Some(last) => {
                 let age_ms = now.saturating_sub(last);
 
-                if age_ms > DRIVER_TIMEOUT_MS {
+                if age_ms > self.driver_timeout_ms {
                     self.terminate(ClientError::DriverTimeout {
                         age_ms,
-                        timeout_ms: DRIVER_TIMEOUT_MS,
+                        timeout_ms: self.driver_timeout_ms,
                     });
                     return false;
                 }
@@ -3847,6 +3905,17 @@ impl Client {
     /// reaches for one afterwards finds nothing rather than a mapping of a log
     /// buffer whose driver is gone.
     fn terminate(&mut self, error: ClientError) {
+        if self.terminated.is_some() {
+            return;
+        }
+
+        if let Some(handler) = self.error_handler.as_mut() {
+            // ADR-0003's callback runs once, and a panicking callback does not
+            // leave the client half-terminated: the state below is what every
+            // later call reads.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&error)));
+        }
+
         self.terminated = Some(error);
         self.subscriptions.clear();
         self.publications.clear();

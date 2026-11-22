@@ -5334,7 +5334,7 @@ impl ConsensusModuleAgent {
                 cluster_members: members.as_slice(),
             };
             for (term, cluster_session_id) in deferred_closes {
-                sessions.on_session_close(term, cluster_session_id, &mut ctx)?;
+                sessions.on_client_session_close(term, cluster_session_id, &mut ctx)?;
             }
             for request in deferred_admins {
                 handle_admin_request(&mut ctx, &*sessions, request)?;
@@ -5856,6 +5856,11 @@ impl ConsensusModuleAgent {
         let member_id = self.config.member_id;
         let leader_member_id = self.leader_member_id();
         let state = self.state;
+        // `onServiceCloseSession`'s guard (`ConsensusModuleAgent.java:1435-1441`):
+        // only an active leader appends and tells the client. The follower half
+        // of the same container call must not touch a log publication it does
+        // not have.
+        let is_active_leader = self.role == Role::Leader && state == ModuleState::Active;
         let now_ns = self.clock.time_nanos();
         let clock = self.clock;
         let ingress_endpoints = self.ingress_endpoints.as_str();
@@ -5926,7 +5931,12 @@ impl ConsensusModuleAgent {
                     cluster_members: members.as_slice(),
                 };
                 for cluster_session_id in deferred_closes {
-                    sessions.on_session_close(leadership_term_id, cluster_session_id, &mut ctx)?;
+                    sessions.on_service_close_session(
+                        leadership_term_id,
+                        cluster_session_id,
+                        is_active_leader,
+                        &mut ctx,
+                    )?;
                 }
             }
 

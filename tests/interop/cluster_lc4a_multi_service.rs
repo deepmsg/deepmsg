@@ -79,7 +79,9 @@ fn two_services_answer_every_message(test_name: &str, members: [MemberSpec; SERV
 
 #[test]
 fn two_services_on_one_node_answer_every_message_in_process() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let Some(mut cluster) = start(
         "lc4a-multi-service-in-process",
@@ -129,7 +131,9 @@ fn two_services_on_one_node_answer_every_message_in_process() {
 
 #[test]
 fn two_services_on_one_node_answer_every_message_external() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     two_services_answer_every_message(
         "lc4a-multi-service-external",
         pair(|_| MemberSpec::our_container(0, "echo", ProcessMode::External)),
@@ -138,7 +142,9 @@ fn two_services_on_one_node_answer_every_message_external() {
 
 #[test]
 fn the_reference_containers_answer_the_same_way() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     two_services_answer_every_message(
         "lc4a-multi-service-java",
         pair(|_| MemberSpec::java_container(0, "ClusterEchoTimerService")),

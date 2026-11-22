@@ -252,7 +252,7 @@ fn session_gets_closed_when_the_ingress_image_goes_unavailable(multicast: bool) 
         "aeron:udp?term-length=128k"
     };
 
-    let Some(cluster) = start(
+    let Some(mut cluster) = start(
         test_name,
         base,
         MEMBERS,
@@ -281,6 +281,7 @@ fn session_gets_closed_when_the_ingress_image_goes_unavailable(multicast: bool) 
     let offered = offer_until_closed(&mut session, Instant::now() + DEADLINE);
 
     assert_the_session_was_closed_for_timeout(&cluster, leader, &session, offered);
+    cluster.shutdown();
 }
 
 /// The client's receives stop arriving, and it must not rejoin the same node's
@@ -292,7 +293,7 @@ fn client_does_not_rejoin_the_egress_image_from_the_same_node() {
     let base = next_port_base();
     let test_name = "lc1-reliability-egress";
 
-    let Some(cluster) = start(
+    let Some(mut cluster) = start(
         test_name,
         base,
         1,
@@ -384,6 +385,7 @@ fn client_does_not_rejoin_the_egress_image_from_the_same_node() {
         echoes.len(),
         session.driver_log()
     );
+    cluster.shutdown();
 }
 
 #[test]
@@ -489,6 +491,7 @@ fn session_gets_closed_when_the_ingress_image_goes_unavailable_after_a_failover(
     let offered = offer_until_closed(&mut session, Instant::now() + DEADLINE);
 
     assert_the_session_was_closed_for_timeout(&cluster, new_leader, &session, offered);
+    cluster.shutdown();
 }
 
 #[test]

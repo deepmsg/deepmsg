@@ -278,6 +278,52 @@ pub fn locate_verified() -> Option<PathBuf> {
     Some(path)
 }
 
+/// The reference checkout's C client include directory.
+///
+/// `DEEPMSG_REF_AERON_INCLUDE` wins, then the sibling `../../aeron` checkout,
+/// then the directory derived from the verified `aeronmd` — the checkout's
+/// `aeron-client/src/main/c`. `None` is the probes' skip: a checkout under a
+/// name other than `aeron` used to be a silent skip even when it was there.
+#[must_use]
+pub fn reference_c_include() -> Option<PathBuf> {
+    if let Some(directory) = std::env::var_os("DEEPMSG_REF_AERON_INCLUDE") {
+        let path = PathBuf::from(directory);
+        return path.is_dir().then_some(path);
+    }
+
+    reference_checkout()
+        .map(|checkout| checkout.join("aeron-client").join("src/main/c"))
+        .filter(|path| path.is_dir())
+}
+
+/// The reference checkout's C client library directory.
+///
+/// `DEEPMSG_REF_AERON_LIB` wins, then the same checkout as
+/// [`reference_c_include`], whose `cppbuild/Release/lib` holds `libaeron`.
+#[must_use]
+pub fn reference_c_lib() -> Option<PathBuf> {
+    if let Some(directory) = std::env::var_os("DEEPMSG_REF_AERON_LIB") {
+        let path = PathBuf::from(directory);
+        return path.is_dir().then_some(path);
+    }
+
+    reference_checkout()
+        .map(|checkout| checkout.join("cppbuild").join("Release").join("lib"))
+        .filter(|path| path.is_dir())
+}
+
+/// The reference checkout: the sibling `../../aeron`, or the one the verified
+/// `aeronmd` lives in (`<checkout>/cppbuild/Release/binaries/aeronmd`).
+fn reference_checkout() -> Option<PathBuf> {
+    let sibling = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../aeron");
+    if sibling.join("aeron-client").join("src/main/c").is_dir() {
+        return Some(sibling);
+    }
+
+    let aeronmd = locate_verified()?;
+    aeronmd.ancestors().nth(4).map(Path::to_path_buf)
+}
+
 /// Environment variable naming **our own** driver binary.
 pub const OWN_DRIVER_ENV: &str = "DEEPMSG_DRIVER";
 
@@ -346,6 +392,11 @@ impl OwnDriver {
     /// The aeron directory this driver owns — where its CnC file lives.
     pub fn aeron_dir(&self) -> &Path {
         self.0.aeron_dir()
+    }
+
+    /// The driver process's id, for a test that has to signal it.
+    pub fn pid(&self) -> u32 {
+        self.0.pid()
     }
 
     /// Wait for the CnC file to be published and readable.

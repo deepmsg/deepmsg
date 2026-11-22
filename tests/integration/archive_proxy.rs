@@ -53,7 +53,9 @@ use deepmsg_codec::archive::list_recordings_request_codec::{self, ListRecordings
 use deepmsg_codec::archive::max_recorded_position_request_codec::{
     self, MaxRecordedPositionRequestDecoder,
 };
-use deepmsg_codec::archive::message_header_codec::MessageHeaderDecoder;
+use deepmsg_codec::archive::message_header_codec::{
+    ENCODED_LENGTH as MESSAGE_HEADER_LENGTH, MessageHeaderDecoder,
+};
 use deepmsg_codec::archive::migrate_segments_request_codec::{self, MigrateSegmentsRequestDecoder};
 use deepmsg_codec::archive::purge_recording_request_codec::{self, PurgeRecordingRequestDecoder};
 use deepmsg_codec::archive::purge_segments_request_codec::{self, PurgeSegmentsRequestDecoder};
@@ -215,6 +217,28 @@ fn next_request(rig: &mut Rig) -> Vec<u8> {
     }
 }
 
+/// The wire carries exactly the SBE message the request names.
+///
+/// `block_length` is the decoder's `encoded_length()` (the fixed body); each
+/// variable field contributes its `u32` length and its bytes. A proxy that
+/// wrote a longer slice would otherwise be invisible: the extra bytes are past
+/// every field the decoder reads.
+fn assert_wire_length(payload: &[u8], block_length: usize, variable: &[usize]) {
+    let expected = MESSAGE_HEADER_LENGTH
+        + block_length
+        + variable.iter().map(|length| 4 + length).sum::<usize>();
+    assert_eq!(
+        expected,
+        payload.len(),
+        "the wire carries exactly the SBE message: block={block_length}, variable={variable:?}"
+    );
+}
+
+/// The same, for a template with no variable fields.
+fn assert_no_variable_data(payload: &[u8], block_length: usize) {
+    assert_wire_length(payload, block_length, &[]);
+}
+
 /// The SBE header of a request, and the checks every request shares.
 ///
 /// The schema id and version are not decoration: an archive reads them to decide
@@ -326,6 +350,7 @@ fn the_session_requests_are_the_ones_a_connect_sends() {
         header_of(&payload, auth_connect_request_codec::SBE_TEMPLATE_ID),
         0,
     );
+    let block_length = request.encoded_length();
     assert_eq!(1, request.correlation_id());
     assert_eq!(20, request.response_stream_id());
     assert_eq!(
@@ -355,6 +380,15 @@ fn the_session_requests_are_the_ones_a_connect_sends() {
         proxy.client_info(),
         var_field!(request, client_info_decoder, client_info_slice)
     );
+    assert_wire_length(
+        &payload,
+        block_length,
+        &[
+            "aeron:udp?endpoint=localhost:0".len(),
+            b"credentials".len(),
+            proxy.client_info().len(),
+        ],
+    );
 
     proxy
         .archive_id(&rig.client, 2)
@@ -364,8 +398,10 @@ fn the_session_requests_are_the_ones_a_connect_sends() {
         header_of(&payload, archive_id_request_codec::SBE_TEMPLATE_ID),
         0,
     );
+    let block_length = request.encoded_length();
     assert_eq!(CONTROL_SESSION_ID, request.control_session_id());
     assert_eq!(2, request.correlation_id());
+    assert_no_variable_data(&payload, block_length);
 
     proxy
         .challenge_response(&rig.client, 3, b"secret")
@@ -375,6 +411,7 @@ fn the_session_requests_are_the_ones_a_connect_sends() {
         header_of(&payload, challenge_response_codec::SBE_TEMPLATE_ID),
         0,
     );
+    let block_length = request.encoded_length();
     assert_eq!(CONTROL_SESSION_ID, request.control_session_id());
     assert_eq!(3, request.correlation_id());
     assert_eq!(
@@ -385,6 +422,7 @@ fn the_session_requests_are_the_ones_a_connect_sends() {
             encoded_credentials_slice
         )
     );
+    assert_wire_length(&payload, block_length, &[b"secret".len()]);
 
     proxy
         .close_session(&rig.client)
@@ -394,6 +432,7 @@ fn the_session_requests_are_the_ones_a_connect_sends() {
         header_of(&payload, close_session_request_codec::SBE_TEMPLATE_ID),
         0,
     );
+    let block_length = request.encoded_length();
     assert_eq!(CONTROL_SESSION_ID, request.control_session_id());
     // A decoder's `encoded_length` is its template's **block length** — the
     // fixed part, before any variable data — so this is the claim that the
@@ -402,6 +441,7 @@ fn the_session_requests_are_the_ones_a_connect_sends() {
     // content is "which session", and a field added to it would be invisible to
     // every assertion above.
     assert_eq!(8, request.encoded_length(), "a session and nothing else");
+    assert_no_variable_data(&payload, block_length);
 }
 
 /// The requests that make and stop a recording.

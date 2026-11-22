@@ -59,10 +59,11 @@
 //! Everything this file drives the archive with is in [`archive`], shared with
 //! the segments file — including the recording, which both make the same way.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use deepmsg_archive::client::ReplayParams;
 use deepmsg_tests::archive::{self, Archive, Recording};
+use deepmsg_tests::ports::port;
 
 /// The connect's correlation id, which its answer echoes.
 const CONNECT_CORRELATION_ID: i64 = 0x5ed1_0004;
@@ -73,11 +74,15 @@ const CONNECT_CORRELATION_ID: i64 = 0x5ed1_0004;
 /// drivers on one host must not pick the same one (`archive_recording.rs` gives
 /// the same reason) — and a **second** one below, because the two tests in this
 /// file are two drivers on one host running at once.
-const RECORDING_CHANNEL: &str = "aeron:udp?endpoint=localhost:33438";
-/// See [`RECORDING_CHANNEL`], and the reason it is here: a UDP endpoint is a
+fn recording_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(0))
+}
+/// See [`recording_channel`], and the reason it is here: a UDP endpoint is a
 /// bound socket, so two tests that record at once cannot share the port.
-const BOUNDED_RECORDING_CHANNEL: &str = "aeron:udp?endpoint=localhost:33443";
-/// See [`RECORDING_CHANNEL`].
+fn bounded_recording_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(2))
+}
+/// See [`recording_channel`].
 const RECORDING_STREAM_ID: i32 = 33;
 
 /// The channel the first test's replay goes out on, and the stream.
@@ -85,20 +90,28 @@ const RECORDING_STREAM_ID: i32 = 33;
 /// Both differ from the recording's, which is what makes the frame-header
 /// assertion mean something: a replay that copied the recorded headers through
 /// would hand the subscriber [`RECORDING_STREAM_ID`].
-const REPLAY_CHANNEL: &str = "aeron:udp?endpoint=localhost:33439";
-/// See [`REPLAY_CHANNEL`].
+fn replay_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(1))
+}
+/// The dedicated-thread case's own recording and replay ports.
+fn dedicated_recording_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(7))
+}
+/// See [`dedicated_recording_channel`].
+fn dedicated_replay_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(8))
+}
+/// See [`replay_channel`].
 const REPLAY_STREAM_ID: i32 = 66;
 
 /// The channels the second test's replays go out on, one each.
 ///
 /// One channel per replay because an image is what a subscription keys a stream
 /// by, and three replays of one recording onto one channel would be three images
-/// of it to tell apart. The ports are [`REPLAY_CHANNEL`]'s plus one, two, three.
-const BOUNDED_REPLAY_CHANNELS: [&str; 3] = [
-    "aeron:udp?endpoint=localhost:33440",
-    "aeron:udp?endpoint=localhost:33441",
-    "aeron:udp?endpoint=localhost:33442",
-];
+/// of it to tell apart. The ports are [`replay_channel`]'s plus one, two, three.
+fn bounded_replay_channels() -> [String; 3] {
+    [4, 5, 6].map(|offset| format!("aeron:udp?endpoint=localhost:{}", port(offset)))
+}
 
 /// How many replays the archive in the second test will run at once
 /// (`aeron.archive.max.concurrent.replays`, `Archive.java:445`).
@@ -139,12 +152,6 @@ const FILE_IO_MAX_LENGTH: i32 = 4096;
 /// suite's own choice (`aeron_archive_test.cpp:3515`), and any id would do: it
 /// is a counter nothing but these tests reads.
 const BOUNDED_COUNTER_TYPE_ID: i32 = 10001;
-
-/// How long the archive is given to notice that a limit counter has gone.
-///
-/// It reads one every turn, so this is a hundred turns of slack rather than a
-/// race.
-const SETTLED: Duration = Duration::from_millis(250);
 
 /// The recording both tests make: [`MESSAGE_COUNT`] messages on `channel`, with
 /// a mark at [`FIRST_MARK`].
@@ -190,7 +197,7 @@ fn properties() -> Vec<String> {
 /// A recording replayed back, frame for frame, carrying the replay's own ids.
 /// One replay round trip, under whichever archive `properties` names.
 ///
-/// `channel` is a parameter rather than [`RECORDING_CHANNEL`] because the two
+/// `channel` is a parameter rather than [`recording_channel`] because the two
 /// criteria below run at once in one binary and a UDP endpoint belongs to one
 /// process at a time.
 fn a_replay_round_trip(
@@ -331,12 +338,28 @@ fn a_replay_round_trip(
 
     let _ = archive.stop();
 }
+/// Wait for the archive's replay-session counter to reach `expected`.
+///
+/// A fixed sleep is a guess at how long the session takes to close; the
+/// counter is the state the case is actually waiting for.
+fn await_replay_sessions(archive: &mut Archive, expected: i64, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        archive.client.poll();
+        if archive::counter_by_label(&archive.client, "Archive Replay Sessions") == Some(expected) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn a_recording_replays_its_own_frames_across_its_segments() {
     a_replay_round_trip(
         "archive-replay-frames",
-        RECORDING_CHANNEL,
-        REPLAY_CHANNEL,
+        &recording_channel(),
+        &replay_channel(),
         &properties(),
     );
 }
@@ -358,8 +381,8 @@ fn a_recording_replays_with_the_replayer_on_its_own_thread() {
 
     a_replay_round_trip(
         "archive-replay-dedicated",
-        "aeron:udp?endpoint=localhost:33444",
-        "aeron:udp?endpoint=localhost:33445",
+        &dedicated_recording_channel(),
+        &dedicated_replay_channel(),
         &properties,
     );
 }
@@ -380,10 +403,11 @@ fn a_replay_whose_limit_has_gone_gives_its_slot_back() {
         return;
     };
 
-    let recording = a_recording(BOUNDED_RECORDING_CHANNEL);
+    let recording = a_recording(&bounded_recording_channel());
     let recorded = archive.record(&recording);
 
-    for (index, channel) in BOUNDED_REPLAY_CHANNELS.iter().enumerate() {
+    let bounded_channels = bounded_replay_channels();
+    for (index, channel) in bounded_channels.iter().enumerate() {
         let counter = archive.limit_counter(BOUNDED_COUNTER_TYPE_ID, recorded.first);
 
         // Naming a limit counter that is not the null one is the whole of what
@@ -429,7 +453,11 @@ fn a_replay_whose_limit_has_gone_gives_its_slot_back() {
             .remove_counter(&counter, archive::COMMAND_TIMEOUT)
             .expect("the driver gives the counter back");
 
-        std::thread::sleep(SETTLED);
+        await_replay_sessions(
+            &mut archive,
+            0,
+            "the bounded replay to give its session back",
+        );
     }
 
     // Two replays have run against a bound of two. If either is still holding
@@ -446,7 +474,7 @@ fn a_replay_whose_limit_has_gone_gives_its_slot_back() {
         .start_replay(
             &mut archive.client,
             recorded.recording_id,
-            REPLAY_CHANNEL,
+            &replay_channel(),
             REPLAY_STREAM_ID,
             &ReplayParams {
                 bounding_limit_counter_id: counter.counter_id(),

@@ -60,6 +60,9 @@ use deepmsg_codec_cluster::challenge_codec::ChallengeDecoder;
 use deepmsg_codec_cluster::challenge_response_codec::ChallengeResponseEncoder;
 use deepmsg_codec_cluster::event_code::EventCode;
 use deepmsg_codec_cluster::message_header_codec::ENCODED_LENGTH as MESSAGE_HEADER_LENGTH;
+use deepmsg_codec_cluster::session_close_request_codec::{
+    SBE_BLOCK_LENGTH as SESSION_CLOSE_REQUEST_BLOCK_LENGTH, SessionCloseRequestEncoder,
+};
 use deepmsg_codec_cluster::session_connect_request_codec::SessionConnectRequestEncoder;
 use deepmsg_codec_cluster::session_event_codec::SessionEventDecoder;
 use deepmsg_codec_cluster::session_keep_alive_codec::{
@@ -2259,7 +2262,16 @@ impl ClientSide {
     /// one the cluster may still hold open.
     pub fn start_at(ports: &Ports, leader_id: i32, egress_offset: u16) -> Option<Self> {
         let ports = &ports.with_egress_offset(egress_offset);
-        let driver = OwnDriver::start(&format!("cluster-harness-client-{}", ports.base()))?;
+        // The driver's directory is named by the *client*, not by the port
+        // block: `with_egress_offset` keeps `base`, so two clients named only
+        // by `base` remove each other's shared memory on start. The offset is
+        // what makes them two directories.
+        let driver_name = if egress_offset == 0 {
+            format!("cluster-harness-client-{}", ports.base())
+        } else {
+            format!("cluster-harness-client-{}-{egress_offset}", ports.base())
+        };
+        let driver = OwnDriver::start(&driver_name)?;
         let mut client = Client::connect(driver.aeron_dir()).expect("the test client connects");
 
         let egress_channel = ports.client_egress_channel();
@@ -2491,6 +2503,26 @@ impl ClientSide {
             payload,
         );
         offer_message(self, faults, &message);
+    }
+
+    /// Send `SessionCloseRequest` — the message `ClusterSession::close` offers
+    /// (`AeronCluster.java:1129-1160`).
+    ///
+    /// Unlike the product client, this leaves the egress subscription in place:
+    /// a case can keep reading it after the close, which is what makes "the
+    /// cluster does not answer a client's own close with an event"
+    /// observable at all.
+    pub fn close_session(&self, session: &SessionEvent, faults: &Faults) {
+        let length = MESSAGE_HEADER_LENGTH + usize::from(SESSION_CLOSE_REQUEST_BLOCK_LENGTH);
+        let mut buffer = vec![0_u8; length];
+        let encoder = SessionCloseRequestEncoder::default()
+            .wrap(WriteBuf::new(&mut buffer), MESSAGE_HEADER_LENGTH);
+        let mut header = encoder.header(0);
+        let mut close = header.parent().expect("the encoder the header wrapped");
+        close
+            .leadership_term_id(session.leadership_term_id)
+            .cluster_session_id(session.cluster_session_id);
+        offer_message(self, faults, &buffer[..length]);
     }
 
     /// Send `count` messages and wait until as many replies have arrived — the

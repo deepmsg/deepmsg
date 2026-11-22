@@ -86,18 +86,24 @@ fn service_messages(test_name: &str, member: MemberSpec) {
 
 #[test]
 fn a_service_message_round_trips_in_process() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     service_messages("lc4a-service-message-in-process", arms()[0].1);
 }
 
 #[test]
 fn a_service_message_round_trips_external() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     service_messages("lc4a-service-message-external", arms()[1].1);
 }
 
 #[test]
 fn the_reference_container_round_trips_a_service_message_the_same_way() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     service_messages("lc4a-service-message-java", arms()[2].1);
 }

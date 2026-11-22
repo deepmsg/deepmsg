@@ -456,7 +456,7 @@ fn a_backup_copies_a_java_clusters_log_and_a_member_starts_from_it() {
     cluster.shutdown();
 
     let recovered = recover_from_backup("p3-9-java-log-recovered", base, archive, cluster_dir);
-    let Some(recovered) = recovered else {
+    let Some(mut recovered) = recovered else {
         skip();
         return;
     };
@@ -470,6 +470,7 @@ fn a_backup_copies_a_java_clusters_log_and_a_member_starts_from_it() {
         "a log with no snapshot comes back by replay alone"
     );
 
+    recovered.shutdown();
     faults.check();
 }
 
@@ -519,7 +520,7 @@ fn a_backup_carries_a_java_clusters_snapshot() {
     let (archive, cluster_dir) = backup.into_directories();
     cluster.shutdown();
 
-    let Some(recovered) =
+    let Some(mut recovered) =
         recover_from_backup("p3-9-java-snapshot-recovered", base, archive, cluster_dir)
     else {
         skip();
@@ -538,6 +539,7 @@ fn a_backup_carries_a_java_clusters_snapshot() {
         "the member came up from the snapshot the backup carried"
     );
 
+    recovered.shutdown();
     faults.check();
 }
 
@@ -597,7 +599,7 @@ fn the_latest_snapshot_decides_where_a_backups_recording_starts() {
     let (archive, cluster_dir) = backup.into_directories();
     cluster.shutdown();
 
-    let Some(recovered) = recover_from_backup(
+    let Some(mut recovered) = recover_from_backup(
         "p3-9-java-replay-start-recovered",
         base,
         archive,
@@ -616,5 +618,6 @@ fn the_latest_snapshot_decides_where_a_backups_recording_starts() {
         "the member came up from the snapshot the backup carried"
     );
 
+    recovered.shutdown();
     faults.check();
 }

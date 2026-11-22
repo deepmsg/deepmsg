@@ -40,7 +40,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Our client opens a session on a single-node Java cluster.
 #[test]
 fn our_client_connects_to_a_java_single_node() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let member = MemberSpec::our_container(0, "echo", ProcessMode::InProcess);
     let Some(mut cluster) = TestCluster::start("lc1-connect", &[member], Options::default()) else {

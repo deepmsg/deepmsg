@@ -118,9 +118,29 @@ pub const CONTAINER_ENV: &str = "DEEPMSG_CONTAINER_BIN";
 pub const DEFAULT_CONTAINER: &str = "../target/debug/deepmsg-clustered-service-container";
 /// Environment variable naming our consensus module binary to run.
 pub const CLUSTER_NODE_ENV: &str = "DEEPMSG_CLUSTER_NODE_BIN";
+/// The other spelling the interop cases use; both name the same binary.
+pub const CLUSTER_NODE_ENV_ALT: &str = "DEEPMSG_CLUSTER_NODE";
 /// Where our consensus module binary is when the variable is unset and the
 /// workspace is built.
 pub const DEFAULT_CLUSTER_NODE: &str = "../target/debug/deepmsg-cluster-node";
+
+/// The consensus module binary, named by either environment variable.
+#[must_use]
+pub fn locate_cluster_node() -> Option<PathBuf> {
+    for env in [CLUSTER_NODE_ENV, CLUSTER_NODE_ENV_ALT] {
+        if let Some(value) = std::env::var_os(env) {
+            let path = PathBuf::from(value);
+            assert!(
+                path.is_file(),
+                "{env} is set to {}, which is not a file",
+                path.display()
+            );
+            return Some(path);
+        }
+    }
+
+    driver::locate_tool(CLUSTER_NODE_ENV, DEFAULT_CLUSTER_NODE)
+}
 
 /// Who runs a member's consensus module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -855,7 +875,7 @@ impl TestCluster {
                 && members.iter().all(|member| {
                     member.node != NodeImpl::Rust
                         || member.mode != ProcessMode::External
-                        || driver::locate_tool(CLUSTER_NODE_ENV, DEFAULT_CLUSTER_NODE).is_some()
+                        || locate_cluster_node().is_some()
                 });
             if !needs_binaries {
                 crate::archiving_driver::announce_skip();
@@ -1409,6 +1429,16 @@ impl TestCluster {
         }
     }
 
+    /// Stop everything a case left running, including when it panicked.
+    ///
+    /// `shutdown` is idempotent: every stop takes its handle, so the second
+    /// call is a no-op. A panic escaping this drop while the test is already
+    /// unwinding aborts the process, which is why the call's own assertions are
+    /// swallowed rather than re-raised.
+    fn drop_cluster(&mut self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.shutdown()));
+    }
+
     /// The last lines of a node's output.
     #[must_use]
     pub fn node_log(&self, member: i32) -> String {
@@ -1743,13 +1773,12 @@ impl TestCluster {
     /// Our consensus module as the `deepmsg-cluster-node` binary.
     fn spawn_cluster_node(&self, index: usize, arguments: &[String]) -> Process {
         let node = &self.nodes[index];
-        let binary =
-            driver::locate_tool(CLUSTER_NODE_ENV, DEFAULT_CLUSTER_NODE).unwrap_or_else(|| {
-                panic!(
-                    "no {DEFAULT_CLUSTER_NODE}; build it with `cargo build --workspace --bins` \
-                     or set {CLUSTER_NODE_ENV}"
-                )
-            });
+        let binary = locate_cluster_node().unwrap_or_else(|| {
+            panic!(
+                "no {DEFAULT_CLUSTER_NODE}; build it with `cargo build --workspace --bins` \
+                     or set {CLUSTER_NODE_ENV}/{CLUSTER_NODE_ENV_ALT}"
+            )
+        });
         let log = node.cluster.path().join("cluster-node.log");
         Process::spawn(&binary, &log, arguments, &[]).unwrap_or_else(|error| {
             panic!(
@@ -2313,6 +2342,12 @@ impl TestCluster {
     }
 }
 
+impl Drop for TestCluster {
+    fn drop(&mut self) {
+        self.drop_cluster();
+    }
+}
+
 /// What a [`TestService`] did, as a test can read it from its own process.
 ///
 /// These are the reference's `TestNode.TestService` observables
@@ -2530,6 +2565,8 @@ pub struct ApiState {
     pub snapshot_records: AtomicUsize,
     /// `ClientSession::close` answers.
     pub closes: AtomicUsize,
+    /// The reasons `on_session_close` was called with, in order.
+    pub close_reasons: Mutex<Vec<CloseReason>>,
     /// The service messages the business offered and later read back, in the
     /// order they came: `(what it offered, what the log delivered)`.
     pub service_messages: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
@@ -2553,6 +2590,15 @@ impl ApiState {
             .clone()
             .into_iter()
             .collect()
+    }
+
+    /// The reasons the business's `on_session_close` was called with, in order.
+    #[must_use]
+    pub fn close_reasons(&self) -> Vec<CloseReason> {
+        self.close_reasons
+            .lock()
+            .expect("the close reasons lock")
+            .clone()
     }
 }
 
@@ -2667,8 +2713,13 @@ impl ClusteredService for ApiService {
         _cluster: &mut deepmsg_cluster_service::Cluster<'_>,
         _session: SessionId,
         _timestamp: i64,
-        _reason: CloseReason,
+        reason: CloseReason,
     ) -> Result<(), ContainerError> {
+        self.state
+            .close_reasons
+            .lock()
+            .expect("the close reasons lock")
+            .push(reason);
         Ok(())
     }
 

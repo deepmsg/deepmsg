@@ -36,6 +36,7 @@ use deepmsg_client::client::Client;
 use deepmsg_tests::archive;
 use deepmsg_tests::archiving_driver::{self, OwnArchivingMediaDriver};
 use deepmsg_tests::java_archiving_driver::{self, JavaArchivingMediaDriver};
+use deepmsg_tests::ports::port;
 use deepmsg_tests::temp::TempDir;
 
 /// The recording the source makes, in the source archive's own driver.
@@ -48,12 +49,6 @@ const CONTROL_STREAM_ID: i32 = 10;
 
 /// The tests in this binary start two archives each.
 static SERIAL: Mutex<()> = Mutex::new(());
-
-/// A port for this run, below `net.ipv4.ip_local_port_range` so that a process
-/// holding an ephemeral port cannot take it mid-run (`records/P3-9.md` §9.2).
-fn port(offset: u32) -> u32 {
-    13_000 + (std::process::id() % 400) * 2 + offset
-}
 
 /// Where the **source** archive listens for clients — UDP, so that the
 /// destination's archive can reach it from another driver.
