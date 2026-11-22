@@ -392,24 +392,32 @@ fn twins_agree_byte_for_byte(test_name: &str, mode: ProcessMode) {
 
 #[test]
 fn a_snapshot_survives_a_container_restart_in_process() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     snapshot_survives_a_restart("lc4a-snapshot-in-process", ProcessMode::InProcess);
 }
 
 #[test]
 fn a_snapshot_survives_a_container_restart_external() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     snapshot_survives_a_restart("lc4a-snapshot-external", ProcessMode::External);
 }
 
 #[test]
 fn the_twins_snapshot_is_the_java_ones_byte_for_byte_in_process() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     twins_agree_byte_for_byte("lc4a-twin-in-process", ProcessMode::InProcess);
 }
 
 #[test]
 fn the_twins_snapshot_is_the_java_ones_byte_for_byte_external() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     twins_agree_byte_for_byte("lc4a-twin-external", ProcessMode::External);
 }

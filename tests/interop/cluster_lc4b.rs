@@ -61,6 +61,18 @@ const ARENA: &str = "0,localhost:9001,localhost:9002,localhost:9003,localhost:90
 const DEFAULT_CLUSTER_NODE: &str = "../target/debug/deepmsg-cluster-node";
 
 fn locate_cluster_node() -> Option<PathBuf> {
+    for env in ["DEEPMSG_CLUSTER_NODE", "DEEPMSG_CLUSTER_NODE_BIN"] {
+        if let Some(value) = std::env::var_os(env) {
+            let path = PathBuf::from(value);
+            assert!(
+                path.is_file(),
+                "{env} is set to {}, which is not a file",
+                path.display()
+            );
+            return Some(path);
+        }
+    }
+
     driver::locate_tool("DEEPMSG_CLUSTER_NODE", DEFAULT_CLUSTER_NODE)
 }
 
@@ -89,12 +101,15 @@ fn compile_java() -> Option<TempDir> {
 /// were.
 struct Lc4b {
     test_name: String,
+    /// The upper processes first: a panic unwinds the fields in declaration
+    /// order, and the container and consensus module must stop before the
+    /// driver whose `cnc.dat` they are attached to.
+    container: Option<ReferenceDriver>,
+    consensus_module: Option<ReferenceDriver>,
     driver: OwnArchivingMediaDriver,
     cluster_dir: PathBuf,
     classes: TempDir,
     jar: PathBuf,
-    container: Option<ReferenceDriver>,
-    consensus_module: Option<ReferenceDriver>,
 }
 
 impl Lc4b {

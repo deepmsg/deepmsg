@@ -73,7 +73,9 @@ impl EgressListener for SharedListener {
 /// Our client sends a message, reads the echo and closes the session.
 #[test]
 fn our_client_offers_a_message_and_closes_the_session() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let member = MemberSpec::test_container(0, "test-service");
     let Some(mut cluster) = TestCluster::start("lc1-echo", &[member], Options::default()) else {

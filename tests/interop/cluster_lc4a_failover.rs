@@ -259,31 +259,41 @@ fn service_messages_survive_restart(test_name: &str, mode: ProcessMode) {
 
 #[test]
 fn three_nodes_elect_one_leader_and_serve_in_process() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     elect_one_leader_and_serve("lc4a-three-nodes-in-process", ProcessMode::InProcess);
 }
 
 #[test]
 fn three_nodes_elect_one_leader_and_serve_external() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     elect_one_leader_and_serve("lc4a-three-nodes-external", ProcessMode::External);
 }
 
 #[test]
 fn a_new_leader_serves_after_the_old_one_is_stopped_in_process() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     new_leader_serves("lc4a-failover-in-process", ProcessMode::InProcess);
 }
 
 #[test]
 fn a_new_leader_serves_after_the_old_one_is_stopped_external() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     new_leader_serves("lc4a-failover-external", ProcessMode::External);
 }
 
 #[test]
 fn service_messages_survive_a_failover_in_process() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     service_messages_survive_failover(
         "lc4a-service-messages-failover-in-process",
         ProcessMode::InProcess,
@@ -292,7 +302,9 @@ fn service_messages_survive_a_failover_in_process() {
 
 #[test]
 fn service_messages_survive_a_failover_external() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     service_messages_survive_failover(
         "lc4a-service-messages-failover-external",
         ProcessMode::External,
@@ -301,7 +313,9 @@ fn service_messages_survive_a_failover_external() {
 
 #[test]
 fn service_messages_survive_a_full_cluster_restart_in_process() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     service_messages_survive_restart(
         "lc4a-service-messages-restart-in-process",
         ProcessMode::InProcess,
@@ -310,7 +324,9 @@ fn service_messages_survive_a_full_cluster_restart_in_process() {
 
 #[test]
 fn service_messages_survive_a_full_cluster_restart_external() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     service_messages_survive_restart(
         "lc4a-service-messages-restart-external",
         ProcessMode::External,
@@ -408,7 +424,9 @@ fn service_messages_survive_snapshot_and_restart(test_name: &str, mode: ProcessM
 
 #[test]
 fn service_messages_survive_a_snapshot_and_a_restart_in_process() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     service_messages_survive_snapshot_and_restart(
         "lc4a-service-messages-snapshot-restart-in-process",
         ProcessMode::InProcess,
@@ -417,7 +435,9 @@ fn service_messages_survive_a_snapshot_and_a_restart_in_process() {
 
 #[test]
 fn service_messages_survive_a_snapshot_and_a_restart_external() {
-    let _serial = SERIAL.lock().expect("the serial lock");
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     service_messages_survive_snapshot_and_restart(
         "lc4a-service-messages-snapshot-restart-external",
         ProcessMode::External,
