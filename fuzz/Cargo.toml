@@ -1,0 +1,109 @@
+[package]
+name = "deepmsg-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# A workspace of its own: the root workspace's members do not include this
+# directory, so `cargo build/test --workspace` never sees `libfuzzer-sys`.
+[workspace]
+
+[dependencies]
+arbitrary = { version = "=1.4.2", features = ["derive"] }
+libfuzzer-sys = "0.4"
+
+deepmsg-core = { path = "../crates/core" }
+deepmsg-cnc = { path = "../crates/cnc" }
+deepmsg-codec = { path = "../crates/codec" }
+deepmsg-client = { path = "../crates/client", features = ["fuzz-hooks"] }
+deepmsg-driver = { path = "../crates/driver" }
+deepmsg-archive = { path = "../crates/archive" }
+deepmsg-cluster-common = { path = "../crates/cluster/common" }
+deepmsg-cluster = { path = "../crates/cluster/consensus" }
+
+[[bin]]
+name = "01_channel_uri"
+path = "fuzz_targets/01_channel_uri.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "02_logbuffer_scan"
+path = "fuzz_targets/02_logbuffer_scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "03_cnc_rings_and_logs"
+path = "fuzz_targets/03_cnc_rings_and_logs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "04_cnc_command_decode"
+path = "fuzz_targets/04_cnc_command_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "05_udp_protocol_frames"
+path = "fuzz_targets/05_udp_protocol_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "06_userspace_packet"
+path = "fuzz_targets/06_userspace_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "07_sbe_archive_codecs"
+path = "fuzz_targets/07_sbe_archive_codecs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "08_sbe_cluster_codecs"
+path = "fuzz_targets/08_sbe_cluster_codecs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "09_archive_catalog_segment"
+path = "fuzz_targets/09_archive_catalog_segment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "10_archive_poller_events"
+path = "fuzz_targets/10_archive_poller_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "11_cluster_recording_log"
+path = "fuzz_targets/11_cluster_recording_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "12_state_machine_rings"
+path = "fuzz_targets/12_state_machine_rings.rs"
+test = false
+doc = false
+bench = false
