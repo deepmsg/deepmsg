@@ -287,6 +287,13 @@ impl EgressPoller {
         // last saw even when it was not a template this build reads.
         self.template_id = Some(header.template_id());
 
+        // The generated decoders panic past the end where the reference's
+        // buffer throws; this is that throw. The per-arm checks stay because
+        // they also bound the fields those arms read.
+        if deepmsg_cluster_common::sbe::fits(payload, &header).is_err() {
+            return Action::Continue;
+        }
+
         match header.template_id() {
             SESSION_MESSAGE_HEADER_TEMPLATE_ID => {
                 if !holds(payload, SESSION_MESSAGE_HEADER_BLOCK_LENGTH) {
