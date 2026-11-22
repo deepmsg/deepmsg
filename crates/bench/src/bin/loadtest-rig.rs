@@ -26,11 +26,10 @@ use deepmsg_bench::loadtest::recorder::{self, Recorder};
 use deepmsg_bench::loadtest::result;
 use deepmsg_bench::loadtest::rig::LoadTestRig;
 use deepmsg_bench::loadtest::transceiver::{MessageTransceiver, SystemClock};
-use deepmsg_bench::loadtest::transport::echo::{EchoTransceiver, PollGate};
+use deepmsg_bench::loadtest::transport::echo::EchoTransceiver;
 use deepmsg_bench::loadtest::transport::live_recording::LiveRecordingTransceiver;
 use deepmsg_bench::loadtest::transport::live_replay::LiveReplayTransceiver;
-use deepmsg_bench::loadtest::transport::util::ChannelSettings;
-use deepmsg_bench::loadtest::transport::util::archive_context;
+use deepmsg_bench::loadtest::transport::util::{ChannelSettings, PollGate, archive_context};
 
 /// What this program accepts.
 const USAGE: &str = "\
@@ -49,18 +48,22 @@ usage: loadtest-rig [--print-config] [-Dname=value ...] [file.properties ...]
 ///
 /// This build's own switch, and deliberately not a setting: it changes what the
 /// rig *is* rather than what it measures, and keeping it out of the property
-/// namespace means a properties file cannot turn it on by accident. Unset means
-/// the rig as it has always been — `Client::poll` on every `receive()`. A value
-/// of `N` where `N > 0` runs the duty cycle **at most once every N nanoseconds**
-/// of the measured thread's monotonic clock, which is the shape the A/B's
-/// "after" arm asks for: a `receive()` where the driver half of the cycle is not
-/// run on every turn.
+/// namespace means a properties file cannot turn it on by accident.
+///
+/// * **unset or empty** — the default: the duty cycle at most once a
+///   millisecond ([`DEFAULT_GATE_NS`]), which is the shape the reference's rig
+///   has because its conductor runs on a thread of its own;
+/// * **`0`** — [`PollGate::Every`]: `Client::poll` on every `receive()`, the
+///   shape the rig ran before the switch existed;
+/// * **a positive integer `N`** — [`PollGate::EveryInterval`]: at most once
+///   every `N` nanoseconds of the measured thread's monotonic clock;
+/// * **anything else** — an error, so a mistyped switch cannot silently name
+///   the wrong arm.
 ///
 /// It is a measurement and not a setting — `poll` carries liveness, the driver's
 /// replies and `expire_pending` (`crates/client/src/client.rs:970-986`), so a
 /// run with this set is a run that runs the duty cycle less often than the rig
-/// has always run it — and an unset, empty, non-numeric or zero value is the
-/// rig's own shape, so the only way to change a run is to say so.
+/// has always run it.
 const CLIENT_POLL_MIN_NS: &str = "DEEPMSG_RIG_CLIENT_POLL_MIN_NS";
 
 fn main() -> ExitCode {
@@ -165,20 +168,19 @@ fn run() -> Result<(), String> {
                 ChannelSettings::from_properties(&settings).map_err(|error| error.to_string())?;
             let context = archive_context(&settings, &channels.directory);
 
-            let transceiver = LiveRecordingTransceiver::new(channels, idle, &context)
-                .map_err(|error| error.to_string())?;
+            let transceiver =
+                LiveRecordingTransceiver::new(channels, idle, &context, configured_gate()?)
+                    .map_err(|error| error.to_string())?;
 
             measure(configuration, transceiver)?;
         }
         Transceiver::Echo => {
             let channels =
                 ChannelSettings::from_properties(&settings).map_err(|error| error.to_string())?;
-            let client_poll_min_ns = poll_min_ns(std::env::var(CLIENT_POLL_MIN_NS).ok().as_deref());
-            let named = std::env::var(CLIENT_POLL_MIN_NS).is_ok();
-            let gate = poll_gate(client_poll_min_ns, named);
 
-            let transceiver = EchoTransceiver::new(channels, idle, logs_directory, gate)
-                .map_err(|error| error.to_string())?;
+            let transceiver =
+                EchoTransceiver::new(channels, idle, logs_directory, configured_gate()?)
+                    .map_err(|error| error.to_string())?;
 
             measure(configuration, transceiver)?;
         }
@@ -187,47 +189,59 @@ fn run() -> Result<(), String> {
     std::io::stdout().flush().map_err(|error| error.to_string())
 }
 
-/// The interval between the client's duty cycles, in nanoseconds.
-///
-/// A value of [`CLIENT_POLL_MIN_NS`], which is a literal decimal number and
-/// nothing else: an unset, empty, non-numeric or zero value is `0` — the duty
-/// cycle on every `receive()` — so a mistyped switch leaves the rig exactly as
-/// it was and the only way to change a run is to say so.
-fn poll_min_ns(value: Option<&str>) -> u64 {
-    match value {
-        Some(value) if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) => {
-            value.parse::<u64>().unwrap_or(0)
-        }
-        _ => 0,
-    }
-}
-
 /// The interval an unset switch gives, in nanoseconds.
 ///
-/// The rig has always run the conductor's duty cycle on **every** `receive()`
-/// ([`PollGate::Every`]), and that is still what naming it asks for: a literal
-/// `0` says so. What changed is only the **default** — an unset switch is the
-/// gate open — and the reason is that the gated shape is the one the reference's
-/// rig has: its conductor is on a thread of its own (`Aeron.java:174`,
+/// The reference's conductor runs on a thread of its own (`Aeron.java:174`,
 /// `AgentRunner.startOnThread`), so its measured thread never runs a duty cycle
-/// at all, and a run that carries ours on every turn is measuring something the
-/// reference does not do.
+/// at all; this is the interval that gives this build's inline conductor the
+/// same shape without taking it off the measured thread. A literal `0` asks for
+/// the rig's old shape — every `receive()` — instead.
 const DEFAULT_GATE_NS: u64 = 1_000_000;
 
-/// The gate the switch names, when it is read.
+/// The gate a value of [`CLIENT_POLL_MIN_NS`] asks for.
 ///
-/// `named` says whether [`CLIENT_POLL_MIN_NS`] was set at all: a switch that was
-/// set asks for what it says — including one a caller mistyped, which
-/// [`poll_min_ns`] reads as `0`, and which therefore asks for the rig's own
-/// shape. Unset is [`DEFAULT_GATE_NS`].
-fn poll_gate(min_ns: u64, named: bool) -> PollGate {
-    if min_ns > 0 {
-        PollGate::EveryInterval(min_ns)
-    } else if named {
+/// Unset or empty is [`DEFAULT_GATE_NS`]; a literal decimal `0` is
+/// [`PollGate::Every`]; a positive decimal `N` is
+/// [`PollGate::EveryInterval`]. Anything else is an error: a mistyped switch
+/// silently naming the wrong arm is exactly what this switch exists to avoid.
+///
+/// # Errors
+///
+/// When the value is not a decimal number of nanoseconds.
+fn poll_gate(value: Option<&str>) -> Result<PollGate, String> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(PollGate::EveryInterval(DEFAULT_GATE_NS));
+    };
+
+    // A literal decimal number and nothing else: `str::parse` would also take a
+    // leading `+`, and a switch that is a number with a sign is a value no doc
+    // here names.
+    let parsed = value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| value.parse::<u64>())
+        .and_then(Result::ok);
+    let Some(min_ns) = parsed else {
+        return Err(format!(
+            "{CLIENT_POLL_MIN_NS}={value} is not a decimal number of nanoseconds"
+        ));
+    };
+
+    Ok(if min_ns == 0 {
         PollGate::Every
     } else {
-        PollGate::EveryInterval(DEFAULT_GATE_NS)
-    }
+        PollGate::EveryInterval(min_ns)
+    })
+}
+
+/// The gate the environment asks for, read once for both transceivers.
+///
+/// `LiveRecordingTransceiver` needs the same gate as `EchoTransceiver`: its
+/// `receive` is the only duty cycle the measured thread runs in that shape, and
+/// the driver reaps a client whose heartbeat stops. Reading it here keeps the
+/// two branches from drifting apart.
+fn configured_gate() -> Result<PollGate, String> {
+    poll_gate(std::env::var(CLIENT_POLL_MIN_NS).ok().as_deref())
 }
 
 /// Run one measurement, whoever is under test.
@@ -353,43 +367,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
-    /// The interval is 0 — the rig's own shape — unless a literal number says
-    /// otherwise. An unset variable, anything a caller might mean by "off", and
-    /// anything that is not a plain decimal number all leave the duty cycle on
-    /// every `receive()`.
+    /// The switch's four shapes: unset/empty is the 1 ms default, `0` is every
+    /// turn, a positive integer is that interval, and anything else is refused
+    /// rather than silently becoming a different arm.
     #[test]
-    fn the_interval_switch_is_zero_unless_a_number_says_otherwise() {
-        for (value, expected) in [
-            (None, 0),
-            (Some(""), 0),
-            (Some("0"), 0),
-            (Some("1"), 1),
-            (Some("1000000"), 1_000_000),
-            (Some(" 1000000"), 0),
-            (Some("1000000 "), 0),
-            (Some("+1000000"), 0),
-            (Some("-1"), 0),
-            (Some("1.0"), 0),
-            (Some("0x10"), 0),
-            (Some("one"), 0),
-            (Some("99999999999999999999999"), 0),
+    fn the_interval_switch_names_the_gate_the_docs_do() {
+        assert_eq!(Ok(PollGate::Every), poll_gate(Some("0")));
+        assert_eq!(Ok(PollGate::Every), poll_gate(Some("000")));
+        assert_eq!(
+            Ok(PollGate::EveryInterval(1_000_000)),
+            poll_gate(Some("1000000"))
+        );
+        assert_eq!(
+            Ok(PollGate::EveryInterval(DEFAULT_GATE_NS)),
+            poll_gate(None)
+        );
+        assert_eq!(
+            Ok(PollGate::EveryInterval(DEFAULT_GATE_NS)),
+            poll_gate(Some(""))
+        );
+
+        for value in [
+            " 1000000",
+            "1000000 ",
+            "+1000000",
+            "-1",
+            "1.0",
+            "0x10",
+            "one",
+            "1ms",
+            "99999999999999999999999",
         ] {
-            assert_eq!(poll_min_ns(value), expected, "for {value:?}");
+            let error = poll_gate(Some(value)).expect_err("refused");
+            assert!(error.contains(CLIENT_POLL_MIN_NS), "{error}");
+            assert!(error.contains(value), "{error}");
         }
-
-        // A switch that was set asks for what it says; naming `0` is the rig's
-        // own shape and naming an interval is the gate at that interval.
-        assert_eq!(PollGate::Every, poll_gate(0, true));
-        assert_eq!(
-            PollGate::EveryInterval(1_000_000),
-            poll_gate(1_000_000, true)
-        );
-
-        // Nothing named is the gate open, at the interval a run gets by default.
-        assert_eq!(
-            PollGate::EveryInterval(DEFAULT_GATE_NS),
-            poll_gate(0, false)
-        );
     }
 
     #[test]

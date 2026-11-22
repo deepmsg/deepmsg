@@ -67,7 +67,7 @@ use crate::loadtest::transceiver::{Clock, MessageTransceiver, SystemClock, Trans
 use crate::loadtest::transport::echo::payload_fields;
 use crate::loadtest::transport::sender::{Kind, MessageSender, PublicationOutbound};
 use crate::loadtest::transport::util::{
-    ChannelSettings, MIN_MESSAGE_LENGTH, await_connected, images, window_limit,
+    ChannelSettings, Gate, MIN_MESSAGE_LENGTH, PollGate, await_connected, images, window_limit,
 };
 
 /// `Aeron.NULL_VALUE`, which is where both positions start
@@ -80,6 +80,10 @@ const NULL_POSITION: i64 = -1;
 pub struct LiveRecordingTransceiver {
     settings: ChannelSettings,
     client: Client,
+    /// The client's duty cycle and how often it runs. The pacemaker's early
+    /// return is *after* this, because a run that is waiting for the archive to
+    /// record still has to keep the client alive.
+    gate: Gate,
     archive: ArchiveClient,
     /// Where a batch is sent: the channel the node reads, and the one recorded.
     publication: i64,
@@ -112,6 +116,7 @@ impl LiveRecordingTransceiver {
         settings: ChannelSettings,
         idle: IdleStrategy,
         archive_context: &ArchiveContext,
+        gate: PollGate,
     ) -> Result<Self, TransceiverError> {
         let mut client =
             Client::connect(&settings.directory).map_err(|error| TransceiverError::Failed {
@@ -143,6 +148,7 @@ impl LiveRecordingTransceiver {
         Ok(Self {
             settings,
             client,
+            gate: Gate::new(gate),
             archive,
             publication: 0,
             subscription: 0,
@@ -399,6 +405,23 @@ impl<C: Clock> MessageTransceiver<C> for LiveRecordingTransceiver {
     }
 
     fn receive(&mut self, recorder: &mut Recorder<C>) {
+        // The client's duty cycle, on the measured thread, **before** the
+        // pacemaker's early return: `poll` is what refreshes the heartbeat the
+        // driver reaps an idle client by, and the turns spent waiting for the
+        // archive to record are exactly the turns that would otherwise let it
+        // lapse. The reference's conductor is on a thread of its own
+        // (`Aeron.java:174`, `AgentRunner.startOnThread`), so it never has this
+        // question; this build's conductor is the measured thread's, and the
+        // gate is what gives it the same shape without polling every turn.
+        //
+        // The reading is the rig's own: `LoadTestRig::send` takes one at the
+        // end of every turn and the gate runs at the top of the next, so a
+        // second `clock_gettime` here would answer a question about a
+        // millisecond with a reading that is 14-19 ns old.
+        if self.gate.is_due(recorder.last_nano_time()) {
+            self.client.poll();
+        }
+
         // The pacemaker, as the reference writes it (`:155-160`): with nothing new
         // recorded there is nothing to read, and the events are what says so.
         if self.recording_position_consumed == self.recording_position {

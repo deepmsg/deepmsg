@@ -121,9 +121,16 @@ impl<C: Clock> Recorder<C> {
         self.last_nano_time.set(now);
 
         let round_trip = now - timestamp;
+        // The reference's own bounds, clamped rather than trusted: an
+        // in-memory round trip can read zero, and a clock that steps back can
+        // read negative. Both are the lowest bucket, not a panic; a value past
+        // the top is the highest.
+        let clamped = u64::try_from(round_trip.max(1))
+            .unwrap_or(u64::MAX)
+            .clamp(self.histogram.low(), self.histogram.high());
         self.histogram
-            .record(u64::try_from(round_trip).unwrap_or(u64::MAX))
-            .expect("the histogram's bounds cover any round trip a run can produce");
+            .record(clamped)
+            .expect("clamped value is within histogram bounds");
         self.received_messages += 1;
     }
 
@@ -245,6 +252,37 @@ mod tests {
             refused.is_err(),
             "a foreign checksum is not a message of ours"
         );
+    }
+
+    #[test]
+    fn a_zero_round_trip_is_the_lowest_bucket() {
+        let mut recorder = recorder(ScriptedClock::new([1_000]), 7);
+
+        recorder.on_message_received(1_000, 7);
+
+        assert_eq!(1, recorder.histogram().max());
+        assert_eq!(1, recorder.received_messages());
+    }
+
+    #[test]
+    fn a_negative_round_trip_is_the_lowest_bucket() {
+        let mut recorder = recorder(ScriptedClock::new([900]), 7);
+
+        recorder.on_message_received(1_000, 7);
+
+        assert_eq!(1, recorder.histogram().max());
+    }
+
+    #[test]
+    fn a_round_trip_past_an_hour_is_the_highest_bucket() {
+        let mut recorder = recorder(ScriptedClock::new([3_600_000_000_001]), 7);
+
+        recorder.on_message_received(0, 7);
+
+        // `max()` is the top of the recorded value's bucket, which is at or
+        // above the histogram's high bound.
+        assert!(recorder.histogram().max() >= 3_600_000_000_000);
+        assert_eq!(1, recorder.histogram().len());
     }
 
     /// The reading the gate reuses is the one the recorder took, not a second
