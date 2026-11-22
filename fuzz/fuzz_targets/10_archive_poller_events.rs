@@ -1,0 +1,90 @@
+#![no_main]
+
+//! Target 10: the archive's client-side pollers and the recording-event
+//! dispatcher.
+//!
+//! A poller is a one-slot state machine fed whole messages. The fuzzer plays
+//! the archive: any bytes, any header, and a message that fails to decode must
+//! leave the slot usable — the next good message still has to land. The golden
+//! control response is the witness for that second half.
+
+use deepmsg_archive::client::poller::ControlResponsePoller;
+use deepmsg_archive::client::recording_events::{RecordingEventsListener, dispatch};
+use deepmsg_client::fragment_assembler::{ControlledHandler, Message, MessageHeader};
+use libfuzzer_sys::fuzz_target;
+
+/// A control response the reference's generator wrote — the bytes a poller has
+/// to accept, whatever the fuzzer just fed it.
+const CONTROL_RESPONSE_OK: &[u8] =
+    include_bytes!("../../tests/fixtures/sbe/101-001-control-response-ok.bin");
+
+fn message(payload: &[u8]) -> Message<'_> {
+    Message {
+        header: MessageHeader {
+            session_id: 1,
+            stream_id: 2,
+            term_offset: 0,
+            flags: 0xC0,
+            position: 0,
+            frame_length: i32::try_from(payload.len()).unwrap_or(i32::MAX) + 32,
+            fragmented_frame_length: i32::try_from(payload.len()).unwrap_or(i32::MAX) + 32,
+            image_registration_id: 0,
+        },
+        payload,
+    }
+}
+
+#[derive(Default)]
+struct CountingListener {
+    started: usize,
+    progressed: usize,
+    stopped: usize,
+}
+
+impl RecordingEventsListener for CountingListener {
+    fn on_start(
+        &mut self,
+        _recording_id: i64,
+        _start_position: i64,
+        _session_id: i32,
+        _stream_id: i32,
+        _channel: &str,
+        _source_identity: &str,
+    ) {
+        self.started += 1;
+    }
+
+    fn on_progress(&mut self, _recording_id: i64, _start_position: i64, _position: i64) {
+        self.progressed += 1;
+    }
+
+    fn on_stop(&mut self, _recording_id: i64, _start_position: i64, _stop_position: i64) {
+        self.stopped += 1;
+    }
+}
+
+fuzz_target!(|data: &[u8]| {
+    let mut poller = ControlResponsePoller::new(1, 10);
+    let _ = poller.on_message(message(data));
+
+    // Whatever the fuzz message did, a golden response still decodes.
+    poller.reset();
+    let _ = poller.on_message(message(CONTROL_RESPONSE_OK));
+    assert!(
+        poller.is_control_response(),
+        "a good response after arbitrary bytes did not decode"
+    );
+
+    let mut listener = CountingListener::default();
+    let _ = dispatch(data, &mut listener);
+    assert!(listener.started + listener.progressed + listener.stopped <= data.len());
+
+    // The golden recording-started signal must reach the listener.
+    let mut listener = CountingListener::default();
+    let started = include_bytes!("../../tests/fixtures/sbe/101-101-recording-started.bin");
+    let _ = dispatch(started, &mut listener);
+    assert_eq!(
+        1, listener.started,
+        "the golden started signal was not delivered"
+    );
+});

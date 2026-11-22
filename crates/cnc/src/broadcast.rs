@@ -198,13 +198,21 @@ impl ToClientsTransmitter {
             payload.len() + layout::RECORD_HEADER_LENGTH,
             layout::RECORD_ALIGNMENT,
         );
-        let new_tail = current_tail + aligned as i64;
+        // The trailer is in shared memory another process may have left
+        // anything in. A counter near `i64::MAX` is not a position, and adding
+        // to it must be an error rather than an overflow panic.
+        let new_tail = current_tail
+            .checked_add(aligned as i64)
+            .ok_or(TransmitError::OutOfRange)?;
         let to_end_of_buffer = self.capacity - self.index_of(current_tail);
         let mut tail = current_tail;
         let mut offset = self.index_of(current_tail);
 
         if to_end_of_buffer < aligned {
-            self.signal_tail_intent(region, new_tail + to_end_of_buffer as i64)?;
+            let intent = new_tail
+                .checked_add(to_end_of_buffer as i64)
+                .ok_or(TransmitError::OutOfRange)?;
+            self.signal_tail_intent(region, intent)?;
 
             // The padding's own length is its distance to the end of the ring:
             // `capacity - offset`, where the capacity is a power of two and
@@ -224,7 +232,9 @@ impl ToClientsTransmitter {
                 i32::try_from(to_end_of_buffer).map_err(|_| TransmitError::OutOfRange)?,
             )?;
 
-            tail += to_end_of_buffer as i64;
+            tail = tail
+                .checked_add(to_end_of_buffer as i64)
+                .ok_or(TransmitError::OutOfRange)?;
             offset = 0;
         } else {
             self.signal_tail_intent(region, new_tail)?;
@@ -251,7 +261,8 @@ impl ToClientsTransmitter {
         self.store_i64(
             region,
             self.trailer(layout::BROADCAST_TAIL_COUNTER_OFFSET),
-            tail + aligned as i64,
+            tail.checked_add(aligned as i64)
+                .ok_or(TransmitError::OutOfRange)?,
         )?;
 
         Ok(())
@@ -634,7 +645,6 @@ mod tests {
                 bytes: Bytes([0u8; REGION]),
             }
         }
-
         /// Run `f` with a writer and a receiver over one ring.
         fn with<T>(&mut self, f: impl FnOnce(&mut Writer<'_>, &mut ToClientsReceiver) -> T) -> T {
             let mut writer = Writer::new(&mut self.bytes.0);
@@ -1065,5 +1075,29 @@ mod tests {
                 "the limit itself is accepted"
             );
         });
+    }
+
+    /// The trailer is shared memory a crashed producer could leave anything
+    /// in. A tail counter near `i64::MAX` is not a position; adding this
+    /// record's aligned length to it must be an error rather than an
+    /// arithmetic panic. Fuzz target `03_cnc_rings_and_logs` found it.
+    #[test]
+    fn a_tail_counter_near_i64_max_is_refused_not_an_overflow() {
+        let mut fixture = Fixture::new();
+        let mut writer = Writer::new(&mut fixture.bytes.0);
+        let trailer = writer
+            .transmitter
+            .trailer(layout::BROADCAST_TAIL_COUNTER_OFFSET);
+        writer
+            .buffer
+            .store_i64_relaxed(trailer, i64::MAX)
+            .expect("the trailer is in range");
+
+        assert!(
+            writer
+                .transmitter
+                .transmit(&writer.buffer, 1, b"x")
+                .is_err()
+        );
     }
 }

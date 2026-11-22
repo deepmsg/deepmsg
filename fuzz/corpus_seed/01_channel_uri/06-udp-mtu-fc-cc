@@ -1,0 +1,1 @@
+aeron:udp?endpoint=localhost:40123|mtu=1408|fc=min|cc=cubic

@@ -62,3 +62,29 @@ gen *args:
 # License and dependency audit.
 deny:
     cargo deny check
+
+# The fuzz suite is a workspace of its own (`fuzz/Cargo.toml`), which is why
+# the recipes above do not reach it. Design: `analysis/fuzz/deepmsg-fuzz-plan.md`.
+
+# Fill the corpora from the committed seeds and the golden fixtures.
+fuzz-seed:
+    ./fuzz/corpus_seed/seed_from_fixtures.sh
+
+# One target, nightly: `just fuzz 05_udp_protocol_frames -- -runs=100000`.
+fuzz target *args:
+    cd fuzz && cargo +nightly fuzz run {{target}} -- {{args}}
+
+# The fuzz workspace's stable gate: formatting, the frozen regressions, and
+# that every target still compiles.
+fuzz-gate:
+    cd fuzz && cargo fmt --check && cargo test && cargo check --bins
+
+# Every target for 60 seconds. A crash fails the recipe; artifacts are under
+# `fuzz/artifacts/`.
+fuzz-smoke:
+    ./fuzz/corpus_seed/seed_from_fixtures.sh
+    cd fuzz && for target in $(cargo +nightly fuzz list); do \
+        echo "== $target"; \
+        cargo +nightly fuzz run "$target" "corpus/$target" \
+            -- -max_total_time=60 -timeout=2 -rss_limit_mb=2048 || exit 1; \
+    done

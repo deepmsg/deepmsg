@@ -10,5 +10,10 @@ rust-version.workspace = true
 deepmsg-core = { path = "../core" }
 deepmsg-cnc = { path = "../cnc" }
 
+[features]
+# The fragment constructor the fuzz suite needs (`fuzz/fuzz_targets/02`).
+# Off in every build the workspace runs; the fuzz workspace turns it on.
+fuzz-hooks = []
+
 [lints]
 workspace = true

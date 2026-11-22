@@ -249,11 +249,22 @@ pub const fn max_possible_position(term_length: i32) -> i64 {
 
 /// Round `value` up to the next multiple of `alignment`, a power of two.
 ///
+/// A `value` so large that the rounded result does not fit an `i32` saturates
+/// to the largest aligned `i32` rather than overflowing: the input is a length
+/// no writer could have produced (a corrupt frame header, in practice), and
+/// every caller's "does it fit" comparison then rejects it. Fuzz targets 02
+/// and 09 found the overflow this replaces.
+///
 /// The same computation as `deepmsg_cnc::layout::align_up`. Deliberately not
 /// shared: `cnc` depends on `core`, not the other way round, and four lines do
 /// not justify a third crate.
 pub const fn align_up(value: i32, alignment: i32) -> i32 {
-    (value + (alignment - 1)) & !(alignment - 1)
+    let mask = alignment - 1;
+
+    match value.checked_add(mask) {
+        Some(sum) => sum & !mask,
+        None => i32::MAX & !mask,
+    }
 }
 
 #[cfg(test)]
@@ -465,5 +476,19 @@ mod tests {
             assert_eq!(0, aligned % descriptor::FRAME_ALIGNMENT);
             assert!(aligned - frame_length < descriptor::FRAME_ALIGNMENT);
         }
+    }
+
+    /// A length no writer could have produced. Aligning it used to add the
+    /// alignment to `i32::MAX` and overflow; the answer saturates, and the
+    /// caller's fit check rejects it. Fuzz targets 02 and 09 found it.
+    #[test]
+    fn an_impossible_length_aligns_to_the_largest_aligned_value() {
+        let alignment = descriptor::FRAME_ALIGNMENT;
+        let saturated = i32::MAX & !(alignment - 1);
+
+        assert_eq!(saturated, align_up(i32::MAX, alignment));
+        assert_eq!(saturated, align_up(i32::MAX - 1, alignment));
+        assert_eq!(32, align_up(1, alignment));
+        assert_eq!(0, align_up(0, alignment));
     }
 }
