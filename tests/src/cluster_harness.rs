@@ -1584,6 +1584,65 @@ impl NodeCounters {
             .expect("the counter is written");
     }
 
+    /// The driver's receive endpoints, as counters.
+    ///
+    /// A blackout failure is usually one of these: a log subscription that
+    /// could not rebind, or an ingress endpoint that never came back. The
+    /// driver's *state* lives in another process, but the endpoint and socket
+    /// counters (`rcv-channel`, type 7 and `rcv-local-sockaddr`, type 14) are
+    /// in the CnC and name the registration they belong to.
+    pub fn receive_endpoint_counters(&self) -> Vec<String> {
+        const RECEIVE_CHANNEL_STATUS: i32 = 7;
+        const LOCAL_SOCKADDR: i32 = 14;
+
+        let Some(counters) = self.cnc.counters() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        counters.for_each(|descriptor| {
+            if descriptor.type_id == RECEIVE_CHANNEL_STATUS || descriptor.type_id == LOCAL_SOCKADDR
+            {
+                out.push(format!(
+                    "type={} id={} reg={} value={} {}",
+                    descriptor.type_id,
+                    descriptor.counter_id,
+                    descriptor.registration_id,
+                    descriptor.value,
+                    descriptor.label
+                ));
+            }
+        });
+        out
+    }
+
+    /// The driver's system counters, by id: bytes, heartbeats, status
+    /// messages, errors and revocations. The data plane's only readable trace
+    /// of "did this member send anything at all" while a blackout runs.
+    pub fn system_counters(&self) -> String {
+        let Some(counters) = self.cnc.counters() else {
+            return "none".to_owned();
+        };
+        // By **label**, not type id: every system counter carries the same
+        // type id, and the label is the name it answers to.
+        let wanted = [
+            "Bytes sent",
+            "Bytes received",
+            "Status Messages sent",
+            "Status Messages received",
+            "Heartbeats sent",
+            "Heartbeats received",
+            "Publications Revoked",
+            "Publication Images Revoked",
+        ];
+        let mut parts: Vec<String> = Vec::new();
+        counters.for_each(|descriptor| {
+            if wanted.contains(&descriptor.label.as_str()) {
+                parts.push(format!("{}={}", descriptor.label, descriptor.value));
+            }
+        });
+        parts.join(", ")
+    }
+
     pub fn role(&self) -> Option<i64> {
         self.value(CLUSTER_NODE_ROLE_TYPE_ID)
     }

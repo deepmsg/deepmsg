@@ -889,16 +889,14 @@ impl NetworkPublication {
             }
         }
 
-        // A **revoked** publication is done as soon as there is nobody left to
-        // tell — that is this build's own shortcut, and `docs/compat.md` says
-        // so. One whose clients have all let go waits the window the reference
-        // waits (`:1329-1341`, whose condition is the linger timeout or an EOS
-        // from a unicast receiver): the endpoint is released with it, and a
-        // client may be about to publish on that channel again.
-        if self.is_revoked() {
-            return !self.has_receivers() || now_ns > since + linger_timeout_ns;
-        }
-
+        // Both waits are the reference's (`:1332-1344`: the linger timeout, or
+        // an EOS from a unicast receiver). The revoked one used to end as soon
+        // as no receiver was still live — a shortcut that is wrong exactly
+        // when it matters: a publication revoked while the network is dark has
+        // receivers its liveness detector has already timed out, and releasing
+        // it there means the `REVOKED` heartbeats never go out at all, so the
+        // remote images stay `DRAINING` for ever. Waiting the window gives the
+        // stream the span the reference gives it to say it is over.
         now_ns > since + linger_timeout_ns
     }
 
@@ -2592,6 +2590,39 @@ mod tests {
         let frame = Frame::new(&term, 0);
         assert_eq!(Some(stalled), frame.frame_length());
         assert!(frame.is_padding(), "the sender can move now");
+    }
+
+    /// A revoked publication waits its linger window even when its liveness
+    /// detector believes nobody is listening.
+    ///
+    /// The receivers a short blackout hides are exactly the ones the `REVOKED`
+    /// heartbeat has to reach. Releasing on "no receivers" — which this build
+    /// used to do — means the heartbeats never go out at all, and the remote
+    /// images stay `DRAINING` for ever behind a reader that is waiting for a
+    /// commit position the next term will never produce. Waiting the window is
+    /// the reference's rule (`aeron_network_publication.c:1332-1344`).
+    #[test]
+    fn a_revoked_publication_waits_the_linger_window_even_with_no_receivers() {
+        let mut fixture = fixture();
+        let (manager, regions) = fixture.counters.open();
+        let publication = &mut fixture.publication;
+        publication.set_revoked();
+
+        let system = System::new(&manager, &regions);
+        assert!(!publication.has_receivers(), "the premise: nobody is live");
+
+        assert!(
+            !publication.notice_revoke(0, 5_000_000_000, &system, &manager, &regions),
+            "entering LINGER is not the end"
+        );
+        assert!(
+            !publication.notice_revoke(4_000_000_000, 5_000_000_000, &system, &manager, &regions),
+            "the window has not gone by"
+        );
+        assert!(
+            publication.notice_revoke(6_000_000_000, 5_000_000_000, &system, &manager, &regions),
+            "and once it has, the publication is done"
+        );
     }
 
     /// The end-of-stream byte is decided on every tick of the drain, not once:

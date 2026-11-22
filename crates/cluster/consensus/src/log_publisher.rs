@@ -139,9 +139,31 @@ impl LogPublisher {
     /// and from `close` (`:300`), in that order of importance: the first is
     /// what makes the *next* term joinable at once rather than after a liveness
     /// timeout, and it is the one this build used to leave out.
+    ///
+    /// # Revoked, where the reference only closes
+    ///
+    /// The reference closes the publication and lets every image drain: its
+    /// readers are expected to have reached the rebuild position, because in
+    /// every scenario it supports the log stream keeps flowing until the term
+    /// ends. A **full receive blackout** breaks that assumption — the leader's
+    /// uncommitted tail (received, rebuilt, never committed) sits above the
+    /// commit position the service's reader stops at, so `is_drained` can never
+    /// be true and the image never leaves `DRAINING`. The image holds its
+    /// receive endpoint, the endpoint holds the member's fixed log port, and
+    /// the next term's subscription cannot bind it — `Address already in use`
+    /// on every attempt, measured (`records/P3-6c.md` §4; analysis
+    /// `plan-2026-11-22-the-full-receive-blackout.md`).
+    ///
+    /// Revoking is the one signal that ends an image without a drain: the
+    /// sender says the stream is over, the readers' images are revoked, and
+    /// the endpoint is released. The term is over either way, and its
+    /// uncommitted tail is discarded by the next leadership by definition, so
+    /// no committed byte is lost when the readers are not made to finish it.
+    /// This is a **deliberate deviation** from the reference, recorded in
+    /// `docs/compat.md`.
     pub fn disconnect(&mut self, client: &mut Client) {
         if let Some(publication) = self.publication.take() {
-            let _ = client.remove_publication(publication.registration_id(), COMMAND_TIMEOUT);
+            let _ = client.revoke_publication(publication.registration_id(), COMMAND_TIMEOUT);
         }
     }
 

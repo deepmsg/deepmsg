@@ -3913,6 +3913,33 @@ impl Conductor {
                     ) {
                         Ok(destination) => destination,
                         Err(error) => {
+                            // A refused bind is a port this driver already
+                            // holds, and the error text names the port, not
+                            // the endpoint holding it. Say which: the
+                            // `rcv-channel` counters prove a socket exists,
+                            // not where it lives.
+                            if matches!(
+                                error,
+                                crate::media::receive_endpoint::ReceiveEndpointError::Bind(_)
+                            ) {
+                                for endpoint in receive_endpoints.entries() {
+                                    println!(
+                                        "deepmsg-driver: bind refused; endpoint id={} \
+                                         status={:?} subscriptions={} images={} destinations={} \
+                                         channel={}",
+                                        endpoint.id,
+                                        endpoint.status,
+                                        endpoint.refcount,
+                                        endpoint.image_refcount,
+                                        endpoint.destination_count,
+                                        String::from_utf8_lossy(&endpoint.channel.original_uri),
+                                    );
+                                }
+                                // stdout is block-buffered when the driver is
+                                // a child process, and this line exists to be
+                                // read while it is still running.
+                                let _ = std::io::Write::flush(&mut std::io::stdout());
+                            }
                             transmit.error(
                                 request.correlation_id,
                                 ERROR_CODE_GENERIC_ERROR,
@@ -6872,7 +6899,7 @@ mod tests {
         // The release waits for the publication to **linger out**, because the
         // endpoint goes with it and a client may be about to publish on that
         // channel again (`media/aeron_network_publication.c:1048-1069`, and
-        // `:1329-1341` for the window). That is the reference's own five
+        // `:1332-1344` for the window). That is the reference's own five
         // seconds, so this test waits them.
         assert_eq!(
             counters_before + 8,
