@@ -29,11 +29,6 @@ use std::process::Command;
 use deepmsg_tests::aeron_tests;
 use deepmsg_tests::driver::{self, OwnDriver, READY_TIMEOUT, ReferenceDriver};
 
-/// Where the reference checkout keeps what compiling against its client needs
-/// (`docs/reference.md`).
-const REFERENCE_INCLUDE: &str = "../../aeron/aeron-client/src/main/c";
-const REFERENCE_LIB: &str = "../../aeron/cppbuild/Release/lib";
-
 /// Compile the probe against the reference's client library, or answer `None`
 /// when the checkout is not there — which is a skip, as it is for every other
 /// interop test. Once per process, for the reason `spy_reference.rs` records:
@@ -47,13 +42,9 @@ fn build_probe() -> Option<PathBuf> {
 fn compile_probe() -> Option<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = aeron_tests::probe("ipc_response_probe.c")?;
-    let include = manifest.join(REFERENCE_INCLUDE);
-    let lib = manifest.join(REFERENCE_LIB);
+    let include = driver::reference_c_include()?;
+    let lib = driver::reference_c_lib()?;
     let output = manifest.join("../target/ipc_response_probe");
-
-    if !include.is_dir() || !lib.is_dir() {
-        return None;
-    }
 
     let status = Command::new("cc")
         .arg("-std=gnu11")

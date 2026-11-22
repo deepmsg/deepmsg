@@ -85,9 +85,20 @@ fn rescue_file(dir: &Path) -> Option<PathBuf> {
     })
 }
 
+/// A driver process that is killed and reaped when the value goes, including
+/// while a test is unwinding.
+struct DriverProcess(Child);
+
+impl Drop for DriverProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Start a driver and wait until it has written the rescue file; it is killed
 /// before the test proceeds (the file is the whole subject).
-fn start_and_wait(binary: &Path, dir: &Path, stderr: &Path) -> Child {
+fn start_and_wait(binary: &Path, dir: &Path, stderr: &Path) -> DriverProcess {
     let stderr_file = fs::File::create(stderr).expect("the stderr file");
     let mut child = Command::new(binary)
         .arg(format!("-Daeron.dir={}", dir.display()))
@@ -99,7 +110,7 @@ fn start_and_wait(binary: &Path, dir: &Path, stderr: &Path) -> Child {
     let deadline = Instant::now() + RESCUE_WAIT;
     while Instant::now() < deadline {
         if rescue_file(dir).is_some() {
-            return child;
+            return DriverProcess(child);
         }
         if let Some(status) = child.try_wait().expect("wait on the driver") {
             panic!(
@@ -155,8 +166,8 @@ fn our_rescue_is_the_references_rescue() {
 
     let reference_stderr = temp.0.join("reference.stderr");
     let ours_stderr = temp.0.join("ours.stderr");
-    let mut reference_child = start_and_wait(&reference, &for_reference, &reference_stderr);
-    let mut ours_child = start_and_wait(&own, &for_ours, &ours_stderr);
+    let _reference_child = start_and_wait(&reference, &for_reference, &reference_stderr);
+    let _ours_child = start_and_wait(&own, &for_ours, &ours_stderr);
 
     let reference_file = rescue_file(&for_reference).expect("the reference's rescue file");
     let ours_file = rescue_file(&for_ours).expect("our rescue file");
@@ -183,9 +194,4 @@ fn our_rescue_is_the_references_rescue() {
         ours_warning.starts_with(expected_prefix),
         "our line: {ours_warning}"
     );
-
-    let _ = reference_child.kill();
-    let _ = reference_child.wait();
-    let _ = ours_child.kill();
-    let _ = ours_child.wait();
 }

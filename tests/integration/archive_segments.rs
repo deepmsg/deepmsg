@@ -76,6 +76,7 @@ use deepmsg_codec::archive::message_header_codec;
 use deepmsg_codec::archive::recording_signal::RecordingSignal;
 use deepmsg_codec::archive::truncate_recording_request_codec::TruncateRecordingRequestEncoder;
 use deepmsg_tests::archive::{self, Archive, DEADLINE, Recording};
+use deepmsg_tests::ports::port;
 
 /// The connect's correlation id, which its answer echoes.
 const CONNECT_CORRELATION_ID: i64 = 0x5ed1_0005;
@@ -124,33 +125,44 @@ const FILE_IO_MAX_LENGTH: i32 = 4096;
 /// replay that has one.
 const LIMIT_COUNTER_TYPE_ID: i32 = 10002;
 
-/// How long the archive is given to notice something it does on its own turns.
-const SETTLED: Duration = Duration::from_millis(250);
-
 /// The channel the truncate test records on, and the one its replay goes out
 /// on.
 ///
 /// A port per test, because `cargo test` runs them at once in one process and a
 /// UDP endpoint is a bound socket (`archive_recording.rs` gives the same
 /// reason).
-const TRUNCATE_CHANNEL: &str = "aeron:udp?endpoint=localhost:33450";
-/// See [`TRUNCATE_CHANNEL`], and the reason it is not the recording's: a replay
+fn truncate_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(0))
+}
+/// See [`truncate_channel`], and the reason it is not the recording's: a replay
 /// that went out on the recorded channel would be a replay onto the image this
 /// test is recording into.
-const TRUNCATE_REPLAY_CHANNEL: &str = "aeron:udp?endpoint=localhost:33451";
+fn truncate_replay_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(1))
+}
 
-/// See [`TRUNCATE_CHANNEL`]: the delete that waits for a replay.
-const WAITING_CHANNEL: &str = "aeron:udp?endpoint=localhost:33452";
-/// See [`TRUNCATE_REPLAY_CHANNEL`].
-const WAITING_REPLAY_CHANNEL: &str = "aeron:udp?endpoint=localhost:33453";
+/// See [`truncate_channel`]: the delete that waits for a replay.
+fn waiting_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(2))
+}
+/// See [`truncate_replay_channel`].
+fn waiting_replay_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(3))
+}
 
-/// See [`TRUNCATE_CHANNEL`]: the replay a delete refuses.
-const GUARD_CHANNEL: &str = "aeron:udp?endpoint=localhost:33454";
-/// See [`TRUNCATE_REPLAY_CHANNEL`].
-const GUARD_REPLAY_CHANNEL: &str = "aeron:udp?endpoint=localhost:33455";
+/// See [`truncate_channel`]: the replay a delete refuses.
+fn guard_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(4))
+}
+/// See [`truncate_replay_channel`].
+fn guard_replay_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(5))
+}
 
-/// See [`TRUNCATE_CHANNEL`]: the delete that finishes a half-rolled one.
-const DETACHED_CHANNEL: &str = "aeron:udp?endpoint=localhost:33456";
+/// See [`truncate_channel`]: the delete that finishes a half-rolled one.
+fn detached_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(6))
+}
 
 /// The archive's properties, plus the three every test in this file needs.
 ///
@@ -239,6 +251,22 @@ fn segment_holding(files: &[(i64, PathBuf)], position: i64) -> (usize, i64, Path
 /// The catalog half of this is `shouldRecordThenReplayThenTruncate`'s; what is
 /// asserted here is the **file**: its length, the zeros from the cut on, the
 /// frames before it, and a replay that reads exactly to the cut and no further.
+/// Wait for the archive's replay-session counter to reach `expected`.
+///
+/// A fixed sleep is a guess at how long the session takes to close; the
+/// counter is the state the case is actually waiting for.
+fn await_replay_sessions(archive: &mut Archive, expected: i64, what: &str) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        archive.client.poll();
+        if archive::counter_by_label(&archive.client, "Archive Replay Sessions") == Some(expected) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn a_truncate_cuts_the_segment_it_stops_inside_and_leaves_it_a_whole_segment() {
     let Some(mut archive) = Archive::start(
@@ -249,7 +277,7 @@ fn a_truncate_cuts_the_segment_it_stops_inside_and_leaves_it_a_whole_segment() {
         return;
     };
 
-    let recording = a_recording(TRUNCATE_CHANNEL, MESSAGE_COUNT);
+    let recording = a_recording(&truncate_channel(), MESSAGE_COUNT);
     let recorded = archive.record(&recording);
     let cut = recorded.first;
 
@@ -339,14 +367,14 @@ fn a_truncate_cuts_the_segment_it_stops_inside_and_leaves_it_a_whole_segment() {
 
     // A reader's half of the same claim: the recording replays to the cut, with
     // the messages below it and none of the ones the truncate took away.
-    let subscription = archive.subscribe(TRUNCATE_REPLAY_CHANNEL, STREAM_ID);
+    let subscription = archive.subscribe(&truncate_replay_channel(), STREAM_ID);
     archive
         .session
         .archive_mut()
         .start_replay(
             &mut archive.client,
             recorded.recording_id,
-            TRUNCATE_REPLAY_CHANNEL,
+            &truncate_replay_channel(),
             STREAM_ID,
             &ReplayParams {
                 file_io_max_length: FILE_IO_MAX_LENGTH,
@@ -396,7 +424,7 @@ fn a_truncate_of_a_recording_a_replay_is_reading_ends() {
         return;
     };
 
-    let recording = a_recording(WAITING_CHANNEL, MESSAGE_COUNT);
+    let recording = a_recording(&waiting_channel(), MESSAGE_COUNT);
     let recorded = archive.record(&recording);
     let cut = recorded.first;
 
@@ -407,14 +435,14 @@ fn a_truncate_of_a_recording_a_replay_is_reading_ends() {
     // A replay of the whole recording, and nothing ever reads it: the
     // publication's term fills and the replay waits on it, which is the state a
     // delete has to wait for.
-    let subscription = archive.subscribe(WAITING_REPLAY_CHANNEL, STREAM_ID);
+    let subscription = archive.subscribe(&waiting_replay_channel(), STREAM_ID);
     let replay_session_id = archive
         .session
         .archive_mut()
         .start_replay(
             &mut archive.client,
             recorded.recording_id,
-            WAITING_REPLAY_CHANNEL,
+            &waiting_replay_channel(),
             STREAM_ID,
             &ReplayParams {
                 file_io_max_length: FILE_IO_MAX_LENGTH,
@@ -432,14 +460,14 @@ fn a_truncate_of_a_recording_a_replay_is_reading_ends() {
     while archive::image(&archive.client, subscription).is_none() {
         assert!(
             Instant::now() < deadline,
-            "the replay's publication never linked to the subscription on \
-             {WAITING_REPLAY_CHANNEL}"
+            "the replay's publication never linked to the subscription on {}",
+            waiting_replay_channel()
         );
         archive.client.poll();
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    std::thread::sleep(SETTLED);
+    await_replay_sessions(&mut archive, 1, "the replay to be open");
 
     assert_eq!(
         Some(1),
@@ -505,7 +533,7 @@ fn a_replay_that_would_read_past_a_delete_in_flight_is_refused() {
         return;
     };
 
-    let recording = a_recording(GUARD_CHANNEL, LONG_MESSAGE_COUNT);
+    let recording = a_recording(&guard_channel(), LONG_MESSAGE_COUNT);
     let recorded = archive.record(&recording);
     let cut = recorded.first;
 
@@ -564,7 +592,7 @@ fn a_replay_that_would_read_past_a_delete_in_flight_is_refused() {
         FILE_IO_MAX_LENGTH,
         counter.counter_id(),
         STREAM_ID,
-        GUARD_REPLAY_CHANNEL,
+        &guard_replay_channel(),
     );
     archive
         .session
@@ -610,7 +638,7 @@ fn a_replay_that_would_read_past_a_delete_in_flight_is_refused() {
         .start_replay(
             &mut archive.client,
             recorded.recording_id,
-            GUARD_REPLAY_CHANNEL,
+            &guard_replay_channel(),
             STREAM_ID,
             &ReplayParams {
                 file_io_max_length: FILE_IO_MAX_LENGTH,
@@ -646,7 +674,7 @@ fn a_delete_of_detached_segments_finishes_one_that_was_half_rolled() {
         return;
     };
 
-    let recording = a_recording(DETACHED_CHANNEL, MESSAGE_COUNT);
+    let recording = a_recording(&detached_channel(), MESSAGE_COUNT);
     let recorded = archive.record(&recording);
 
     let files = archive.segment_files(recorded.recording_id);

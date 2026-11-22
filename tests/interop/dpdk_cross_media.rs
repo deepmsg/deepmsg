@@ -208,6 +208,15 @@ struct ArpCapture {
     path: std::path::PathBuf,
 }
 
+impl Drop for ArpCapture {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(self.path.with_extension("err"));
+    }
+}
+
 impl ArpCapture {
     /// Start watching `interface`, or [`None`] when there is no `tcpdump` to
     /// run — the same "announce and carry on" a missing sample gets.

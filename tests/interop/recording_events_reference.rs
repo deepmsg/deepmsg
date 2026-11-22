@@ -37,14 +37,19 @@ use deepmsg_tests::archive::{self, DEADLINE, Session};
 use deepmsg_tests::archiving_driver::{self, OwnArchivingMediaDriver};
 use deepmsg_tests::driver;
 use deepmsg_tests::java;
+use deepmsg_tests::ports::port;
 use deepmsg_tests::temp::TempDir;
 
 /// The channel recorded, and the stream: a port of its own, because two drivers
 /// on one host must not pick the same one.
-const RECORDING_CHANNEL: &str = "aeron:udp?endpoint=localhost:33533";
+fn recording_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(0))
+}
 /// The same, for the `DEDICATED` criterion: two tests in one binary run at
 /// once, and a UDP endpoint is one process's at a time.
-const RECORDING_CHANNEL_DEDICATED: &str = "aeron:udp?endpoint=localhost:33534";
+fn recording_channel_dedicated() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(1))
+}
 const RECORDING_STREAM_ID: i32 = 35;
 
 /// The events channel and stream, which the archive is configured with and the
@@ -148,6 +153,13 @@ impl Event {
 struct Probe {
     child: Child,
     lines: Arc<Mutex<Vec<String>>>,
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Probe {
@@ -571,7 +583,7 @@ fn publish_messages(
 fn the_references_own_adapter_decodes_the_three_events() {
     a_recording_whose_events_the_reference_reads(
         "recording-events-reference",
-        RECORDING_CHANNEL,
+        &recording_channel(),
         &PROPERTIES,
     );
 }
@@ -591,7 +603,7 @@ fn the_references_own_adapter_decodes_them_from_a_dedicated_recorder_too() {
 
     a_recording_whose_events_the_reference_reads(
         "recording-events-reference-dedicated",
-        RECORDING_CHANNEL_DEDICATED,
+        &recording_channel_dedicated(),
         &properties,
     );
 }

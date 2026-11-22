@@ -42,12 +42,19 @@ fn build_probe() -> Option<PathBuf> {
         .clone()
 }
 
-/// Run the probe and hand back everything it printed.
+/// Run the probe and hand back everything it printed, with its exit status.
 ///
 /// Not `java::run_probe`, which asserts a zero exit: a probe whose whole job is
 /// to report whether a connect comes back must be allowed to come back with a
-/// stack trace instead, and that trace is a reading.
-fn readings(jar: &Path, classes: &Path, aeron_dir: &Path, archive_dir: &Path) -> String {
+/// stack trace instead, and that trace is a reading. The status is still
+/// checked by the case: a successful reading is `CONNECT ok`, and a failure is
+/// `CONNECT failed:` with a non-zero exit.
+fn readings(
+    jar: &Path,
+    classes: &Path,
+    aeron_dir: &Path,
+    archive_dir: &Path,
+) -> (String, std::process::ExitStatus) {
     let classpath = std::env::join_paths([jar, classes]).expect("two paths join");
 
     let output = Command::new("java")
@@ -60,10 +67,13 @@ fn readings(jar: &Path, classes: &Path, aeron_dir: &Path, archive_dir: &Path) ->
         .output()
         .expect("java runs");
 
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    (
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        output.status,
     )
 }
 
@@ -109,8 +119,9 @@ fn the_connect_comes_back_on_both_drivers() {
     let theirs_dir = TempDir::new("archive-connect-reference-data");
     let ours_dir = TempDir::new("archive-connect-own-data");
 
-    let theirs = readings(&jar, &classes, reference.aeron_dir(), theirs_dir.path());
-    let ours = readings(&jar, &classes, own.aeron_dir(), ours_dir.path());
+    let (theirs, theirs_status) =
+        readings(&jar, &classes, reference.aeron_dir(), theirs_dir.path());
+    let (ours, ours_status) = readings(&jar, &classes, own.aeron_dir(), ours_dir.path());
 
     println!("--- reference driver ---\n{theirs}");
     println!("--- this driver ---\n{ours}");
@@ -121,8 +132,17 @@ fn the_connect_comes_back_on_both_drivers() {
     println!("--- this driver's log ---\n{}", own.log_tail(60));
 
     assert!(
-        theirs.contains("CONNECT ") && ours.contains("CONNECT "),
-        "both runs must report a connect attempt:\nreference:\n{theirs}\nthis driver:\n{ours}"
+        theirs_status.success() && ours_status.success(),
+        "both probes must exit zero:\nreference ({theirs_status}):\n{theirs}\n\
+         this driver ({ours_status}):\n{ours}"
+    );
+    assert!(
+        theirs.contains("CONNECT ok") && ours.contains("CONNECT ok"),
+        "both runs must report a successful connect:\nreference:\n{theirs}\nthis driver:\n{ours}"
+    );
+    assert!(
+        !theirs.contains("CONNECT failed:") && !ours.contains("CONNECT failed:"),
+        "neither run may report a failed connect:\nreference:\n{theirs}\nthis driver:\n{ours}"
     );
 
     let _ = own.stop();

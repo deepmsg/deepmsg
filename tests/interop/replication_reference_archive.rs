@@ -34,6 +34,7 @@ use deepmsg_codec::archive::recording_signal::RecordingSignal as SignalCode;
 use deepmsg_tests::archive;
 use deepmsg_tests::archiving_driver::{self, OwnArchivingMediaDriver};
 use deepmsg_tests::java_archiving_driver::{self, JavaArchivingMediaDriver};
+use deepmsg_tests::ports::port;
 use deepmsg_tests::temp::TempDir;
 
 /// Where the recording to be copied goes. The recording is made **through the
@@ -49,11 +50,6 @@ const REPLICATION_CHANNEL: &str = "aeron:udp?endpoint=localhost:0";
 
 /// The reference archive's own control stream default.
 const CONTROL_STREAM_ID: i32 = 10;
-
-/// A port for this run, so that two test processes do not take the same one.
-fn port(offset: u32) -> u32 {
-    13_000 + (std::process::id() % 400) * 2 + offset
-}
 
 /// Where the **reference** archive listens for clients — UDP, and it has to be:
 /// a Java archive refuses anything else outright (`Archive.java:1225`).

@@ -58,7 +58,7 @@ impl CasePorts {
     fn new(index: u16) -> Self {
         static BASE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
         let base = *BASE.get_or_init(|| Ports::new().base());
-        Self(Ports::with_base(base + (index + 1) * 50))
+        Self(Ports::with_base(base + (index + 1) * 64))
     }
 
     fn ports(&self) -> Ports {

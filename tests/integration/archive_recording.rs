@@ -52,6 +52,7 @@ use deepmsg_core::buffer::ReadOnly;
 use deepmsg_core::logbuffer::append::Appended;
 use deepmsg_tests::archive::{self, DEADLINE, Session};
 use deepmsg_tests::archiving_driver::{self, OwnArchivingMediaDriver};
+use deepmsg_tests::ports::port;
 use deepmsg_tests::temp::TempDir;
 
 /// The connect's correlation id, which its answer echoes.
@@ -67,17 +68,21 @@ const ARCHIVE_ID: i64 = ARCHIVE_ID_DEFAULT;
 /// A port of its own rather than the C suite's 3333: those tests are run by hand
 /// and these by `cargo test`, and two drivers on one host must not pick the same
 /// one.
-const RECORDING_CHANNEL: &str = "aeron:udp?endpoint=localhost:33433";
+fn recording_channel() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(0))
+}
 
 /// The same, for the `DEDICATED` criterion: two tests in one binary run at
 /// once, and a UDP endpoint is one process's at a time.
-const RECORDING_CHANNEL_DEDICATED: &str = "aeron:udp?endpoint=localhost:33434";
+fn recording_channel_dedicated() -> String {
+    format!("aeron:udp?endpoint=localhost:{}", port(1))
+}
 
 /// The two archives' `TempDir` names, which are also the two `test_name`s the
 /// harness logs under.
 const SHARED_ARCHIVE: &str = "archive-recording";
 const DEDICATED_ARCHIVE: &str = "archive-recording-dedicated";
-/// See [`RECORDING_CHANNEL`].
+/// See [`recording_channel`].
 const RECORDING_STREAM_ID: i32 = 33;
 
 /// A third port, for the log criterion: the three tests in this binary run at
@@ -86,7 +91,9 @@ const RECORDING_STREAM_ID: i32 = 33;
 /// `term-length=64k` is what makes the segment length small: the archive takes
 /// `max(configured, term length)` (`ArchiveConductor.java:2006`), so a 64 KiB
 /// setting without a 64 KiB term would still be a 16 MiB segment.
-const RECORDING_CHANNEL_LOG: &str = "aeron:udp?endpoint=localhost:33435|term-length=64k";
+fn recording_channel_log() -> String {
+    format!("aeron:udp?endpoint=localhost:{}|term-length=64k", port(2))
+}
 
 /// How many messages the recording is asked to carry: enough to be more than one
 /// frame, so the archive has to read the image on more than one turn.
@@ -111,7 +118,7 @@ const PROPERTIES: [&str; 4] = [
 /// followed, stopped where the publication did, and read back out of the
 /// catalog.
 ///
-/// `channel` is a parameter rather than [`RECORDING_CHANNEL`] because the two
+/// `channel` is a parameter rather than [`recording_channel`] because the two
 /// criteria below run at once in one binary and a UDP endpoint belongs to one
 /// process at a time.
 fn a_recording_round_trip(test_name: &str, channel: &str, properties: &[&str]) {
@@ -271,7 +278,7 @@ fn a_recording_round_trip_with_env(
 
 #[test]
 fn a_recording_is_made_and_stops_where_the_publication_did() {
-    a_recording_round_trip(SHARED_ARCHIVE, RECORDING_CHANNEL, &PROPERTIES);
+    a_recording_round_trip(SHARED_ARCHIVE, &recording_channel(), &PROPERTIES);
 }
 
 /// ★ P2-9a: the same round trip with the archive's **`DEDICATED`** mode, where
@@ -288,7 +295,11 @@ fn a_recording_is_made_with_the_recorder_on_its_own_thread() {
     let mut properties: Vec<&str> = PROPERTIES.to_vec();
     properties.push("-Daeron.archive.threading.mode=DEDICATED");
 
-    a_recording_round_trip(DEDICATED_ARCHIVE, RECORDING_CHANNEL_DEDICATED, &properties);
+    a_recording_round_trip(
+        DEDICATED_ARCHIVE,
+        &recording_channel_dedicated(),
+        &properties,
+    );
 }
 
 /// The archive's lifecycle lines: one `recording.start` and one
@@ -308,7 +319,7 @@ fn a_recording_is_reported_in_the_log() {
 
     a_recording_round_trip_with_env(
         "archive-recording-log",
-        RECORDING_CHANNEL_LOG,
+        &recording_channel_log(),
         &properties,
         &[
             ("DEEPMSG_LOG_DIR", log_dir_text),
