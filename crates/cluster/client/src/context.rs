@@ -8,7 +8,7 @@
 //! initial values from them (`AC:1424-1442`). Here the same values come from
 //! [`Properties`](deepmsg_cluster_common::config::Properties), which is this
 //! build's reader for the same `-D` list, and
-//! [`AeronClusterContext::from_properties`] is the constructor that reads them.
+//! [`ClusterClientContext::from_properties`] is the constructor that reads them.
 //! Nothing here looks at the process's own configuration: a test that sets one
 //! context's values cannot disturb another's, which is the same reason the
 //! archive client reads a list.
@@ -26,7 +26,7 @@
 //!   `context.newLeaderTimeoutNs()` after the connect. A Rust context holds a
 //!   `Box<dyn CredentialsSupplier>` and is not `Clone`, so the connect takes
 //!   ownership and the values a completed connect settled on are read from the
-//!   [`AeronCluster`](crate::cluster::AeronCluster) instead.
+//!   [`ClusterClient`](crate::cluster::ClusterClient) instead.
 //! * **There is no `ownsAeronClient`.** A `Client` is always the caller's here
 //!   (the spec's shape), so there is no directory name to connect to and no
 //!   client to close.
@@ -139,7 +139,7 @@ impl CredentialsSupplier for NullCredentialsSupplier {
 }
 
 /// What a connect starts from.
-pub struct AeronClusterContext {
+pub struct ClusterClientContext {
     /// `aeron.cluster.message.timeout`, and the deadline of the whole connect.
     pub message_timeout_ns: i64,
     /// `newLeaderTimeoutNs`; `None` is `Aeron.NULL_VALUE`, which a completed
@@ -174,7 +174,7 @@ pub struct AeronClusterContext {
     is_concluded: bool,
 }
 
-impl Default for AeronClusterContext {
+impl Default for ClusterClientContext {
     fn default() -> Self {
         Self {
             message_timeout_ns: MESSAGE_TIMEOUT_DEFAULT_NS,
@@ -195,9 +195,9 @@ impl Default for AeronClusterContext {
     }
 }
 
-impl fmt::Debug for AeronClusterContext {
+impl fmt::Debug for ClusterClientContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AeronClusterContext")
+        f.debug_struct("ClusterClientContext")
             .field("message_timeout_ns", &self.message_timeout_ns)
             .field("new_leader_timeout_ns", &self.new_leader_timeout_ns)
             .field("ingress_endpoints", &self.ingress_endpoints)
@@ -217,7 +217,7 @@ impl fmt::Debug for AeronClusterContext {
     }
 }
 
-impl AeronClusterContext {
+impl ClusterClientContext {
     /// An empty context with the reference's defaults and no channels.
     #[must_use]
     pub fn new() -> Self {
@@ -436,8 +436,8 @@ mod tests {
 
     /// The context every accepting test starts from: a channel pair that
     /// concludes.
-    fn context() -> AeronClusterContext {
-        AeronClusterContext::default()
+    fn context() -> ClusterClientContext {
+        ClusterClientContext::default()
             .ingress_channel(Some("aeron:udp"))
             .egress_channel(Some("aeron:udp?endpoint=localhost:0"))
     }
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn conclude_refuses_a_missing_ingress_channel() {
         for missing in [None, Some("")] {
-            let mut context = AeronClusterContext::default()
+            let mut context = ClusterClientContext::default()
                 .ingress_channel(missing)
                 .egress_channel(Some("aeron:udp?endpoint=localhost:0"));
 
@@ -463,7 +463,7 @@ mod tests {
     /// `concludeThrowsConfigurationExceptionIfIngressChannelIsSetToIpcAndIngressEndpointsSpecified`.
     #[test]
     fn conclude_refuses_ipc_ingress_with_endpoints() {
-        let mut context = AeronClusterContext::default()
+        let mut context = ClusterClientContext::default()
             .ingress_channel(Some("aeron:ipc"))
             .ingress_endpoints(Some("0,localhost:1234"))
             .egress_channel(Some("aeron:udp?endpoint=localhost:0"));
@@ -480,7 +480,7 @@ mod tests {
     #[test]
     fn conclude_refuses_a_missing_egress_channel() {
         for missing in [None, Some("")] {
-            let mut context = AeronClusterContext::default()
+            let mut context = ClusterClientContext::default()
                 .ingress_channel(Some("aeron:udp"))
                 .egress_channel(missing);
 
@@ -502,7 +502,7 @@ mod tests {
             }
 
             let context =
-                AeronClusterContext::from_properties(&properties).expect("no name is no problem");
+                ClusterClientContext::from_properties(&properties).expect("no name is no problem");
 
             assert_eq!("", context.client_name);
         }
@@ -529,7 +529,7 @@ mod tests {
                 .expect("a property");
 
             let context =
-                AeronClusterContext::from_properties(&properties).expect("a readable context");
+                ClusterClientContext::from_properties(&properties).expect("a readable context");
 
             assert_eq!(name, context.client_name);
         }
@@ -635,7 +635,7 @@ mod tests {
             ])
             .expect("properties");
 
-        let context = AeronClusterContext::from_properties(&properties).expect("readable");
+        let context = ClusterClientContext::from_properties(&properties).expect("readable");
 
         assert_eq!(3_000_000_000, context.message_timeout_ns);
         assert_eq!(

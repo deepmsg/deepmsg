@@ -3,7 +3,7 @@
 //!
 //! The reference's harness gives its client a driver of its own
 //! (`TestCluster.java:960-990` builds a second `MediaDriver.Context` for it),
-//! and that is the shape a deployment has: our `AeronCluster` is the client,
+//! and that is the shape a deployment has: our `ClusterClient` is the client,
 //! the nodes are somebody else's, and the medium between them is UDP. Both
 //! LC-1 test binaries use this kit so that a scenario and a reliability case
 //! differ in what they assert, not in how they connect.
@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use crate::driver::OwnDriver;
 use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::MessageHeader;
-use deepmsg_cluster_client::{AeronCluster, AeronClusterContext, EgressListener};
+use deepmsg_cluster_client::{ClusterClient, ClusterClientContext, EgressListener};
 use deepmsg_codec_cluster::admin_request_type::AdminRequestType;
 use deepmsg_codec_cluster::admin_response_code::AdminResponseCode;
 use deepmsg_codec_cluster::event_code::EventCode;
@@ -115,7 +115,7 @@ pub struct Session {
     /// The client the session runs on.
     pub client: Client,
     /// The session.
-    pub session: AeronCluster,
+    pub session: ClusterClient,
     /// Everything the egress delivered.
     pub received: Rc<RefCell<Received>>,
 }
@@ -134,7 +134,7 @@ impl Session {
     /// connect to the cluster.
     pub fn connect(
         label: &str,
-        mut context: AeronClusterContext,
+        mut context: ClusterClientContext,
         driver_properties: &[&str],
         diagnostics: impl Fn() -> String,
     ) -> Option<Self> {
@@ -146,7 +146,7 @@ impl Session {
             panic!("{label}: the client did not connect to our driver: {error}")
         });
 
-        let session = AeronCluster::connect(context, &mut client).unwrap_or_else(|error| {
+        let session = ClusterClient::connect(context, &mut client).unwrap_or_else(|error| {
             panic!(
                 "{label}: our client did not connect: {error}\n{}\nour driver:\n{}",
                 diagnostics(),
@@ -227,8 +227,8 @@ impl Session {
 /// message timeout equal to the test's own deadline, and a UDP egress channel
 /// whose port the driver picks.
 #[must_use]
-pub fn base_context(client_name: &str, message_timeout: Duration) -> AeronClusterContext {
-    let mut context = AeronClusterContext::default();
+pub fn base_context(client_name: &str, message_timeout: Duration) -> ClusterClientContext {
+    let mut context = ClusterClientContext::default();
     context.message_timeout_ns =
         i64::try_from(message_timeout.as_nanos()).expect("a timeout that fits an i64");
     context.ingress_stream_id = INGRESS_STREAM_ID;

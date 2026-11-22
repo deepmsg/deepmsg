@@ -53,6 +53,20 @@ Binaries and configuration carry the deepmsg name (`deepmsg-driver`,
 `deepmsg-stat`, `DEEPMSG_*`), so ownership is clear without inventing a
 parallel concept vocabulary.
 
+### The reference's class names lose the brand
+
+Where a mirrored reference type's name carries the `Aeron` brand, the Rust type
+drops it: `AeronArchive` → `Archive`, `AeronArchive.Context` →
+`ArchiveContext`, `AeronCluster` → `ClusterClient`, `AeronCluster.Context` →
+`ClusterClientContext`. The brand belongs to the process boundary
+(`deepmsg-*`), not to a Tier-3 type, and those four were the only ones that had
+it. What a name is *for* stays: the concept, and the reference's class name
+whenever a comment cites it (`AeronCluster.java:94`).
+
+`ClusterClient` rather than `Cluster` because the service-side business API is
+already `Cluster` (`crates/cluster/service`), and rather than `ClusterSession`
+because the consensus module already has one.
+
 ### New concepts get fresh names
 
 deepmsg-only mechanisms with no reference counterpart are named freely and

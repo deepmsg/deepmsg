@@ -3,7 +3,7 @@
 //! `P3-3a` built what a *successful connect* hands back and a `close`; this
 //! card gives the handle its two directions: sending (`offer`, `try_claim`, the
 //! keep-alive, the admin request, the session close) and receiving
-//! ([`AeronCluster::poll_egress`]), plus what a leadership change does to both.
+//! ([`ClusterClient::poll_egress`]), plus what a leadership change does to both.
 //!
 //! # The session header
 //!
@@ -47,7 +47,7 @@ use crate::async_connect::{
     parse_ingress_endpoints,
 };
 use crate::client_ops::{ClientOps, PublicationKind};
-use crate::context::AeronClusterContext;
+use crate::context::ClusterClientContext;
 use crate::egress::{
     ControlledEgressListenerExtension, Egress, EgressListenerExtension, SESSION_HEADER_LENGTH,
     decode,
@@ -173,8 +173,8 @@ impl SessionClaim<'_> {
 }
 
 /// A session a completed connect established.
-pub struct AeronCluster {
-    context: AeronClusterContext,
+pub struct ClusterClient {
+    context: ClusterClientContext,
     /// `None` once the publication has been given back (disconnect, close).
     ingress: Option<IngressPublication>,
     egress_subscription: i64,
@@ -217,9 +217,9 @@ fn missing_egress_listener() -> ClusterClientError {
     )
 }
 
-impl core::fmt::Debug for AeronCluster {
+impl core::fmt::Debug for ClusterClient {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("AeronCluster")
+        f.debug_struct("ClusterClient")
             .field("cluster_session_id", &self.cluster_session_id)
             .field("leadership_term_id", &self.leadership_term_id)
             .field("leader_member_id", &self.leader_member_id)
@@ -228,7 +228,7 @@ impl core::fmt::Debug for AeronCluster {
     }
 }
 
-impl AeronCluster {
+impl ClusterClient {
     /// The synchronous connect (`AC:141-200`): an [`crate::AsyncConnect`] in a
     /// loop, with the caller's client driven.
     ///
@@ -241,7 +241,7 @@ impl AeronCluster {
     ///
     /// Whatever the connect fails with.
     pub fn connect(
-        context: AeronClusterContext,
+        context: ClusterClientContext,
         client: &mut Client,
     ) -> Result<Self, crate::error::ClusterClientError> {
         crate::async_connect::connect(context, client)
@@ -249,7 +249,7 @@ impl AeronCluster {
 
     /// Assemble a session from what a connect established.
     pub(crate) fn new(
-        context: AeronClusterContext,
+        context: ClusterClientContext,
         ingress: IngressPublication,
         egress_subscription: i64,
         egress_image: Option<i64>,
@@ -300,7 +300,7 @@ impl AeronCluster {
     /// caller's `Context` object alive and updates it in place; this context
     /// moved, so the session is where its settled values live.
     #[must_use]
-    pub fn context(&self) -> &AeronClusterContext {
+    pub fn context(&self) -> &ClusterClientContext {
         &self.context
     }
 
@@ -549,8 +549,8 @@ impl AeronCluster {
 
     /// Close the session if it is due (`AC:648-660`).
     ///
-    /// Needed explicitly by a caller that reads [`AeronCluster::egress_subscription`]
-    /// directly instead of calling [`AeronCluster::poll_egress`].
+    /// Needed explicitly by a caller that reads [`ClusterClient::egress_subscription`]
+    /// directly instead of calling [`ClusterClient::poll_egress`].
     pub fn poll_state_changes(&mut self, client: &mut Client) -> usize {
         self.poll_state_changes_with(client)
     }
@@ -1351,7 +1351,7 @@ mod tests {
     }
 
     struct Harness {
-        session: AeronCluster,
+        session: ClusterClient,
         client: RecordingClient,
         clock: Rc<Cell<i64>>,
         listener: Rc<RefCell<RecordingListener>>,
@@ -1366,14 +1366,14 @@ mod tests {
 
         let clock = Rc::new(Cell::new(1_000));
         let listener = Rc::new(RefCell::new(RecordingListener::default()));
-        let context = AeronClusterContext::default()
+        let context = ClusterClientContext::default()
             .ingress_channel(Some("aeron:ipc"))
             .egress_channel(Some("aeron:ipc"))
             .new_leader_timeout_ns(Some(NEW_LEADER_TIMEOUT_NS))
             .nano_clock(Box::new(TestClock(Rc::clone(&clock))))
             .egress_listener(Box::new(SharedListener(Rc::clone(&listener))));
 
-        let session = AeronCluster::new(
+        let session = ClusterClient::new(
             context,
             IngressPublication::Exclusive(ingress),
             EGRESS_SUBSCRIPTION,
@@ -1460,7 +1460,7 @@ mod tests {
         buffer
     }
 
-    fn poll(session: &mut AeronCluster, client: &mut RecordingClient, bytes: Vec<u8>) -> usize {
+    fn poll(session: &mut ClusterClient, client: &mut RecordingClient, bytes: Vec<u8>) -> usize {
         client.push_egress(bytes);
         session.poll_egress_with(client).expect("the poll")
     }
@@ -1829,10 +1829,10 @@ mod tests {
     #[test]
     fn a_message_with_no_listener_is_a_configuration_error() {
         let mut h = harness();
-        let context = AeronClusterContext::default()
+        let context = ClusterClientContext::default()
             .ingress_channel(Some("aeron:ipc"))
             .egress_channel(Some("aeron:ipc"));
-        let mut session = AeronCluster::new(
+        let mut session = ClusterClient::new(
             context,
             IngressPublication::Exclusive(h.ingress),
             EGRESS_SUBSCRIPTION,

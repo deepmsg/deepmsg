@@ -27,7 +27,7 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use deepmsg_cluster_client::{AeronCluster, AeronClusterContext};
+use deepmsg_cluster_client::{ClusterClient, ClusterClientContext};
 use deepmsg_tests::cluster::{MemberSpec, Options, ProcessMode, TestCluster};
 
 /// The tests in this binary each start a whole cluster.
@@ -56,7 +56,7 @@ fn our_client_connects_to_a_java_single_node() {
 
     let mut client = cluster.client();
 
-    let context = AeronClusterContext::default()
+    let context = ClusterClientContext::default()
         .ingress_channel(Some("aeron:ipc"))
         .egress_channel(Some("aeron:ipc"))
         .client_name("deepmsg-lc1-connect")
@@ -64,7 +64,7 @@ fn our_client_connects_to_a_java_single_node() {
             i64::try_from(CONNECT_TIMEOUT.as_nanos()).expect("a timeout that fits an i64"),
         );
 
-    let mut session = AeronCluster::connect(context, &mut client).unwrap_or_else(|error| {
+    let mut session = ClusterClient::connect(context, &mut client).unwrap_or_else(|error| {
         panic!(
             "our client did not connect: {error}\nnode log:\n{}",
             cluster.node_log(0)
