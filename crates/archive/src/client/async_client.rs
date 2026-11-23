@@ -53,19 +53,15 @@ use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::{Action, ControlledHandler, Message};
 use deepmsg_codec::archive::SBE_SCHEMA_ID;
 use deepmsg_codec::archive::control_response_code::ControlResponseCode;
-use deepmsg_codec::archive::control_response_codec::{
-    ControlResponseDecoder, SBE_BLOCK_LENGTH as CONTROL_RESPONSE_BLOCK_LENGTH,
-};
-use deepmsg_codec::archive::recording_descriptor_codec::{
-    RecordingDescriptorDecoder, SBE_BLOCK_LENGTH as RECORDING_DESCRIPTOR_BLOCK_LENGTH,
-};
+use deepmsg_codec::archive::control_response_codec::ControlResponseDecoder;
+use deepmsg_codec::archive::recording_descriptor_codec::RecordingDescriptorDecoder;
 use deepmsg_core::logbuffer::append::Appended;
 
 use crate::client::archive::archive_to_client_error_code;
 use crate::client::async_connect::{AsyncConnect, ConnectError, Credentials, Polled};
 use crate::client::context::ArchiveContext;
 use crate::client::descriptor_poller::RecordingDescriptor;
-use crate::client::poller::{holds, sbe_header};
+use crate::client::poller::sbe_header;
 use crate::client::proxy::{ArchiveProxy, ProxyError, ReplayParams};
 
 /// `AERON_ARCHIVE_ASYNC_CLIENT_FRAGMENT_LIMIT` — how many fragments a
@@ -644,13 +640,15 @@ impl ControlledHandler for Decoder<'_> {
             return Action::Break;
         }
 
+        // The generated decoders panic past the end where the reference's
+        // buffer throws; the shared table bounds every response template.
+        if crate::sbe::message_fits(payload).is_err() {
+            self.malformed = true;
+            return Action::Break;
+        }
+
         match header.template_id() {
             CONTROL_RESPONSE_TEMPLATE_ID => {
-                if !holds(payload, CONTROL_RESPONSE_BLOCK_LENGTH) {
-                    self.malformed = true;
-                    return Action::Break;
-                }
-
                 let mut response = ControlResponseDecoder::default().header(header, 0);
 
                 // **Somebody else's session is not this client's answer.** The
@@ -689,11 +687,6 @@ impl ControlledHandler for Decoder<'_> {
                 Action::Continue
             }
             RECORDING_DESCRIPTOR_TEMPLATE_ID => {
-                if !holds(payload, RECORDING_DESCRIPTOR_BLOCK_LENGTH) {
-                    self.malformed = true;
-                    return Action::Break;
-                }
-
                 let mut descriptor = RecordingDescriptorDecoder::default().header(header, 0);
 
                 // The session is filtered and the correlation id is **not**: a

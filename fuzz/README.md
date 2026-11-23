@@ -17,14 +17,15 @@ The design and the per-target contracts are in
 | `04_cnc_command_decode` | every control command decoder, plus encode→decode |
 | `05_udp_protocol_frames` | UDP frames off a socket, resolution walk included |
 | `06_userspace_packet` | Ethernet / IPv4 / UDP / ARP / ICMP bytes off a DPDK port |
-| `07_sbe_archive_codecs` | the archive control requests (first batch: seven templates) |
-| `08_sbe_cluster_codecs` | `BackupResponse` (nested group), `SessionEvent`, the length guard |
+| `07_sbe_archive_codecs` | every archive control request `dispatch` answers (34 templates) |
+| `08_sbe_cluster_codecs` | every cluster template a production entry point decodes (groups included) |
 | `09_archive_catalog_segment` | `archive.catalog` and a `.rec` segment (slow tier) |
 | `10_archive_poller_events` | the client pollers and `RecordingEvents` dispatch |
 | `11_cluster_recording_log` | `recording.log` and `node-state.dat` (slow tier) |
 | `12_state_machine_rings` | structured claim/commit/abort/write sequences on the rings |
+| `13_mark_files` | the archive and cluster mark files, read from a scratch path |
 
-The slow tier (09, 11) writes a fixed file under `/dev/shm` per iteration —
+The slow tier (09, 11, 13) writes a fixed file under `/dev/shm` per iteration —
 `$DEEPMSG_FUZZ_SCRATCH` overrides the directory. Run it with a smaller budget:
 
     cargo +nightly fuzz run 09_archive_catalog_segment -- -runs=2000 -max_len=65536 -timeout=5

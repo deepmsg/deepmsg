@@ -22,6 +22,7 @@ deepmsg-client = { path = "../crates/client", features = ["fuzz-hooks"] }
 deepmsg-driver = { path = "../crates/driver" }
 deepmsg-archive = { path = "../crates/archive" }
 deepmsg-cluster-common = { path = "../crates/cluster/common" }
+deepmsg-codec-cluster-mark = { path = "../crates/codec/cluster-mark" }
 deepmsg-cluster = { path = "../crates/cluster/consensus" }
 
 [[bin]]
@@ -104,6 +105,13 @@ bench = false
 [[bin]]
 name = "12_state_machine_rings"
 path = "fuzz_targets/12_state_machine_rings.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "13_mark_files"
+path = "fuzz_targets/13_mark_files.rs"
 test = false
 doc = false
 bench = false

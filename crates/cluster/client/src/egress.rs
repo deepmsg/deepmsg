@@ -260,6 +260,13 @@ pub(crate) fn decode<'a>(message: &Message<'a>) -> Option<Egress<'a>> {
         });
     }
 
+    // The generated decoders panic past the end where the reference's buffer
+    // throws; this is that throw, in front of every arm below. The per-arm
+    // checks stay because they also bound the fields this guard does not read.
+    if deepmsg_cluster_common::sbe::fits(payload, &header).is_err() {
+        return None;
+    }
+
     match header.template_id() {
         SESSION_MESSAGE_HEADER_TEMPLATE_ID => {
             if payload.len() < SESSION_HEADER_LENGTH {

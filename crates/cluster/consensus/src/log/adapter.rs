@@ -332,6 +332,10 @@ impl LogAdapter {
             return Ok(Action::Continue);
         }
 
+        // The generated decoders panic past the end where the reference's
+        // buffer throws; this is that throw, in front of every arm below.
+        deepmsg_cluster_common::sbe::fits(payload, &header)?;
+
         match header.template_id() {
             deepmsg_codec_cluster::session_message_header_codec::SBE_TEMPLATE_ID => {
                 let decoder = SessionMessageHeaderDecoder::default().header(header, 0);

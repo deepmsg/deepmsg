@@ -383,6 +383,10 @@ fn decode<'a>(
         )));
     }
 
+    // The generated decoders panic past the end where the reference's buffer
+    // throws; this is that throw, in front of every arm below.
+    deepmsg_cluster_common::sbe::fits(bytes, &header)?;
+
     let template_id = header.template_id();
     let (message, payload) = match template_id {
         deepmsg_codec_cluster::session_message_header_codec::SBE_TEMPLATE_ID => {
