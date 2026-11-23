@@ -18,12 +18,20 @@
 //! for is a question about the threading mode, which is not known here.
 //!
 //! It matters for more than tidiness. A pair is a receive queue and a transmit
-//! queue at the same index, so "one receive and two transmit" is *three* pairs,
-//! and a device has to have three of each to carry that. Every virtual device
-//! this build's tests run on reports **one** (`net_pcap`: `max_rx_queues: 1,
-//! max_tx_queues: 1`), so a media that insisted on three could not be opened
+//! queue at the same index, so the number a mode asks for is the larger of its
+//! two directions: "one receive and two transmit" is *two* pairs, and a device
+//! has to have two of each to carry that. Every virtual device this build's
+//! tests run on reports **one** (`net_pcap`: `max_rx_queues: 1,
+//! max_tx_queues: 1`), so a media that insisted on two could not be opened
 //! without a real NIC — and the close path, which is what this module is for,
 //! would be the one thing that only ever ran on hardware.
+//!
+//! The receive side takes both receive queues of a `DEDICATED` media
+//! ([`DpdkMedia::into_ports`]), and that is not tidiness either: a virtio
+//! device announces `RTE_MAX(nb_rx_queues, nb_tx_queues)` queue pairs
+//! (`drivers/net/virtio/virtio_ethdev.c:2383-2385`) and the backend hashes inbound flows across
+//! all of them, so a receive port polling one queue would never see the flows
+//! that landed on another (2026-11-23, Aliyun).
 //!
 //! # What is *not* a value
 //!
@@ -198,17 +206,27 @@ impl std::error::Error for DpdkError {}
 
 /// How many queue pairs a threading mode's map needs (§4.7).
 ///
-/// A pair is a receive queue and a transmit queue at one index, so a mode that
-/// wants one receive queue and two transmit queues asks for **three** pairs and
-/// the receive port takes the first; a mode whose two roles share a thread
-/// wants one of each, which is one pair.
+/// A pair is a receive queue and a transmit queue at one index, so the number
+/// is the **larger** of the two directions, not their sum: `DEDICATED` wants
+/// one receive queue and two transmit queues, which a device carries with
+/// **two** pairs — the receive thread polls both receive queues, and each
+/// sending agent takes one transmit queue ([`DpdkMedia::into_ports`]).
+///
+/// Asking for one receive and two transmit queues as three pairs was the
+/// 2026-11-23 defect: a virtio device announces
+/// `RTE_MAX(nb_rx_queues, nb_tx_queues)` queue pairs and the backend hashes
+/// inbound flows across all of them, so the queues opened beyond the one the
+/// receive port polled were queues nothing ever read. Symmetric counts leave
+/// no such queue: every receive queue opened is one the receive port polls.
+///
+/// A mode whose two roles share a thread wants one of each, which is one pair.
 ///
 /// `INVOKER` is in the second group because the map puts everything on the
 /// calling thread — the mode a *media driver process* refuses to start with,
 /// and one a caller driving the stack itself still has to configure for.
 pub const fn queue_pairs(mode: ThreadingMode) -> u16 {
     match mode {
-        ThreadingMode::Dedicated => 3,
+        ThreadingMode::Dedicated => 2,
         ThreadingMode::SharedNetwork | ThreadingMode::Shared | ThreadingMode::Invoker => 1,
     }
 }
@@ -377,12 +395,12 @@ impl DpdkMedia {
     ///
     /// What a pair *is* decides the shape of this, and it is the crate's shape
     /// rather than this build's: one receive queue and one transmit queue at
-    /// the same index, driven together. So
+    /// the same index, which [`QueuePair::split`] can take apart. So
     ///
-    /// * `DEDICATED` — a thread per role — takes a pair each, and the receive
-    ///   port's own transmit queue goes unused (the map asks the machine for
-    ///   one receive queue and two transmit ones, and a pair cannot be asked
-    ///   for one of its two halves);
+    /// * `DEDICATED` — a thread per role — **splits every pair**: the receive
+    ///   port takes every receive queue, and each sending agent takes one
+    ///   transmit queue. Every receive queue has to be polled, because the
+    ///   device may have put a frame on any of them ([`queue_pairs`] says why);
     /// * the modes with both agents on one thread want **one** receive queue
     ///   and **one** transmit queue, which is one pair — and the two roles
     ///   share it, the receive port driving one direction and the transmit
@@ -407,25 +425,27 @@ impl DpdkMedia {
         let mut pairs = self.pairs.into_iter();
         let mut take = || pairs.next();
 
-        let Some(first) = take() else {
-            return Err(short(opened));
-        };
-
         let (rx, tx) = match mode {
             ThreadingMode::Dedicated => {
-                let (Some(sender), Some(receiver)) = (take(), take()) else {
+                let (Some(first), Some(second)) = (take(), take()) else {
                     return Err(short(opened));
                 };
 
+                let (rx0, tx0) = first.split();
+                let (rx1, tx1) = second.split();
+
                 (
-                    Box::new(DpdkRxPort::new(first, self.pool)) as Box<dyn RxPort>,
+                    Box::new(DpdkRxPort::over(vec![rx0, rx1], self.pool)) as Box<dyn RxPort>,
                     TransmitQueues::PerRole(
-                        Box::new(DpdkTxPort::new(sender, self.pool)),
-                        Box::new(DpdkTxPort::new(receiver, self.pool)),
+                        Box::new(DpdkTxPort::on(tx0, self.pool)),
+                        Box::new(DpdkTxPort::on(tx1, self.pool)),
                     ),
                 )
             }
             ThreadingMode::SharedNetwork | ThreadingMode::Shared | ThreadingMode::Invoker => {
+                let Some(first) = take() else {
+                    return Err(short(opened));
+                };
                 let shared = Arc::new(Mutex::new(first));
 
                 (
@@ -771,7 +791,7 @@ mod tests {
     fn the_pool_is_sized_for_the_descriptors_and_no_smaller() {
         assert_eq!(
             8191,
-            pool_frames(&settings(), 3),
+            pool_frames(&settings(), 2),
             "the design's defaults land on about eight thousand, and a ring of \
              two to the thirteenth less one is what DPDK prefers"
         );
@@ -782,10 +802,10 @@ mod tests {
             ..settings()
         };
         assert!(
-            pool_frames(&bigger, 3) >= 4096 * 2 * 3,
+            pool_frames(&bigger, 2) >= 4096 * 2 * 2,
             "a pool smaller than the queues fill themselves from would starve \
              them: {}",
-            pool_frames(&bigger, 3)
+            pool_frames(&bigger, 2)
         );
 
         let said_so = DpdkSettings {
@@ -794,7 +814,7 @@ mod tests {
         };
         assert_eq!(
             65_536,
-            pool_frames(&said_so, 3),
+            pool_frames(&said_so, 2),
             "a configuration that knows its own number gets it, unfolded"
         );
     }
@@ -802,12 +822,13 @@ mod tests {
     /// §4.7's table, as the number of queue pairs a device is asked for.
     ///
     /// A pair is one receive queue and one transmit queue, so the two counts
-    /// the table gives are not the count this asks for: `DEDICATED` wants one
-    /// receive queue and **two** transmit queues, which is three pairs, and
-    /// the modes with both agents on one thread want one of each, which is one.
+    /// the table gives are **not summed**: `DEDICATED` wants one receive queue
+    /// and **two** transmit queues, which is two pairs, and the modes with both
+    /// agents on one thread want one of each, which is one. The sum would open
+    /// receive queues no role polls — the 2026-11-23 defect.
     #[test]
     fn a_mode_asks_for_the_pairs_its_map_needs() {
-        assert_eq!(3, queue_pairs(ThreadingMode::Dedicated));
+        assert_eq!(2, queue_pairs(ThreadingMode::Dedicated));
         for mode in [
             ThreadingMode::SharedNetwork,
             ThreadingMode::Shared,
@@ -817,9 +838,9 @@ mod tests {
         }
 
         assert_eq!(
-            3,
+            2,
             queue_pairs(ThreadingMode::DEFAULT),
-            "and the driver's default mode is the three-pair one"
+            "and the driver's default mode is the two-pair one"
         );
     }
 
@@ -828,15 +849,15 @@ mod tests {
     /// `rte_eth_dev_configure` answering a code.
     #[test]
     fn a_port_with_too_few_queues_is_refused_by_name() {
-        let refused = check_capability(&described(1), 3).expect_err("one queue short");
+        let refused = check_capability(&described(1), 2).expect_err("one queue short");
         assert!(matches!(refused, DpdkError::Capability { .. }));
         assert!(
-            refused.to_string().contains("a-port") && refused.to_string().contains("3"),
+            refused.to_string().contains("a-port") && refused.to_string().contains('2'),
             "the message names the port and what was asked: {refused}"
         );
 
         assert!(check_capability(&described(1), 1).is_ok());
-        assert!(check_capability(&described(3), 3).is_ok());
+        assert!(check_capability(&described(2), 2).is_ok());
     }
 
     /// The configured next hops travel with the stack's other settings, rather

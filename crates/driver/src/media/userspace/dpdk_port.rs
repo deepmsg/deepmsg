@@ -31,64 +31,103 @@ use std::sync::{Arc, Mutex};
 
 use deepmsg_dpdk::{
     Checksum as DpdkChecksum, Disposition as DpdkDisposition, Mempool, QueuePair,
-    RxFrame as DpdkFrame, TxOffloads as DpdkOffloads,
+    RxFrame as DpdkFrame, RxQueue, TxOffloads as DpdkOffloads, TxQueue,
 };
 
 use super::frame::{ETHERNET_HEADER_LENGTH, L4Checksum, TxOffloads};
 use super::packet_io::{Disposition, Offloads, ReadyFrame, RxFrame, RxPort, TxPort, Verdict};
 use super::ports::Binding;
 
-/// The queue pair a port drives, and whether the port beside it drives it too.
+/// What a receive port polls, and whether the port beside it drives the same
+/// queues too.
 ///
-/// A pair is one receive queue and one transmit queue at the same index, and
-/// §4.7's map does not always give each role one of its own: `DEDICATED` has a
-/// thread per role and a queue each, while the modes with both agents on one
-/// thread have **one** pair between them — the receive port takes its receive
-/// queue and the transmit port its transmit queue, out of the same pair.
+/// §4.7's map does not always give each role one queue of its own: `DEDICATED`
+/// has a thread per role, the receive thread polls **every** receive queue the
+/// device was given, and the two sending agents take a transmit queue each;
+/// the modes with both agents on one thread have **one** pair between them —
+/// the receive port takes its receive queue and the transmit port its
+/// transmit queue, out of the same pair.
+///
+/// Why every queue: which queue the **device** puts an inbound frame on is not
+/// this build's to choose. A virtio port announces
+/// `RTE_MAX(nb_rx_queues, nb_tx_queues)` queue pairs at device start
+/// (`drivers/net/virtio/virtio_ethdev.c:2383-2385`) and the backend hashes inbound flows across
+/// all of them, so a port that polled one receive queue would never see the
+/// flows that hashed to the others. That is the 2026-11-23 Aliyun finding:
+/// `DEDICATED` over a virtio ENI lost every burst whose tuple landed on a
+/// queue nobody polled, while `SHARED` (one pair) took them all.
 ///
 /// The two shapes are one type because the difference is not worth two: a port
-/// that owns its pair pays nothing, and a port that shares one pays an
+/// that owns its queues pays nothing, and a port that shares a pair pays an
 /// uncontended lock — which is what keeps the crate's invariant true, since
 /// `QueuePair` is deliberately not `Sync` and two roles reaching one queue at
 /// once is exactly what that says must not happen.
-enum Pair {
-    /// This port's own, one per role.
-    Owned(QueuePair),
+enum Receiving {
+    /// This port's own receive queues, in the order the port takes them, and
+    /// the queue this call starts with. The one receive thread holds all of
+    /// them, so the rotation needs no lock.
+    Owned { queues: Vec<RxQueue>, next: usize },
     /// One pair, shared with the port on the other side of the stack.
     Shared(Arc<Mutex<QueuePair>>),
 }
 
-impl std::fmt::Debug for Pair {
+impl std::fmt::Debug for Receiving {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Owned(pair) => pair.fmt(f),
+            Self::Owned { queues, .. } => f.debug_list().entries(queues.iter()).finish(),
             Self::Shared(pair) => pair.lock().expect("the queue pair").fmt(f),
         }
     }
 }
 
-impl Pair {
-    /// Run `f` on the pair, taking the lock where there is one.
-    fn with<R>(&mut self, f: impl FnOnce(&mut QueuePair) -> R) -> R {
-        match self {
-            Self::Owned(pair) => f(pair),
-            Self::Shared(pair) => f(&mut pair.lock().expect("the queue pair")),
-        }
-    }
-
-    /// What the port behind the pair is, whichever shape this is.
+impl Receiving {
+    /// What the port behind these queues is, whichever shape this is.
     fn port(&self) -> Arc<deepmsg_dpdk::Port> {
         match self {
-            Self::Owned(pair) => Arc::clone(pair.port()),
+            Self::Owned { queues, .. } => {
+                Arc::clone(queues.first().expect("a receive port polls a queue").port())
+            }
             Self::Shared(pair) => Arc::clone(pair.lock().expect("the queue pair").port()),
         }
     }
 }
 
-/// The receive half of a queue pair, as this stack's [`RxPort`].
+/// The transmit queue a port sends on, and whether the port beside it shares
+/// the pair it came from.
+///
+/// `DEDICATED` gives each sending agent a queue of its own — two agents
+/// sharing one transmit queue is the 2026-11-16 lost-frame shape — and the
+/// single-thread modes give the one pair to both directions.
+enum Transmitting {
+    /// This port's own transmit queue.
+    Owned(TxQueue),
+    /// One pair, shared with the port on the other side of the stack.
+    Shared(Arc<Mutex<QueuePair>>),
+}
+
+impl std::fmt::Debug for Transmitting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Owned(queue) => queue.fmt(f),
+            Self::Shared(pair) => pair.lock().expect("the queue pair").fmt(f),
+        }
+    }
+}
+
+impl Transmitting {
+    /// What the port behind this queue is, whichever shape this is.
+    fn port(&self) -> Arc<deepmsg_dpdk::Port> {
+        match self {
+            Self::Owned(queue) => Arc::clone(queue.port()),
+            Self::Shared(pair) => Arc::clone(pair.lock().expect("the queue pair").port()),
+        }
+    }
+}
+
+/// The receive side of a queue pair, as this stack's [`RxPort`].
 pub struct DpdkRxPort {
-    pair: Pair,
-    /// The pool the queue was set up with, which every frame it hands over
+    queues: Receiving,
+    /// The pool the queues were set up with, which every frame they hand over
     /// borrows. One per process, which is why the borrow can be `'static`.
     pool: &'static Mempool,
     mac: [u8; 6],
@@ -97,15 +136,27 @@ pub struct DpdkRxPort {
 }
 
 impl DpdkRxPort {
-    /// A receive port over `pair`, whose frames come from `pool`.
+    /// A receive port over `pair`'s receive queue, whose frames come from
+    /// `pool`.
     ///
-    /// The port describes itself rather than being told: the MAC every frame
-    /// carries and the largest frame it carries come from the device, and what
-    /// it judges comes from its receive capabilities. Those are the same two
-    /// offloads the driver asks for when it configures the port, so what
-    /// [`RxPort::offloads`] answers is what the frames' verdicts mean.
+    /// The pair's transmit half is dropped: a case that builds a receive port
+    /// from one pair receives and does not send, and the queue it does not use
+    /// is the device's to leave idle.
     pub fn new(pair: QueuePair, pool: &'static Mempool) -> Self {
-        Self::of(Pair::Owned(pair), pool)
+        Self::over(vec![pair.split().0], pool)
+    }
+
+    /// A receive port polling **every** queue in `queues`, in that order.
+    ///
+    /// This is the `DEDICATED` shape: one receive thread, and every receive
+    /// queue the device was given, because the backend's hash decides which of
+    /// them a frame arrives on ([`Receiving`]).
+    pub fn over(queues: Vec<RxQueue>, pool: &'static Mempool) -> Self {
+        debug_assert!(
+            !queues.is_empty(),
+            "a receive port polls at least one queue"
+        );
+        Self::of(Receiving::Owned { queues, next: 0 }, pool)
     }
 
     /// A receive port sharing `pair` with the transmit port beside it.
@@ -114,11 +165,11 @@ impl DpdkRxPort {
     /// machine gives it, with the receive port taking one direction and the
     /// transmit port the other.
     pub fn sharing(pair: Arc<Mutex<QueuePair>>, pool: &'static Mempool) -> Self {
-        Self::of(Pair::Shared(pair), pool)
+        Self::of(Receiving::Shared(pair), pool)
     }
 
-    fn of(pair: Pair, pool: &'static Mempool) -> Self {
-        let port = pair.port();
+    fn of(queues: Receiving, pool: &'static Mempool) -> Self {
+        let port = queues.port();
         let info = port.info();
         let offloads = Offloads {
             ipv4_checksum: info.can_judge_ipv4_checksum(),
@@ -127,7 +178,7 @@ impl DpdkRxPort {
         let (mac, mtu) = describe(&port);
 
         Self {
-            pair,
+            queues,
             pool,
             mac,
             mtu,
@@ -154,27 +205,47 @@ impl RxPort for DpdkRxPort {
         let mut bindings = Vec::new();
         let mut parked = Vec::new();
 
-        let handed = self.pair.with(|pair| {
-            pair.rx_burst(
-                pool,
-                max,
-                &mut |frame: DpdkFrame<'_>| {
-                    let answer = f(RxFrame {
-                        bytes: frame.bytes(),
-                        checksums: offloads.checksums(verdict(frame.checksum())),
-                    });
+        let mut answer = |frame: DpdkFrame<'_>| {
+            let answer = f(RxFrame {
+                bytes: frame.bytes(),
+                checksums: offloads.checksums(verdict(frame.checksum())),
+            });
 
-                    match answer {
-                        Disposition::Consumed => DpdkDisposition::Release,
-                        Disposition::Keep(binding) => {
-                            bindings.push(binding);
-                            DpdkDisposition::Keep
-                        }
+            match answer {
+                Disposition::Consumed => DpdkDisposition::Release,
+                Disposition::Keep(binding) => {
+                    bindings.push(binding);
+                    DpdkDisposition::Keep
+                }
+            }
+        };
+
+        let handed = match &mut self.queues {
+            Receiving::Owned { queues, next } => {
+                // One burst per queue, starting where the last call left off:
+                // the budget stays the caller's, the queues take turns, and a
+                // queue that is empty costs one `rte_eth_rx_burst` and no
+                // more. `max` is spent across the queues, not given to each —
+                // a pass carries the frames the caller asked for however many
+                // queues they arrived on.
+                let count = queues.len();
+                let mut total = 0;
+                for _ in 0..count {
+                    if total >= max {
+                        break;
                     }
-                },
-                &mut parked,
-            )
-        });
+
+                    let queue = &mut queues[*next];
+                    *next = (*next + 1) % count;
+                    total += queue.rx_burst(pool, max - total, &mut answer, &mut parked);
+                }
+                total
+            }
+            Receiving::Shared(pair) => {
+                let mut pair = pair.lock().expect("the queue pair");
+                pair.rx_burst(pool, max, &mut answer, &mut parked)
+            }
+        };
 
         debug_assert_eq!(
             bindings.len(),
@@ -207,7 +278,7 @@ impl RxPort for DpdkRxPort {
 impl std::fmt::Debug for DpdkRxPort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DpdkRxPort")
-            .field("pair", &self.pair)
+            .field("queues", &self.queues)
             .field("mac", &self.mac)
             .field("mtu", &self.mtu)
             .field("offloads", &self.offloads)
@@ -215,14 +286,14 @@ impl std::fmt::Debug for DpdkRxPort {
     }
 }
 
-/// The transmit half of a queue pair, as this stack's [`TxPort`].
+/// The transmit side of a queue pair, as this stack's [`TxPort`].
 ///
 /// Nothing here is copied either: the sender writes its headers and its
 /// payload straight into the room the port allocated, and the port hands that
 /// frame to the NIC. A frame the NIC did not take is freed inside the burst, so
 /// what this answers is exactly what left the machine (§4.4).
 pub struct DpdkTxPort {
-    pair: Pair,
+    queue: Transmitting,
     pool: &'static Mempool,
     mac: [u8; 6],
     mtu: usize,
@@ -244,23 +315,36 @@ pub struct DpdkTxPort {
 }
 
 impl DpdkTxPort {
-    /// A transmit port over `pair`, whose frames come from `pool`.
+    /// A transmit port over `pair`'s transmit queue, whose frames come from
+    /// `pool`.
+    ///
+    /// The pair's receive half is dropped: a case that builds a transmit port
+    /// from one pair sends and does not receive.
     pub fn new(pair: QueuePair, pool: &'static Mempool) -> Self {
-        Self::of(Pair::Owned(pair), pool)
+        Self::on(pair.split().1, pool)
+    }
+
+    /// A transmit port over its own `queue`.
+    ///
+    /// This is the `DEDICATED` shape: each sending agent gets one transmit
+    /// queue, and no agent shares one with another.
+    pub fn on(queue: TxQueue, pool: &'static Mempool) -> Self {
+        Self::of(Transmitting::Owned(queue), pool)
     }
 
     /// A transmit port sharing `pair` with the receive port beside it; see
     /// [`DpdkRxPort::sharing`].
     pub fn sharing(pair: Arc<Mutex<QueuePair>>, pool: &'static Mempool) -> Self {
-        Self::of(Pair::Shared(pair), pool)
+        Self::of(Transmitting::Shared(pair), pool)
     }
 
-    fn of(pair: Pair, pool: &'static Mempool) -> Self {
-        let (mac, mtu) = describe(&pair.port());
-        let computes_checksums = pair.port().info().can_compute_both_checksums();
+    fn of(queue: Transmitting, pool: &'static Mempool) -> Self {
+        let port = queue.port();
+        let (mac, mtu) = describe(&port);
+        let computes_checksums = port.info().can_compute_both_checksums();
 
         Self {
-            pair,
+            queue,
             pool,
             mac,
             mtu,
@@ -285,26 +369,32 @@ impl TxPort for DpdkTxPort {
         // back, so the disagreement stops here rather than being sent: it is a
         // programming error, not a transient condition, and a burst that
         // reported success for it would be a burst that lied.
-        self.pair.with(|pair| {
-            pair.tx_burst(pool, count, &mut |buffer| {
-                let (written, offloads) = fill(buffer);
-                let (computes_here, l2_len, l3_len) = offloads.asked();
+        let mut frame = |buffer: &mut [u8]| {
+            let (written, offloads) = fill(buffer);
+            let (computes_here, l2_len, l3_len) = offloads.asked();
 
-                assert!(
-                    !computes_here || computes,
-                    "a frame asks the NIC for a checksum this port was not \
-                     configured to compute (`tx_checksums` says software)"
-                );
+            assert!(
+                !computes_here || computes,
+                "a frame asks the NIC for a checksum this port was not \
+                 configured to compute (`tx_checksums` says software)"
+            );
 
-                let offloads = if computes_here {
-                    DpdkOffloads::ipv4_and_udp_checksums(l2_len, l3_len)
-                } else {
-                    DpdkOffloads::NONE
-                };
+            let offloads = if computes_here {
+                DpdkOffloads::ipv4_and_udp_checksums(l2_len, l3_len)
+            } else {
+                DpdkOffloads::NONE
+            };
 
-                (written, offloads)
-            })
-        })
+            (written, offloads)
+        };
+
+        match &mut self.queue {
+            Transmitting::Owned(queue) => queue.tx_burst(pool, count, &mut frame),
+            Transmitting::Shared(pair) => {
+                let mut pair = pair.lock().expect("the queue pair");
+                pair.tx_burst(pool, count, &mut frame)
+            }
+        }
     }
 
     fn checksums(&self) -> L4Checksum {
@@ -327,7 +417,7 @@ impl TxPort for DpdkTxPort {
 impl std::fmt::Debug for DpdkTxPort {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DpdkTxPort")
-            .field("pair", &self.pair)
+            .field("queue", &self.queue)
             .field("mac", &self.mac)
             .field("mtu", &self.mtu)
             .finish()

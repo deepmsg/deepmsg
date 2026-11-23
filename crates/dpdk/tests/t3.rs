@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 
 use deepmsg_dpdk::{
     Checksum, Disposition, Eal, FrameRing, Mempool, MempoolSettings, ParkedFrame, Port,
-    PortSettings, QueuePair, RegisteredThread, TxOffloads, restore_affinity, save_affinity,
+    PortSettings, QueuePair, RegisteredThread, RxQueue, TxOffloads, TxQueue, restore_affinity,
+    save_affinity,
 };
 
 /// The EAL arguments every case here starts with.
@@ -617,17 +618,20 @@ fn a_transmitted_frame_leaves_through_the_pmd_in_the_child() {
 
 /// The ports a frame and a queue pair have to cross.
 ///
-/// `QueuePair`, `ParkedFrame` and the ring's halves are `Send`: they are made
-/// on one thread and used on another. They are also not `Sync`, which is the
-/// other half of the same invariant — and that half cannot be asserted here,
-/// because proving the *absence* of a trait needs a compile-fail harness this
-/// workspace has no room for. What enforces it is the type: `PhantomData<*mut
-/// ()>` in `QueuePair` and in both ring halves.
+/// `QueuePair`, its two halves, `ParkedFrame` and the ring's halves are
+/// `Send`: they are made on one thread and used on another. They are also not
+/// `Sync`, which is the other half of the same invariant — and that half
+/// cannot be asserted here, because proving the *absence* of a trait needs a
+/// compile-fail harness this workspace has no room for. What enforces it is the
+/// type: `PhantomData<*mut ()>` in `QueuePair`, in `RxQueue` and `TxQueue`,
+/// and in both ring halves.
 #[test]
 fn what_crosses_threads_can() {
     fn assert_send<T: Send>() {}
 
     assert_send::<QueuePair>();
+    assert_send::<RxQueue>();
+    assert_send::<TxQueue>();
     assert_send::<ParkedFrame<'static>>();
     assert_send::<deepmsg_dpdk::Producer<'static>>();
     assert_send::<deepmsg_dpdk::Consumer<'static>>();

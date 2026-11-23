@@ -564,9 +564,16 @@ impl Port {
         let port = Arc::new(Self { id, info });
         let pairs = (0..settings.rx_queues)
             .map(|queue| QueuePair {
-                port: Arc::clone(&port),
-                rx_queue: queue,
-                tx_queue: queue,
+                rx: RxQueue {
+                    port: Arc::clone(&port),
+                    queue,
+                    _one_thread: PhantomData,
+                },
+                tx: TxQueue {
+                    port: Arc::clone(&port),
+                    queue,
+                    _one_thread: PhantomData,
+                },
                 _one_thread: PhantomData,
             })
             .collect();
@@ -602,10 +609,14 @@ impl std::fmt::Debug for Port {
 /// type: `rte_eth_rx_burst` on one queue from two threads at once is not a
 /// thing DPDK offers, and a queue pair crossing to the thread that will use it
 /// is exactly what the driver does with it.
+///
+/// The two directions can also be taken apart ([`QueuePair::split`]), and the
+/// DPDK media does take them apart: the one receive thread polls **every**
+/// receive queue the port opened, while each sending agent owns one transmit
+/// queue. See [`RxQueue`] and [`TxQueue`].
 pub struct QueuePair {
-    port: Arc<Port>,
-    rx_queue: u16,
-    tx_queue: u16,
+    rx: RxQueue,
+    tx: TxQueue,
     _one_thread: PhantomData<*mut ()>,
 }
 
@@ -616,6 +627,44 @@ unsafe impl Send for QueuePair {}
 
 impl QueuePair {
     /// The port this pair belongs to.
+    pub fn port(&self) -> &Arc<Port> {
+        self.rx.port()
+    }
+
+    /// The two directions, one per thread that drives them.
+    ///
+    /// Why this exists rather than a pair per role: which queue the **device**
+    /// puts an inbound frame on is not this crate's to choose. A virtio port
+    /// announces `RTE_MAX(nb_rx_queues, nb_tx_queues)` queue pairs at device
+    /// start (`drivers/net/virtio/virtio_ethdev.c:2383-2385`) and the backend hashes inbound
+    /// flows across every pair it was given, so the one receive thread has to
+    /// poll every receive queue the port opened — while two sending agents
+    /// still need a transmit queue each. A pair bundling both directions could
+    /// not express that: the receive side would have to own pairs whose
+    /// transmit halves belong to somebody else.
+    pub fn split(self) -> (RxQueue, TxQueue) {
+        (self.rx, self.tx)
+    }
+}
+
+/// The receive half of a queue pair, owned by the one thread that polls it.
+///
+/// `Send` and neither `Sync` nor `Clone`, for the reason [`QueuePair`] gives:
+/// one queue, one thread — and the driver's receive thread holds every receive
+/// queue the port opened, in one `Vec`, in the order it polls them.
+pub struct RxQueue {
+    port: Arc<Port>,
+    queue: u16,
+    _one_thread: PhantomData<*mut ()>,
+}
+
+// SAFETY: the queue is moved to the thread that owns it and never shared;
+// nothing in it is bound to the thread that created it (the port's id is a
+// number and DPDK's queues are not thread-affine, only single-threaded).
+unsafe impl Send for RxQueue {}
+
+impl RxQueue {
+    /// The port this queue belongs to.
     pub fn port(&self) -> &Arc<Port> {
         &self.port
     }
@@ -654,12 +703,12 @@ impl QueuePair {
 
         // SAFETY: the descriptor array holds `SHIM_BURST_MAX` writable
         // descriptors and `max` is at most that; the queue index is one this
-        // pair was set up with, and the pair's `Send + !Sync` means no other
-        // thread is in this queue.
+        // queue was set up with, and the `Send + !Sync` means no other thread
+        // is in this queue.
         let count = unsafe {
             sys::shim_rx_burst(
                 c_uint::from(self.port.id),
-                c_uint::from(self.rx_queue),
+                c_uint::from(self.queue),
                 descs.as_mut_ptr(),
                 max as c_uint,
             )
@@ -700,7 +749,30 @@ impl QueuePair {
     }
 }
 
-impl QueuePair {
+/// The transmit half of a queue pair, owned by the one thread that sends on
+/// it.
+///
+/// `Send` and neither `Sync` nor `Clone`, for the reason [`QueuePair`] gives:
+/// one queue, one thread — and the DPDK media gives each sending agent a
+/// transmit queue of its own, because two agents sharing one is the
+/// 2026-11-16 lost-frame shape.
+pub struct TxQueue {
+    port: Arc<Port>,
+    queue: u16,
+    _one_thread: PhantomData<*mut ()>,
+}
+
+// SAFETY: the queue is moved to the thread that owns it and never shared;
+// nothing in it is bound to the thread that created it (the port's id is a
+// number and DPDK's queues are not thread-affine, only single-threaded).
+unsafe impl Send for TxQueue {}
+
+impl TxQueue {
+    /// The port this queue belongs to.
+    pub fn port(&self) -> &Arc<Port> {
+        &self.port
+    }
+
     /// Allocate up to `count` frames, let `fill` write each, and hand them to
     /// the NIC. Answers how many left.
     ///
@@ -771,12 +843,12 @@ impl QueuePair {
         }
 
         // SAFETY: the first `allocated` slots hold live frames this code owns,
-        // with the lengths it just wrote; the queue index is one this pair was
+        // with the lengths it just wrote; the queue index is one this queue was
         // set up with, and `Send + !Sync` means no other thread is in it.
         let sent = unsafe {
             sys::shim_tx_burst(
                 c_uint::from(self.port.id),
-                c_uint::from(self.tx_queue),
+                c_uint::from(self.queue),
                 slots.as_mut_ptr(),
                 allocated as c_uint,
             )
@@ -786,12 +858,54 @@ impl QueuePair {
     }
 }
 
+impl QueuePair {
+    /// Take up to `max` frames off the receive queue; see
+    /// [`RxQueue::rx_burst`].
+    pub fn rx_burst<'pool>(
+        &mut self,
+        pool: &'pool Mempool,
+        max: usize,
+        f: &mut dyn FnMut(RxFrame<'_>) -> Disposition,
+        kept: &mut Vec<ParkedFrame<'pool>>,
+    ) -> usize {
+        self.rx.rx_burst(pool, max, f, kept)
+    }
+
+    /// Allocate up to `count` frames and send them; see [`TxQueue::tx_burst`].
+    pub fn tx_burst(
+        &mut self,
+        pool: &Mempool,
+        count: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> (usize, TxOffloads),
+    ) -> usize {
+        self.tx.tx_burst(pool, count, fill)
+    }
+}
+
 impl std::fmt::Debug for QueuePair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QueuePair")
+            .field("port", &self.rx.port.info.name)
+            .field("rx_queue", &self.rx.queue)
+            .field("tx_queue", &self.tx.queue)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RxQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RxQueue")
             .field("port", &self.port.info.name)
-            .field("rx_queue", &self.rx_queue)
-            .field("tx_queue", &self.tx_queue)
+            .field("queue", &self.queue)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for TxQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxQueue")
+            .field("port", &self.port.info.name)
+            .field("queue", &self.queue)
             .finish()
     }
 }

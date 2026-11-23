@@ -127,6 +127,19 @@ fn answer_echo(
         return;
     }
 
+    // The answer leaves by the route table, not by the MAC the request
+    // happened to arrive with: a cloud VPC sends its outbound frames to the
+    // gateway's MAC and does not promise to keep the inbound source MAC, so a
+    // reply addressed to `ethernet.source` is dropped on the way out
+    // (2026-11-23, Aliyun c7). The inbound MAC remains the fallback for a peer
+    // the neighbour table does not know.
+    let mut reply_destination = ethernet.source;
+    if let Some(next_hop) = stack.next_hop(ipv4.source) {
+        if let super::neighbour::NextHop::Known(hardware) = stack.neighbour(next_hop) {
+            reply_destination = hardware;
+        }
+    }
+
     let params = stack.params();
     let mut reply = vec![
         0u8;
@@ -138,7 +151,7 @@ fn answer_echo(
     let Some(written) = frame::write_icmp_echo_reply(
         &mut reply,
         &frame::Ipv4Write {
-            destination_hardware: ethernet.source,
+            destination_hardware: reply_destination,
             source_hardware: params.mac,
             source: params.address,
             destination: ipv4.source,
@@ -566,6 +579,112 @@ mod tests {
         );
 
         assert!(answered, "and the answer left");
+    }
+
+    /// A reply leaves by the neighbour table, not by the MAC the request
+    /// happened to arrive with: a cloud VPC sends its outbound frames to the
+    /// gateway's MAC, and an answer addressed to the peer's real MAC is
+    /// dropped before it reaches it (2026-11-23, `answer_echo` answered ICMP
+    /// with `ethernet.source`).
+    #[test]
+    fn an_echo_reply_goes_to_the_neighbours_mac() {
+        const GATEWAY_MAC: [u8; 6] = [0xee, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let wire = Wire::new();
+        let params = StackParams {
+            static_neighbours: vec![(PEER, GATEWAY_MAC)],
+            ..StackParams::new(OWN, 24, OUR_MAC)
+        };
+        let stack = Stack::over_a_fake_wire(&wire, Side::A, params, Clock::Monotonic);
+
+        let payload = b"ping";
+        let mut bytes = vec![0u8; frame::ETHERNET_HEADER_LENGTH + 20 + 8 + payload.len()];
+        let written = frame::write_icmp_echo(
+            &mut bytes,
+            &Ipv4Write {
+                destination_hardware: OUR_MAC,
+                source_hardware: PEER_MAC,
+                source: PEER,
+                destination: OWN,
+                identification: 3,
+            },
+            &IcmpEcho {
+                echo_type: ICMP_ECHO_REQUEST,
+                identifier: 0x1234,
+                sequence: 7,
+                payload,
+            },
+            ICMP_ECHO_REQUEST,
+        )
+        .expect("a frame");
+        bytes.truncate(written);
+
+        send(&mut far_end(&wire), &bytes);
+        assert_eq!(1, stack.pump());
+        assert_eq!(1, wire.queued(Side::A), "the answer left");
+
+        let mut destination = None;
+        far_end(&wire).rx_burst(
+            1,
+            &mut |frame| {
+                let header = frame::read_ethernet_header(frame.bytes).expect("an Ethernet header");
+                destination = Some(header.destination);
+                Disposition::Consumed
+            },
+            &mut Vec::new(),
+        );
+
+        assert_eq!(
+            Some(GATEWAY_MAC),
+            destination,
+            "the reply goes to the next hop's MAC, not the inbound source's"
+        );
+    }
+
+    /// ...and when the neighbour table has nothing, the inbound source MAC is
+    /// the only address known, so it is what the answer uses.
+    #[test]
+    fn an_echo_reply_falls_back_to_the_inbound_source_mac() {
+        let wire = Wire::new();
+        let stack = stack(&wire);
+
+        let payload = b"ping";
+        let mut bytes = vec![0u8; frame::ETHERNET_HEADER_LENGTH + 20 + 8 + payload.len()];
+        let written = frame::write_icmp_echo(
+            &mut bytes,
+            &Ipv4Write {
+                destination_hardware: OUR_MAC,
+                source_hardware: PEER_MAC,
+                source: PEER,
+                destination: OWN,
+                identification: 3,
+            },
+            &IcmpEcho {
+                echo_type: ICMP_ECHO_REQUEST,
+                identifier: 0x1234,
+                sequence: 7,
+                payload,
+            },
+            ICMP_ECHO_REQUEST,
+        )
+        .expect("a frame");
+        bytes.truncate(written);
+
+        send(&mut far_end(&wire), &bytes);
+        assert_eq!(1, stack.pump());
+        assert_eq!(1, wire.queued(Side::A), "the answer left");
+
+        let mut destination = None;
+        far_end(&wire).rx_burst(
+            1,
+            &mut |frame| {
+                let header = frame::read_ethernet_header(frame.bytes).expect("an Ethernet header");
+                destination = Some(header.destination);
+                Disposition::Consumed
+            },
+            &mut Vec::new(),
+        );
+
+        assert_eq!(Some(PEER_MAC), destination, "the only MAC anybody knows");
     }
 
     /// A frame with no ethertype the stack serves is counted as an
