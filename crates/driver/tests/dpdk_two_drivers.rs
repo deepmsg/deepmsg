@@ -157,10 +157,10 @@ impl Driver {
     /// Start a driver whose data paths are on `device`, holding `address`.
     ///
     /// `SHARED` and not the default `DEDICATED`: a threading mode is a map of
-    /// queues to threads, `DEDICATED` wants three queue pairs, and a virtual
+    /// queues to threads, `DEDICATED` wants two queue pairs, and a virtual
     /// device has one of each — the same wall every vdev in this build has met
     /// (the D4 record's "虚拟设备只有一条队列"). The hardware port would take
-    /// three, but the mode is not what this case is about: what it is about is
+    /// two, but the mode is not what this case is about: what it is about is
     /// whether a message crosses, and one thread running both agents is the
     /// smallest thing that can answer.
     fn start(dir: &Path, device: &Device, address: &str) -> Self {

@@ -52,6 +52,9 @@ const EAL_ARGS: [&str; 4] = [
 /// Where a child is told to find the capture it receives.
 const RX_PCAP: &str = "DEEPMSG_DRIVER_DPDK_RX_PCAP";
 
+/// Where the case that polls two queues finds the second capture.
+const RX_PCAP_TWO: &str = "DEEPMSG_DRIVER_DPDK_RX_PCAP_TWO";
+
 /// Where a child is told to write what it sends.
 const TX_PCAP: &str = "DEEPMSG_DRIVER_DPDK_TX_PCAP";
 
@@ -144,6 +147,100 @@ fn a_frame_arrives_as_a_parked_mbuf_in_the_child() {
         started.pool.available(),
         "and every one of them is back when its transport lets it go"
     );
+}
+
+/// A receive port polls **every** queue it was given, one burst each in turn.
+///
+/// The queues come from two `net_pcap` ports, and that is what makes the case
+/// able to say which queue a frame came from: the two captures hold
+/// distinguishable frames. What is under test is the adapter's rotation, not
+/// how one device fills its own queues — the 2026-11-23 Aliyun defect was an
+/// adapter polling a single receive queue while the device hashed inbound
+/// flows across several, and this is that shape with the frames made visible.
+#[test]
+fn a_receive_port_polls_every_queue_it_was_given() {
+    let first = Capture::of("polled-first", std::slice::from_ref(&a_frame(0)));
+    let second = Capture::of("polled-second", std::slice::from_ref(&a_frame(1)));
+    in_a_child(
+        "a_receive_port_polls_every_queue_it_was_given_in_the_child",
+        &[(RX_PCAP, first.path()), (RX_PCAP_TWO, second.path())],
+    );
+}
+
+/// One receive call over `port`, asking for a single frame.
+fn take_one(port: &mut DpdkRxPort, arrived: &mut Vec<Vec<u8>>) -> usize {
+    port.rx_burst(
+        1,
+        &mut |frame| {
+            arrived.push(frame.bytes.to_vec());
+            Disposition::Consumed
+        },
+        &mut Vec::new(),
+    )
+}
+
+#[test]
+#[ignore = "runs as a child of `a_receive_port_polls_every_queue_it_was_given`"]
+fn a_receive_port_polls_every_queue_it_was_given_in_the_child() {
+    let first = std::env::var(RX_PCAP).expect("the parent passes the first capture's path");
+    let second = std::env::var(RX_PCAP_TWO).expect("and the second's");
+
+    let mut args = EAL_ARGS.to_vec();
+    let first_vdev = format!("--vdev=net_pcap0,rx_pcap={first}");
+    let second_vdev = format!("--vdev=net_pcap1,rx_pcap={second}");
+    args.push(&first_vdev);
+    args.push(&second_vdev);
+    Eal::init(&args).expect("EAL starts");
+
+    let pool = Box::leak(Box::new(
+        Mempool::create(
+            "dpdk_port_two_queues",
+            &MempoolSettings {
+                count: 1023,
+                cache: 64,
+                ..MempoolSettings::default()
+            },
+        )
+        .expect("a pool"),
+    ));
+
+    let settings = PortSettings {
+        rx_queues: 1,
+        tx_queues: 0,
+        rx_descriptors: 128,
+        ..PortSettings::default()
+    };
+    let (_first_port, mut first_pairs) =
+        Port::start("net_pcap0", &settings, pool).expect("the first port starts");
+    let (_second_port, mut second_pairs) =
+        Port::start("net_pcap1", &settings, pool).expect("the second port starts");
+
+    let (first_queue, _) = first_pairs.pop().expect("a queue pair").split();
+    let (second_queue, _) = second_pairs.pop().expect("a queue pair").split();
+
+    let mut port = DpdkRxPort::over(vec![first_queue, second_queue], pool);
+    let mut arrived = Vec::new();
+
+    // The first call takes the first queue, the second the next one: one
+    // burst each, the budget shared across them, and the cursor left where it
+    // stopped. An adapter that polled one queue only would answer the second
+    // call with the same capture's frame, or with nothing.
+    assert_eq!(
+        1,
+        take_one(&mut port, &mut arrived),
+        "the first queue had one"
+    );
+    assert_eq!(
+        1,
+        take_one(&mut port, &mut arrived),
+        "and so did the second"
+    );
+    assert_eq!(a_frame(0), arrived[0], "the first queue's frame");
+    assert_eq!(a_frame(1), arrived[1], "then the other queue's");
+
+    // And the rotation keeps going: both queues are empty now, so a call that
+    // asks for one takes nothing and says so.
+    assert_eq!(0, take_one(&mut port, &mut arrived));
 }
 
 /// A frame the reader consumes is released inside the burst, so a pass that

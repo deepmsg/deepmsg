@@ -25,10 +25,12 @@
 //!
 //! The port every case here uses is `net_pcap`, which has **one** receive queue
 //! and one transmit queue — so the modes that put both agents on one thread
-//! open, and `DEDICATED`, which wants three pairs, does not. That is a fact
+//! open, and `DEDICATED`, which wants two pairs, does not. That is a fact
 //! about the CI path rather than about this port: every virtual device this
-//! build's tests run on reports one queue of each, so the three-pair shape is
-//! one only a real NIC is ever asked for.
+//! build's tests run on reports one queue of each, so the two-pair shape is
+//! one only a real NIC is ever asked for. The case that does open it
+//! (`a_dedicated_media_opens_on_a_two_queue_device`) uses `net_null`, which
+//! has as many queues as a card.
 
 #![cfg(feature = "dpdk")]
 
@@ -445,14 +447,14 @@ fn the_eal_starts_no_workers_of_its_own_in_the_child() {
 // ---- what a device that cannot carry the shape is told ------------------
 
 /// §4.7's `DEDICATED` shape is one receive queue and two transmit queues, which
-/// on a device that hands out queue pairs is three of each — and `net_pcap` has
+/// on a device that hands out queue pairs is two of each — and `net_pcap` has
 /// one.
 ///
 /// The refusal is the criterion: it names the port and both numbers, where
 /// `rte_eth_dev_configure` would answer a code with no sentence attached. And
 /// it is a fact about the CI path rather than about this port: every virtual
 /// device this build's tests run on reports one queue of each, so the
-/// three-pair shape is one only a real NIC is ever asked for.
+/// two-pair shape is one only a real NIC is ever asked for.
 #[test]
 fn a_device_with_too_few_queues_is_refused_by_name() {
     let capture = capture_of("few", 0);
@@ -478,6 +480,60 @@ fn a_device_with_too_few_queues_is_refused_by_name_in_the_child() {
         refused.to_string().contains("1 receive and 1 transmit"),
         "and what the device has, beside what was asked: {refused}"
     );
+}
+
+/// A device that **can** carry `DEDICATED`'s two pairs opens, and the receive
+/// side is one port polling both receive queues.
+///
+/// `net_null` has as many queues as a real NIC, so this is the shape a
+/// `DEDICATED` media has on hardware: two pairs opened, both receive queues
+/// polled by the one receive thread, and each sending agent on a transmit
+/// queue of its own. The frames are the PMD's own — it generates one on
+/// whichever queue it is asked for — so what this judges is the open, the
+/// queue map and the close; the bytes have cases of their own above, and which
+/// queue an adapter polls has one in `dpdk_port.rs`.
+#[test]
+fn a_dedicated_media_opens_on_a_two_queue_device() {
+    in_a_child(
+        "a_dedicated_media_opens_on_a_two_queue_device_in_the_child",
+        &[],
+    );
+}
+
+#[test]
+#[ignore = "runs as a child of `a_dedicated_media_opens_on_a_two_queue_device`"]
+fn a_dedicated_media_opens_on_a_two_queue_device_in_the_child() {
+    let settings = DpdkSettings {
+        eal_args: "--no-huge --vdev=net_null0".to_owned(),
+        port: Some("net_null0".to_owned()),
+        address: Some((OWN, 24)),
+        ..DpdkSettings::default()
+    };
+
+    let media = DpdkMedia::open(&settings, ThreadingMode::Dedicated, None)
+        .expect("net_null carries the two pairs DEDICATED asks for");
+    let pool = media.pool();
+    let whole = media.pool_size();
+
+    let mut ports = media.into_ports().expect("the mode's three roles");
+    let mut parked = Vec::new();
+    assert_eq!(
+        1,
+        ports
+            .rx
+            .rx_burst(1, &mut |_| Disposition::Consumed, &mut parked),
+        "the receive port hands a frame over"
+    );
+    assert_eq!(
+        1,
+        ports
+            .rx
+            .rx_burst(1, &mut |_| Disposition::Consumed, &mut parked),
+        "and the port keeps handing frames over"
+    );
+
+    drop(ports);
+    assert_eq!(whole, pool.available(), "and a close gives everything back");
 }
 
 // ---- one media per process ----------------------------------------------

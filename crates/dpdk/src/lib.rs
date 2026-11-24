@@ -48,7 +48,7 @@ pub use error::Error;
 pub use mempool::{Mempool, MempoolSettings, ParkedFrame};
 pub use port::{
     Checksum, Disposition, Link, Port, PortInfo, PortSettings, PortStats, QueuePair, RxFrame,
-    TxOffloads,
+    RxQueue, TxOffloads, TxQueue,
 };
 pub use ring::{Consumer, FrameRing, Producer};
 pub use sys::{SHIM_BURST_MAX, SHIM_BURST_MIN};
