@@ -89,3 +89,31 @@ fn f11_a_min_mark_timestamp_is_not_alive() {
     ));
     let _ = std::fs::remove_file(&path);
 }
+
+/// Found by `03_cnc_rings_and_logs`: a broadcast region whose latest counter
+/// is not a position, so the liveness check's `cursor + capacity` overflowed.
+/// The production regression is `broadcast.rs`'s
+/// `a_latest_counter_that_is_not_a_position_is_not_a_ring`; the whole region
+/// the nightly run wrote is kept under `corpus_seed/03_cnc_rings_and_logs/`
+/// and replayed here.
+#[test]
+fn f12_a_broadcast_region_without_a_position_reads_as_nothing() {
+    const BROADCAST: usize = 4096 + deepmsg_cnc::layout::BROADCAST_TRAILER_LENGTH;
+
+    #[repr(align(64))]
+    struct Aligned([u8; BROADCAST]);
+
+    let data = include_bytes!(
+        "../corpus_seed/03_cnc_rings_and_logs/crash-3feaa0d2-i64-max-latest-counter"
+    );
+    let mut bytes = Aligned([0_u8; BROADCAST]);
+    let len = data.len().min(BROADCAST);
+    bytes.0[..len].copy_from_slice(&data[..len]);
+
+    let region = deepmsg_core::buffer::AtomicBuffer::from_slice(&bytes.0).expect("aligned");
+    if let Some(mut receiver) = deepmsg_cnc::broadcast::ToClientsReceiver::new(&region) {
+        for _ in 0..16 {
+            let _ = receiver.receive(&region);
+        }
+    }
+}

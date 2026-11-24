@@ -260,3 +260,20 @@ mark_header 13_mark_files archive-mark 100 56 4 2 196864
 # A DATA frame header (32 bytes total) with no payload behind it.
 crafted 05_udp_protocol_frames 01-data-header \
     '\040\000\000\000\000\300\001\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000'
+
+# Every target needs a `corpus/<target>/` even when it has no seed: the smoke
+# recipe hands libFuzzer an explicit corpus path, and libFuzzer refuses one
+# that does not exist. The targets without crafted seeds (`02_logbuffer_scan`,
+# `04_cnc_command_decode`, `11_cluster_recording_log`, `12_state_machine_rings`)
+# had none, so the scheduled smoke failed on the first of them (2026-11-24);
+# the pull-request tier only compiles the targets, so it never saw this.
+#
+# A target can also carry durable seeds of its own (`corpus_seed/<target>/`),
+# which is where a crash from the nightly run is kept: the replay is what keeps
+# the corpus from losing the shape that found it. `seed_dir` copies whatever
+# is there, and does nothing for a target without one.
+for target in "$root"/fuzz_targets/*.rs; do
+    name=$(basename "$target" .rs)
+    mkdir -p "$root/corpus/$name"
+    seed_dir "$name"
+done
