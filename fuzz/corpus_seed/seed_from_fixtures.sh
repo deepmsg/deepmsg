@@ -267,6 +267,13 @@ crafted 05_udp_protocol_frames 01-data-header \
 # `04_cnc_command_decode`, `11_cluster_recording_log`, `12_state_machine_rings`)
 # had none, so the scheduled smoke failed on the first of them (2026-11-24);
 # the pull-request tier only compiles the targets, so it never saw this.
+#
+# A target can also carry durable seeds of its own (`corpus_seed/<target>/`),
+# which is where a crash from the nightly run is kept: the replay is what keeps
+# the corpus from losing the shape that found it. `seed_dir` copies whatever
+# is there, and does nothing for a target without one.
 for target in "$root"/fuzz_targets/*.rs; do
-    mkdir -p "$root/corpus/$(basename "$target" .rs)"
+    name=$(basename "$target" .rs)
+    mkdir -p "$root/corpus/$name"
+    seed_dir "$name"
 done

@@ -111,6 +111,18 @@ impl std::fmt::Display for TransmitError {
 
 impl std::error::Error for TransmitError {}
 
+/// Whether `position` is one a writer could have produced.
+///
+/// The counters are in shared memory another process may have left anything
+/// in. A position is non-negative and has room for one ring window after it,
+/// so the receiver's `position + capacity` comparison is total; anything else
+/// is not a position (2026-11-24, `03_cnc_rings_and_logs`: a latest counter of
+/// `i64::MAX` overflowed `slot_is_live`). The transmitter applies the same
+/// rule to its own additions (`TransmitError::OutOfRange`).
+fn is_writer_position(position: i64, capacity: usize) -> bool {
+    position >= 0 && position.checked_add(capacity as i64).is_some()
+}
+
 /// A writer over the to-clients region.
 ///
 /// The driver is its only user, and the only writer on this ring in the whole
@@ -400,6 +412,16 @@ impl ToClientsReceiver {
         let next_record =
             region.load_i64_acquire(trailer + layout::BROADCAST_LATEST_COUNTER_OFFSET)?;
 
+        // The trailer is shared memory another process may have left anything
+        // in, and the reader's window check adds `capacity` to a position. The
+        // transmitter already refuses to add to a counter near `i64::MAX`
+        // (`TransmitError::OutOfRange`); a receiver constructed on such a
+        // counter would panic in `slot_is_live` instead, so it is no ring
+        // (2026-11-24, `03_cnc_rings_and_logs`).
+        if !is_writer_position(next_record, capacity) {
+            return None;
+        }
+
         Some(Self {
             capacity,
             mask: capacity - 1,
@@ -437,12 +459,16 @@ impl ToClientsReceiver {
         self.discarded
     }
 
-    /// How many records carried a length the writer could not have produced.
+    /// How many records carried a length — or a counter carried a position —
+    /// the writer could not have produced.
     ///
     /// The reference has no equivalent: it trusts the record's own length when
     /// computing where the next one starts, and that length is a *signed*
     /// field, so garbage there can move its cursor backwards. Bounding it
-    /// first is a deliberate divergence, recorded rather than silent.
+    /// first is a deliberate divergence, recorded rather than silent. The same
+    /// rule is applied to the trailer's counters: one that is not a position
+    /// is a zero answer rather than an index (`broadcast.rs`'s
+    /// [`is_writer_position`]).
     pub const fn malformed(&self) -> u64 {
         self.malformed
     }
@@ -463,6 +489,10 @@ impl ToClientsReceiver {
         let Some(tail) = self.load_counter(region, layout::BROADCAST_TAIL_COUNTER_OFFSET) else {
             return Received::Empty;
         };
+        if !is_writer_position(tail, self.capacity) {
+            self.malformed += 1;
+            return Received::Empty;
+        }
 
         let mut cursor = self.next_record;
         if tail <= cursor {
@@ -480,6 +510,10 @@ impl ToClientsReceiver {
             else {
                 return Received::Empty;
             };
+            if !is_writer_position(latest, self.capacity) {
+                self.malformed += 1;
+                return Received::Empty;
+            }
             cursor = latest;
             offset = self.index_of(cursor);
         }
@@ -579,6 +613,13 @@ impl ToClientsReceiver {
     /// Whether the slot at `cursor` has not yet been (or is not about to be)
     /// overwritten.
     fn slot_is_live(&self, region: &AtomicBuffer<ReadOnly>, cursor: i64) -> bool {
+        // Every cursor this type computes or accepts is checked by
+        // [`is_writer_position`] before it gets here; the debug build holds
+        // that to be true, and the release build is where the check pays.
+        debug_assert!(
+            is_writer_position(cursor, self.capacity),
+            "a cursor the writer could have produced"
+        );
         self.load_counter(region, layout::BROADCAST_TAIL_INTENT_COUNTER_OFFSET)
             .is_none_or(|intent| cursor + self.capacity as i64 > intent)
     }
@@ -1099,5 +1140,69 @@ mod tests {
                 .transmit(&writer.buffer, 1, b"x")
                 .is_err()
         );
+    }
+
+    /// The same rule on the reader's side. A latest counter near `i64::MAX` is
+    /// not a position, and a receiver built on one would put a cursor one
+    /// ring-window past `i64::MAX` into `slot_is_live`. Fuzz target
+    /// `03_cnc_rings_and_logs` found it (2026-11-24).
+    #[test]
+    fn a_latest_counter_that_is_not_a_position_is_not_a_ring() {
+        let mut fixture = Fixture::new();
+        let writer = Writer::new(&mut fixture.bytes.0);
+
+        for hostile in [-1, i64::MAX, i64::MAX - CAPACITY as i64 + 1] {
+            writer.store_i64(layout::BROADCAST_LATEST_COUNTER_OFFSET, hostile);
+            assert!(
+                ToClientsReceiver::new(&writer.as_read_only()).is_none(),
+                "latest {hostile} is not a position"
+            );
+        }
+
+        writer.store_i64(
+            layout::BROADCAST_LATEST_COUNTER_OFFSET,
+            i64::MAX - CAPACITY as i64,
+        );
+        assert!(
+            ToClientsReceiver::new(&writer.as_read_only()).is_some(),
+            "the last position with room for one window is still a position"
+        );
+    }
+
+    /// A tail counter that is not a position is a zero answer and counted —
+    /// not an index into the ring.
+    #[test]
+    fn a_tail_counter_that_is_not_a_position_is_malformed() {
+        for hostile in [-1, i64::MAX] {
+            let mut fixture = Fixture::new();
+
+            fixture.with(|writer, receiver| {
+                writer.set_tail(hostile);
+
+                assert_eq!(
+                    Received::Empty,
+                    receiver.receive(&writer.as_read_only()),
+                    "tail {hostile} is not a position"
+                );
+                assert_eq!(1, receiver.malformed(), "and it is counted");
+            });
+        }
+    }
+
+    /// A forced resync to a latest counter that is not a position is a zero
+    /// answer and counted — not an overflowing liveness check.
+    #[test]
+    fn a_latest_counter_that_is_not_a_position_at_resync_is_malformed() {
+        let mut fixture = Fixture::new();
+
+        fixture.with(|writer, receiver| {
+            writer.store_i64(layout::BROADCAST_LATEST_COUNTER_OFFSET, i64::MAX);
+            writer.set_tail(8);
+            writer.overtake(CAPACITY as i64);
+
+            assert_eq!(Received::Empty, receiver.receive(&writer.as_read_only()));
+            assert_eq!(1, receiver.lapped(), "the resync is what was attempted");
+            assert_eq!(1, receiver.malformed());
+        });
     }
 }
