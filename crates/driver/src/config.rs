@@ -1498,10 +1498,15 @@ impl DriverConfig {
             }
         }
 
-        if let Some(value) = get(&Setting::UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA) {
-            config.media = parse_media(&Setting::UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA, &value)?;
+        let media_named = get(&Setting::UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA);
+        if let Some(value) = media_named.as_deref() {
+            config.media = parse_media(&Setting::UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA, value)?;
         }
         parse_dpdk(&get, &mut config.dpdk)?;
+        if let Some(value) = get(&Setting::DPDK_ENABLED) {
+            let enabled = parse_bool(&Setting::DPDK_ENABLED, &value)?;
+            config.media = switched_media(config.media, media_named.is_some(), enabled, &value)?;
+        }
         if let Some(value) = get(&Setting::CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA) {
             parse_transport_bindings(
                 &Setting::CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA,
@@ -2147,6 +2152,18 @@ impl Setting {
     const DIR: Self = Self {
         property: "dir",
         env: "AERON_DIR",
+    };
+    /// `deepmsg.dpdk.enabled` (`DEEPMSG_DPDK_ENABLED`): the C++ media's own
+    /// switch for the DPDK media, served here as an **alias** for the
+    /// reference's media name so that a configuration written for that media
+    /// means the same thing on this one.
+    ///
+    /// The reference's `aeron.udp.channel.transport.bindings.media=dpdk` stays
+    /// the primary name; naming both is allowed only when they agree
+    /// ([`ConfigError::DpdkSwitchConflict`]).
+    const DPDK_ENABLED: Self = Self {
+        property: "dpdk.enabled",
+        env: "DEEPMSG_DPDK_ENABLED",
     };
     /// `deepmsg.dpdk.eal.args` (`DEEPMSG_DPDK_EAL_ARGS`): what the EAL is
     /// initialised with, verbatim (`design.md` §4.9). The driver appends its
@@ -3044,6 +3061,17 @@ pub enum ConfigError {
         /// And the one that would have decided instead.
         second: &'static str,
     },
+    /// `deepmsg.dpdk.enabled` and the transport-bindings media name disagree
+    /// about which media runs.
+    ///
+    /// The two names are one answer — the C++ media's switch is an alias for
+    /// the reference's — so naming both and having them say different things
+    /// is refused rather than resolved by an order nothing documents.
+    DpdkSwitchConflict {
+        /// What `deepmsg.dpdk.enabled` said, which is the half the message
+        /// has to name: the other name's value is the other half.
+        enabled: bool,
+    },
     /// A supplier name the reference's symbol table does not know — flow
     /// control, congestion control or name resolution — which for the
     /// reference is a driver that does not start.
@@ -3171,6 +3199,12 @@ impl std::fmt::Display for ConfigError {
                 "{first} and {second} both name a rule for what the receive side \
                  should drop, and only one can be in force"
             ),
+            Self::DpdkSwitchConflict { enabled } => write!(
+                f,
+                "deepmsg.dpdk.enabled is {enabled} and \
+                 aeron.udp.channel.transport.bindings.media names the other media; \
+                 the two are one answer and may not disagree"
+            ),
             Self::UnknownSupplier { name, value } => {
                 write!(f, "{name} is {value}, which names no supplier")
             }
@@ -3249,6 +3283,7 @@ impl std::error::Error for ConfigError {
             | Self::NotANumber { .. }
             | Self::OutOfRange { .. }
             | Self::ConflictingSettings { .. }
+            | Self::DpdkSwitchConflict { .. }
             | Self::UnknownSupplier { .. }
             | Self::UnknownTransportBindings { .. }
             | Self::MalformedValue { .. }
@@ -3328,6 +3363,54 @@ fn parse_media(setting: &Setting, value: &str) -> Result<MediaSelection, ConfigE
             name: setting.property,
             value: other.to_owned(),
         }),
+    }
+}
+
+/// Which media runs, given the reference's media name (if it was named) and
+/// the C++ media's `deepmsg.dpdk.enabled` switch (if it was named).
+///
+/// Two names, one answer: the switch is an **alias**, so a configuration
+/// written for either media means the same thing here. What the alias may not
+/// do is disagree with the name the reference owns — two switches that say
+/// different things are refused rather than resolved by an order nothing
+/// documents ([`ConfigError::DpdkSwitchConflict`]).
+///
+/// `true` in a build without the feature is refused the same way a
+/// `media=dpdk` name is, and for the same reason: the reference's answer to a
+/// bindings name it does not hold is a driver that does not start
+/// (`aeron_driver_context.c:1258-1270`).
+///
+/// # Errors
+///
+/// [`ConfigError::DpdkSwitchConflict`] when the two names disagree, and
+/// [`ConfigError::DpdkNotInThisBuild`] for `true` without the feature.
+fn switched_media(
+    named: MediaSelection,
+    media_named: bool,
+    enabled: bool,
+    value: &str,
+) -> Result<MediaSelection, ConfigError> {
+    if media_named && matches!(named, MediaSelection::Dpdk) != enabled {
+        return Err(ConfigError::DpdkSwitchConflict { enabled });
+    }
+
+    if !enabled {
+        return Ok(MediaSelection::Default);
+    }
+
+    #[cfg(feature = "dpdk")]
+    {
+        // The value is only carried into the missing-feature message, which
+        // the other arm writes.
+        let _ = value;
+        Ok(MediaSelection::Dpdk)
+    }
+    #[cfg(not(feature = "dpdk"))]
+    {
+        Err(ConfigError::DpdkNotInThisBuild {
+            name: Setting::DPDK_ENABLED.property,
+            value: value.to_owned(),
+        })
     }
 }
 
@@ -5640,6 +5723,96 @@ mod tests {
                     other => panic!("{property}={name} must be refused, got {other:?}"),
                 }
             }
+        }
+    }
+
+    /// The C++ media's `deepmsg.dpdk.enabled` is served as an alias for the
+    /// reference's media name, and the two may not disagree.
+    #[test]
+    fn the_dpdk_enabled_switch_is_the_name_the_cpp_media_uses() {
+        // `true` alone selects the DPDK media, exactly as `media=dpdk` does:
+        // a configuration written for the C++ media names no second switch.
+        #[cfg(feature = "dpdk")]
+        {
+            let config = resolve(&[
+                ("aeron.dir", "/tmp/aeron-test"),
+                ("deepmsg.dpdk.enabled", "true"),
+            ])
+            .expect("the switch alone is enough");
+            assert_eq!(MediaSelection::Dpdk, config.media);
+
+            // The same switch through the environment, which is the other name
+            // both media read.
+            let config = resolve_with_env(
+                &[("aeron.dir", "/tmp/aeron-test")],
+                &[("DEEPMSG_DPDK_ENABLED", "true")],
+            )
+            .expect("the switch has an environment name");
+            assert_eq!(MediaSelection::Dpdk, config.media);
+
+            // Two names that agree are one answer.
+            let config = resolve(&[
+                ("aeron.dir", "/tmp/aeron-test"),
+                ("deepmsg.dpdk.enabled", "true"),
+                ("aeron.udp.channel.transport.bindings.media", "dpdk"),
+            ])
+            .expect("two names that agree");
+            assert_eq!(MediaSelection::Dpdk, config.media);
+
+            // `false` next to the reference's `dpdk` is a contradiction.
+            match resolve(&[
+                ("aeron.dir", "/tmp/aeron-test"),
+                ("deepmsg.dpdk.enabled", "false"),
+                ("aeron.udp.channel.transport.bindings.media", "dpdk"),
+            ]) {
+                Err(ConfigError::DpdkSwitchConflict { enabled }) => assert!(!enabled),
+                other => panic!("false next to dpdk must be refused, got {other:?}"),
+            }
+        }
+
+        // In a build without the feature `true` names the missing feature, the
+        // way the reference's own name does.
+        #[cfg(not(feature = "dpdk"))]
+        match resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            ("deepmsg.dpdk.enabled", "true"),
+        ]) {
+            Err(ConfigError::DpdkNotInThisBuild { name, value }) => {
+                assert_eq!("dpdk.enabled", name);
+                assert_eq!("true", value);
+            }
+            other => panic!("enabled=true must name the missing feature, got {other:?}"),
+        }
+
+        // `false` alone is the kernel path, and that needs no feature.
+        let config = resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            ("deepmsg.dpdk.enabled", "false"),
+        ])
+        .expect("the switch turned off");
+        assert_eq!(MediaSelection::Default, config.media);
+
+        // `true` next to the reference's `default` is the other contradiction,
+        // and it is refused without the feature being built.
+        match resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            ("deepmsg.dpdk.enabled", "true"),
+            ("aeron.udp.channel.transport.bindings.media", "default"),
+        ]) {
+            Err(ConfigError::DpdkSwitchConflict { enabled }) => assert!(enabled),
+            other => panic!("true next to default must be refused, got {other:?}"),
+        }
+
+        // A value that is not a boolean names the setting it was given to.
+        match resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            ("deepmsg.dpdk.enabled", "turnip"),
+        ]) {
+            Err(ConfigError::NotABoolean { name, value }) => {
+                assert_eq!("dpdk.enabled", name);
+                assert_eq!("turnip", value);
+            }
+            other => panic!("a non-boolean must be refused, got {other:?}"),
         }
     }
 
