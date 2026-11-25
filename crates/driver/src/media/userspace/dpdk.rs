@@ -58,6 +58,9 @@
 //!   EAL                          (before the CnC file, so a failure leaves no
 //!                                 half a driver directory — §4.13)
 //!   the port, by name            (found, then asked what it is)
+//!   the hardware address         (**before** any configuration: a PMD may
+//!                                 rewrite the driver's copy while it
+//!                                 negotiates — see `Port::hardware_address`)
 //!   the pool                     (on that port's socket; one per process)
 //!   the port, started            (with what it said it could do)
 //!   the queue pairs, to be handed to whatever drives them
@@ -139,6 +142,9 @@ pub enum DpdkError {
     Pool(PortError),
     /// The port would not start.
     Port(PortError),
+    /// The port would not report the hardware address it had before anything
+    /// was configured on it.
+    HardwareAddress(PortError),
     /// The port would not report its extended statistics — its list of them, at
     /// open, or their values, on the timer.
     Extended(String),
@@ -182,6 +188,9 @@ impl std::fmt::Display for DpdkError {
             ),
             Self::Pool(error) => write!(f, "the frame pool could not be made: {error}"),
             Self::Port(error) => write!(f, "the port would not start: {error}"),
+            Self::HardwareAddress(error) => {
+                write!(f, "the port would not report its hardware address: {error}")
+            }
             Self::Extended(error) => {
                 write!(
                     f,
@@ -246,6 +255,10 @@ pub struct DpdkMedia {
     settings: DpdkSettings,
     mode: ThreadingMode,
     info: PortInfo,
+    /// The address the device had **before it was configured**, which is the
+    /// one a stack filters on: a PMD may rewrite the driver's live copy while
+    /// it negotiates features (see [`Port::hardware_address`]).
+    mac: [u8; 6],
     pool: &'static Mempool,
     /// How many frames the pool was made with, which is what a close has to
     /// give back (see the module note).
@@ -324,6 +337,16 @@ impl DpdkMedia {
             name: Some(name.clone()),
             found,
         })?;
+
+        // **The device's hardware address, taken before anything configures
+        // it.** A configuration may make the PMD renegotiate its features and
+        // rewrite the driver's copy of the address (DPDK's virtio does when
+        // both checksum offloads are asked for; on the Alibaba CIPU backend
+        // that copy came back with its second byte zeroed, 2026-11-25). The
+        // address the device shipped with does not move, and it is the one a
+        // stack has to filter on: the switch delivers frames to it.
+        let mac = Port::hardware_address(&name).map_err(DpdkError::HardwareAddress)?;
+
         let pairs = queue_pairs(mode);
         check_capability(&info, pairs)?;
 
@@ -353,6 +376,7 @@ impl DpdkMedia {
             settings: settings.clone(),
             mode,
             info,
+            mac,
             pool,
             pool_size,
             pairs,
@@ -362,6 +386,17 @@ impl DpdkMedia {
     /// What the port is, as it described itself before it was configured.
     pub const fn info(&self) -> &PortInfo {
         &self.info
+    }
+
+    /// The port this media opened — the device behind its first queue pair —
+    /// or `None` for a media with no pairs.
+    ///
+    /// A reading of the live object rather than a copy: the address it reports
+    /// is the driver's current one, which a PMD may have rewritten while it
+    /// negotiated. What the stack filters on is the copy taken before the
+    /// configuration (see [`Port::hardware_address`]).
+    pub fn port(&self) -> Option<&Arc<Port>> {
+        self.pairs.first().map(QueuePair::port)
     }
 
     /// The pool every frame of this media's comes from, and goes back to.
@@ -490,16 +525,18 @@ impl DpdkMedia {
     /// own address and prefix length, which nothing else can supply — and
     /// whatever [`DpdkMedia::into_ports`] answers.
     pub fn into_stack(self, now: Clock, receive_window: usize) -> Result<Arc<Stack>, DpdkError> {
-        let mac = match self.pairs.first() {
-            Some(pair) => pair.port().mac(),
-            None => {
-                return Err(DpdkError::Capability {
-                    name: self.info.name.clone(),
-                    asked: "a stack, from a media with no queue pairs".to_owned(),
-                });
-            }
-        };
-        let params = stack_params(&self.settings, mac, receive_window)?;
+        if self.pairs.is_empty() {
+            return Err(DpdkError::Capability {
+                name: self.info.name.clone(),
+                asked: "a stack, from a media with no queue pairs".to_owned(),
+            });
+        }
+        // The address is the one read **before** the port was configured,
+        // rather than the driver's live copy: a PMD is allowed to rewrite that
+        // copy while it negotiates, and DPDK's virtio does (see
+        // [`Port::hardware_address`]). A stack filtering on a rewritten
+        // address drops every frame the switch delivers.
+        let params = stack_params(&self.settings, self.mac, receive_window)?;
 
         // What the counters will be labelled with, and how the timer reads the
         // numbers only the device has (design §4.10) — taken **before** the

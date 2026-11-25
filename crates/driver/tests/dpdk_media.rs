@@ -536,6 +536,69 @@ fn a_dedicated_media_opens_on_a_two_queue_device_in_the_child() {
     assert_eq!(whole, pool.available(), "and a close gives everything back");
 }
 
+// ---- the address the stack filters on -----------------------------------
+
+/// The stack filters on the address the device had **before** the
+/// configuration, not on the driver's live copy.
+///
+/// The reason is a measured one (2026-11-25): DPDK's virtio, asked for both
+/// checksum offloads in `rte_eth_dev_configure`, renegotiates its features,
+/// and on the Alibaba CIPU backend the address read back afterwards has its
+/// second byte zeroed (`00:16:3e:…` became `00:00:3e:…`). A media that built
+/// its stack from the post-configuration copy dropped every frame the switch
+/// delivered — the demultiplexer filters on its own address.
+///
+/// `net_null` does not move the address by itself, so this case moves it with
+/// the operation a PMD uses (`rte_eth_dev_default_mac_addr_set`), which is the
+/// same move. The mutant is [`DpdkMedia::into_stack`] reading
+/// `port().mac()`: this case then answers the rewritten address and fails.
+#[test]
+fn the_stack_filters_on_the_address_the_device_shipped_with() {
+    in_a_child(
+        "the_stack_filters_on_the_address_the_device_shipped_with_in_the_child",
+        &[],
+    );
+}
+
+#[test]
+#[ignore = "runs as a child of `the_stack_filters_on_the_address_the_device_shipped_with`"]
+fn the_stack_filters_on_the_address_the_device_shipped_with_in_the_child() {
+    let settings = DpdkSettings {
+        eal_args: "--no-huge --vdev=net_null0".to_owned(),
+        port: Some("net_null0".to_owned()),
+        address: Some((OWN, 24)),
+        ..DpdkSettings::default()
+    };
+
+    let media = DpdkMedia::open(&settings, ONE_PAIR, None).expect("the media opens");
+    let port = media.port().expect("a media has a port").clone();
+    let shipped = port.mac();
+
+    // What a PMD does to the driver's copy while it negotiates. The second
+    // byte is the one the cloud saw zeroed; `0xff` rather than `0x00` only so
+    // that a device that already shipped with a zero there cannot make this
+    // case say nothing.
+    let mut rewritten = shipped;
+    rewritten[1] ^= 0xff;
+    port.set_hardware_address(rewritten)
+        .expect("net_null takes an address");
+    assert_eq!(
+        rewritten,
+        port.mac(),
+        "the driver's live copy moved, so the two readings differ"
+    );
+
+    let stack = media
+        .into_stack(Clock::Monotonic, 128 * 1024)
+        .expect("a stack");
+    assert_eq!(
+        shipped,
+        stack.params().mac,
+        "the stack filters on the address taken before the configuration, not \
+         on the one the driver holds afterwards"
+    );
+}
+
 // ---- one media per process ----------------------------------------------
 
 /// A second media is refused rather than opened on the first one's pool.

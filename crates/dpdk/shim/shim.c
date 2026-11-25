@@ -345,6 +345,16 @@ int shim_port_mac(unsigned port, unsigned char *out)
     return rc;
 }
 
+int shim_port_set_mac(unsigned port, const unsigned char *in)
+{
+    struct rte_ether_addr addr;
+
+    memcpy(addr.addr_bytes, in, 6);
+
+    rte_errno = 0; /* this call's failure, not an earlier one's */
+    return rte_eth_dev_default_mac_addr_set((uint16_t)port, &addr);
+}
+
 int shim_port_mtu(unsigned port, uint16_t *out) { return rte_eth_dev_get_mtu((uint16_t)port, out); }
 
 int shim_port_stats(unsigned port, shim_port_stats_t *out)
