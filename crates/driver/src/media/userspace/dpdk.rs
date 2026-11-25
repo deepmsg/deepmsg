@@ -661,7 +661,7 @@ fn pool(
         ..MempoolSettings::default()
     };
 
-    let made = Mempool::create("deepmsg_dpdk_pool", &settings).map_err(DpdkError::Pool)?;
+    let made = Mempool::create("deepmsg-dpdk-pool", &settings).map_err(DpdkError::Pool)?;
 
     // A second opener loses the race and answers the pool the winner made,
     // which is the only pool this process will ever have.
