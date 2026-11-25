@@ -313,13 +313,79 @@ impl Port {
         info_of(id_of(name)?)
     }
 
-    /// This port's hardware address.
+    /// The hardware address the port named `name` reports **before anything is
+    /// configured on it**.
+    ///
+    /// A hardware address does not change with a configuration; the copy a
+    /// started port reports is the driver's, and a PMD is allowed to rewrite
+    /// it while it negotiates. DPDK's virtio is one that does: requesting both
+    /// the receive and the transmit checksum offloads in
+    /// `rte_eth_dev_configure` makes it renegotiate its features, and on the
+    /// Alibaba CIPU backend (measured 2026-11-25) the configuration it reads
+    /// back afterwards has the address's second byte zeroed — `00:16:3e:…`
+    /// became `00:00:3e:…`. A media that builds its stack around the
+    /// post-configuration copy then drops every frame addressed to the device
+    /// (the demultiplexer filters on its own address), which is exactly what
+    /// the 2026-11-25 cloud run saw.
+    ///
+    /// So a caller that needs the address to *be* the device's takes it here,
+    /// and [`Port::mac`] is what it is only for a reading, not a contract.
+    ///
+    /// # Errors
+    ///
+    /// [`Error`] when the name is not a port this EAL knows, or the port will
+    /// not answer with its address.
+    pub fn hardware_address(name: &str) -> Result<[u8; 6], Error> {
+        let id = id_of(name)?;
+        let mut mac = [0u8; 6];
+        // SAFETY: the buffer is six bytes, which is what the call writes.
+        let rc = unsafe { sys::shim_port_mac(c_uint::from(id), mac.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(Error::from_rte_errno(
+                "the port would not report its hardware address",
+            ));
+        }
+        Ok(mac)
+    }
+
+    /// This port's hardware address, as the driver holds it **now**.
+    ///
+    /// A reading, not a contract: what this answers can differ from what the
+    /// device shipped with once a configuration has made the PMD renegotiate
+    /// (see [`Port::hardware_address`], which takes the copy that does not
+    /// move).
     pub fn mac(&self) -> [u8; 6] {
         let mut mac = [0u8; 6];
         // SAFETY: the buffer is six bytes, which is what the call writes.
         let rc = unsafe { sys::shim_port_mac(c_uint::from(self.id), mac.as_mut_ptr()) };
         debug_assert_eq!(rc, 0, "a started port has a MAC address");
         mac
+    }
+
+    /// Change this port's hardware address — DPDK's **default** MAC address,
+    /// which a PMD may refuse.
+    ///
+    /// The media does not do this: a device's address is normally the one it
+    /// shipped with, and [`Port::hardware_address`] is how that one is taken.
+    /// This is the operation that changes the driver's copy, and it is here
+    /// because a test needs it to replay what a PMD does to the address while
+    /// it negotiates (DPDK's virtio with both checksum offloads asked for):
+    /// without it, "the stack keeps the address taken before the
+    /// configuration" has nothing to fail against.
+    ///
+    /// # Errors
+    ///
+    /// [`Error`] when the device will not take an address — most virtual
+    /// devices do, and a PMD that has none is one a caller cannot ask this of.
+    pub fn set_hardware_address(&self, mac: [u8; 6]) -> Result<(), Error> {
+        // SAFETY: the array is six bytes, which is what the call reads.
+        let rc = unsafe { sys::shim_port_set_mac(c_uint::from(self.id), mac.as_ptr()) };
+        if rc != 0 {
+            return Err(Error::from_rte_errno(
+                "the port would not take a hardware address",
+            ));
+        }
+        Ok(())
     }
 
     /// The port's MTU.

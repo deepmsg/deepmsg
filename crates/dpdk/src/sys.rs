@@ -182,6 +182,7 @@ unsafe extern "C" {
     pub fn shim_port_stop(port: c_uint);
     pub fn shim_port_close(port: c_uint);
     pub fn shim_port_mac(port: c_uint, out: *mut u8) -> c_int;
+    pub fn shim_port_set_mac(port: c_uint, mac: *const u8) -> c_int;
     pub fn shim_port_mtu(port: c_uint, out: *mut u16) -> c_int;
     pub fn shim_port_stats(port: c_uint, out: *mut ShimPortStats) -> c_int;
     pub fn shim_port_link(port: c_uint, out: *mut ShimPortLink) -> c_int;

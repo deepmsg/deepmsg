@@ -89,6 +89,13 @@ pub const LOG_LEVEL: &str = "--log-level=1";
 pub enum EalArgumentError {
     /// The process may run on no CPU, so there is no lcore set to give.
     NoCpus,
+    /// `--no-huge` and `--in-memory` are both in the operator's arguments.
+    ///
+    /// The EAL refuses the pair itself — `--no-huge` implies the legacy memory
+    /// layout, which `--in-memory` refuses — and a media that let it through
+    /// would fail inside `rte_eal_init` with a message about the EAL rather
+    /// than about the configuration that produced it.
+    MemoryFlagsConflict,
 }
 
 impl std::fmt::Display for EalArgumentError {
@@ -96,6 +103,10 @@ impl std::fmt::Display for EalArgumentError {
         match self {
             Self::NoCpus => f.write_str(
                 "the process may run on no CPU, so there is no lcore set to start the EAL with",
+            ),
+            Self::MemoryFlagsConflict => f.write_str(
+                "--no-huge and --in-memory are both in `deepmsg.dpdk.eal.args`, and the EAL \
+                 refuses the pair: `--no-huge` implies the legacy memory layout",
             ),
         }
     }
@@ -124,6 +135,15 @@ pub fn arguments(
 
     let operator: Vec<&str> = settings.eal_args.split_whitespace().collect();
 
+    // **The two memory flags cannot both be given**, and the operator saying
+    // so is a configuration error rather than an EAL one: `--no-huge` implies
+    // the legacy memory layout, which `--in-memory` refuses.
+    let no_huge = operator.contains(&NO_HUGE);
+    let in_memory = operator.contains(&IN_MEMORY);
+    if no_huge && in_memory {
+        return Err(EalArgumentError::MemoryFlagsConflict);
+    }
+
     let mut arguments = Vec::with_capacity(operator.len() + 7);
     arguments.push(PROGRAM.to_owned());
 
@@ -140,17 +160,24 @@ pub fn arguments(
     }
 
     arguments.extend(operator.iter().map(|argument| (*argument).to_owned()));
-    arguments.push(NO_TELEMETRY.to_owned());
+    // The three arguments below are the media's, but three of them are also
+    // idempotent: an operator who names `--no-telemetry`, `--in-memory` or
+    // `--no-shconf` gets their copy and **not a second one** — the C++ media
+    // reads them the same way, and the EAL treats a repeated option as an
+    // error. The lcore set and the log level are the media's alone; the
+    // configuration refuses an operator's copy of either.
+    if !operator.contains(&NO_TELEMETRY) {
+        arguments.push(NO_TELEMETRY.to_owned());
+    }
     arguments.push(LOG_LEVEL.to_owned());
     arguments.push(format!("--lcores=0@({})", cpu_list(cpus)));
-    arguments.push(
-        if operator.contains(&NO_HUGE) {
-            NO_SHCONF
-        } else {
-            IN_MEMORY
+    if no_huge {
+        if !operator.contains(&NO_SHCONF) {
+            arguments.push(NO_SHCONF.to_owned());
         }
-        .to_owned(),
-    );
+    } else if !in_memory {
+        arguments.push(IN_MEMORY.to_owned());
+    }
 
     Ok(arguments)
 }
@@ -312,6 +339,44 @@ mod tests {
                 "{candidate} was not picked and must not be allowed: {built:?}"
             );
         }
+    }
+
+    /// **The idempotent three may be the operator's**, and the media adds no
+    /// second copy of any of them: the EAL treats a repeated option as an
+    /// error, and the C++ media reads the same three the same way.
+    #[test]
+    fn the_idempotent_arguments_are_not_given_twice() {
+        let built =
+            arguments(&settings("--no-telemetry --in-memory"), &[0], None).expect("a cpuset");
+        for argument in [NO_TELEMETRY, IN_MEMORY] {
+            assert_eq!(
+                1,
+                built.iter().filter(|a| a.as_str() == argument).count(),
+                "{argument} exactly once: {built:?}"
+            );
+        }
+        assert!(!built.contains(&NO_SHCONF.to_owned()));
+
+        // `--no-huge` with the operator's own `--no-shconf` is one copy too.
+        let built =
+            arguments(&settings("--no-huge -m 512 --no-shconf"), &[0], None).expect("a cpuset");
+        assert_eq!(
+            1,
+            built.iter().filter(|a| a.as_str() == NO_SHCONF).count(),
+            "{built:?}"
+        );
+        assert!(!built.contains(&IN_MEMORY.to_owned()));
+    }
+
+    /// `--no-huge` and `--in-memory` in one configuration is the operator's
+    /// mistake, refused here rather than inside `rte_eal_init` — the EAL's own
+    /// answer would name the EAL and not the setting that produced it.
+    #[test]
+    fn the_two_memory_flags_in_one_configuration_are_refused() {
+        assert!(matches!(
+            arguments(&settings("--no-huge --in-memory -m 512"), &[0], None),
+            Err(EalArgumentError::MemoryFlagsConflict)
+        ));
     }
 
     /// The operator's arguments arrive as they were written, in order, after

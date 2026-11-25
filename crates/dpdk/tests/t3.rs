@@ -455,6 +455,13 @@ fn a_port_describes_itself_in_the_child() {
     );
 
     assert_eq!(port._port.mac().len(), 6, "a port has an address");
+    assert_eq!(
+        port._port.mac(),
+        Port::hardware_address("net_pcap0").expect("a port answers with its address"),
+        "the address taken by name is the one a started port reports: nothing \
+         here has moved it, and the media takes it before the configuration \
+         because a PMD may (see `Port::hardware_address`)"
+    );
     assert!(port._port.mtu() > 0, "and reports an MTU");
 
     // The device's own counters, which a driver publishes as the DPDK media's
