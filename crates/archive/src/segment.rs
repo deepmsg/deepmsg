@@ -2023,6 +2023,14 @@ pub fn recover_stop_offset(
             break;
         }
 
+        // 1.54.2's `isValidFragment` checks this before anything else: a
+        // length below the data header is not a frame, and treating it as one
+        // would both move the stop past it and underflow the checksum's
+        // payload length.
+        if usize::try_from(frame_length).unwrap_or(0) < DATA_HEADER_LENGTH {
+            break;
+        }
+
         let aligned = usize::try_from(align_up(frame_length, FRAME_ALIGNMENT)).unwrap_or(0);
         if 0 == aligned || next_offset + aligned > limit {
             break;
@@ -2121,6 +2129,19 @@ fn is_write_complete(
     length: usize,
     checksum: Option<Checksum>,
 ) -> bool {
+    // 1.54.2 guards the two arithmetic facts before the checksum reads
+    // anything: a length below the header has no payload, and an offset past
+    // the mapping is not a fragment. Without the first,
+    // `length - DATA_HEADER_LENGTH` underflows; without the second, the
+    // checksum reads outside the buffer.
+    if length < DATA_HEADER_LENGTH
+        || offset
+            .checked_add(length)
+            .is_none_or(|end| end > segment.len())
+    {
+        return false;
+    }
+
     if let Some(checksum) = checksum {
         let mut payload = vec![0_u8; length - DATA_HEADER_LENGTH];
         if segment
@@ -2158,3 +2179,67 @@ fn is_write_complete(
 /// The page size the straddle rule is measured in
 /// (`Catalog.PAGE_SIZE`, `:110`).
 const PAGE_SIZE: usize = 4096;
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::mark::tests::TempDir;
+
+    fn write_frame(segment: &mut [u8], offset: usize, length: i32) {
+        segment[offset + FRAME_LENGTH_OFFSET..offset + FRAME_LENGTH_OFFSET + 4]
+            .copy_from_slice(&length.to_le_bytes());
+    }
+
+    #[test]
+    fn a_frame_shorter_than_the_data_header_stops_the_scan() {
+        // 1.54.2's `isValidFragment` refuses this before the checksum path;
+        // treating the one byte as a frame both moves the stop past it and
+        // underflows `length - DATA_HEADER_LENGTH`.
+        let dir = TempDir::new();
+        let mut segment = vec![0_u8; PAGE_SIZE];
+        write_frame(&mut segment, 0, 1);
+        std::fs::write(dir.path().join("7-0.rec"), &segment).expect("the file");
+
+        assert_eq!(
+            0,
+            recover_stop_offset(dir.path(), "7-0.rec", 0, None).expect("recovered")
+        );
+    }
+
+    #[test]
+    fn an_oversized_frame_is_not_a_fragment() {
+        let dir = TempDir::new();
+        let mut segment = vec![0_u8; PAGE_SIZE];
+        write_frame(&mut segment, 0, i32::MAX);
+        std::fs::write(dir.path().join("7-0.rec"), &segment).expect("the file");
+
+        assert_eq!(
+            0,
+            recover_stop_offset(dir.path(), "7-0.rec", 0, None).expect("recovered")
+        );
+    }
+
+    #[test]
+    fn a_page_straddling_last_frame_survives_a_zero_frame_after_it() {
+        // The frame starts 64 bytes before the page boundary and ends 64 bytes
+        // after it. The four bytes at its end are a zero frame length, which is
+        // what the preallocated tail reads as — and the straddling frame is
+        // still the last fragment, not something to drop.
+        let dir = TempDir::new();
+        let offset = PAGE_SIZE - 64;
+        let length: usize = 128;
+        let mut segment = vec![0_u8; PAGE_SIZE * 2];
+        segment[offset + DATA_HEADER_LENGTH..offset + length].fill(0xAB);
+        write_frame(
+            &mut segment,
+            offset,
+            i32::try_from(length).expect("a length"),
+        );
+        std::fs::write(dir.path().join("7-0.rec"), &segment).expect("the file");
+
+        assert_eq!(
+            offset + length,
+            recover_stop_offset(dir.path(), "7-0.rec", offset, None).expect("recovered")
+        );
+    }
+}

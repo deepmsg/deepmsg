@@ -1949,19 +1949,6 @@ pub struct Sessions {
     /// subscription, which is what decides when it is given back
     /// (`abortRecordingSessionAndCloseSubscription`, `:1766-1780`).
     subscription_ref_counts: HashMap<i64, i64>,
-    /// `numActiveRecordings` (`:139`): how many recordings are in flight, which
-    /// is what [`RecordingSettings::max_concurrent_recordings`] bounds
-    /// (`:538-543`).
-    ///
-    /// **Two movements, and they are not the pair they look like.** It goes
-    /// **up where the subscription is added** (`:569`, in
-    /// [`Sessions::claim_pending_starts`]) and **down where a recording
-    /// *session* closes** (`:1361`, in [`Sessions::close_recording_session`]) —
-    /// *not* where an image arrives, and *not* where a subscription is stopped.
-    /// Getting either wrong is invisible until the bound is reached: an extra
-    /// increment per recording walks the count up to the maximum and leaves it
-    /// there, refusing every later recording for the life of the process.
-    num_active_recordings: usize,
     /// The settings those requests are answered from.
     recording: RecordingSettings,
     /// Starts whose `ADD_SUBSCRIPTION` has gone out and not been answered.
@@ -2534,7 +2521,6 @@ impl Sessions {
             pending: Vec::new(),
             recording_subscriptions: HashMap::new(),
             subscription_ref_counts: HashMap::new(),
-            num_active_recordings: 0,
             pending_starts: Vec::new(),
             pending_removals: Vec::new(),
             recording_session_by_id: HashMap::new(),
@@ -2729,6 +2715,11 @@ impl Sessions {
             else {
                 continue;
             };
+            // The image path answers its own refusal below, after the image has
+            // been taken; copy the two fields now so the `&self` borrow of the
+            // subscription does not outlive it.
+            let control_session_id = subscription.session_id;
+            let correlation_id = subscription.correlation_id;
 
             // ★ The image **leaves the client here** (P2-9a): the session that
             // reads it is made a turn or more later, once the position counter
@@ -2746,6 +2737,35 @@ impl Sessions {
             else {
                 continue;
             };
+
+            // 1.54.2's second bound (`ArchiveConductor.java:1997-2013` and
+            // `:2090-2103`): one subscription can yield several images, and
+            // each of those is a session. Check the map size again here so a
+            // burst of images cannot walk past the configured maximum.
+            let maximum = self.recording.max_concurrent_recordings;
+            if self.recording_session_by_id.len() >= maximum {
+                let message = format!("max concurrent recordings reached at {maximum}");
+                self.send_error_response(
+                    control_session_id,
+                    correlation_id,
+                    MAX_RECORDINGS,
+                    &message,
+                    now_ms,
+                );
+                self.warnings.push(message);
+                continue;
+            }
+            if let Some(message) = self.is_low_storage_space() {
+                self.send_error_response(
+                    control_session_id,
+                    correlation_id,
+                    STORAGE_SPACE,
+                    &message,
+                    now_ms,
+                );
+                self.warnings.push(message);
+                continue;
+            }
 
             // The image itself, for the five things only it knows: the catalog
             // row keeps every one of them (`:1999-2019`).
@@ -3027,11 +3047,8 @@ impl Sessions {
 
         // `subscriptionRefCountMap.incrementAndGet`, `recordingSessionByIdMap
         // .put` and `ctx.recordingSessionCounter().incrementRelease()`
-        // (`:2053-2056`) — and **not** `numActiveRecordings`, which the
-        // reference moves at the subscription add (`:569`) and nowhere else.
-        // Moving it here as well would count every recording twice and never
-        // give the second one back: the count would climb to the configured
-        // maximum and stay there, refusing every later recording and extension.
+        // (`:2053-2056`). The 1.54.2 bound is the size of the two maps, so
+        // this insert is what makes a later image count as another recording.
         *self
             .subscription_ref_counts
             .entry(subscription_id)
@@ -3153,8 +3170,6 @@ impl Sessions {
         // `recordingSessionByIdMap.remove(recordingId)` (`:1360`): from here the
         // two position questions fall back to the catalog again.
         self.recording_session_by_id.remove(&recording_id);
-
-        self.num_active_recordings = self.num_active_recordings.saturating_sub(1);
 
         if let Some(counter) = &self.recording_session_counter {
             counter.decrement(counters);
@@ -5496,10 +5511,16 @@ impl Sessions {
         original_channel: &str,
     ) -> StartDecision {
         let maximum = self.recording.max_concurrent_recordings;
-        if self.num_active_recordings >= maximum {
+        // 1.54.2 counts the two maps rather than a separate counter: a
+        // subscription that never produced an image is still a recording the
+        // client asked for, and the old counter leaked it when the session was
+        // never created.
+        if self.recording_subscriptions.len() >= maximum
+            || self.recording_session_by_id.len() >= maximum
+        {
             return StartDecision::Refuse {
                 relevant_id: MAX_RECORDINGS,
-                message: format!("max concurrent recordings reached {maximum}"),
+                message: format!("max concurrent recordings reached at {maximum}"),
             };
         }
 
@@ -5588,7 +5609,6 @@ impl Sessions {
                         .subscription_ref_counts
                         .entry(start.registration_id)
                         .or_insert(0) += 1;
-                    self.num_active_recordings += 1;
 
                     if let Some(entry) = self.sessions.get_mut(&start.session_id) {
                         entry.control.send_ok_response(
@@ -5904,11 +5924,11 @@ impl Sessions {
         original_channel: &str,
     ) -> StartDecision {
         let maximum = self.recording.max_concurrent_recordings;
-        if self.num_active_recordings >= maximum {
+        if self.recording_subscriptions.len() >= maximum
+            || self.recording_session_by_id.len() >= maximum
+        {
             return StartDecision::Refuse {
                 relevant_id: MAX_RECORDINGS,
-                // `reached **at**` — the start's says `reached` (`:1079` against
-                // `:540`), and the reference means it.
                 message: format!("max concurrent recordings reached at {maximum}"),
             };
         }
@@ -6194,12 +6214,9 @@ impl Sessions {
     /// subscription is found by its **id** and taken out of the map by its key,
     /// which is the only thing the map is keyed by.
     ///
-    /// **`numActiveRecordings` does not move here.** The reference's field counts
-    /// live *recording sessions* — it goes up when a start is accepted (`:569`)
-    /// and down when a session closes (`:1361`), and a subscription stopped
-    /// while its recording is still running is a recording that has not ended
-    /// yet. So this slice, which has no recording sessions, has a count that can
-    /// only rise, and the movement down arrives with the recorder.
+    /// Taking a subscription out of the map is what a stop does; a recording
+    /// session that is still running keeps its own entry in
+    /// `recording_session_by_id` until it closes.
     fn remove_recording_subscription(&mut self, subscription_id: i64) -> Option<String> {
         let key = self
             .recording_subscriptions
@@ -8418,7 +8435,15 @@ mod tests {
         // the bound counts recordings, not what has been asked for
         // (`:538-543`).
         let mut full = sessions();
-        full.num_active_recordings = 20;
+        for id in 0..20 {
+            full.recording_session_by_id.insert(
+                id,
+                RecordingHandle {
+                    position: RecordingPos::for_test(1),
+                    subscription_id: 11,
+                },
+            );
+        }
 
         let mut sessions = sessions();
 
@@ -8494,9 +8519,35 @@ mod tests {
         assert_eq!(
             StartDecision::Refuse {
                 relevant_id: MAX_RECORDINGS,
-                message: "max concurrent recordings reached 20".to_owned(),
+                message: "max concurrent recordings reached at 20".to_owned(),
             },
             full.decide_start(
+                33,
+                SourceLocation::LOCAL,
+                "aeron:udp?endpoint=localhost:3333"
+            )
+        );
+    }
+
+    /// A recording subscription that never produced an image still counts
+    /// towards the 1.54.2 bound. The old separate counter only moved at the
+    /// subscription add and at a session close, so a subscription whose image
+    /// never arrived held a slot forever.
+    #[test]
+    fn a_subscription_without_an_image_still_counts_towards_the_recording_limit() {
+        let mut sessions = sessions();
+        for id in 0..20 {
+            sessions
+                .recording_subscriptions
+                .insert(format!("{id}:ipc"), held(11));
+        }
+
+        assert_eq!(
+            StartDecision::Refuse {
+                relevant_id: MAX_RECORDINGS,
+                message: "max concurrent recordings reached at 20".to_owned(),
+            },
+            sessions.decide_start(
                 33,
                 SourceLocation::LOCAL,
                 "aeron:udp?endpoint=localhost:3333"
@@ -8577,7 +8628,15 @@ mod tests {
         );
 
         let mut full = sessions();
-        full.num_active_recordings = 20;
+        for id in 0..20 {
+            full.recording_session_by_id.insert(
+                id,
+                RecordingHandle {
+                    position: RecordingPos::for_test(1),
+                    subscription_id: 11,
+                },
+            );
+        }
 
         let sessions = sessions();
 
@@ -8792,7 +8851,6 @@ mod tests {
         sessions
             .recording_subscriptions
             .insert("34:ipc".to_owned(), held(22));
-        sessions.num_active_recordings = 2;
 
         assert_eq!(
             Some("34:ipc".to_owned()),
@@ -8809,8 +8867,9 @@ mod tests {
         );
         assert!(sessions.recording_subscriptions.is_empty());
         assert_eq!(
-            2, sessions.num_active_recordings,
-            "a stopped subscription is a recording session that has not ended"
+            0,
+            sessions.recording_session_by_id.len(),
+            "a stopped subscription is not a recording session"
         );
     }
 
