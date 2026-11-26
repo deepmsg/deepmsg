@@ -18,7 +18,7 @@ name: archive
 #
 # # What runs
 #
-# The nine archive binaries the reference's suite is made of, case by case
+# The ten archive binaries the reference's suite is made of, case by case
 # (`.github/scripts/archive-suite.py`, which also checks that the cases that ran
 # are the ones in `crates/archive/tests/reference-cases.tsv` — the committed
 # ledger is the denominator, so a binary that quietly lost a case is reported
@@ -100,9 +100,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # The exact reference commit the byte contracts were read from
-  # (`docs/reference.md`), and the tag `1.53.2` is that commit — the same
+  # (`docs/reference.md`), and the tag `1.54.2` is that commit — the same
   # checkout `interop.yml` makes, with the same assertion that the tag still is.
-  AERON_COMMIT: 664f58e705
+  AERON_COMMIT: 481d4271ad
 
 jobs:
   archive-suite:
@@ -117,13 +117,13 @@ jobs:
       - name: Check out the reference at the pinned commit
         working-directory: ${{ github.workspace }}/..
         run: |
-          git clone --quiet --depth 1 --branch 1.53.2 \
+          git clone --quiet --depth 1 --branch 1.54.2 \
             https://github.com/aeron-io/aeron.git aeron
           actual=$(git -C aeron rev-parse HEAD)
           case "$actual" in
             "$AERON_COMMIT"*) echo "reference at $actual (pinned $AERON_COMMIT)" ;;
             *)
-              echo "::error::the 1.53.2 tag is at $actual, which is not the pinned $AERON_COMMIT"
+              echo "::error::the 1.54.2 tag is at $actual, which is not the pinned $AERON_COMMIT"
               exit 1
               ;;
           esac
@@ -180,6 +180,7 @@ jobs:
             aeron_archive_persistent_subscription_resilience_test \
             aeron_archive_async_client_test \
             aeron_archive_async_connect_leak_test \
+            aeron_archive_recording_pos_test \
             archiveTestW persistentSubscriptionTestW persistentSubscriptionContextTestW
 
       # `|| true` and not `continue-on-error`: the exit status is *checked*

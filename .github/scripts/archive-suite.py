@@ -8,7 +8,7 @@ cases, because gtest only makes the process exit non-zero. And running `ctest`
 at the top of the build tree runs the whole tree: the driver's unit tests, the
 client's, everything, for a result about none of them.
 
-So this runs the nine archive binaries itself and lets gtest write its own XML.
+So this runs the ten archive binaries itself and lets gtest write its own XML.
 Nothing in the reference tree is modified.
 
     .github/scripts/archive-suite.py <build-dir> <out.tsv> \
@@ -55,6 +55,7 @@ BINARIES = [
     "aeron_archive_async_client_test",
     "aeron_archive_persistent_subscription_context_test",
     "aeron_archive_async_connect_leak_test",
+    "aeron_archive_recording_pos_test",
     "archiveTestW",
     "persistentSubscriptionTestW",
     "persistentSubscriptionContextTestW",
@@ -66,7 +67,7 @@ PER_BINARY_TIMEOUT = 300
 
 # The fallback runs one case per process, and a case that hangs there is one
 # case, not a suite: it gets ctest's per-test timeout (`CMakeLists.txt:45`),
-# not the per-binary one. 204 cases at 300 s each would be a day.
+# not the per-binary one. 317 cases at 300 s each would be a day.
 PER_CASE_TIMEOUT = 60
 
 # The committed denominator, two directories up from `.github/scripts`.
@@ -212,7 +213,7 @@ def write_shim_config(
     """Beside the binary, which is the only place it looks.
 
     Paths are absolute because the shim's working directory is whatever the C
-    test's was, and one of the nine runs from a different subdirectory than the
+    test's was, and one of the ten runs from a different subdirectory than the
     others.
 
     The three binaries are the three main classes the reference's suite spawns

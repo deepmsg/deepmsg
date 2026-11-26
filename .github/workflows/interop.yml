@@ -91,7 +91,7 @@ env:
   # The exact reference commit the byte contracts were read from
   # (`docs/reference.md`). Every cache key below is derived from it, so bumping
   # it invalidates the reference build in one place.
-  AERON_COMMIT: 664f58e705
+  AERON_COMMIT: 481d4271ad
 
 jobs:
   system-tests:
@@ -108,8 +108,8 @@ jobs:
       # workspace would work for this job and break the moment the Rust interop
       # suite is added here, because that one looks for a sibling.
       #
-      # The pinned commit `664f58e705f850dfb926f6293707b204ba804726` **is** the
-      # `1.53.2` release tag, so a shallow clone of the tag is the whole of it —
+      # The pinned commit `481d4271ad5d52db1ae080bfb29d6259f10566fb` **is** the
+      # `1.54.2` release tag, so a shallow clone of the tag is the whole of it —
       # 30 MB and a few seconds instead of the full history. The assertion below
       # is what keeps that equivalence honest: if the tag ever moved, or a typo
       # landed in `AERON_COMMIT`, this fails here instead of producing a run
@@ -123,13 +123,13 @@ jobs:
       - name: Check out the reference at the pinned commit
         working-directory: ${{ github.workspace }}/..
         run: |
-          git clone --quiet --depth 1 --branch 1.53.2 \
+          git clone --quiet --depth 1 --branch 1.54.2 \
             https://github.com/aeron-io/aeron.git aeron
           actual=$(git -C aeron rev-parse HEAD)
           case "$actual" in
             "$AERON_COMMIT"*) echo "reference at $actual (pinned $AERON_COMMIT)" ;;
             *)
-              echo "::error::the 1.53.2 tag is at $actual, which is not the pinned $AERON_COMMIT"
+              echo "::error::the 1.54.2 tag is at $actual, which is not the pinned $AERON_COMMIT"
               exit 1
               ;;
           esac

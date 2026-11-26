@@ -22,7 +22,7 @@ branch, under `deepmsg-tests/probes/` and `deepmsg-tests/java/`.
 ## `cnc-header.bin`
 
 The first 512 bytes of a `cnc.dat` written by a **default-configured
-`aeronmd` 1.53.2** (commit `664f58e705`), captured on 2026-09-26.
+`aeronmd` 1.54.2** (commit `481d4271ad`), captured on 2026-11-26.
 
 The file it came from was **48,238,592 bytes**. That number is asserted in
 `tests/integration/cnc_fixture.rs` as the length the region arithmetic has to
@@ -54,10 +54,10 @@ in `tests/src/driver.rs` exists partly so that no test has to remember this.
 ## `counters-metadata.bin`
 
 The first **46 counter metadata records** — 46 × 512 = 23,552 bytes — of the
-same captured `cnc.dat`: the counters a default-configured `aeronmd` 1.53.2
+same captured `cnc.dat`: the counters a default-configured `aeronmd` 1.54.2
 allocates before it publishes anything.
 
-Captured from the same run as `cnc-header.bin` (2026-09-27), from the start of
+Captured from the same run as `cnc-header.bin` (2026-11-26), from the start of
 the counters metadata region, which `docs/protocol/cnc-layout.md` places at
 128 + to_driver + to_clients = 2,098,176 for the default layout.
 

@@ -43,11 +43,11 @@ fn rows() -> Vec<Row> {
 }
 
 #[test]
-fn the_denominator_is_five_hundred_and_seventy_four() {
+fn the_denominator_is_five_hundred_and_seventy_nine() {
     let rows = rows();
-    assert_eq!(rows.len(), 574, "574 = 178 system + 396 unit");
-    assert_eq!(rows.iter().filter(|r| r.kind == "system").count(), 178);
-    assert_eq!(rows.iter().filter(|r| r.kind == "unit").count(), 396);
+    assert_eq!(rows.len(), 579, "579 = 175 system + 404 unit");
+    assert_eq!(rows.iter().filter(|r| r.kind == "system").count(), 175);
+    assert_eq!(rows.iter().filter(|r| r.kind == "unit").count(), 404);
 }
 
 #[test]

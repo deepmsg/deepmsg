@@ -7,7 +7,7 @@
 //! written by the reference's authors against the Java implementation and
 //! encode behaviour we would not think to ask about. It is also an instrument
 //! rather than a test suite — it needs a reference checkout, a CMake build of
-//! nine binaries, a shim and a JDK, and it runs for seven minutes serialised
+//! ten binaries, a shim and a JDK, and it runs for seven minutes serialised
 //! (ports are hard-coded). It cannot be this crate's tests.
 //!
 //! **This suite** answers "is our archive correct, and did it stay correct?".
@@ -16,9 +16,9 @@
 //! suite drives through the client API and never opens a catalog or a segment.
 //!
 //! `reference-cases.tsv` is the join between the two. It lists every case the
-//! reference runs — 306 of them, from `--gtest_list_tests` on the suite built
-//! at `664f58e705` — so that the denominator is a set of **names** rather than a
-//! count, which is all the acceptance run can hold this build to. Forty of them
+//! reference runs — 317 of them, from `--gtest_list_tests` on the suite built
+//! at `481d4271ad` — so that the denominator is a set of **names** rather than a
+//! count, which is all the acceptance run can hold this build to. 44 of them
 //! are `client-unit`: unit tests of the reference's *client* library
 //! (`shouldThrowIf…` argument validation, an async-op leak), which the client
 //! track answers to and this crate does not.
@@ -49,10 +49,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
-/// The nine binaries the reference builds, with the number of cases each
+/// The ten binaries the reference builds, with the number of cases each
 /// contributes. Pinned so that a row disappearing is a deliberate edit.
 const REFERENCE_BINARIES: &[(&str, usize, Kind)] = &[
-    ("aeron_archive_test", 74, Kind::System),
+    ("aeron_archive_test", 80, Kind::System),
     (
         "aeron_archive_persistent_subscription_test",
         80,
@@ -64,7 +64,8 @@ const REFERENCE_BINARIES: &[(&str, usize, Kind)] = &[
         Kind::System,
     ),
     ("aeron_archive_async_client_test", 3, Kind::System),
-    ("archiveTestW", 50, Kind::System),
+    ("aeron_archive_recording_pos_test", 4, Kind::ClientUnit),
+    ("archiveTestW", 51, Kind::System),
     ("persistentSubscriptionTestW", 9, Kind::System),
     (
         "aeron_archive_persistent_subscription_context_test",
@@ -75,9 +76,9 @@ const REFERENCE_BINARIES: &[(&str, usize, Kind)] = &[
     ("persistentSubscriptionContextTestW", 8, Kind::ClientUnit),
 ];
 
-/// How many cases the ledger holds. 266 exercise the archive server; 40 are the
+/// How many cases the ledger holds. 273 exercise the archive server; 44 are the
 /// reference client's own unit tests.
-const REFERENCE_CASES: usize = 306;
+const REFERENCE_CASES: usize = 317;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -123,7 +124,7 @@ fn ledger() -> Vec<Row> {
 
 /// The denominator, and that nobody has lost a row.
 ///
-/// A count on its own would be weak — 306 minus one plus one is still 306 — so
+/// A count on its own would be weak — 317 minus one plus one is still 317 — so
 /// it is checked per binary, against the list above, and the case names are
 /// checked for duplicates. What this cannot see is a case the *reference* gained
 /// since; that is the acceptance run's comparison, and the module comment says

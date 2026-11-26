@@ -13,9 +13,9 @@ rather than a message because that is the only shape in which those facts exist.
 
 | | |
 |---|---|
-| Written by | `GenerateMarkFile.java` (in the fork `aeron-deepmsg`, branch `deepmsg-tests`), from `aeron-all-1.53.2.jar` |
+| Written by | `GenerateMarkFile.java` (in the fork `aeron-deepmsg`, branch `deepmsg-tests`), from `aeron-all-1.54.2.jar` |
 | Fixtures | `archive-mark.dat` (1 056 768 bytes), `mark-file.tsv` (19 readings) |
-| Captured | 2026-10-06 |
+| Captured | 2026-11-26 (re-run at 1.54.2; only the pid field changed) |
 | Read by | `crates/archive/tests/mark_file.rs` (no reference needed) and `tests/interop/mark_file_reference.rs` (both readers, live) |
 
 ## The files
@@ -33,7 +33,7 @@ difference between a golden and a hope, and it is the same rule
 
 ## Regenerating
 
-    JAR=../../aeron/aeron-all/build/libs/aeron-all-1.53.2.jar
+    JAR=../../aeron/aeron-all/build/libs/aeron-all-1.54.2.jar
     javac -proc:none -cp "$JAR" -d /tmp/markgen \
          "$AERON_DEEPMSG/deepmsg-tests/generators/mark-file/GenerateMarkFile.java"
     java --add-exports java.base/jdk.internal.misc=ALL-UNNAMED \
