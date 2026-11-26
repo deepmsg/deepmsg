@@ -1233,11 +1233,26 @@ fn add_snapshots(
             && entry.leadership_term_id == snapshot.leadership_term_id
             && entry.log_position == snapshot.log_position
         {
-            // `snapshots.add(serviceId + 1, ..)`: the service's id is the slot,
-            // so the list is ordered by service and the module's entry stays
-            // first only because it is appended first.
-            let slot = (entry.service_id + 1).max(0) as usize;
-            let slot = slot.min(snapshots.len());
+            // `snapshots.add(serviceId + 1, ..)` (`:1328`): the service's id is
+            // the slot, so the list is ordered by service and the module's
+            // entry stays first only because it is appended first. The id is
+            // read from the file, and the same record another process may have
+            // left anything in can name a slot no set holds. `checked_add`
+            // makes that the missing-snapshot answer the index check above
+            // gives (`:1319`) instead of an overflow; the reference's
+            // `ArrayList.add` throws for it too. Found by
+            // `11_cluster_recording_log` (2026-11-26) with `serviceId` =
+            // `i32::MAX`.
+            let slot = entry
+                .service_id
+                .checked_add(1)
+                .and_then(|slot| usize::try_from(slot).ok());
+            let Some(slot) = slot.filter(|&slot| slot <= snapshots.len()) else {
+                return Err(RecordingLogError::SnapshotMissing {
+                    service_id: i,
+                    snapshot_index,
+                });
+            };
             snapshots.insert(
                 slot,
                 Snapshot {
@@ -1373,6 +1388,39 @@ mod tests {
             .expect("the complete set at 2000");
         assert_eq!(2000, snapshots[0].log_position);
         assert_eq!(2, snapshots.len());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A service snapshot whose id is `i32::MAX` names a slot no set holds.
+    /// `serviceId + 1` overflowed while the recovery plan placed it; the
+    /// reference's `ArrayList.add` throws for the same record, and this build
+    /// answers `SnapshotMissing`. Found by `11_cluster_recording_log`
+    /// (2026-11-26).
+    #[test]
+    fn a_service_id_the_writer_could_not_have_written_is_refused() {
+        let directory =
+            std::env::temp_dir().join(format!("deepmsg-recording-log-slot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("recording.log");
+        let mut log = RecordingLog::open(&path).unwrap();
+
+        log.append_snapshot(1, 0, 1000, 1000, 100, i32::MAX)
+            .unwrap();
+        log.append_snapshot(1, 0, 1000, 1000, 100, CONSENSUS_MODULE_SERVICE_ID)
+            .unwrap();
+
+        match log.create_recovery_plan(|_| None, 1, -1) {
+            Err(RecordingLogError::SnapshotMissing {
+                service_id,
+                snapshot_index,
+            }) => {
+                assert_eq!(1, service_id);
+                assert_eq!(1, snapshot_index);
+            }
+            other => panic!("a slot no writer could have written: {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(directory);
     }

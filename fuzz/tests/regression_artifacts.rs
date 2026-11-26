@@ -117,3 +117,27 @@ fn f12_a_broadcast_region_without_a_position_reads_as_nothing() {
         }
     }
 }
+
+/// Found by `11_cluster_recording_log`: a service snapshot whose id is
+/// `i32::MAX`, so the recovery plan's `serviceId + 1` overflowed. The
+/// production regression is `recording_log.rs`'s
+/// `a_service_id_the_writer_could_not_have_written_is_refused`; the nightly's
+/// own bytes are kept under `corpus_seed/11_cluster_recording_log/` and
+/// replayed here.
+#[test]
+fn f13_a_snapshot_slot_no_writer_could_have_written_is_refused() {
+    let data =
+        include_bytes!("../corpus_seed/11_cluster_recording_log/crash-166e5149-i32-max-service-id");
+    let path = std::env::temp_dir().join(format!("deepmsg-f13-{}.log", std::process::id()));
+    std::fs::write(&path, data).expect("write");
+
+    let log = deepmsg_cluster::persist::recording_log::RecordingLog::open(&path).expect("the log");
+    let service_count = i32::from(data[0] % 8);
+    assert!(
+        log.create_recovery_plan(|_| None, service_count, -1)
+            .is_err(),
+        "a service id no writer could have produced"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}

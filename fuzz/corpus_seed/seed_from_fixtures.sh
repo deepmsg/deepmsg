@@ -49,6 +49,11 @@ mkdir -p "$root/corpus/09_archive_catalog_segment"
         "$root/corpus/09_archive_catalog_segment/archive.catalog"
 echo "09_archive_catalog_segment: $(ls "$root/corpus/09_archive_catalog_segment" | wc -l) seed(s)"
 
+# The recording.log the nightly's `11_cluster_recording_log` panicked on
+# (2026-11-26): a service snapshot whose id is `i32::MAX`, which overflowed
+# the slot the recovery plan placed it in.
+seed_dir 11_cluster_recording_log
+
 # Crafted headers. The fuzzer has to find a schema id, a template id and a
 # block length before any decoder is reached; these seeds put it there, and
 # each is only the eight-byte SBE header — the truncation is the point.
