@@ -589,13 +589,14 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
         &mut self,
         log_position: i64,
         leadership_term_id: i64,
+        term_base_log_position: i64,
     ) -> Result<(), ContainerError> {
         let mut recording_id = NULL_POSITION;
         let mut failure = None;
 
         self.snapshot_duration
             .on_snapshot_begin(deepmsg_core::clock::monotonic_nano_time());
-        match self.take_snapshot(log_position, leadership_term_id) {
+        match self.take_snapshot(log_position, leadership_term_id, term_base_log_position) {
             Ok(id) => recording_id = id,
             Err(error) => failure = Some(error),
         }
@@ -627,6 +628,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
         &mut self,
         log_position: i64,
         leadership_term_id: i64,
+        term_base_log_position: i64,
     ) -> Result<i64, ContainerError> {
         let Self {
             client,
@@ -687,6 +689,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
             SnapshotAction {
                 log_position,
                 leadership_term_id,
+                term_base_log_position,
             },
         )?;
 
@@ -810,7 +813,11 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
         self.cluster_time = new_cluster_time;
 
         if let Some(action) = snapshot_action {
-            self.execute_snapshot_action(action.log_position, action.leadership_term_id)?;
+            self.execute_snapshot_action(
+                action.log_position,
+                action.leadership_term_id,
+                action.term_base_log_position,
+            )?;
         }
 
         if read == 0 && self.log_adapter.is_done() {
@@ -1269,6 +1276,7 @@ struct EventHandler<'a, S: ClusteredService> {
 struct SnapshotAction {
     log_position: i64,
     leadership_term_id: i64,
+    term_base_log_position: i64,
 }
 
 impl<S: ClusteredService> EventHandler<'_, S> {
@@ -1438,6 +1446,7 @@ impl<S: ClusteredService> LogHandler for EventHandler<'_, S> {
             LogMessage::ClusterAction {
                 leadership_term_id,
                 log_position,
+                term_base_log_position,
                 timestamp,
                 action,
                 flags,
@@ -1449,6 +1458,7 @@ impl<S: ClusteredService> LogHandler for EventHandler<'_, S> {
                     *self.snapshot_action = Some(SnapshotAction {
                         log_position,
                         leadership_term_id,
+                        term_base_log_position,
                     });
                 }
                 Ok(())
@@ -1601,11 +1611,19 @@ fn snapshot_state(
     };
     let mut taker = ServiceSnapshotTaker::new(&mut sink, time_unit, app_version);
 
-    taker.mark_begin(action.log_position, action.leadership_term_id)?;
+    taker.mark_begin(
+        action.leadership_term_id,
+        action.term_base_log_position,
+        action.log_position,
+    )?;
     for session in sessions.iter() {
         taker.snapshot_session(session)?;
     }
-    taker.mark_end(action.log_position, action.leadership_term_id)
+    taker.mark_end(
+        action.leadership_term_id,
+        action.term_base_log_position,
+        action.log_position,
+    )
 }
 
 /// The snapshot publication and the idle that drives the client between

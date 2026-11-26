@@ -14,7 +14,7 @@ covers it.
 | Archive catalog **file** | `Catalog.CATALOG_FILE_NAME` | **`archive.catalog`** | `aeron-archive/src/main/java/io/aeron/archive/Archive.java:284` |
 | Archive catalog record | `Catalog.DEFAULT_ALIGNMENT` | records are **variable length**, aligned to the header's `alignment` (1024 by default); `DEFAULT_RECORD_LENGTH = 1024` is `@Deprecated` | `aeron-archive/src/main/java/io/aeron/archive/Catalog.java:57-95`, `:113-119` |
 | Archive protocol version | `AeronArchive.Configuration.PROTOCOL_SEMANTIC_VERSION` | **1.12.0** (major 1, minor 12, patch 0); `1.11.0` is the archive-id **threshold**, not this value | `aeron-archive/src/main/java/io/aeron/archive/client/AeronArchive.java:2648-2668`, `:3839` |
-| Cluster protocol SBE | schema id / version | 111 / 17 (semanticVersion 5.4) | `schemas/aeron-cluster-codecs.xml` |
+| Cluster protocol SBE | schema id / version | 111 / 18 (semanticVersion 5.4); v18 adds the optional `termBaseLogPosition` to `ClusterActionRequest` (id 6) and `SnapshotMarker` (id 8) | `schemas/aeron-cluster-codecs.xml` |
 | Cluster mark SBE | schema id / version | 110 / 2 (semanticVersion 5.4) | `schemas/aeron-cluster-mark-codecs.xml` |
 | Cluster node-state SBE | schema id / version | 112 / 10 | `schemas/aeron-cluster-node-state-codecs.xml` |
 | Cluster counters | type ids / key layout | 200–241 (206 and 225 unused); key = `clusterId` [+ `serviceId`], or the recovery-state struct; label suffix ` - clusterId=` | `aeron-client/src/main/java/io/aeron/AeronCounters.java:860-1106`, `aeron-cluster/src/main/java/io/aeron/cluster/service/ClusterCounters.java:54-203` |

@@ -149,10 +149,16 @@ impl<'a> ConsensusModuleSnapshotTaker<'a> {
     /// [`ClusterError::Cluster`] when the record is refused.
     pub fn mark_begin(
         &mut self,
-        log_position: i64,
         leadership_term_id: i64,
+        term_base_log_position: i64,
+        log_position: i64,
     ) -> Result<(), ClusterError> {
-        self.mark(SnapshotMark::BEGIN, log_position, leadership_term_id)
+        self.mark(
+            SnapshotMark::BEGIN,
+            leadership_term_id,
+            term_base_log_position,
+            log_position,
+        )
     }
 
     /// `SnapshotTaker.markEnd` (`SnapshotTaker.java:127-136`).
@@ -162,10 +168,16 @@ impl<'a> ConsensusModuleSnapshotTaker<'a> {
     /// As [`Self::mark_begin`].
     pub fn mark_end(
         &mut self,
-        log_position: i64,
         leadership_term_id: i64,
+        term_base_log_position: i64,
+        log_position: i64,
     ) -> Result<(), ClusterError> {
-        self.mark(SnapshotMark::END, log_position, leadership_term_id)
+        self.mark(
+            SnapshotMark::END,
+            leadership_term_id,
+            term_base_log_position,
+            log_position,
+        )
     }
 
     /// `snapshotConsensusModuleState` (`:56-83`).
@@ -327,8 +339,9 @@ impl<'a> ConsensusModuleSnapshotTaker<'a> {
     fn mark(
         &mut self,
         mark: SnapshotMark,
-        log_position: i64,
         leadership_term_id: i64,
+        term_base_log_position: i64,
+        log_position: i64,
     ) -> Result<(), ClusterError> {
         let length = MESSAGE_HEADER_LENGTH + usize::from(SNAPSHOT_MARKER_BLOCK_LENGTH);
         self.size_buffer(length);
@@ -347,7 +360,8 @@ impl<'a> ConsensusModuleSnapshotTaker<'a> {
                 .index(0)
                 .mark(mark)
                 .time_unit(self.time_unit)
-                .app_version(self.app_version);
+                .app_version(self.app_version)
+                .term_base_log_position(term_base_log_position);
         }
 
         self.claim(length)

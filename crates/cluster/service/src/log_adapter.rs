@@ -103,6 +103,9 @@ pub enum LogMessage {
         leadership_term_id: i64,
         /// The position the request was made at.
         log_position: i64,
+        /// The term's base position; `-1` (`Aeron.NULL_VALUE`) when a 1.53.2
+        /// peer wrote the action before the field existed.
+        term_base_log_position: i64,
         /// The log timestamp.
         timestamp: i64,
         /// What to do.
@@ -452,6 +455,7 @@ fn decode<'a>(
                 LogMessage::ClusterAction {
                     leadership_term_id: decoder.leadership_term_id(),
                     log_position: decoder.log_position(),
+                    term_base_log_position: decoder.term_base_log_position().unwrap_or(-1),
                     timestamp: decoder.timestamp(),
                     action: decoder.action(),
                     flags: decoder.flags().unwrap_or(CLUSTER_ACTION_FLAGS_DEFAULT),

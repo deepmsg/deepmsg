@@ -1269,6 +1269,7 @@ impl ConsensusModuleAgent {
         self.log_publisher.append_cluster_action(
             &self.client,
             self.leadership_term_id,
+            self.term_base_log_position(),
             timestamp,
             action,
             CLUSTER_ACTION_FLAGS_DEFAULT,
@@ -6265,19 +6266,15 @@ impl ConsensusModuleAgent {
             identity.recording_id
         };
 
-        self.snapshot_state(&publication, log_position)?;
+        let term_base_log_position = self.term_base_log_position();
+        self.snapshot_state(
+            &publication,
+            self.leadership_term_id,
+            term_base_log_position,
+            log_position,
+        )?;
         let position = publication.position().unwrap_or(0);
         self.await_recording_complete(recording_id, position, counter_id)?;
-
-        let term_base_log_position = self
-            .recording_log
-            .entries()
-            .iter()
-            .find(|entry| {
-                entry.leadership_term_id == self.leadership_term_id
-                    && entry.entry_type == recording_log::ENTRY_TYPE_TERM
-            })
-            .map_or(0, |entry| entry.term_base_log_position);
 
         for (service_id, ack) in service_acks.iter().enumerate().rev() {
             #[allow(clippy::cast_possible_truncation)] // bounded by MAX_SERVICE_COUNT
@@ -6326,11 +6323,24 @@ impl ConsensusModuleAgent {
         Ok(())
     }
 
+    /// `termBaseLogPosition()` (`ConsensusModuleAgent.java:3214-3218`): the
+    /// current term's entry, or the recovery plan's last term base when the
+    /// entry is not in the log (a snapshot taken immediately after a restart).
+    fn term_base_log_position(&self) -> i64 {
+        self.recording_log
+            .find_term_entry(self.leadership_term_id)
+            .map_or(self.recovery_plan.last_term_base_log_position, |entry| {
+                entry.term_base_log_position
+            })
+    }
+
     /// `snapshotState` (`:3221-3253`): the record order and the iteration
     /// containers are documented in [`crate::snapshot`].
     fn snapshot_state(
         &mut self,
         publication: &ExclusivePublication,
+        leadership_term_id: i64,
+        term_base_log_position: i64,
         log_position: i64,
     ) -> Result<(), ClusterError> {
         let Self {
@@ -6339,7 +6349,6 @@ impl ConsensusModuleAgent {
             sessions,
             timer,
             trackers,
-            leadership_term_id,
             config,
             counters,
             ..
@@ -6355,7 +6364,7 @@ impl ConsensusModuleAgent {
             config.app_version,
         );
 
-        taker.mark_begin(log_position, *leadership_term_id)?;
+        taker.mark_begin(leadership_term_id, term_base_log_position, log_position)?;
         let (next_service_session_id, log_service_session_id, pending_message_capacity) =
             match trackers.first() {
                 Some(tracker) => (
@@ -6387,7 +6396,7 @@ impl ConsensusModuleAgent {
                 corrections += 1;
             }
         }
-        taker.mark_end(log_position, *leadership_term_id)?;
+        taker.mark_end(leadership_term_id, term_base_log_position, log_position)?;
         drop(taker);
 
         // The reference reports each missed-message correction through its

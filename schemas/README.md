@@ -7,8 +7,10 @@ generated (`docs/protocol/wire-frames.md`) — and neither is the archive
 `recording.log`, which is hand-rolled inside `deepmsg-archive`.
 
 Forked verbatim from the [aeron-io/aeron](https://github.com/aeron-io/aeron)
-**1.53.2** tree (commit `664f58e705`) on 2026-09-25. Upstream filenames are
-kept for painless diffing.
+**1.54.2** tree (commit `481d4271ad`) on 2026-11-26. Upstream filenames are
+kept for painless diffing. The archive, archive-mark, cluster-mark and
+node-state schemas are byte-identical to their 1.53.2 copies; only
+`aeron-cluster-codecs.xml` changed (schema version 17 → 18).
 
 Copyright 2014-2025 Real Logic Limited, licensed under the Apache License 2.0.
 Aeron is owned and operated by Adaptive Financial Consulting.
@@ -25,7 +27,7 @@ unmodified, header included.
 |---|---|---|
 | `aeron-archive-codecs.xml` | 101 / 14 | `aeron-archive/src/main/resources/archive/` |
 | `aeron-archive-mark-codecs.xml` | 100 / 2 | `aeron-archive/src/main/resources/archive/` |
-| `aeron-cluster-codecs.xml` | 111 / 17 | `aeron-cluster/src/main/resources/cluster/` |
+| `aeron-cluster-codecs.xml` | 111 / 18 | `aeron-cluster/src/main/resources/cluster/` |
 | `aeron-cluster-mark-codecs.xml` | 110 / 2 | `aeron-cluster/src/main/resources/cluster/` |
 | `aeron-cluster-node-state-codecs.xml` | 112 / see file | `aeron-cluster/src/main/resources/cluster/` |
 | `fpl/sbe.xsd` | — (the schema of a schema) | `aeron-archive/src/main/resources/archive/fpl/` |
@@ -40,6 +42,6 @@ Rules:
   byte-identical today, so this directory holds one.
 - Upstream bumps: copy the new file in, commit the diff, update
   `docs/compat.md`, extend the interop/golden tests.
-- The cluster schemas are carried for the future cluster track; nothing in
-  the workspace depends on their contents yet (`deepmsg-codec` only validates
-  their presence).
+- The cluster schemas are used by the cluster track: `deepmsg-codec-cluster`
+  is the generated codec crate, and its acting-version bounds live in
+  `crates/cluster/common/src/sbe.rs`.
