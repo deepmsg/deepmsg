@@ -2,7 +2,7 @@
 //!
 //! Every counter in this file is allocated at conductor init, in table order,
 //! with **id equal to its index** — the reference checks that
-//! (`aeron-driver/src/main/c/aeron_system_counters.c:82-117`: it fails init if
+//! (`aeron-driver/src/main/c/aeron_system_counters.c:87-122`: it fails init if
 //! the manager hands back any other id), which means the system counters must be
 //! the first thing allocated on a fresh CnC file and nothing may get in front of
 //! them.
@@ -13,13 +13,13 @@
 //! the index, `registration_id` equal to the index and `owner_id` equal to
 //! `NULL_VALUE` (`-1`). The `AeronStat` against the reference driver shows the
 //! value record as `registration == index`, which is where that column comes
-//! from: `aeron_system_counters_init` writes it (`:110-111`).
+//! from: `aeron_system_counters_init` writes it (`:115-116`).
 //!
 //! # Labels that name a build
 //!
 //! Two labels embed who wrote the file — `Errors: version=… commit=…` (id 15)
 //! and `Aeron software: version=… commit=…` (id 34)
-//! (`aeron_system_counters.c:41,60`). The reference writes its own
+//! (`aeron_system_counters.c:46,60`). The reference writes its own
 //! `AERON_VERSION_TXT` and git sha; this build writes the Aeron version whose
 //! contracts it implements and its own identity
 //! ([`deepmsg_core::version::BUILD_IDENTITY`]). The literals below are checked
@@ -29,7 +29,7 @@
 //! # Labels the conductor appends to at runtime
 //!
 //! The reference adds a suffix to eight labels right after allocating them
-//! (`aeron-driver/src/main/c/aeron_driver_conductor.c:848-951`): the resolver's
+//! (`aeron-driver/src/main/c/aeron_driver_conductor.c:889-992`): the resolver's
 //! name, the driver's threading mode and the four duty-cycle thresholds. All
 //! eight are here, built from [`LabelSuffixes`], because every one of them is a
 //! setting a deployment can move: the mode from `aeron.threading.mode` and the
@@ -55,7 +55,7 @@ pub mod id {
     /// `AERON_SYSTEM_COUNTER_ID_PUBLICATIONS_REVOKED` — incremented when a
     /// `REMOVE_PUBLICATION` carrying the revoke flag cuts a stream off
     /// (`aeron_counters.h:61`, incremented at
-    /// `aeron-driver/src/main/c/aeron_ipc_publication.c:520`).
+    /// `aeron-driver/src/main/c/aeron_ipc_publication.c:544`).
     pub const PUBLICATIONS_REVOKED: i32 = 40;
     /// `AERON_SYSTEM_COUNTER_ID_CLIENT_TIMEOUTS` — incremented once per client
     /// reaped for silence, never for one that closed itself.
@@ -125,7 +125,7 @@ pub mod id {
     pub const RESOLUTION_CHANGES: i32 = 25;
     /// `AERON_SYSTEM_COUNTER_ID_NAME_RESOLVER_MAX_TIME` (`aeron_system_counters.h:34`):
     /// the longest a single resolution has taken, which is what the driver's
-    /// own resolver is measured by (`aeron_driver_native_resource_agent.c:39-60`).
+    /// own resolver is measured by (`aeron_driver_native_resource_agent.c:44-65`).
     pub const NAME_RESOLVER_MAX_TIME: i32 = 32;
     /// `AERON_SYSTEM_COUNTER_ID_NAME_RESOLVER_TIME_THRESHOLD_EXCEEDED` (`:35`).
     pub const NAME_RESOLVER_TIME_THRESHOLD_EXCEEDED: i32 = 33;
@@ -149,7 +149,7 @@ pub mod id {
 /// (`AERON_SYSTEM_COUNTER_DUMMY_LAST`, `aeron_system_counters.h:73`).
 pub const COUNT: usize = 46;
 
-/// The table, in id order (`aeron_system_counters.c:24-71`), verbatim.
+/// The table, in id order (`aeron_system_counters.c:29-76`), verbatim.
 ///
 /// Entries 15 and 34 are the two that carry a build identity; the test
 /// `the_two_build_identity_labels_name_this_build` holds them to the constants
@@ -204,7 +204,7 @@ const LABELS: [&str; COUNT] = [
 ];
 
 /// The settings the runtime label suffixes are built from
-/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:848-951`).
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:889-992`).
 ///
 /// The reference reads all of them off its context at one point, right after
 /// the counters are allocated; this is that point in this build's terms, so
@@ -212,22 +212,22 @@ const LABELS: [&str; COUNT] = [
 /// them can read a stale label.
 pub struct LabelSuffixes<'a> {
     /// The name the resolver was configured with, or `""` — the reference
-    /// prints an empty one rather than skipping the suffix (`:852-856`).
+    /// prints an empty one rather than skipping the suffix (`:893-897`).
     pub resolver_name: &'a str,
     /// The mode this driver runs in, spelled the reference's way
     /// (`aeron_driver_threading_mode_to_string`, `aeron_driver_context.c:53-61`).
     pub threading_mode: &'a str,
     /// The duty-cycle thresholds of the three threads that have one
-    /// (`aeron_driver_context.c:1031-1043`), each printed as a duration.
+    /// (`aeron_driver_context.c:1061-1073`), each printed as a duration.
     pub conductor_cycle_threshold_ns: i64,
     /// The sender's, for counter 29.
     pub sender_cycle_threshold_ns: i64,
     /// The receiver's, for counter 31.
     pub receiver_cycle_threshold_ns: i64,
-    /// The resolver's threshold (`:1049-1055`), and the one suffix the
+    /// The resolver's threshold (`:1079-1085`), and the one suffix the
     /// reference prints **without** a threading mode: a resolver runs on the
     /// native resource agent, which has no duty cycle of its own to name
-    /// (`:937-951`).
+    /// (`:978-992`).
     pub name_resolver_threshold_ns: i64,
 }
 
@@ -241,8 +241,8 @@ pub struct LabelSuffixes<'a> {
 /// Nothing gives them back, and that is a decision rather than an omission —
 /// `Conductor::close` carries the reason. The C driver does give its own back,
 /// at the end of its shutdown
-/// (`aeron-driver/src/main/c/aeron_system_counters.c:119-125`, called from
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:3487`), so this is a
+/// (`aeron-driver/src/main/c/aeron_system_counters.c:124-130`, called from
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:3584`), so this is a
 /// deliberate departure from the authority, taken because what it costs is the
 /// file's readability and what it buys is nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -272,7 +272,7 @@ impl SystemCounters {
 pub enum SystemCounterError {
     /// The manager did not hand out the id the table expected.
     ///
-    /// The reference fails init on this (`aeron_system_counters.c:99-107`) and
+    /// The reference fails init on this (`aeron_system_counters.c:104-112`) and
     /// so does this: the ids are the contract `AeronStat` reads, so a file
     /// where counter 24 is something else is not a file this driver should
     /// publish.
@@ -367,7 +367,7 @@ pub fn allocate_all(
     // The eight runtime suffixes, in the reference's own four shapes: the
     // resolver's name, the mode alone, the threshold and the mode, and the
     // resolver's threshold alone. Appending is what the reference does —
-    // `aeron_counters_manager_append_to_label` (`:848-951`) — so what a reader
+    // `aeron_counters_manager_append_to_label` (`:889-992`) — so what a reader
     // sees is the base label above plus this.
     let mode = suffixes.threading_mode;
     let conductor = format_duration_ns(suffixes.conductor_cycle_threshold_ns);
@@ -651,7 +651,7 @@ mod tests {
         );
 
         // Every one of the eight suffixes the reference appends is here
-        // (`aeron_driver_conductor.c:848-951`), built from the settings.
+        // (`aeron_driver_conductor.c:889-992`), built from the settings.
         assert_eq!("Resolution changes: driverName=", label(&regions, 25));
         assert_eq!(
             "Conductor max cycle time doing its work in ns: DEDICATED",
@@ -663,7 +663,7 @@ mod tests {
         );
 
         // The sender and the receiver say which mode they run in too, as the
-        // reference's do (`aeron_driver_conductor.c:867-888`).
+        // reference's do (`aeron_driver_conductor.c:908-929`).
         assert_eq!(
             "Sender max cycle time doing its work in ns: DEDICATED",
             label(&regions, 28)
@@ -684,9 +684,9 @@ mod tests {
         // The resolver's pair carries no threading mode — a resolver runs on
         // the native resource agent, which is an `INVOKER`, and the reference
         // appends `DEDICATED` only to the three threads that have one
-        // (`aeron_driver_conductor.c:857-935`) — but the threshold it counts
+        // (`aeron_driver_conductor.c:898-976`) — but the threshold it counts
         // past is a value, so it goes in the label
-        // (`:938-951`, formatted by `aeron_format_duration_ns`).
+        // (`:979-992`, formatted by `aeron_format_duration_ns`).
         assert_eq!(
             "NameResolver exceeded threshold count: threshold=5s",
             label(&regions, 33)
@@ -695,7 +695,7 @@ mod tests {
 
         // And a `Resolution changes` counter names the resolver it counts for,
         // which is how two drivers in one `AeronStat` are told apart
-        // (`:848-856`).
+        // (`:889-897`).
         assert_eq!("Resolution changes: driverName=", label(&regions, 25));
     }
 

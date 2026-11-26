@@ -98,7 +98,7 @@ pub trait ReplicationArchive {
     /// Any refusal that is not `UNKNOWN_REPLICATION`.
     fn try_stop_replication(&mut self, replication_id: i64) -> Result<bool, ClusterError>;
 
-    /// `RecordingPos.findCounterIdByRecording` (`RecordingPos.java:157-188`) for
+    /// `RecordingPos.findCounterIdByRecording` (`RecordingPos.java:143-174`) for
     /// this archive.
     fn recording_position_counter(&self, recording_id: i64) -> Option<i32>;
 
@@ -166,7 +166,7 @@ impl ReplicationArchive for ArchiveClient<'_> {
 }
 
 /// `RecordingPos.isActive(counters, counterId, recordingId)`
-/// (`RecordingPos.java:292-298`) for a counter id this code only holds rather
+/// (`RecordingPos.java:264-270`) for a counter id this code only holds rather
 /// than a claimed [`deepmsg_archive::server::recording_pos::RecordingPos`].
 fn counter_is_for_recording<Access>(
     counters: &deepmsg_cnc::CountersReader<'_, Access>,

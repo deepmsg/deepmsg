@@ -16,7 +16,7 @@
 //!   is a client that never learns the archive refused something.
 //! * [`Archive::wait_for_response`] is the ordinary one: the answer, or an error.
 //! * [`Archive::wait_for_response_allowing_error`] is the `try_*` shape
-//!   (`:147-215`): an error whose `relevantId` is the **one the caller expected**
+//!   (`:218-286`): an error whose `relevantId` is the **one the caller expected**
 //!   is not an error at all but a `false` — a stop-subscription that says the
 //!   subscription is already gone has done what it was asked to do.
 //! * [`Archive::poll_for_recording_signals`] and
@@ -28,7 +28,7 @@
 //! # A deadline per operation, and a deadline per connect
 //!
 //! Each wait takes the clock **once** and holds it for that operation
-//! (`:157`, `:2095`). The connect, one layer down, does the same for itself
+//! (`:228`, `:2141`). The connect, one layer down, does the same for itself
 //! (`AsyncConnect`). The two are not the same deadline and are not meant to be:
 //! a connect's budget covers making the session, and an operation's covers
 //! waiting for one answer.
@@ -36,7 +36,7 @@
 //! # Two error codes for one refusal
 //!
 //! The archive speaks codes `0..=16` and the client speaks `200..=216`
-//! ([`archive_to_client_error_code`], `:2609-2616`). A caller matches on the
+//! ([`archive_to_client_error_code`], `:2701-2708`). A caller matches on the
 //! client's; the wire carries the archive's; and [`ArchiveError::Refused`]
 //! carries both so that neither has to be re-derived.
 //!
@@ -52,11 +52,11 @@
 //!
 //! ## What is not here, and why each one is not
 //!
-//! * **`start_replay` and `replay`** (`:1364-1528`): the next commit. They are
+//! * **`start_replay` and `replay`** (`:1427-1591`): the next commit. They are
 //!   not five lines — `aeron_archive_start_replay_locked` builds a replay channel
 //!   out of a `ReplayParams`, which is a string-builder port of its own.
 //! * **`aeron_archive_add_recorded_publication`** and its exclusive twin
-//!   (`:582-737`): they add a publication **through the client** and then record
+//!   (`:636-791`): they add a publication **through the client** and then record
 //!   the session it was given, so they need a way to report "the client could not
 //!   add it" — and [`ArchiveError`] has no variant for that, its
 //!   [`Request`](ArchiveError::Request) holding a [`ProxyError`]. The second
@@ -65,7 +65,7 @@
 //!   with `registration_id`, and our driver's `ON_PUBLICATION_READY`
 //!   (`crates/cnc/src/command.rs:842-860`) carries the second and not the first.
 //! * **`aeron_archive_stop_recording_publication`** and its two siblings
-//!   (`:1074-1126`): all three are [`channel_with_session_id`] and
+//!   (`:1141-1193`): all three are [`channel_with_session_id`] and
 //!   [`Archive::stop_recording_channel_and_stream`], and nothing else. The
 //!   reference's versions read the channel out of
 //!   `aeron_publication_constants_t`; our `deepmsg_client`'s `Publication` carries
@@ -136,7 +136,7 @@ pub struct RecordingSignal {
 ///
 /// The two are told apart here rather than by the caller because they arrive
 /// on the same subscription and in the same slot
-/// (`ConsensusModuleAgent.java:2071-2104` is the reference telling them
+/// (`ConsensusModuleAgent.java:2087-2120` is the reference telling them
 /// apart).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordingEvent {
@@ -187,7 +187,7 @@ const UNKNOWN_REPLICATION: i64 = 12;
 const ERROR_CODE_GENERIC: i32 = 0;
 
 /// A channel with a `session-id` put on it
-/// (`aeron_archive_channel_with_session_id`, `:2592-2607`).
+/// (`aeron_archive_channel_with_session_id`, `:2684-2699`).
 ///
 /// **This is the whole of what "record *that* publication" means.** A
 /// publication's own channel does not name the session the driver gave it, and
@@ -199,7 +199,7 @@ const ERROR_CODE_GENERIC: i32 = 0;
 ///
 /// **One deviation, and it is in the parameter order written back.** The
 /// reference parses into a `ChannelUriStringBuilder` and prints its fields in a
-/// fixed order (`ChannelUriStringBuilder.java:2451-2512`); [`ChannelUri::build`]
+/// fixed order (`ChannelUriStringBuilder.java:2505-2566`); [`ChannelUri::build`]
 /// prints the parameters it read, in the order it read them, with this one put
 /// back where it was or appended. A channel that had its parameters in another
 /// order comes back with them kept, which is a round trip rather than a
@@ -244,16 +244,16 @@ pub enum ArchiveError {
         message: String,
     },
     /// The subscription the answers arrive on has no image, so nothing is
-    /// coming (`:131-135`).
+    /// coming (`:132-136`).
     NotConnected,
-    /// Nothing came back before the operation's deadline (`:137-141`).
+    /// Nothing came back before the operation's deadline (`:138-142`).
     TimedOut {
         /// The reference's own name for the operation, in the message it writes.
         operation: String,
         /// The request that got no answer.
         correlation_id: i64,
     },
-    /// An answer arrived that was neither `OK` nor `ERROR` (`:204-207`).
+    /// An answer arrived that was neither `OK` nor `ERROR` (`:207-210`).
     UnexpectedCode(i32),
     /// A message on the control subscription was not a well-formed archive
     /// message.
@@ -294,7 +294,7 @@ impl ArchiveError {
 impl core::fmt::Display for ArchiveError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            // The reference's text (`:182-187`), verbatim — it is what a C
+            // The reference's text (`:184-189`), verbatim — it is what a C
             // client's errmsg prints and what a caller greps for.
             Self::Refused {
                 correlation_id,
@@ -328,14 +328,14 @@ impl std::error::Error for ArchiveError {}
 /// through.
 ///
 /// `aeron_archive_t`. The reference builds this object **inside** the connect's
-/// last state (`transition_to_done`, `:462-519`); here the connect answers with
+/// last state (`transition_to_done`, `:465-522`); here the connect answers with
 /// what it assembled — [`Connected`] — and this type is built from that. The
 /// split, and why this build's handler placement makes it forced rather than
 /// provisional, is in `async_connect`'s module note.
 #[derive(Debug)]
 pub struct Archive {
     /// The context this archive was opened with. The reference owns a
-    /// *duplicate* of the caller's (`:330`); here it is moved in, which is the
+    /// *duplicate* of the caller's (`:333`); here it is moved in, which is the
     /// same promise without the copy.
     context: ArchiveContext,
     proxy: ArchiveProxy,
@@ -361,7 +361,7 @@ pub struct Archive {
     ///
     /// **A recorded difference.** The reference keeps these on the *context* and
     /// its `duplicate` copies them — and its own case asserts the copy's is
-    /// equal to the original's (`aeron_archive_test.cpp:3388`). Rust cannot make
+    /// equal to the original's (`aeron_archive_test.cpp:3405`). Rust cannot make
     /// that claim: `rustc` warns that function pointer comparisons "do not
     /// produce meaningful results since their addresses are not guaranteed to be
     /// unique", so the assertion has no counterpart here whichever type they
@@ -499,13 +499,13 @@ impl Archive {
             .is_some_and(deepmsg_client::subscription::Subscription::is_connected)
     }
 
-    /// `RecordingSignalPoller.isPollComplete()` (`ConsensusModuleAgent.java:2076`):
+    /// `RecordingSignalPoller.isPollComplete()` (`ConsensusModuleAgent.java:2092`):
     /// whether the last [`Self::poll_recording_event`] filled its slot — an
     /// answer, a refusal, or anything else this poller understands.
     ///
     /// A caller reads this **after** the poll, for the reference's "the poll
     /// found nothing and the control subscription has no image" arm
-    /// (`:2123-2128`).
+    /// (`:2139-2144`).
     #[must_use]
     pub const fn control_poll_is_complete(&self) -> bool {
         self.control_response_poller.is_poll_complete()
@@ -1266,9 +1266,9 @@ impl Archive {
     ///
     /// `-1` here is an **answer**, not a failure: it is the archive saying there
     /// is no such recording, and of the questions about a recording this is the
-    /// one whose "not found" is a value (`ArchiveConductor.java:754-757`).
+    /// one whose "not found" is a value (`ArchiveConductor.java:753-756`).
     /// A `min_recording_id` below zero is a different matter — the archive
-    /// **refuses** it (`:749-753`), and that comes back as
+    /// **refuses** it (`:748-752`), and that comes back as
     /// [`ArchiveError::Refused`].
     ///
     /// # Errors
@@ -1306,10 +1306,10 @@ impl Archive {
     // a **subscription** is what the archive opened, a **channel and stream** is
     // what the caller asked for, an **identity** is the recording, and each of
     // the last three has a `try_` form whose "there was nothing to stop" is a
-    // `false` rather than an error. `aeron_archive_client.c:904-1070`.
+    // `false` rather than an error. `aeron_archive_client.c:976-1142`.
 
     /// Stop recording by the subscription the archive opened
-    /// (`:904-933`).
+    /// (`:976-1005`).
     ///
     /// # Errors
     ///
@@ -1328,7 +1328,7 @@ impl Archive {
     }
 
     /// The same, for a caller that does not mind there being nothing to stop
-    /// (`:935-966`).
+    /// (`:1006-1037`).
     ///
     /// Answers whether it stopped one: a refusal the archive words as
     /// `UNKNOWN_SUBSCRIPTION` is the caller's expected answer rather than this
@@ -1351,7 +1351,7 @@ impl Archive {
     }
 
     /// Stop recording by the channel and stream it was asked for
-    /// (`:968-999`).
+    /// (`:1038-1069`).
     ///
     /// # Errors
     ///
@@ -1371,7 +1371,7 @@ impl Archive {
     }
 
     /// The same, for a caller that does not mind there being nothing to stop
-    /// (`:1001-1034`).
+    /// (`:1070-1103`).
     ///
     /// # Errors
     ///
@@ -1390,7 +1390,7 @@ impl Archive {
         )
     }
 
-    /// Stop recording by the recording's own id (`:1036-1072`).
+    /// Stop recording by the recording's own id (`:1104-1140`).
     ///
     /// **This one is a plain wait**, and it is the reference's shape rather than
     /// an oversight: the archive answers `OK` with a `relevantId` that is zero
@@ -1415,7 +1415,7 @@ impl Archive {
     }
 
     /// Cut a recording's log down to its first `position`
-    /// (`aeron_archive_truncate_recording`, `:1530-1562`).
+    /// (`aeron_archive_truncate_recording`, `:1591-1623`).
     ///
     /// Answers the count the archive reports — see the reference's own field,
     /// `count_p`.
@@ -1437,7 +1437,7 @@ impl Archive {
     }
 
     /// Stop one replay, by the session the archive gave it
-    /// (`aeron_archive_stop_replay`, `:1564-1593`).
+    /// (`aeron_archive_stop_replay`, `:1624-1653`).
     ///
     /// # Errors
     ///
@@ -1453,7 +1453,7 @@ impl Archive {
         .map(|_| ())
     }
 
-    /// Stop every replay of one recording (`:1595-1624`).
+    /// Stop every replay of one recording (`:1654-1683`).
     ///
     /// # Errors
     ///
@@ -1472,7 +1472,7 @@ impl Archive {
     }
 
     /// Forget a recording entirely (`aeron_archive_purge_recording`,
-    /// `:1675-1705`).
+    /// `:1732-1762`).
     ///
     /// Answers the number of segments the archive deleted.
     ///
@@ -1492,7 +1492,7 @@ impl Archive {
     }
 
     /// Keep recording a stopped recording's channel as a **new** recording
-    /// (`aeron_archive_extend_recording`, `:1707-1745`).
+    /// (`aeron_archive_extend_recording`, `:1763-1801`).
     ///
     /// Answers the new recording's **subscription** id, which is what the
     /// reference's `subscription_id_p` is — not the recording id, which the
@@ -1531,7 +1531,7 @@ impl Archive {
     }
 
     /// Ask another archive to replicate a recording here
-    /// (`aeron_archive_replicate`, `:1747-1783`).
+    /// (`aeron_archive_replicate`, `:1802-1838`).
     ///
     /// Answers the replication's id, which is what a caller stops it with.
     ///
@@ -1558,7 +1558,7 @@ impl Archive {
         })
     }
 
-    /// Stop one replication (`:1785-1814`).
+    /// Stop one replication (`:1839-1868`).
     ///
     /// # Errors
     ///
@@ -1577,7 +1577,7 @@ impl Archive {
     }
 
     /// The same, for a caller that does not mind there being nothing to stop
-    /// (`:1816-1847`).
+    /// (`:1869-1900`).
     ///
     /// # Errors
     ///
@@ -1599,13 +1599,13 @@ impl Archive {
     // Segments
     // -----------------------------------------------------------------------
     //
-    // The five of `aeron_archive_client.c:1849-1990`. Four of them answer a
+    // The five of `aeron_archive_client.c:1901-2042`. Four of them answer a
     // **count** — how many segments the archive moved — and `detachSegments` is
     // the one that does not, which is the reference's `NULL` rather than a
     // choice here.
 
     /// Detach a recording's segments from `new_start_position` onward
-    /// (`:1849-1880`).
+    /// (`:1901-1932`).
     ///
     /// # Errors
     ///
@@ -1625,7 +1625,7 @@ impl Archive {
     }
 
     /// Delete the segments [`Self::detach_segments`] detached
-    /// (`:1882-1912`).
+    /// (`:1933-1963`).
     ///
     /// # Errors
     ///
@@ -1643,7 +1643,7 @@ impl Archive {
     }
 
     /// Take a recording's **own** segments out from `new_start_position` onward
-    /// (`:1914-1946`).
+    /// (`:1964-1996`).
     ///
     /// # Errors
     ///
@@ -1661,7 +1661,7 @@ impl Archive {
         )
     }
 
-    /// Put a detached recording's segments back (`:1948-1978`).
+    /// Put a detached recording's segments back (`:1997-2027`).
     ///
     /// # Errors
     ///
@@ -1679,7 +1679,7 @@ impl Archive {
     }
 
     /// Move one recording's segments onto another recording
-    /// (`:1980-2008`).
+    /// (`:2028-2056`).
     ///
     /// # Errors
     ///
@@ -1700,7 +1700,7 @@ impl Archive {
     }
 
     /// Change the channel a stopped recording claims to have been made on
-    /// (`aeron_archive_update_channel`, `:2010-2040`).
+    /// (`aeron_archive_update_channel`, `:2057-2087`).
     ///
     /// # Errors
     ///
@@ -1720,7 +1720,7 @@ impl Archive {
     }
 
     /// Where a recording has got to (`aeron_archive_get_recording_position`,
-    /// `:776-806`).
+    /// `:852-882`).
     ///
     /// # Errors
     ///
@@ -1737,7 +1737,7 @@ impl Archive {
         )
     }
 
-    /// Where a recording begins (`aeron_archive_get_start_position`, `:808-837`).
+    /// Where a recording begins (`aeron_archive_get_start_position`, `:883-912`).
     ///
     /// The catalog's start position: for most recordings it is the log's first
     /// position, and it is the one question of the four that a recording in
@@ -1758,7 +1758,7 @@ impl Archive {
         )
     }
 
-    /// Where a recording stopped (`aeron_archive_get_stop_position`, `:840-869`).
+    /// Where a recording stopped (`aeron_archive_get_stop_position`, `:914-943`).
     ///
     /// **This is the one to ask about a recording that is not in flight.**
     /// [`Self::get_recording_position`] answers a **live** position, so the
@@ -1809,20 +1809,20 @@ impl Archive {
     // Replays
     // -----------------------------------------------------------------------
     //
-    // `aeron_archive_client.c:1364-1528`. The two are one operation and one
+    // `aeron_archive_client.c:1427-1591`. The two are one operation and one
     // convenience: `start_replay` is the request, and `replay` is "and give me a
     // subscription on the channel it is replaying onto", which is what a caller
     // almost always wants and is why it exists separately.
 
     /// Start replaying a recording onto a channel
-    /// (`aeron_archive_start_replay`, `:1364-1379` over `:1297-1360`).
+    /// (`aeron_archive_start_replay`, `:1427-1442` over `:1360-1423`).
     ///
     /// Answers the **replay's** session id — the id [`Self::stop_replay`] takes,
     /// and not the recording's.
     ///
     /// **One branch is not here.** When the replay channel says
     /// `control-mode=response` the reference goes to
-    /// `aeron_archive_start_replay_via_response_channel` (`:2296-2591`, with its
+    /// `aeron_archive_start_replay_via_response_channel` (`:2356-2651`, with its
     /// two siblings), a replay that is delivered over a response channel with a
     /// token of its own — a mechanism this client does not have. A caller here
     /// gets the plain branch whatever the channel says, which is a difference a
@@ -1853,7 +1853,7 @@ impl Archive {
     }
 
     /// Start a replay **and subscribe to it**
-    /// (`aeron_archive_replay`, `:1512-1528` over `:1381-1510`).
+    /// (`aeron_archive_replay`, `:1574-1590` over `:1443-1572`).
     ///
     /// Answers the replay subscription's registration id. The subscription is on
     /// the replay channel **with the replay's session id on it**, which is the
@@ -1887,7 +1887,7 @@ impl Archive {
         // the replay's publication was given**, which is what a subscription has
         // to name to receive it. The reference truncates for exactly that reason
         // and in both languages: `(int32_t)replay_session_id` there
-        // (`:1476`) and `(int) pollForResponse(...)` here
+        // (`:1538`) and `(int) pollForResponse(...)` here
         // (`AeronArchive.java:890-891`).
         let session_id = replay_session_id as i32;
         let replay_channel_with_session =
@@ -1906,13 +1906,13 @@ impl Archive {
     // A publication the archive is asked to record
     // -----------------------------------------------------------------------
     //
-    // `aeron_archive_client.c:582-737`. These two are the reason
+    // `aeron_archive_client.c:636-791`. These two are the reason
     // [`channel_with_session_id`] is public: a publication's channel does not
     // name the session the driver gave it, so "record this publication" can only
     // be said by naming both.
 
     /// Add a publication **and ask the archive to record it**
-    /// (`aeron_archive_add_recorded_publication`, `:582-661`).
+    /// (`aeron_archive_add_recorded_publication`, `:636-715`).
     ///
     /// Answers the publication's registration id. What makes it *recorded* is
     /// that the channel handed to [`Self::start_recording`] is this one with the
@@ -1947,7 +1947,7 @@ impl Archive {
     }
 
     /// The same, for a publication only this client writes to
-    /// (`aeron_archive_add_recorded_exclusive_publication`, `:663-737`).
+    /// (`aeron_archive_add_recorded_exclusive_publication`, `:729-803`).
     ///
     /// The reference has no `original_registration_id` check on this one — an
     /// exclusive publication is never one the driver already had — so the one
@@ -2043,7 +2043,7 @@ impl Archive {
     /// no request in flight.
     ///
     /// This is what a cluster's duty cycle does with its own
-    /// `RecordingSignalPoller` (`ConsensusModuleAgent.java:2061-2075`): a
+    /// `RecordingSignalPoller` (`ConsensusModuleAgent.java:2077-2091`): a
     /// replication's progress arrives as `EXTEND`/`SYNC`/`STOP`/
     /// `REPLICATE_END` events, not as answers, and they have to be read while
     /// the replication is waiting rather than only inside a blocking call.
@@ -2053,7 +2053,7 @@ impl Archive {
     /// refusing something — a replication that the source archive would not
     /// serve answers under **the replication's own correlation id**
     /// (`ReplicationSession.error`, `:923-926`). The reference's callers read
-    /// that as an `ArchiveException` (`ConsensusModuleAgent.java:2074-2098`,
+    /// that as an `ArchiveException` (`ConsensusModuleAgent.java:2090-2114`,
     /// `ClusterBackupAgent.java:1063-1088`); a caller that only takes signals
     /// never learns the copy is over, which is a stall with no error in it.
     ///
@@ -2165,7 +2165,7 @@ impl Archive {
     }
 
     /// The reference's `aeron_archive_context_invoke_error_handler`
-    /// (`aeron_archive_context.c:472-494`), including its text.
+    /// (`aeron_archive_context.c:482-504`), including its text.
     fn invoke_error_handler(&self, error_code: i32, message: &str) {
         if let Some(handler) = self.handlers.error {
             handler(error_code, message);

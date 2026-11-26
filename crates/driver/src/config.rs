@@ -53,12 +53,12 @@ use crate::publication_params;
 use crate::sys::{self, SocketBufferLengths};
 
 /// Timer interval default: one second (`aeron-driver/src/main/c/aeron_driver_context.h:194`,
-/// assigned from `AERON_TIMER_INTERVAL_NS_DEFAULT` at `aeron_driver_context.c:470`).
+/// assigned from `AERON_TIMER_INTERVAL_NS_DEFAULT` at `aeron_driver_context.c:473`).
 pub const TIMER_INTERVAL_NS_DEFAULT: i64 = 1_000_000_000;
 
 /// How stale another driver's heartbeat may be before this one treats the
 /// directory as abandoned: `AERON_DRIVER_TIMEOUT_MS_DEFAULT (10 * 1000)`
-/// (`aeron-driver/src/main/c/aeron_driver_context.c:217`).
+/// (`aeron-driver/src/main/c/aeron_driver_context.c:219`).
 pub const DRIVER_TIMEOUT_MS_DEFAULT: i64 = 10 * 1000;
 
 /// The largest tier period this driver accepts: one hour.
@@ -71,7 +71,7 @@ pub const MAX_TIMER_INTERVAL_NS: i64 = 60 * 60 * 1_000_000_000;
 
 /// How long a reclaimed counter stays out of reuse: one second, the reference's
 /// `AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT_NS_DEFAULT`
-/// (`aeron-driver/src/main/c/aeron_driver_context.c:211`).
+/// (`aeron-driver/src/main/c/aeron_driver_context.c:213`).
 ///
 /// It is a *floor* on how soon an id can come back, not a delay before a
 /// reclaimed slot is readable again: the slot is unusable the moment its state
@@ -112,143 +112,143 @@ pub const SOCKET_SO_SNDBUF_DEFAULT: i32 = 0;
 /// with `ttl=`.
 pub const SOCKET_MULTICAST_TTL_DEFAULT: u8 = 0;
 
-/// `AERON_SOCKET_TOS_DEFAULT` (`aeron_driver_context.c:194`): `-1`, the null
+/// `AERON_SOCKET_TOS_DEFAULT` (`aeron_driver_context.c:195`): `-1`, the null
 /// value — a socket with no traffic class of its own.
 pub const SOCKET_TOS_DEFAULT: i32 = -1;
 
 /// `AERON_RECEIVER_POLL_TO_SLOW_WORK_RATIO_DEFAULT`
-/// (`aeron_driver_context.c:201`): ten data polls to one slow tick.
+/// (`aeron_driver_context.c:203`): ten data polls to one slow tick.
 pub const RECEIVER_POLL_TO_SLOW_WORK_RATIO_DEFAULT: usize = 10;
 
 /// `AERON_UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD_DEFAULT`
-/// (`aeron_driver_context.c:252`): at or below five transports the poller
+/// (`aeron_driver_context.c:255`): at or below five transports the poller
 /// reads each one directly.
 pub const UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD_DEFAULT: usize = 5;
 
 /// `AERON_UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT_DEFAULT`
-/// (`aeron_driver_context.c:253`): a readable socket is polled at most four
+/// (`aeron_driver_context.c:256`): a readable socket is polled at most four
 /// times in one pass.
 pub const UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT_DEFAULT: usize = 4;
 
 /// `AERON_NAK_MULTICAST_GROUP_SIZE_DEFAULT`
-/// (`aeron_driver_context.c:220`): how many receivers a group is assumed to
+/// (`aeron_driver_context.c:222`): how many receivers a group is assumed to
 /// have, which is what a NAK's backoff is drawn against.
 pub const NAK_MULTICAST_GROUP_SIZE_DEFAULT: usize = 10;
 
 /// The least a multicast backoff may be set to
-/// (`aeron_driver_context.c:945-950`): a microsecond.
+/// (`aeron_driver_context.c:975-980`): a microsecond.
 pub const NAK_MULTICAST_MAX_BACKOFF_NS_MIN: i64 = 1_000;
 
 /// `AERON_NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT`
-/// (`aeron_driver_context.c:221`): ten milliseconds, and **not** the sixty the
+/// (`aeron_driver_context.c:223`): ten milliseconds, and **not** the sixty the
 /// dead `AERON_LOSS_DETECTOR_NAK_MULTICAST_MAX_BACKOFF_NS` macro says
 /// (`aeron_loss_detector.h:76`). Ten is what the scale factor of this
 /// distribution is, so it is also the mean backoff.
 pub const NAK_MULTICAST_MAX_BACKOFF_NS_DEFAULT: i64 = 10 * 1000 * 1000;
 
-/// `AERON_RECEIVER_GROUP_CONSIDERATION_DEFAULT` (`aeron_driver_context.c:227`).
+/// `AERON_RECEIVER_GROUP_CONSIDERATION_DEFAULT` (`aeron_driver_context.c:229`).
 pub const RECEIVER_GROUP_CONSIDERATION_DEFAULT: InferableBoolean = InferableBoolean::Infer;
 
 /// What a channel that names no `gtag=` stamps into its status messages: none
 /// (`AERON_RECEIVER_GROUP_TAG_IS_PRESENT_DEFAULT` and
-/// `..._VALUE_DEFAULT`, `aeron_driver_context.c:194-195`).
+/// `..._VALUE_DEFAULT`, `aeron_driver_context.c:195-196`).
 ///
 /// The reference keeps the two halves apart — `is_present = false` *and*
 /// `value = -1` — and the difference is real: an endpoint with no tag sends a
 /// 36-byte status message, and one whose tag is `-1` sends 44
-/// (`aeron_receive_channel_endpoint.c:309-312`). [`None`] is the absent half.
+/// (`aeron_receive_channel_endpoint.c:314-317`). [`None`] is the absent half.
 pub const RECEIVER_GROUP_TAG_DEFAULT: Option<i64> = None;
 
-/// `AERON_FLOW_CONTROL_GROUP_TAG_DEFAULT` (`aeron_driver_context.c:196`): no
+/// `AERON_FLOW_CONTROL_GROUP_TAG_DEFAULT` (`aeron_driver_context.c:197`): no
 /// tag, which is a tag of `-1` and not an absent one — this is the `tagged`
 /// strategy's own group tag, the one a status message has to carry, and the
 /// endpoint's `gtag` is a different setting.
 pub const FLOW_CONTROL_GROUP_TAG_DEFAULT: i64 = -1;
 
-/// `AERON_FLOW_CONTROL_GROUP_MIN_SIZE_DEFAULT` (`:197`): a group of one, so
+/// `AERON_FLOW_CONTROL_GROUP_MIN_SIZE_DEFAULT` (`:198`): a group of one, so
 /// that naming `fc=min` alone means "wait for the slowest of whoever is there"
 /// rather than "wait for a quorum nobody configured".
 pub const FLOW_CONTROL_GROUP_MIN_SIZE_DEFAULT: i32 = 0;
 
-/// `AERON_FLOW_CONTROL_RECEIVER_TIMEOUT_NS_DEFAULT` (`:198`): five seconds
+/// `AERON_FLOW_CONTROL_RECEIVER_TIMEOUT_NS_DEFAULT` (`:199`): five seconds
 /// before a receiver that has gone quiet is dropped.
 pub const FLOW_CONTROL_RECEIVER_TIMEOUT_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000;
 
-/// `AERON_IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT` (`aeron_driver_context.c:204`):
+/// `AERON_IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT` (`aeron_driver_context.c:206`):
 /// how long an image may go quiet before it starts draining.
 ///
 /// It is also what an IPC publication measures a refusal against
-/// (`aeron_ipc_publication.c:177`), which is why it is a driver setting rather
+/// (`aeron_ipc_publication.c:182`), which is why it is a driver setting rather
 /// than an image's own.
 pub const IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT: i64 = 10 * 1000 * 1000 * 1000;
 
-/// `AERON_NAME_RESOLVER_SUPPLIER_DEFAULT` (`aeronmd.h:809`): `default`, which
+/// `AERON_NAME_RESOLVER_SUPPLIER_DEFAULT` (`aeronmd.h:843`): `default`, which
 /// is the synchronous resolver this build has always had.
 pub const NAME_RESOLVER_SUPPLIER_DEFAULT: crate::name_resolver::Supplier =
     crate::name_resolver::Supplier::Default;
 
 /// `AERON_DRIVER_RESOLVER_NEIGHBOR_TIMEOUT_NS_DEFAULT`
-/// (`aeron_driver_context.c:231`): how long a neighbor, and a cached name, are
+/// (`aeron_driver_context.c:233`): how long a neighbor, and a cached name, are
 /// believed after the moment they were last about.
 pub const RESOLVER_NEIGHBOR_TIMEOUT_NS_DEFAULT: i64 = 10 * 1000 * 1000 * 1000;
 
-/// `AERON_DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL_NS_DEFAULT` (`:232`).
+/// `AERON_DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL_NS_DEFAULT` (`:234`).
 pub const RESOLVER_SELF_RESOLUTION_INTERVAL_NS_DEFAULT: i64 = 1000 * 1000 * 1000;
 
-/// `AERON_DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT` (`:233`).
+/// `AERON_DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT` (`:235`).
 pub const RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT: i64 = 2 * 1000 * 1000 * 1000;
 
 /// `AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT`
-/// (`:234`).
+/// (`:236`).
 pub const RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL_NS_DEFAULT: i64 = 10 * 1000 * 1000 * 1000;
 
 /// `AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL_NS_DEFAULT`
-/// (`aeron_driver_context.c:235`): how often a sender and a receiver look for
+/// (`aeron_driver_context.c:237`): how often a sender and a receiver look for
 /// names that need resolving again.
 ///
 /// One second, and a value of **zero turns the whole feature off** — the two
 /// loops are `if interval_ns > 0 && deadline passed`
-/// (`aeron_driver_sender.c:183`, `aeron_driver_receiver.c:254`), so a driver
+/// (`aeron_driver_sender.c:183`, `aeron_driver_receiver.c:223`), so a driver
 /// configured with zero does no re-resolution at all.
 pub const RERESOLUTION_CHECK_INTERVAL_NS_DEFAULT: i64 = 1000 * 1000 * 1000;
 
-/// `AERON_DRIVER_NAME_RESOLVER_THRESHOLD_NS_DEFAULT` (`:239`): how long a
+/// `AERON_DRIVER_NAME_RESOLVER_THRESHOLD_NS_DEFAULT` (`:241`): how long a
 /// single resolution may take before system counter 33 counts it.
 ///
 /// Five **seconds**, which reads like a typo for milliseconds and is not one:
 /// the reference writes `5 * 1000 * 1000 * INT64_C(1000)`, and the Java
 /// `Configuration` default is the same five seconds
-/// (`aeron-driver/src/main/java/io/aeron/driver/Configuration.java:1118-1124`).
+/// (`aeron-driver/src/main/java/io/aeron/driver/Configuration.java:1151-1157`).
 /// A threshold that only a name server on fire can cross is the point: ordinary
 /// resolution is microseconds.
 pub const NAME_RESOLVER_THRESHOLD_NS_DEFAULT: i64 = 5 * 1000 * 1000 * 1000;
 
 /// `AERON_DRIVER_{CONDUCTOR,SENDER,RECEIVER}_CYCLE_THRESHOLD_NS_DEFAULT`
-/// (`aeron_driver_context.c:236-238`, all three `100 * 1000 * INT64_C(1000)`).
+/// (`aeron_driver_context.c:238-240`, all three `100 * 1000 * INT64_C(1000)`).
 ///
 /// One per thread that has a duty cycle, and they do two jobs with one number:
 /// a pass longer than its slot's threshold is counted in
 /// `*_CYCLE_TIME_THRESHOLD_EXCEEDED`, and the threshold is what that counter's
 /// **label** says it is
-/// (`aeron_driver_conductor.c:889-935`, both out of the same tracker field).
+/// (`aeron_driver_conductor.c:930-976`, both out of the same tracker field).
 pub const CYCLE_THRESHOLD_NS_DEFAULT: i64 = 100 * 1000 * 1000;
 
-/// `AERON_CPU_AFFINITY_DEFAULT` (`aeron_driver_context.c:244`): the index a
+/// `AERON_CPU_AFFINITY_DEFAULT` (`aeron_driver_context.c:246`): the index a
 /// slot's affinity setting starts at, meaning **no affinity** — the thread is
 /// left where the scheduler put it.
 pub const CPU_AFFINITY_DEFAULT: i32 = -1;
 
-/// `AERON_DRIVER_CONNECT_DEFAULT` (`aeron_driver_context.c:247`): whether a
+/// `AERON_DRIVER_CONNECT_DEFAULT` (`aeron_driver_context.c:249`): whether a
 /// send endpoint whose channel names an explicit endpoint **connects** its
 /// socket to it.
 ///
-/// True by default. Read at `:668`, used at
-/// `media/aeron_send_channel_endpoint.c:89` — the reference's `else if` puts
+/// True by default. Read at `:675`, used at
+/// `media/aeron_send_channel_endpoint.c:81` — the reference's `else if` puts
 /// the connect on the branch a multi-destination channel is *not* on, and this
 /// setting is the second half of that condition.
 pub const DRIVER_CONNECT_DEFAULT: bool = true;
 
-/// `AERON_LOSS_REPORT_BUFFER_LENGTH_DEFAULT` (`aeronmd.h:385`, the Java
+/// `AERON_LOSS_REPORT_BUFFER_LENGTH_DEFAULT` (`aeronmd.h:402`, the Java
 /// `Configuration`'s `LOSS_REPORT_BUFFER_LENGTH_DEFAULT`): the length of the
 /// loss report file the driver creates in the aeron directory.
 ///
@@ -259,27 +259,27 @@ pub const LOSS_REPORT_BUFFER_LENGTH_DEFAULT: i64 = 1024 * 1024;
 
 /// The smallest one of the resolver's four **intervals** may be
 /// (`aeron_config_parse_duration_ns(..., 1000 * 1000, INT64_MAX)`, which is how
-/// each of them is read, `aeron_driver_context.c:609-636`): a millisecond, so
+/// each of them is read, `aeron_driver_context.c:616-643`): a millisecond, so
 /// that a resolver cannot gossip in a busy loop.
 ///
 /// The **threshold** beside them has no floor at all — it is read with `0` as
-/// its minimum (`:1049-1055`), and the reference's own re-resolution test sets
+/// its minimum (`:1079-1085`), and the reference's own re-resolution test sets
 /// it to a single nanosecond to make every resolution count
 /// (`NameReResolutionTest.java`'s `nameResolverThresholdNs(1)`). A floor here
 /// would not be strictness: it would be a driver that will not start for a
 /// configuration the reference serves.
 pub const RESOLVER_INTERVAL_NS_MIN: i64 = 1000 * 1000;
 
-/// `AERON_MULTICAST_FLOWCONTROL_SUPPLIER_DEFAULT` (`aeron_driver_context.c:201`):
+/// `AERON_MULTICAST_FLOWCONTROL_SUPPLIER_DEFAULT` (`aeron_driver_context.c:203`):
 /// `max`.
 pub const MULTICAST_FLOW_CONTROL_SUPPLIER_DEFAULT: Supplier = Supplier::Max;
 
-/// `AERON_UNICAST_FLOWCONTROL_SUPPLIER_DEFAULT` (`:202`): `max` as well, under
+/// `AERON_UNICAST_FLOWCONTROL_SUPPLIER_DEFAULT` (`:204`): `max` as well, under
 /// the name of the unicast supplier (`aeron_flow_control.c:326-365`).
 pub const UNICAST_FLOW_CONTROL_SUPPLIER_DEFAULT: Supplier = Supplier::Max;
 
 /// A boolean that has a third answer: **work it out**
-/// (`aeron_inferable_boolean_t`, `aeronmd.h:703-709`).
+/// (`aeron_inferable_boolean_t`, `aeronmd.h:720-726`).
 ///
 /// One parameter needs it — a subscription's `group=` — because "this channel
 /// is a group" is a question the channel itself usually answers, and a client
@@ -315,7 +315,7 @@ impl InferableBoolean {
 
     /// The answer, given what the channel itself says
     /// (`aeron_driver_conductor_treat_image_as_multicast`,
-    /// `aeron_driver_conductor.c:674-680`).
+    /// `aeron_driver_conductor.c:715-721`).
     pub const fn resolve(self, channel_says_so: bool) -> bool {
         match self {
             Self::Infer => channel_says_so,
@@ -325,29 +325,29 @@ impl InferableBoolean {
     }
 }
 
-/// `AERON_RCV_INITIAL_WINDOW_LENGTH_DEFAULT` (`aeron_driver_context.c:205`).
+/// `AERON_RCV_INITIAL_WINDOW_LENGTH_DEFAULT` (`aeron_driver_context.c:207`).
 pub const RCV_INITIAL_WINDOW_LENGTH_DEFAULT: i32 = 128 * 1024;
 
-/// `AERON_RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT` (`aeron_driver_context.c:200`):
+/// `AERON_RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT` (`aeron_driver_context.c:202`):
 /// 200 milliseconds, and the window after which a receiver decides the sender
 /// has gone.
 pub const RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT: i64 = 200 * 1000 * 1000;
 
-/// `AERON_SPIES_SIMULATE_CONNECTION_DEFAULT` (`aeron_driver_context.c:210`):
+/// `AERON_SPIES_SIMULATE_CONNECTION_DEFAULT` (`aeron_driver_context.c:212`):
 /// false, so a stream with only spies looks unconnected until someone asks.
 pub const SPIES_SIMULATE_CONNECTION_DEFAULT: bool = false;
 
-/// `AERON_RECEIVER_IO_VECTOR_CAPACITY_DEFAULT` (`aeron_driver_context.c:240`):
+/// `AERON_RECEIVER_IO_VECTOR_CAPACITY_DEFAULT` (`aeron_driver_context.c:242`):
 /// how many datagrams one receive poll may read, and how many buffers the
 /// receiver keeps for it.
 pub const RECEIVER_IO_VECTOR_CAPACITY_DEFAULT: usize = 4;
 
-/// `AERON_SENDER_IO_VECTOR_CAPACITY_DEFAULT` (`aeron_driver_context.c:241`):
+/// `AERON_SENDER_IO_VECTOR_CAPACITY_DEFAULT` (`aeron_driver_context.c:243`):
 /// how many buffers the **sender** keeps for the control frames it reads.
 ///
 /// It does not decide how many of them a poll fills: the sender reads exactly
 /// one datagram per poll (`aeron_driver_sender.c:154` builds `mmsghdr[1]` and
-/// `:170` passes `vlen = 1`), so the capacity sizes a pool whose first entry is
+/// `:147` passes `vlen = 1`), so the capacity sizes a pool whose first entry is
 /// the only one ever used.
 pub const SENDER_IO_VECTOR_CAPACITY_DEFAULT: usize = 4;
 
@@ -355,43 +355,43 @@ pub const SENDER_IO_VECTOR_CAPACITY_DEFAULT: usize = 4;
 /// `AERON_DRIVER_SENDER_IO_VECTOR_LENGTH_MAX` (`aeron_driver_context.h:55`,
 /// `:59`): the ceiling both of this build's readers are bounded by, which is
 /// what the reference's two setters clamp to
-/// (`aeron_driver_context.c:3348-3371`).
-pub const IO_VECTOR_CAPACITY_MAX: usize = 16;
+/// (`aeron_driver_context.c:3449-3472`). Sixty-four since 1.54.2; it was 16.
+pub const IO_VECTOR_CAPACITY_MAX: usize = 64;
 
 /// `AERON_NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND_DEFAULT`
-/// (`aeron_driver_context.c:242`), which is clamped to
+/// (`aeron_driver_context.c:244`), which is clamped to
 /// [`crate::media::udp_transport`]'s sixteen by the context setter
-/// (`:3378-3384`).
+/// (`:3479-3485`).
 pub const NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND_DEFAULT: usize = 4;
 
-/// `AERON_SEND_TO_STATUS_POLL_RATIO_DEFAULT` (`aeron_driver_context.c:199`).
+/// `AERON_SEND_TO_STATUS_POLL_RATIO_DEFAULT` (`aeron_driver_context.c:200`).
 pub const SEND_TO_STATUS_POLL_RATIO_DEFAULT: u8 = 6;
 
 /// `AERON_PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT`
-/// (`aeron_driver_context.c:208`).
+/// (`aeron_driver_context.c:210`).
 pub const PUBLICATION_CONNECTION_TIMEOUT_NS_DEFAULT: i64 = 5_000_000_000;
 
-/// `AERON_PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT` (`aeron_driver_context.c:207`).
+/// `AERON_PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT` (`aeron_driver_context.c:209`).
 ///
 /// How long a publisher may sit with its position unmoved and its log blocked
 /// before the driver decides it is gone and covers the run for it. It must
 /// exceed the client liveness timeout — the check is
-/// `aeron_driver_validate_unblock_timeout` (`:1514-1537`) — because a client
+/// `aeron_driver_validate_unblock_timeout` (`:1558-1581`) — because a client
 /// that has not yet been declared dead is one whose claim may still be live.
 pub const PUBLICATION_UNBLOCK_TIMEOUT_NS_DEFAULT: i64 = 15_000_000_000;
 
-/// `AERON_RETRANSMIT_UNICAST_DELAY_NS_DEFAULT` (`aeron_driver_context.c:218`).
+/// `AERON_RETRANSMIT_UNICAST_DELAY_NS_DEFAULT` (`aeron_driver_context.c:220`).
 pub const RETRANSMIT_UNICAST_DELAY_NS_DEFAULT: i64 = 0;
 
 /// `AERON_RETRANSMIT_UNICAST_LINGER_NS_DEFAULT`
-/// (`aeron_driver_context.c:219`).
+/// (`aeron_driver_context.c:221`).
 pub const RETRANSMIT_UNICAST_LINGER_NS_DEFAULT: i64 = 10_000_000;
 
-/// `AERON_RETRANSMIT_HANDLER_MAX_RESEND` (`aeron_driver_context.c:499`).
+/// `AERON_RETRANSMIT_HANDLER_MAX_RESEND` (`aeron_driver_context.c:504`).
 pub const MAX_RESEND_DEFAULT: i32 = 16;
 
 /// `AERON_DRIVER_STREAM_SESSION_LIMIT_DEFAULT`
-/// (`aeron_driver_context.c:249`): no limit.
+/// (`aeron_driver_context.c:251`): no limit.
 #[allow(clippy::cast_sign_loss)] // the reference's own INT32_MAX default
 pub const STREAM_SESSION_LIMIT_DEFAULT: usize = i32::MAX as usize;
 
@@ -431,10 +431,10 @@ pub const UNTETHERED_LINGER_TIMEOUT_NS_DEFAULT: i64 = -1;
 pub const UNTETHERED_RESTING_TIMEOUT_NS_DEFAULT: i64 = 10_000_000_000;
 
 /// The bottom of the session id range the driver keeps for itself: `-1`
-/// (`aeron.publication.reserved.session.id.low`, `aeron_driver_context.c:229`).
+/// (`aeron.publication.reserved.session.id.low`, `aeron_driver_context.c:231`).
 pub const PUBLICATION_RESERVED_SESSION_ID_LOW_DEFAULT: i32 = -1;
 
-/// And the top: `1000` (`:230`).
+/// And the top: `1000` (`:232`).
 ///
 /// The range exists so that a session id a *client* invents cannot collide
 /// with one the driver hands out, and so that `session-id=-1` — which a client
@@ -452,7 +452,7 @@ pub const PUBLICATION_RESERVED_SESSION_ID_HIGH_DEFAULT: i32 = 1000;
 pub const TERM_BUFFER_SPARSE_FILE_DEFAULT: bool = true;
 
 /// Whether creating a log buffer is preceded by a space check: **true**
-/// (`perform.storage.checks`, `aeron_driver_context.c:182`, set at `:457`).
+/// (`perform.storage.checks`, `aeron_driver_context.c:182`, set at `:460`).
 pub const PERFORM_STORAGE_CHECKS_DEFAULT: bool = true;
 
 /// The free space below which the reference records a low-space warning:
@@ -465,7 +465,7 @@ pub const LOW_FILE_STORE_WARNING_THRESHOLD_DEFAULT: u64 = 10 * 16 * 1024 * 1024;
 ///
 /// The reference has no compiled-in answer: it loads one of two functions by
 /// name (`aeron-driver/src/main/c/aeron_termination_validator.c:28-40`),
-/// defaulting to `deny` (`aeron_driver_context.c:1247-1251`). Denying by
+/// defaulting to `deny` (`aeron_driver_context.c:1277-1281`). Denying by
 /// default is the safety property — a stray client must not be able to stop a
 /// production driver — and it is what `aeronmd` ships with, so a driver that
 /// accepted termination out of the box would be the surprising one.
@@ -482,7 +482,7 @@ impl TerminationPolicy {
     ///
     /// The **C** reference's symbol table has exactly two names and fails
     /// start-up on anything else (`aeron_termination_validator.c:55-62`
-    /// returns null, and `aeron_driver_context.c:1247-1251` fails
+    /// returns null, and `aeron_driver_context.c:1277-1281` fails
     /// initialisation on null). The **Java** driver takes a class name instead
     /// and its two defaults mean exactly these two policies —
     /// `DefaultAllowTerminationValidator.allowTermination` returns `true`
@@ -523,7 +523,7 @@ impl TerminationPolicy {
 // (`media/aeron_udp_channel_transport_loss.c:24`), and that is the reference's
 // type for it too.
 /// Which media the driver's UDP data paths run on
-/// (`AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA`, `aeronmd.h:731`).
+/// (`AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA`, `aeronmd.h:748`).
 ///
 /// The *selection*, not the bindings themselves: the bindings are a value the
 /// driver binary builds once the EAL is up and the stack exists, and the
@@ -739,7 +739,7 @@ pub struct DriverConfig {
     /// What a fresh socket reports as its receive and send buffer sizes.
     ///
     /// These are four of the fields every log buffer's metadata carries
-    /// (`aeron-driver/src/main/c/aeron_ipc_publication.c:117-124`), so they are
+    /// (`aeron-driver/src/main/c/aeron_ipc_publication.c:122-129`), so they are
     /// **not** zeroes and they are not this driver's to choose: the reference
     /// probes the kernel at start-up
     /// (`aeron-client/src/main/c/util/aeron_netutil.c:883-919`) and writes
@@ -780,25 +780,25 @@ pub struct DriverConfig {
     ///
     /// Zero is the reference's default and is also what `ttl=` with no value
     /// leaves behind, so the two are one case and the socket keeps the
-    /// kernel's own limit (`aeron_send_channel_endpoint.c:129`).
+    /// kernel's own limit (`aeron_send_channel_endpoint.c:122`).
     pub socket_multicast_ttl: u8,
-    /// `aeron.socket.tos` (`AERON_SOCKET_TOS`, `aeronmd.h:257`): the traffic
+    /// `aeron.socket.tos` (`AERON_SOCKET_TOS`, `aeronmd.h:265`): the traffic
     /// class a socket with no `so-tos=` of its own gets. `-1` is the null
     /// value, which leaves the kernel's default.
     pub socket_tos: i32,
     /// `aeron.receiver.poll.to.slow.work.ratio`
-    /// (`AERON_RECEIVER_POLL_TO_SLOW_WORK_RATIO`, `aeronmd.h:274`): after this
+    /// (`AERON_RECEIVER_POLL_TO_SLOW_WORK_RATIO`, `aeronmd.h:291`): after this
     /// many data polls the receiver runs its slow tick work (status messages,
     /// NAKs, RTTMs, pending setups, re-resolution).
     pub receiver_poll_to_slow_work_ratio: usize,
     /// `aeron.udp.channel.transport.poller.iteration.threshold`
     /// (`AERON_UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD`,
-    /// `aeronmd.h:765`): the transport count at or below which the receiver
+    /// `aeronmd.h:799`): the transport count at or below which the receiver
     /// reads each socket directly instead of asking epoll.
     pub udp_channel_transport_poller_iteration_threshold: usize,
     /// `aeron.udp.channel.transport.poller.socket.poll.limit`
     /// (`AERON_UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT`,
-    /// `aeronmd.h:774`): how many times one readable socket is polled in a
+    /// `aeronmd.h:808`): how many times one readable socket is polled in a
     /// pass, `1..=16`.
     pub udp_channel_transport_poller_socket_poll_limit: usize,
     /// Which strategy a multicast or multi-destination channel gets when it
@@ -822,7 +822,7 @@ pub struct DriverConfig {
     /// image by image. Naming one of the others makes every image that one.
     pub congestion_control_supplier: crate::congestion_control::Supplier,
     /// The raw `aeron.cubiccongestioncontrol.initialrtt`
-    /// (`AERON_CUBICCONGESTIONCONTROL_INITIALRTT`, `aeronmd.h:351`).
+    /// (`AERON_CUBICCONGESTIONCONTROL_INITIALRTT`, `aeronmd.h:368`).
     ///
     /// **A string, not a duration, and the shape is the reference's.** The
     /// three `aeron.cubiccongestioncontrol.*` settings are read by `getenv`
@@ -834,13 +834,13 @@ pub struct DriverConfig {
     /// reference and fails the start-up instead.
     pub cubic_initial_rtt: Option<String>,
     /// Whether CUBIC measures round trips at all
-    /// (`aeron.cubiccongestioncontrol.measurertt`, `aeronmd.h:346`).
+    /// (`aeron.cubiccongestioncontrol.measurertt`, `aeronmd.h:363`).
     ///
     /// Off by default, and that is the reference's default — an image that does
     /// not measure sends no RTTM and keeps the initial RTT for ever.
     pub cubic_measure_rtt: bool,
     /// Whether CUBIC takes the TCP-friendly window after a loss
-    /// (`aeron.cubiccongestioncontrol.tcpmode`, `aeronmd.h:359`).
+    /// (`aeron.cubiccongestioncontrol.tcpmode`, `aeronmd.h:376`).
     pub cubic_tcp_mode: bool,
     /// The tag a `fc=tagged` channel that names no `g:` matches against
     /// (`aeron.flow.control.gtag`, `AERON_FLOW_CONTROL_GROUP_TAG`).
@@ -862,7 +862,7 @@ pub struct DriverConfig {
     pub receiver_group_tag: Option<i64>,
     /// What a subscription's `group=` does when it names nothing
     /// (`aeron.receiver.group.consideration`, `AERON_RECEIVER_GROUP_CONSIDERATION`;
-    /// the default is `infer`, `aeron_driver_context.c:227`).
+    /// the default is `infer`, `aeron_driver_context.c:229`).
     ///
     /// It is the *default for the parameter*, not a driver-wide switch: a
     /// subscription that names `group=true` or `group=infer` overrules it.
@@ -883,13 +883,13 @@ pub struct DriverConfig {
     /// The window a receiver offers a publication when the channel named none
     /// (`aeron.rcv.initial.window.length`, which `aeronmd` turns into
     /// `AERON_RCV_INITIAL_WINDOW_LENGTH`,
-    /// `aeron-driver/src/main/c/aeronmd.h:331`, read at
-    /// `aeron_driver_context.c:834-840`; see
+    /// `aeron-driver/src/main/c/aeronmd.h:348`, read at
+    /// `aeron_driver_context.c:864-870`; see
     /// [`RCV_INITIAL_WINDOW_LENGTH_DEFAULT`]).
     ///
     /// It is the window an *image* advertises in its status messages, and so
     /// the one the untethered state machine measures a reader's lag against
-    /// (`aeron_publication_image.c:1180-1181`, three quarters of it).
+    /// (`aeron_publication_image.c:1185-1186`, three quarters of it).
     pub receiver_window_length: i32,
     /// How many datagrams one send batch may carry
     /// (`aeron.network.publication.max.messages.per.send`, default four, one
@@ -922,7 +922,7 @@ pub struct DriverConfig {
     /// How many sessions one stream may have before the driver stops making
     /// images for it (`aeron.stream.session.limit`; the reference's default is
     /// no limit at all, `INT32_MAX`,
-    /// `aeron-driver/src/main/c/aeron_driver_context.c:249`).
+    /// `aeron-driver/src/main/c/aeron_driver_context.c:251`).
     pub stream_session_limit: usize,
     /// What to withhold on the **send** side (`debug.send.data.loss.…`), so
     /// that a test can exercise loss recovery on a wire that does not lose
@@ -984,17 +984,17 @@ pub struct DriverConfig {
     pub debug_resolver_delay_ms: u64,
     /// Which resolver this driver builds and keeps
     /// (`aeron.name.resolver.supplier`, `AERON_NAME_RESOLVER_SUPPLIER`,
-    /// `aeronmd.h:808-809`, whose default is `default`) — `default`,
+    /// `aeronmd.h:842-843`, whose default is `default`) — `default`,
     /// `csv_table` or `driver`.
     ///
     /// A name that is not one of the three fails the driver's start-up, which
     /// is what the reference's `aeron_name_resolver_supplier_load` returning
     /// `NULL` does to its context init
-    /// (`aeron_driver_context.c:588-594`).
+    /// (`aeron_driver_context.c:595-601`).
     pub name_resolver_supplier: crate::name_resolver::Supplier,
-    /// The raw `AERON_NAME_RESOLVER_INIT_ARGS` (`aeronmd.h:818`), which is the
+    /// The raw `AERON_NAME_RESOLVER_INIT_ARGS` (`aeronmd.h:852`), which is the
     /// CSV table's configuration and nothing else's — read into the context by
-    /// the reference (`aeron_driver_context.c:599`) and handed to whichever
+    /// the reference (`aeron_driver_context.c:606`) and handed to whichever
     /// supplier was named.
     ///
     /// A string here rather than a parsed table, because who parses it depends
@@ -1003,23 +1003,23 @@ pub struct DriverConfig {
     /// that will not parse fails the *resolver* and not the driver.
     pub name_resolver_init_args: Option<String>,
     /// What this driver answers to (`aeron.driver.resolver.name`,
-    /// `AERON_DRIVER_RESOLVER_NAME`, `aeronmd.h:780`).
+    /// `AERON_DRIVER_RESOLVER_NAME`, `aeronmd.h:814`).
     ///
     /// Required as soon as an interface is named
-    /// (`aeron_driver_context.c:601-608`), because a resolver that gossips
+    /// (`aeron_driver_context.c:608-615`), because a resolver that gossips
     /// without a name has nothing to announce.
     pub resolver_name: Option<String>,
     /// What the driver's resolver binds and announces
     /// (`aeron.driver.resolver.interface`, `AERON_DRIVER_RESOLVER_INTERFACE`,
-    /// `aeronmd.h:790`).
+    /// `aeronmd.h:824`).
     pub resolver_interface: Option<String>,
     /// Who to start gossiping with, comma-separated
     /// (`aeron.driver.resolver.bootstrap.neighbor`,
-    /// `AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR`, `aeronmd.h:800`).
+    /// `AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR`, `aeronmd.h:834`).
     pub resolver_bootstrap_neighbor: Option<String>,
     /// `aeron.driver.resolver.neighbor.timeout` (`AERON_DRIVER_RESOLVER_NEIGHBOR_TIMEOUT`),
     /// which is both how long a neighbor may go unheard-from and how long a
-    /// cached name lives (`aeron_driver_name_resolver.c:463`).
+    /// cached name lives (`aeron_driver_name_resolver.c:464`).
     pub resolver_neighbor_timeout_ns: i64,
     /// `aeron.driver.resolver.self.resolution.interval`
     /// (`AERON_DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL`).
@@ -1031,46 +1031,46 @@ pub struct DriverConfig {
     /// (`AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL`).
     pub resolver_bootstrap_neighbor_resolution_interval_ns: i64,
     /// `aeron.name.resolver.threshold` (`AERON_DRIVER_NAME_RESOLVER_THRESHOLD`,
-    /// `aeronmd.h:932`): how long one resolution may take before system counter
-    /// 33 counts it (`aeron_driver_native_resource_agent.c:39-60`).
+    /// `aeronmd.h:966`): how long one resolution may take before system counter
+    /// 33 counts it (`aeron_driver_native_resource_agent.c:44-65`).
     pub name_resolver_threshold_ns: i64,
     /// `aeron.driver.conductor.cycle.threshold`
-    /// (`AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD`, `aeronmd.h:908`): how long one
+    /// (`AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD`, `aeronmd.h:942`): how long one
     /// conductor pass may take before counter 27 counts it
-    /// (`aeron_driver_conductor.c:3401-3404`), and the number counter 27's
+    /// (`aeron_driver_conductor.c:3498-3501`), and the number counter 27's
     /// label carries (`:889-905`).
     pub conductor_cycle_threshold_ns: i64,
-    /// `aeron.driver.sender.cycle.threshold` (`aeronmd.h:916`), for counter 29
-    /// and the sender's own pass (`aeron_driver_sender.c:262-276`).
+    /// `aeron.driver.sender.cycle.threshold` (`aeronmd.h:950`), for counter 29
+    /// and the sender's own pass (`aeron_driver_sender.c:264-278`).
     pub sender_cycle_threshold_ns: i64,
-    /// `aeron.driver.receiver.cycle.threshold` (`aeronmd.h:924`), for counter
-    /// 31 and the receiver's own pass (`aeron_driver_receiver.c:411-425`).
+    /// `aeron.driver.receiver.cycle.threshold` (`aeronmd.h:958`), for counter
+    /// 31 and the receiver's own pass (`aeron_driver_receiver.c:421-435`).
     pub receiver_cycle_threshold_ns: i64,
     /// `aeron.driver.reresolution.check.interval`
-    /// (`AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL`, `aeronmd.h:857`): how often
+    /// (`AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL`, `aeronmd.h:891`): how often
     /// the sender and the receiver look for names that need resolving again,
     /// and **zero to turn it off** (`aeron_driver_sender.c:183`).
     pub re_resolution_check_interval_ns: i64,
     /// `aeron.sender.wildcard.port.range`
-    /// (`AERON_SENDER_WILDCARD_PORT_RANGE`, `aeronmd.h:878`): the ports a
+    /// (`AERON_SENDER_WILDCARD_PORT_RANGE`, `aeronmd.h:912`): the ports a
     /// publication whose channel named port zero is given, and `0 0` to let the
-    /// kernel choose (`aeron_driver_context.c:1058-1069`).
+    /// kernel choose (`aeron_driver_context.c:1088-1099`).
     pub sender_wildcard_port_range: PortRange,
     /// `aeron.receiver.wildcard.port.range`
-    /// (`AERON_RECEIVER_WILDCARD_PORT_RANGE`, `aeronmd.h:888`), likewise, for
-    /// the destinations a subscription listens on (`:1071-1081`).
+    /// (`AERON_RECEIVER_WILDCARD_PORT_RANGE`, `aeronmd.h:922`), likewise, for
+    /// the destinations a subscription listens on (`:1105-1115`).
     pub receiver_wildcard_port_range: PortRange,
     /// `aeron.loss.report.buffer.length` (`AERON_LOSS_REPORT_BUFFER_LENGTH`,
-    /// `aeronmd.h:385`): how long the loss report file is, before it is aligned
-    /// up to the file page size (`aeron_driver.c:329-330`).
+    /// `aeronmd.h:402`): how long the loss report file is, before it is aligned
+    /// up to the file page size (`aeron_driver.c:346-347`).
     pub loss_report_buffer_length: i64,
-    /// `aeron.nak.unicast.delay` (`AERON_NAK_UNICAST_DELAY`, `aeronmd.h:661`):
+    /// `aeron.nak.unicast.delay` (`AERON_NAK_UNICAST_DELAY`, `aeronmd.h:678`):
     /// how long an image waits before asking for a gap it has seen, where its
     /// channel named no `nak-delay=`.
     ///
     /// Clamped up to [`crate::loss_detector::NAK_UNICAST_DELAY_NS`], which is
     /// the reference's own floor (`AERON_NAK_UNICAST_DELAY_NS_MIN`,
-    /// `aeron_driver_context.c:222`) — a zero here would be a driver that
+    /// `aeron_driver_context.c:224`) — a zero here would be a driver that
     /// asked for every gap the instant it saw it.
     pub nak_unicast_delay_ns: i64,
     /// The incoming interceptors every channel's transports read through, from
@@ -1080,16 +1080,16 @@ pub struct DriverConfig {
     /// Resolved once, here, so that a name the reference's own table does not
     /// hold stops the driver at start rather than at the first channel that
     /// would have used it — which is the reference's behaviour too
-    /// (`aeron_driver_context.c:1283-1290` is a `goto error`). One
+    /// (`aeron_driver_context.c:1313-1320` is a `goto error`). One
     /// [`crate::media::interceptor::Incoming`] is built from this per
     /// transport, because two of the three keep per-stream state.
     pub incoming_interceptors: Vec<crate::media::interceptor::Interceptor>,
-    /// `aeron.driver.connect` (`AERON_DRIVER_CONNECT`, `aeronmd.h:723`):
+    /// `aeron.driver.connect` (`AERON_DRIVER_CONNECT`, `aeronmd.h:740`):
     /// whether a send endpoint connects its socket to the endpoint its channel
-    /// names (`media/aeron_send_channel_endpoint.c:89`).
+    /// names (`media/aeron_send_channel_endpoint.c:81`).
     pub connect_enabled: bool,
-    /// `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` (`aeronmd.h:731`): what the
-    /// UDP data paths run on (`aeron_driver_context.c:1258-1263`). The
+    /// `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` (`aeronmd.h:748`): what the
+    /// UDP data paths run on (`aeron_driver_context.c:1288-1293`). The
     /// conductor's twin is checked and not kept: its one servable value is the
     /// one its only user, the name resolver, always runs on
     /// ([`crate::media::bindings`]).
@@ -1103,26 +1103,26 @@ pub struct DriverConfig {
     /// [`MediaSelection::Dpdk`] and ignored otherwise (`design.md` §4.9).
     pub dpdk: DpdkSettings,
     /// `aeron.thread.affinity.use.cpuset.offsets`
-    /// (`AERON_THREAD_AFFINITY_USE_CPUSET_OFFSETS`, `aeronmd.h:1003`): whether
+    /// (`AERON_THREAD_AFFINITY_USE_CPUSET_OFFSETS`, `aeronmd.h:1037`): whether
     /// the per-agent affinity numbers are offsets into the effective cgroup
-    /// cpuset rather than CPU ids (`aeron_driver.c:1214-1230`). **Off by
+    /// cpuset rather than CPU ids (`aeron_driver.c:1369-1385`). **Off by
     /// default** — the numbers stand as written.
     pub thread_affinity_use_cpuset_offsets: bool,
     /// `aeron.thread.affinity.fail.on.validation.errors`
-    /// (`AERON_THREAD_AFFINITY_FAIL_ON_VALIDATION_ERRORS`, `aeronmd.h:1007`):
+    /// (`AERON_THREAD_AFFINITY_FAIL_ON_VALIDATION_ERRORS`, `aeronmd.h:1041`):
     /// whether a topology complaint stops the driver instead of being printed
     /// (`aeron_driver.c:1337-1360`).
     pub thread_affinity_fail_on_validation_errors: bool,
     /// `aeron.conductor.cpu.affinity` (`AERON_CONDUCTOR_CPU_AFFINITY`,
-    /// `aeronmd.h:953`): which CPU **of the cpuset** the conductor takes, by
+    /// `aeronmd.h:987`): which CPU **of the cpuset** the conductor takes, by
     /// position — and `-1` to leave it alone
-    /// (`aeron_driver_context.c:3540-3552`).
+    /// (`aeron_driver_context.c:3643-3655`).
     pub conductor_cpu_affinity: i32,
-    /// `aeron.receiver.cpu.affinity` (`aeronmd.h:957`), likewise.
+    /// `aeron.receiver.cpu.affinity` (`aeronmd.h:991`), likewise.
     pub receiver_cpu_affinity: i32,
-    /// `aeron.sender.cpu.affinity` (`aeronmd.h:961`), likewise.
+    /// `aeron.sender.cpu.affinity` (`aeronmd.h:995`), likewise.
     pub sender_cpu_affinity: i32,
-    /// `aeron.driver.native.resource.agent.cpu.affinity` (`aeronmd.h:965`),
+    /// `aeron.driver.native.resource.agent.cpu.affinity` (`aeronmd.h:999`),
     /// likewise.
     pub native_resource_agent_cpu_affinity: i32,
     /// How the driver's work is spread over threads (`aeron.threading.mode`).
@@ -1132,7 +1132,7 @@ pub struct DriverConfig {
     /// The conductor slot's idle strategy, and the five others beside it.
     /// Each is read when its runner is built, and a name that is not one of the
     /// six is refused there — the reference refuses at the same point
-    /// (`aeron_driver_context.c:1152-1158`).
+    /// (`aeron_driver_context.c:1182-1188`).
     pub conductor_idle: IdleStrategySetting,
     pub sender_idle: IdleStrategySetting,
     pub receiver_idle: IdleStrategySetting,
@@ -1235,7 +1235,7 @@ impl Default for DriverConfig {
             re_resolution_check_interval_ns: RERESOLUTION_CHECK_INTERVAL_NS_DEFAULT,
             // Both default to the kernel's wildcard, which is the state
             // `aeron_wildcard_port_manager_init` leaves them in
-            // (`aeron_port_manager.c:49-52`): a driver that named no range is
+            // (`aeron_port_manager.c:54-57`): a driver that named no range is
             // not a driver that named `0 0`, but it behaves as one.
             sender_wildcard_port_range: PortRange::OS_WILDCARD,
             receiver_wildcard_port_range: PortRange::OS_WILDCARD,
@@ -1266,7 +1266,7 @@ impl Default for DriverConfig {
 /// (`aeron_config_parse_threading_mode`, `aeron_driver_context.c:45-71`).
 ///
 /// The four values are the reference's, and each names a set of runners
-/// (`aeron_driver.c:1003-1122`): four threads, three, one, or none at all.
+/// (`aeron_driver.c:1043-1162`): four threads, three, one, or none at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadingMode {
     /// One thread each, which is the reference's default.
@@ -1278,7 +1278,7 @@ pub enum ThreadingMode {
     Shared,
     /// No threads of the driver's own: the caller drives them, and the medium
     /// driver process **refuses to start with it**
-    /// (`aeron_driver_start`, `aeron_driver.c:1225-1230`).
+    /// (`aeron_driver_start`, `aeron_driver.c:1380-1385`).
     Invoker,
 }
 
@@ -1308,7 +1308,7 @@ impl ThreadingMode {
     }
 
     /// The name the reference prints for it (`aeron_driver_threading_mode_to_string`,
-    /// `aeron_driver.c:487-503`).
+    /// `aeron_driver.c:504-520`).
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Dedicated => "DEDICATED",
@@ -1346,7 +1346,7 @@ impl ThreadNaming {
 
 /// One slot's idle strategy: the name it answers to and the init args beside
 /// it, which the reference reads as two separate settings
-/// (`aeron_driver_context.c:1150-1200`).
+/// (`aeron_driver_context.c:1180-1230`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdleStrategySetting {
     /// The name, one of the six `aeron_idle_strategy_load` knows
@@ -1358,9 +1358,9 @@ pub struct IdleStrategySetting {
 
 impl IdleStrategySetting {
     /// What five of the driver's six slots default to
-    /// (`aeron_driver_context.c:1143-1147`).
+    /// (`aeron_driver_context.c:1173-1177`).
     pub const BACKOFF_DEFAULT: &'static str = "backoff";
-    /// What the native resource agent defaults to (`:1148`) — it maps files and
+    /// What the native resource agent defaults to (`:1178`) — it maps files and
     /// resolves names on its own thread, and spinning there is a core nobody
     /// can use.
     pub const NATIVE_RESOURCE_AGENT_DEFAULT_NAME: &'static str = "sleep-ns";
@@ -1373,21 +1373,21 @@ impl IdleStrategySetting {
     /// reading only that function says this slot sleeps a nanosecond — a busy
     /// spin wearing a sleep's name, burning a core. The reference never lets
     /// that happen: **its caller** overrides the arguments with `"1ms"`
-    /// whenever the strategy was not named (`aeron_driver_context.c:1205-1207`),
+    /// whenever the strategy was not named (`aeron_driver_context.c:1235-1237`),
     /// and Java builds the same one-millisecond strategy outright
-    /// (`Configuration.java:2081-2089`).
+    /// (`Configuration.java:2229-2237`).
     pub const NATIVE_RESOURCE_AGENT_DEFAULT_ARGS: &'static str = "1ms";
 
     /// The strategy this setting names, or `None` when the name is not one of
     /// the six — which the reference refuses to start over
-    /// (`aeron_driver_context.c:1152-1158`).
+    /// (`aeron_driver_context.c:1182-1188`).
     pub fn strategy(&self) -> Option<crate::idle::Strategy> {
         crate::idle::Strategy::by_name(&self.name, self.init_args.as_deref())
     }
 }
 
 /// The native resource agent's default, which is the one slot that is not
-/// backoff (`aeron_driver_context.c:1148`).
+/// backoff (`aeron_driver_context.c:1178`).
 impl IdleStrategySetting {
     pub fn sleeping_default() -> Self {
         Self {
@@ -1533,7 +1533,7 @@ impl DriverConfig {
 
         // The two settings whose value is **code**: the reference loads a
         // library or looks up a symbol and fails its context init when it
-        // cannot (`aeron_driver_context.c:539-546`, `:555-561`). This build
+        // cannot (`aeron_driver_context.c:546-553`, `:572-578`). This build
         // does neither — ADR-0002 keeps FFI out — so a deployment that names
         // one gets the failure the reference would give it, with the reason
         // said out loud rather than the setting quietly dropped.
@@ -1644,7 +1644,7 @@ impl DriverConfig {
         }
         if let Some(value) = get(&Setting::DRIVER_STREAM_SESSION_LIMIT) {
             // The reference holds this one as an `int32_t`
-            // (`aeron_config_parse_int32`, `aeron_driver_context.c:1115-1118`),
+            // (`aeron_config_parse_int32`, `aeron_driver_context.c:1145-1148`),
             // so a value the type cannot hold — or a negative one, which is not
             // a count — is refused rather than wrapped.
             config.stream_session_limit =
@@ -1763,7 +1763,7 @@ impl DriverConfig {
         }
         if let Some(value) = get(&Setting::SOCKET_MULTICAST_TTL) {
             // The reference's bounds are a `uint8_t`'s: `0..255`, refused
-            // rather than clamped (`aeron_driver_context.c:768-772`).
+            // rather than clamped (`aeron_driver_context.c:775-779`).
             config.socket_multicast_ttl = u8::try_from(parse_bounded_size32(
                 &Setting::SOCKET_MULTICAST_TTL,
                 &value,
@@ -1807,7 +1807,7 @@ impl DriverConfig {
             )?;
         }
         if let Some(value) = get(&Setting::NAK_MULTICAST_GROUP_SIZE) {
-            // Bounded where the reference bounds it (`:938-943`, one to
+            // Bounded where the reference bounds it (`:968-973`, one to
             // `INT32_MAX`): a group of nobody is a backoff with no scale.
             config.nak_multicast_group_size = usize::try_from(parse_bounded_size32(
                 &Setting::NAK_MULTICAST_GROUP_SIZE,
@@ -1818,7 +1818,7 @@ impl DriverConfig {
             .unwrap_or(NAK_MULTICAST_GROUP_SIZE_DEFAULT);
         }
         if let Some(value) = get(&Setting::NAK_MULTICAST_MAX_BACKOFF) {
-            // The reference's lower bound is a microsecond (`:945-950`);
+            // The reference's lower bound is a microsecond (`:975-980`);
             // above it there is none worth naming.
             let backoff = parse_duration_ns(&Setting::NAK_MULTICAST_MAX_BACKOFF, &value)?;
             if backoff < NAK_MULTICAST_MAX_BACKOFF_NS_MIN {
@@ -1843,7 +1843,7 @@ impl DriverConfig {
         // stricter than the reference's prefix comparison (see `parse_bool`).
         if let Some(value) = get(&Setting::CONGESTIONCONTROL_SUPPLIER) {
             // A name the reference's table does not carry is a **driver that
-            // does not start** (`aeron_driver_context.c:579-585`'s `goto
+            // does not start** (`aeron_driver_context.c:586-592`'s `goto
             // error`), not an image that fails later.
             config.congestion_control_supplier =
                 parse_congestion_control_supplier(&Setting::CONGESTIONCONTROL_SUPPLIER, &value)?;
@@ -1910,7 +1910,7 @@ impl DriverConfig {
             None,
         )?;
         // The native resource agent is the one slot whose default arguments are
-        // not the strategy's own (`aeron_driver_context.c:1205-1207`).
+        // not the strategy's own (`aeron_driver_context.c:1235-1237`).
         config.native_resource_agent_idle = idle_strategy(
             &get,
             IdleStrategySetting::NATIVE_RESOURCE_AGENT_DEFAULT_NAME,
@@ -1923,7 +1923,7 @@ impl DriverConfig {
         }
         if let Some(value) = get(&Setting::FLOW_CONTROL_GROUP_MIN_SIZE) {
             // `aeron_config_parse_int32` refuses a value the type cannot hold
-            // rather than wrapping it (`aeron_driver_context.c:249-290`).
+            // rather than wrapping it (`aeron_driver_context.c:251-292`).
             config.flow_control_group_min_size =
                 i32::try_from(parse_count(&Setting::FLOW_CONTROL_GROUP_MIN_SIZE, &value)?)
                     .map_err(|_| ConfigError::OutOfRange {
@@ -2023,7 +2023,7 @@ impl DriverConfig {
         // Carried as it was written, not parsed: the CSV table's own `init`
         // reads it (`aeron_csv_table_name_resolver.c:110-160`), and a table
         // that will not parse is a resolver that will not build rather than a
-        // driver that will not start (`aeron_driver_context.c:599` reads the
+        // driver that will not start (`aeron_driver_context.c:606` reads the
         // string and nothing else).
         config.name_resolver_init_args = get(&Setting::NAME_RESOLVER_INIT_ARGS);
         config.resolver_name = get(&Setting::DRIVER_RESOLVER_NAME);
@@ -2053,7 +2053,7 @@ impl DriverConfig {
 
                 // The four intervals are read with a floor of a millisecond
                 // (`aeron_config_parse_duration_ns(..., 1000 * 1000, INT64_MAX)`,
-                // `aeron_driver_context.c:609-636`), which is what stops a
+                // `aeron_driver_context.c:616-643`), which is what stops a
                 // resolver that gossips in a busy loop.
                 if parsed < RESOLVER_INTERVAL_NS_MIN {
                     return Err(ConfigError::OutOfRange {
@@ -2066,7 +2066,7 @@ impl DriverConfig {
             }
         }
 
-        // The threshold is read with **no** floor (`:1049-1055`), which is not
+        // The threshold is read with **no** floor (`:1089-1095`), which is not
         // an oversight in the reference: the test that counts what a slow
         // resolution costs sets it to one nanosecond
         // (`NameReResolutionTest.java`, `nameResolverThresholdNs(1)`).
@@ -2076,7 +2076,7 @@ impl DriverConfig {
         }
 
         // The three duty-cycle thresholds, read the same way and with no floor
-        // of their own (`aeron_driver_context.c:1031-1053`). The harness sends
+        // of their own (`aeron_driver_context.c:1061-1083`). The harness sends
         // them as **bare nanosecond counts** — `String.valueOf(
         // context.conductorCycleThresholdNs())` (`CTestMediaDriver.java:294-296`)
         // — which is what a suffix-less duration means here (and in
@@ -2112,7 +2112,7 @@ impl DriverConfig {
         // The two wildcard ranges are read as text and parsed here, which is
         // where the reference reads them too: a range that will not parse
         // fails the driver's start-up rather than the channel that needed it
-        // (`aeron_driver_context.c:1058-1082`, whose `goto error` is the whole
+        // (`aeron_driver_context.c:1088-1112`, whose `goto error` is the whole
         // of what its `AERON_APPEND_ERR` is for).
         for (setting, field) in [
             (
@@ -2136,7 +2136,7 @@ impl DriverConfig {
         // A resolver that gossips needs a name: its own name is what it
         // announces, and the reference refuses the start-up rather than
         // running one that can only answer other people's questions
-        // (`aeron_driver_context.c:601-608`, the only cross-field check in
+        // (`aeron_driver_context.c:608-615`, the only cross-field check in
         // this group).
         if config.resolver_interface.is_some()
             && config
@@ -2181,7 +2181,7 @@ impl DriverConfig {
             });
         }
 
-        // `aeron_driver_validate_unblock_timeout` (`aeron_driver_context.c:1514-1537`)
+        // `aeron_driver_validate_unblock_timeout` (`aeron_driver_context.c:1558-1581`)
         // is two rules and this is its first: a publication is only unblocked
         // for a client the driver has already given up on, so the unblock
         // window has to be the longer of the two. Its second rule — liveness
@@ -2197,7 +2197,7 @@ impl DriverConfig {
         // compatible client derives its keepalive contract from it, so a value
         // that is zero, negative, or no longer than the tier that checks it is
         // a promise the driver cannot keep. The reference refuses both
-        // (`aeron_driver_context.c:1526-1533`).
+        // (`aeron_driver_context.c:1570-1577`).
         if config.client_liveness_timeout_ns <= 0
             || config.client_liveness_timeout_ns <= config.timer_interval_ns
         {
@@ -2209,7 +2209,7 @@ impl DriverConfig {
 
         // The UDP channel's interceptors. The reference reads both lists here
         // too, and **fails its context init** on a name its table does not hold
-        // (`aeron_driver_context.c:1274-1290`): a driver that came up without
+        // (`aeron_driver_context.c:1304-1320`): a driver that came up without
         // the loss injection a deployment asked for would report losses that
         // never happened. None of the three it compiles in has an outgoing
         // half, so an outgoing list is always such a name.
@@ -2226,8 +2226,8 @@ impl DriverConfig {
 /// The environment names are the reference's own strings
 /// (`aeron-driver/src/main/c/aeronmd.h`), and one of them is *not* the property
 /// name in capitals: `aeron.flow.control.group.tag`
-/// (`aeron-driver/src/main/java/io/aeron/driver/Configuration.java:993`) is
-/// `AERON_FLOW_CONTROL_GROUP_TAG` (`:542`), not anything respelled from
+/// (`aeron-driver/src/main/java/io/aeron/driver/Configuration.java:1026`) is
+/// `AERON_FLOW_CONTROL_GROUP_TAG` (`:559`), not anything respelled from
 /// `group.tag`. That is why this is a table rather than a derivation.
 struct Setting {
     /// `deepmsg.` plus this, or `aeron.` plus this.
@@ -2377,7 +2377,7 @@ impl Setting {
         env: "AERON_DIR_DELETE_ON_SHUTDOWN",
     };
     /// `aeron.conductor.buffer.length` (`aeron_driver_context.h:208`,
-    /// `Configuration.java:182`). Its environment variable is
+    /// `Configuration.java:183`). Its environment variable is
     /// `AERON_CONDUCTOR_BUFFER_LENGTH` (`aeronmd.h:97`), and the property is
     /// **not** that name lowercased: `to.conductor.buffer.length` appears
     /// nowhere in the reference, and reading it as the property is how this
@@ -2387,14 +2387,14 @@ impl Setting {
         env: "AERON_CONDUCTOR_BUFFER_LENGTH",
     };
     /// `aeron.clients.buffer.length` (`aeron_driver_context.h:209`,
-    /// `Configuration.java:198`) — again not
+    /// `Configuration.java:199`) — again not
     /// `AERON_CLIENTS_BUFFER_LENGTH` lowercased (`:105`).
     const TO_CLIENTS_BUFFER_LENGTH: Self = Self {
         property: "clients.buffer.length",
         env: "AERON_CLIENTS_BUFFER_LENGTH",
     };
     /// `aeron.counters.buffer.length` (`aeron_driver_context.h:210`,
-    /// `Configuration.java:216`) — the values buffer loses its `values`, which
+    /// `Configuration.java:217`) — the values buffer loses its `values`, which
     /// is only in the environment variable (`:113`).
     const COUNTERS_VALUES_BUFFER_LENGTH: Self = Self {
         property: "counters.buffer.length",
@@ -2420,12 +2420,12 @@ impl Setting {
         property: "ipc.publication.term.window.length",
         env: "AERON_IPC_PUBLICATION_TERM_WINDOW_LENGTH",
     };
-    /// `aeron.publication.reserved.session.id.low` (`aeronmd.h:760`).
+    /// `aeron.publication.reserved.session.id.low` (`aeronmd.h:794`).
     const PUBLICATION_RESERVED_SESSION_ID_LOW: Self = Self {
         property: "publication.reserved.session.id.low",
         env: "AERON_PUBLICATION_RESERVED_SESSION_ID_LOW",
     };
-    /// `aeron.publication.reserved.session.id.high` (`aeronmd.h:765`).
+    /// `aeron.publication.reserved.session.id.high` (`aeronmd.h:799`).
     const PUBLICATION_RESERVED_SESSION_ID_HIGH: Self = Self {
         property: "publication.reserved.session.id.high",
         env: "AERON_PUBLICATION_RESERVED_SESSION_ID_HIGH",
@@ -2435,17 +2435,17 @@ impl Setting {
         property: "publication.linger.timeout",
         env: "AERON_PUBLICATION_LINGER_TIMEOUT",
     };
-    /// `aeron.publication.unblock.timeout` (`aeronmd.h:393`).
+    /// `aeron.publication.unblock.timeout` (`aeronmd.h:410`).
     const PUBLICATION_UNBLOCK_TIMEOUT: Self = Self {
         property: "publication.unblock.timeout",
         env: "AERON_PUBLICATION_UNBLOCK_TIMEOUT",
     };
-    /// `aeron.publication.connection.timeout` (`aeronmd.h:401`).
+    /// `aeron.publication.connection.timeout` (`aeronmd.h:418`).
     const PUBLICATION_CONNECTION_TIMEOUT: Self = Self {
         property: "publication.connection.timeout",
         env: "AERON_PUBLICATION_CONNECTION_TIMEOUT",
     };
-    /// `aeron.driver.stream.session.limit` (`aeronmd.h:989`).
+    /// `aeron.driver.stream.session.limit` (`aeronmd.h:1023`).
     const DRIVER_STREAM_SESSION_LIMIT: Self = Self {
         property: "driver.stream.session.limit",
         env: "AERON_DRIVER_STREAM_SESSION_LIMIT",
@@ -2467,288 +2467,288 @@ impl Setting {
     };
     /// `aeron.term.buffer.length`: the length of one term of a *network*
     /// publication's log buffer (`aeronmd.h:137`, read at
-    /// `aeron_driver_context.c:712-717`, bounds 1024 to `INT32_MAX`).
+    /// `aeron_driver_context.c:719-724`, bounds 1024 to `INT32_MAX`).
     const TERM_BUFFER_LENGTH: Self = Self {
         property: "term.buffer.length",
         env: "AERON_TERM_BUFFER_LENGTH",
     };
     /// `aeron.mtu.length`: the largest frame a network publication writes
-    /// (`aeronmd.h:193`, read at `:726-731`, bounded by the data header and the
+    /// (`aeronmd.h:193`, read at `:743-748`, bounded by the data header and the
     /// largest UDP payload).
     const MTU_LENGTH: Self = Self {
         property: "mtu.length",
         env: "AERON_MTU_LENGTH",
     };
     /// `aeron.publication.term.window.length`: how far ahead of its slowest
-    /// reader a network producer may run (`aeronmd.h:217`, read at `:747-752`,
+    /// reader a network producer may run (`aeronmd.h:217`, read at `:781-786`,
     /// zero meaning half a term).
     const PUBLICATION_WINDOW_LENGTH: Self = Self {
         property: "publication.term.window.length",
         env: "AERON_PUBLICATION_TERM_WINDOW_LENGTH",
     };
     /// `aeron.socket.so_rcvbuf`: the socket buffer a channel that named none
-    /// gets (`aeron_driver_context.h:218`, `Configuration.java:322`; the
+    /// gets (`aeron_driver_context.h:218`, `Configuration.java:343`; the
     /// environment variable is `AERON_SOCKET_SO_RCVBUF`, `aeronmd.h:233`, read
-    /// at `:754-759`). A single underscore, not a second dot.
+    /// at `:788-793`). A single underscore, not a second dot.
     const SOCKET_SO_RCVBUF: Self = Self {
         property: "socket.so_rcvbuf",
         env: "AERON_SOCKET_SO_RCVBUF",
     };
     /// `aeron.socket.so_sndbuf` (`aeron_driver_context.h:219`; environment
-    /// variable `AERON_SOCKET_SO_SNDBUF`, `aeronmd.h:241`, read at `:761-766`).
+    /// variable `AERON_SOCKET_SO_SNDBUF`, `aeronmd.h:241`, read at `:768-773`).
     /// Underscored like its receive twin above.
     const SOCKET_SO_SNDBUF: Self = Self {
         property: "socket.so_sndbuf",
         env: "AERON_SOCKET_SO_SNDBUF",
     };
-    /// `aeron.receiver.io.vector.capacity` (`aeron_driver_context.h:228`,
+    /// `aeron.receiver.io.vector.capacity` (`aeron_driver_context.h:230`,
     /// environment variable `AERON_RECEIVER_IO_VECTOR_CAPACITY`,
-    /// `aeronmd.h:937`, read at `aeron_driver_context.c:1084-1089`).
+    /// `aeronmd.h:971`, read at `aeron_driver_context.c:1114-1119`).
     const RECEIVER_IO_VECTOR_CAPACITY: Self = Self {
         property: "receiver.io.vector.capacity",
         env: "AERON_RECEIVER_IO_VECTOR_CAPACITY",
     };
-    /// `aeron.sender.io.vector.capacity` (`aeron_driver_context.h:229`,
+    /// `aeron.sender.io.vector.capacity` (`aeron_driver_context.h:231`,
     /// environment variable `AERON_SENDER_IO_VECTOR_CAPACITY`,
-    /// `aeronmd.h:941`, read at `aeron_driver_context.c:1091-1097`).
+    /// `aeronmd.h:975`, read at `aeron_driver_context.c:1121-1127`).
     const SENDER_IO_VECTOR_CAPACITY: Self = Self {
         property: "sender.io.vector.capacity",
         env: "AERON_SENDER_IO_VECTOR_CAPACITY",
     };
-    /// `aeron.socket.multicast.ttl` (`aeronmd.h:249`, read at `:768-772`).
+    /// `aeron.socket.multicast.ttl` (`aeronmd.h:249`, read at `:775-779`).
     const SOCKET_MULTICAST_TTL: Self = Self {
         property: "socket.multicast.ttl",
         env: "AERON_SOCKET_MULTICAST_TTL",
     };
-    /// `aeron.socket.tos` (`aeronmd.h:257`, read at `:782-788`).
+    /// `aeron.socket.tos` (`aeronmd.h:265`, read at `:816-822`).
     const SOCKET_TOS: Self = Self {
         property: "socket.tos",
         env: "AERON_SOCKET_TOS",
     };
-    /// `aeron.receiver.poll.to.slow.work.ratio` (`aeronmd.h:274`).
+    /// `aeron.receiver.poll.to.slow.work.ratio` (`aeronmd.h:291`).
     const RECEIVER_POLL_TO_SLOW_WORK_RATIO: Self = Self {
         property: "receiver.poll.to.slow.work.ratio",
         env: "AERON_RECEIVER_POLL_TO_SLOW_WORK_RATIO",
     };
     /// `aeron.udp.channel.transport.poller.iteration.threshold`
-    /// (`aeronmd.h:765`).
+    /// (`aeronmd.h:799`).
     const UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD: Self = Self {
         property: "udp.channel.transport.poller.iteration.threshold",
         env: "AERON_UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD",
     };
     /// `aeron.udp.channel.transport.poller.socket.poll.limit`
-    /// (`aeronmd.h:774`).
+    /// (`aeronmd.h:808`).
     const UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT: Self = Self {
         property: "udp.channel.transport.poller.socket.poll.limit",
         env: "AERON_UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT",
     };
-    /// `aeron.nak.multicast.group.size` (`aeronmd.h:645`, read at `:938-943`).
+    /// `aeron.nak.multicast.group.size` (`aeronmd.h:662`, read at `:972-977`).
     const NAK_MULTICAST_GROUP_SIZE: Self = Self {
         property: "nak.multicast.group.size",
         env: "AERON_NAK_MULTICAST_GROUP_SIZE",
     };
-    /// `aeron.nak.multicast.max.backoff` (`aeronmd.h:653`, read at `:945-950`).
+    /// `aeron.nak.multicast.max.backoff` (`aeronmd.h:670`, read at `:975-980`).
     const NAK_MULTICAST_MAX_BACKOFF: Self = Self {
         property: "nak.multicast.max.backoff",
         env: "AERON_NAK_MULTICAST_MAX_BACKOFF",
     };
-    /// `aeron.receiver.group.consideration` (`aeronmd.h:701`, read at
-    /// `:451-452` — environment only, with no property read in the reference;
+    /// `aeron.receiver.group.consideration` (`aeronmd.h:718`, read at
+    /// `:468-469` — environment only, with no property read in the reference;
     /// this build reads the property too, as it does for every other name).
     /// `aeron.multicast.flowcontrol.supplier`
-    /// (`aeronmd.h:684-690`).
+    /// (`aeronmd.h:701-707`).
     const MULTICAST_FLOWCONTROL_SUPPLIER: Self = Self {
         property: "multicast.flowcontrol.supplier",
         env: "AERON_MULTICAST_FLOWCONTROL_SUPPLIER",
     };
-    /// `aeron.unicast.flowcontrol.supplier` (`aeronmd.h:676-682`).
+    /// `aeron.unicast.flowcontrol.supplier` (`aeronmd.h:693-699`).
     const UNICAST_FLOWCONTROL_SUPPLIER: Self = Self {
         property: "unicast.flowcontrol.supplier",
         env: "AERON_UNICAST_FLOWCONTROL_SUPPLIER",
     };
     /// `aeron.congestioncontrol.supplier`
-    /// (`AERON_CONGESTIONCONTROL_SUPPLIER`, `aeronmd.h:339`).
+    /// (`AERON_CONGESTIONCONTROL_SUPPLIER`, `aeronmd.h:356`).
     const CONGESTIONCONTROL_SUPPLIER: Self = Self {
         property: "congestioncontrol.supplier",
         env: "AERON_CONGESTIONCONTROL_SUPPLIER",
     };
-    /// `aeron.name.resolver.supplier` (`aeronmd.h:808`): `default`,
+    /// `aeron.name.resolver.supplier` (`aeronmd.h:842`): `default`,
     /// `csv_table` or `driver`.
     const NAME_RESOLVER_SUPPLIER: Self = Self {
         property: "name.resolver.supplier",
         env: "AERON_NAME_RESOLVER_SUPPLIER",
     };
-    /// `aeron.name.resolver.init.args` (`aeronmd.h:818`), the CSV table's
+    /// `aeron.name.resolver.init.args` (`aeronmd.h:852`), the CSV table's
     /// configuration — **environment only**, and deliberately: the reference
     /// reads it into the context with `getenv` and never a property
-    /// (`aeron_driver_context.c:599`), and this build's `Setting` table answers
+    /// (`aeron_driver_context.c:606`), and this build's `Setting` table answers
     /// to both names for every other setting.
     const NAME_RESOLVER_INIT_ARGS: Self = Self {
         property: "name.resolver.init.args",
         env: "AERON_NAME_RESOLVER_INIT_ARGS",
     };
-    /// `aeron.driver.resolver.name` (`aeronmd.h:780`).
+    /// `aeron.driver.resolver.name` (`aeronmd.h:814`).
     const DRIVER_RESOLVER_NAME: Self = Self {
         property: "driver.resolver.name",
         env: "AERON_DRIVER_RESOLVER_NAME",
     };
-    /// `aeron.driver.resolver.interface` (`aeronmd.h:790`).
+    /// `aeron.driver.resolver.interface` (`aeronmd.h:824`).
     const DRIVER_RESOLVER_INTERFACE: Self = Self {
         property: "driver.resolver.interface",
         env: "AERON_DRIVER_RESOLVER_INTERFACE",
     };
     /// `aeron.sender.wildcard.port.range`
-    /// (`AERON_SENDER_WILDCARD_PORT_RANGE`, `aeronmd.h:878`): **two numbers
+    /// (`AERON_SENDER_WILDCARD_PORT_RANGE`, `aeronmd.h:912`): **two numbers
     /// separated by a space**, which is what the reference's two `strtoll`
-    /// calls make of it (`aeron_port_manager.c:176-211`).
+    /// calls make of it (`aeron_port_manager.c:181-216`).
     const SENDER_WILDCARD_PORT_RANGE: Self = Self {
         property: "sender.wildcard.port.range",
         env: "AERON_SENDER_WILDCARD_PORT_RANGE",
     };
     /// `aeron.receiver.wildcard.port.range`
-    /// (`AERON_RECEIVER_WILDCARD_PORT_RANGE`, `aeronmd.h:888`).
+    /// (`AERON_RECEIVER_WILDCARD_PORT_RANGE`, `aeronmd.h:922`).
     const RECEIVER_WILDCARD_PORT_RANGE: Self = Self {
         property: "receiver.wildcard.port.range",
         env: "AERON_RECEIVER_WILDCARD_PORT_RANGE",
     };
-    /// `aeron.driver.resolver.bootstrap.neighbor` (`aeronmd.h:800`).
+    /// `aeron.driver.resolver.bootstrap.neighbor` (`aeronmd.h:834`).
     const DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR: Self = Self {
         property: "driver.resolver.bootstrap.neighbor",
         env: "AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR",
     };
-    /// `aeron.driver.resolver.neighbor.timeout` (`aeronmd.h:827`).
+    /// `aeron.driver.resolver.neighbor.timeout` (`aeronmd.h:861`).
     const DRIVER_RESOLVER_NEIGHBOR_TIMEOUT: Self = Self {
         property: "driver.resolver.neighbor.timeout",
         env: "AERON_DRIVER_RESOLVER_NEIGHBOR_TIMEOUT",
     };
-    /// `aeron.driver.resolver.self.resolution.interval` (`aeronmd.h:834`).
+    /// `aeron.driver.resolver.self.resolution.interval` (`aeronmd.h:868`).
     const DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL: Self = Self {
         property: "driver.resolver.self.resolution.interval",
         env: "AERON_DRIVER_RESOLVER_SELF_RESOLUTION_INTERVAL",
     };
-    /// `aeron.driver.resolver.neighbor.resolution.interval` (`aeronmd.h:842`).
+    /// `aeron.driver.resolver.neighbor.resolution.interval` (`aeronmd.h:876`).
     const DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL: Self = Self {
         property: "driver.resolver.neighbor.resolution.interval",
         env: "AERON_DRIVER_RESOLVER_NEIGHBOR_RESOLUTION_INTERVAL",
     };
     /// `aeron.driver.resolver.bootstrap.neighbor.resolution.interval`
-    /// (`aeronmd.h:848`).
+    /// (`aeronmd.h:882`).
     const DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL: Self = Self {
         property: "driver.resolver.bootstrap.neighbor.resolution.interval",
         env: "AERON_DRIVER_RESOLVER_BOOTSTRAP_NEIGHBOR_RESOLUTION_INTERVAL",
     };
-    /// `aeron.driver.reresolution.check.interval` (`aeronmd.h:857`).
+    /// `aeron.driver.reresolution.check.interval` (`aeronmd.h:891`).
     const DRIVER_RERESOLUTION_CHECK_INTERVAL: Self = Self {
         property: "driver.reresolution.check.interval",
         env: "AERON_DRIVER_RERESOLUTION_CHECK_INTERVAL",
     };
-    /// `aeron.driver.connect` (`aeronmd.h:723`).
+    /// `aeron.driver.connect` (`aeronmd.h:740`).
     const DRIVER_CONNECT: Self = Self {
         property: "driver.connect",
         env: "AERON_DRIVER_CONNECT",
     };
-    /// `aeron.thread.affinity.use.cpuset.offsets` (`aeronmd.h:1003`).
+    /// `aeron.thread.affinity.use.cpuset.offsets` (`aeronmd.h:1037`).
     const THREAD_AFFINITY_USE_CPUSET_OFFSETS: Self = Self {
         property: "thread.affinity.use.cpuset.offsets",
         env: "AERON_THREAD_AFFINITY_USE_CPUSET_OFFSETS",
     };
-    /// `aeron.thread.affinity.fail.on.validation.errors` (`aeronmd.h:1007`).
+    /// `aeron.thread.affinity.fail.on.validation.errors` (`aeronmd.h:1041`).
     const THREAD_AFFINITY_FAIL_ON_VALIDATION_ERRORS: Self = Self {
         property: "thread.affinity.fail.on.validation.errors",
         env: "AERON_THREAD_AFFINITY_FAIL_ON_VALIDATION_ERRORS",
     };
-    /// `aeron.conductor.cpu.affinity` (`aeronmd.h:953`).
+    /// `aeron.conductor.cpu.affinity` (`aeronmd.h:987`).
     const CONDUCTOR_CPU_AFFINITY: Self = Self {
         property: "conductor.cpu.affinity",
         env: "AERON_CONDUCTOR_CPU_AFFINITY",
     };
-    /// `aeron.receiver.cpu.affinity` (`aeronmd.h:957`).
+    /// `aeron.receiver.cpu.affinity` (`aeronmd.h:991`).
     const RECEIVER_CPU_AFFINITY: Self = Self {
         property: "receiver.cpu.affinity",
         env: "AERON_RECEIVER_CPU_AFFINITY",
     };
-    /// `aeron.sender.cpu.affinity` (`aeronmd.h:961`).
+    /// `aeron.sender.cpu.affinity` (`aeronmd.h:995`).
     const SENDER_CPU_AFFINITY: Self = Self {
         property: "sender.cpu.affinity",
         env: "AERON_SENDER_CPU_AFFINITY",
     };
-    /// `aeron.driver.native.resource.agent.cpu.affinity` (`aeronmd.h:965`).
+    /// `aeron.driver.native.resource.agent.cpu.affinity` (`aeronmd.h:999`).
     const NATIVE_RESOURCE_AGENT_CPU_AFFINITY: Self = Self {
         property: "driver.native.resource.agent.cpu.affinity",
         env: "AERON_DRIVER_NATIVE_RESOURCE_AGENT_CPU_AFFINITY",
     };
-    /// `aeron.driver.dynamic.libraries` (`aeronmd.h:980`): the libraries the
+    /// `aeron.driver.dynamic.libraries` (`aeronmd.h:1014`): the libraries the
     /// reference `dlopen`s at context init. This build refuses it — see
     /// [`ConfigError::DynamicLoadingNotSupported`].
     const DRIVER_DYNAMIC_LIBRARIES: Self = Self {
         property: "driver.dynamic.libraries",
         env: "AERON_DRIVER_DYNAMIC_LIBRARIES",
     };
-    /// `aeron.agent.on.start.function` (`aeronmd.h:513`): the symbol the
+    /// `aeron.agent.on.start.function` (`aeronmd.h:530`): the symbol the
     /// reference `dlsym`s and calls on every agent's start. Refused, like the
     /// libraries above.
     const AGENT_ON_START_FUNCTION: Self = Self {
         property: "agent.on.start.function",
         env: "AERON_AGENT_ON_START_FUNCTION",
     };
-    /// `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` (`aeronmd.h:731`): which
+    /// `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` (`aeronmd.h:748`): which
     /// implementation of the transport bindings the driver's UDP data paths
-    /// run on (`aeron_driver_context.c:1258-1263`). See
+    /// run on (`aeron_driver_context.c:1288-1293`). See
     /// [`parse_transport_bindings`].
     const UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA: Self = Self {
         property: "udp.channel.transport.bindings.media",
         env: "AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA",
     };
-    /// `AERON_CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` (`aeronmd.h:736`):
+    /// `AERON_CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` (`aeronmd.h:753`):
     /// the same choice for the conductor's own transports, which only the name
-    /// resolver opens (`aeron_driver_context.c:1266-1270`,
+    /// resolver opens (`aeron_driver_context.c:1296-1300`,
     /// `aeron_driver_name_resolver.c:399`).
     const CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA: Self = Self {
         property: "conductor.udp.channel.transport.bindings.media",
         env: "AERON_CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA",
     };
-    /// `aeron.loss.report.buffer.length` (`aeronmd.h:385`).
+    /// `aeron.loss.report.buffer.length` (`aeronmd.h:402`).
     const LOSS_REPORT_BUFFER_LENGTH: Self = Self {
         property: "loss.report.buffer.length",
         env: "AERON_LOSS_REPORT_BUFFER_LENGTH",
     };
-    /// `aeron.name.resolver.threshold` (`aeronmd.h:932`).
+    /// `aeron.name.resolver.threshold` (`aeronmd.h:966`).
     const DRIVER_NAME_RESOLVER_THRESHOLD: Self = Self {
         property: "name.resolver.threshold",
         env: "AERON_DRIVER_NAME_RESOLVER_THRESHOLD",
     };
-    /// `aeron.driver.conductor.cycle.threshold` (`aeronmd.h:908`; the property
-    /// name is the Java `Configuration`'s, `:1070`).
+    /// `aeron.driver.conductor.cycle.threshold` (`aeronmd.h:942`; the property
+    /// name is the Java `Configuration`'s, `:1100`).
     const DRIVER_CONDUCTOR_CYCLE_THRESHOLD: Self = Self {
         property: "driver.conductor.cycle.threshold",
         env: "AERON_DRIVER_CONDUCTOR_CYCLE_THRESHOLD",
     };
-    /// `aeron.driver.sender.cycle.threshold` (`aeronmd.h:916`, `:1085`).
+    /// `aeron.driver.sender.cycle.threshold` (`aeronmd.h:950`, `:1115`).
     const DRIVER_SENDER_CYCLE_THRESHOLD: Self = Self {
         property: "driver.sender.cycle.threshold",
         env: "AERON_DRIVER_SENDER_CYCLE_THRESHOLD",
     };
-    /// `aeron.driver.receiver.cycle.threshold` (`aeronmd.h:924`, `:1100`).
+    /// `aeron.driver.receiver.cycle.threshold` (`aeronmd.h:958`, `:1140`).
     const DRIVER_RECEIVER_CYCLE_THRESHOLD: Self = Self {
         property: "driver.receiver.cycle.threshold",
         env: "AERON_DRIVER_RECEIVER_CYCLE_THRESHOLD",
     };
-    /// `aeron.cubiccongestioncontrol.initialrtt` (`aeronmd.h:351`).
+    /// `aeron.cubiccongestioncontrol.initialrtt` (`aeronmd.h:368`).
     const CUBIC_INITIAL_RTT: Self = Self {
         property: "cubiccongestioncontrol.initialrtt",
         env: "AERON_CUBICCONGESTIONCONTROL_INITIALRTT",
     };
-    /// `aeron.cubiccongestioncontrol.measurertt` (`aeronmd.h:346`).
+    /// `aeron.cubiccongestioncontrol.measurertt` (`aeronmd.h:363`).
     const CUBIC_MEASURE_RTT: Self = Self {
         property: "cubiccongestioncontrol.measurertt",
         env: "AERON_CUBICCONGESTIONCONTROL_MEASURERTT",
     };
-    /// `aeron.cubiccongestioncontrol.tcpmode` (`aeronmd.h:359`).
+    /// `aeron.cubiccongestioncontrol.tcpmode` (`aeronmd.h:376`).
     const CUBIC_TCP_MODE: Self = Self {
         property: "cubiccongestioncontrol.tcpmode",
         env: "AERON_CUBICCONGESTIONCONTROL_TCPMODE",
     };
-    /// `aeron.image.liveness.timeout` (`aeronmd.h:323`).
+    /// `aeron.image.liveness.timeout` (`aeronmd.h:340`).
     const IMAGE_LIVENESS_TIMEOUT: Self = Self {
         property: "image.liveness.timeout",
         env: "AERON_IMAGE_LIVENESS_TIMEOUT",
@@ -2763,59 +2763,59 @@ impl Setting {
         property: "thread.naming",
         env: "AERON_THREAD_NAMING",
     };
-    /// `aeron.conductor.idle.strategy` (`aeronmd.h:425`).
+    /// `aeron.conductor.idle.strategy` (`aeronmd.h:442`).
     const CONDUCTOR_IDLE_STRATEGY: Self = Self {
         property: "conductor.idle.strategy",
         env: "AERON_CONDUCTOR_IDLE_STRATEGY",
     };
-    /// `aeron.conductor.idle.strategy.init.args` (`aeronmd.h:465`).
+    /// `aeron.conductor.idle.strategy.init.args` (`aeronmd.h:482`).
     const CONDUCTOR_IDLE_STRATEGY_INIT_ARGS: Self = Self {
         property: "conductor.idle.strategy.init.args",
         env: "AERON_CONDUCTOR_IDLE_STRATEGY_INIT_ARGS",
     };
-    /// `aeron.sender.idle.strategy` (`aeronmd.h:417`).
+    /// `aeron.sender.idle.strategy` (`aeronmd.h:434`).
     const SENDER_IDLE_STRATEGY: Self = Self {
         property: "sender.idle.strategy",
         env: "AERON_SENDER_IDLE_STRATEGY",
     };
-    /// `aeron.sender.idle.strategy.init.args` (`aeronmd.h:457`).
+    /// `aeron.sender.idle.strategy.init.args` (`aeronmd.h:474`).
     const SENDER_IDLE_STRATEGY_INIT_ARGS: Self = Self {
         property: "sender.idle.strategy.init.args",
         env: "AERON_SENDER_IDLE_STRATEGY_INIT_ARGS",
     };
-    /// `aeron.receiver.idle.strategy` (`aeronmd.h:433`).
+    /// `aeron.receiver.idle.strategy` (`aeronmd.h:450`).
     const RECEIVER_IDLE_STRATEGY: Self = Self {
         property: "receiver.idle.strategy",
         env: "AERON_RECEIVER_IDLE_STRATEGY",
     };
-    /// `aeron.receiver.idle.strategy.init.args` (`aeronmd.h:473`).
+    /// `aeron.receiver.idle.strategy.init.args` (`aeronmd.h:490`).
     const RECEIVER_IDLE_STRATEGY_INIT_ARGS: Self = Self {
         property: "receiver.idle.strategy.init.args",
         env: "AERON_RECEIVER_IDLE_STRATEGY_INIT_ARGS",
     };
-    /// `aeron.shared.idle.strategy` (`aeronmd.h:449`).
+    /// `aeron.shared.idle.strategy` (`aeronmd.h:466`).
     const SHARED_IDLE_STRATEGY: Self = Self {
         property: "shared.idle.strategy",
         env: "AERON_SHARED_IDLE_STRATEGY",
     };
-    /// `aeron.shared.idle.strategy.init.args` (`aeronmd.h:489`).
+    /// `aeron.shared.idle.strategy.init.args` (`aeronmd.h:506`).
     const SHARED_IDLE_STRATEGY_INIT_ARGS: Self = Self {
         property: "shared.idle.strategy.init.args",
         env: "AERON_SHARED_IDLE_STRATEGY_INIT_ARGS",
     };
-    /// `aeron.sharednetwork.idle.strategy` (`aeronmd.h:441`) — the reference
+    /// `aeron.sharednetwork.idle.strategy` (`aeronmd.h:458`) — the reference
     /// spells this one without the underscore between the two words, and its
     /// env var is what a deployment writes.
     const SHARED_NETWORK_IDLE_STRATEGY: Self = Self {
         property: "sharednetwork.idle.strategy",
         env: "AERON_SHAREDNETWORK_IDLE_STRATEGY",
     };
-    /// `aeron.sharednetwork.idle.strategy.init.args` (`aeronmd.h:481`).
+    /// `aeron.sharednetwork.idle.strategy.init.args` (`aeronmd.h:498`).
     const SHARED_NETWORK_IDLE_STRATEGY_INIT_ARGS: Self = Self {
         property: "sharednetwork.idle.strategy.init.args",
         env: "AERON_SHAREDNETWORK_IDLE_STRATEGY_INIT_ARGS",
     };
-    /// `aeron.driver.native.resource.agent.idle.strategy` (`aeronmd.h:497`) —
+    /// `aeron.driver.native.resource.agent.idle.strategy` (`aeronmd.h:514`) —
     /// the one slot whose names carry the `driver.` infix, which is what its
     /// environment variable spells.
     const NATIVE_RESOURCE_AGENT_IDLE_STRATEGY: Self = Self {
@@ -2823,22 +2823,22 @@ impl Setting {
         env: "AERON_DRIVER_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY",
     };
     /// `aeron.driver.native.resource.agent.idle.strategy.init.args`
-    /// (`aeronmd.h:505`).
+    /// (`aeronmd.h:522`).
     const NATIVE_RESOURCE_AGENT_IDLE_STRATEGY_INIT_ARGS: Self = Self {
         property: "driver.native.resource.agent.idle.strategy.init.args",
         env: "AERON_DRIVER_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY_INIT_ARGS",
     };
-    /// `aeron.receiver.group.tag` (`aeronmd.h:558`).
+    /// `aeron.receiver.group.tag` (`aeronmd.h:575`).
     const RECEIVER_GROUP_TAG: Self = Self {
         property: "receiver.group.tag",
         env: "AERON_RECEIVER_GROUP_TAG",
     };
-    /// `aeron.flow.control.group.tag` (`Configuration.java:993`; the
-    /// environment variable is `AERON_FLOW_CONTROL_GROUP_TAG`, `aeronmd.h:542`).
+    /// `aeron.flow.control.group.tag` (`Configuration.java:1026`; the
+    /// environment variable is `AERON_FLOW_CONTROL_GROUP_TAG`, `aeronmd.h:559`).
     ///
     /// The one name where the two references disagree: C's context header
     /// comments this field `aeron.flow.control.gtag`
-    /// (`aeron_driver_context.h:253`). C reads no property at all here — only
+    /// (`aeron_driver_context.h:259`). C reads no property at all here — only
     /// the environment variable — so its comment describes a name it does not
     /// consume, and Java's is the one a `-D` deployment would have written.
     const FLOW_CONTROL_GROUP_TAG: Self = Self {
@@ -2860,7 +2860,7 @@ impl Setting {
         env: "AERON_RECEIVER_GROUP_CONSIDERATION",
     };
     /// `aeron.rcv.initial.window.length`: the window a receiver offers when the
-    /// channel named none (`aeronmd.h:331`, read at `:834-839`).
+    /// channel named none (`aeronmd.h:348`, read at `:868-873`).
     ///
     /// It is the window an image advertises, and so the one the untethered
     /// state machine measures a reader's lag against.
@@ -2869,14 +2869,14 @@ impl Setting {
         env: "AERON_RCV_INITIAL_WINDOW_LENGTH",
     };
     /// `aeron.rcv.status.message.timeout`: how long a receiver may hear nothing
-    /// before it decides the sender is gone (`aeronmd.h:265`, read at
-    /// `:820-825`).
+    /// before it decides the sender is gone (`aeronmd.h:282`, read at
+    /// `:854-859`).
     const RCV_STATUS_MESSAGE_TIMEOUT: Self = Self {
         property: "rcv.status.message.timeout",
         env: "AERON_RCV_STATUS_MESSAGE_TIMEOUT",
     };
     /// `aeron.send.to.status.poll.ratio`: how many sender passes go by between
-    /// two polls of the control sockets (`aeronmd.h:257`, read at `:806-811`).
+    /// two polls of the control sockets (`aeronmd.h:265`, read at `:840-845`).
     const SEND_TO_STATUS_POLL_RATIO: Self = Self {
         property: "send.to.status.poll.ratio",
         env: "AERON_SEND_TO_STATUS_POLL_RATIO",
@@ -2888,23 +2888,23 @@ impl Setting {
         env: "AERON_SPIES_SIMULATE_CONNECTION",
     };
     /// `aeron.max.resend`: how many times a term may be retransmitted
-    /// (`aeronmd.h:677`, read at `:916-921`, bounded by
+    /// (`aeronmd.h:694`, read at `:950-955`, bounded by
     /// `AERON_RETRANSMIT_HANDLER_MAX_RESEND_MAX`).
     const MAX_RESEND: Self = Self {
         property: "max.resend",
         env: "AERON_MAX_RESEND",
     };
-    /// `aeron.untethered.window.limit.timeout` (`aeronmd.h:611`).
+    /// `aeron.untethered.window.limit.timeout` (`aeronmd.h:628`).
     const UNTETHERED_WINDOW_LIMIT_TIMEOUT: Self = Self {
         property: "untethered.window.limit.timeout",
         env: "AERON_UNTETHERED_WINDOW_LIMIT_TIMEOUT",
     };
-    /// `aeron.untethered.linger.timeout` (`aeronmd.h:620`).
+    /// `aeron.untethered.linger.timeout` (`aeronmd.h:637`).
     const UNTETHERED_LINGER_TIMEOUT: Self = Self {
         property: "untethered.linger.timeout",
         env: "AERON_UNTETHERED_LINGER_TIMEOUT",
     };
-    /// `aeron.untethered.resting.timeout` (`aeronmd.h:629`).
+    /// `aeron.untethered.resting.timeout` (`aeronmd.h:646`).
     const UNTETHERED_RESTING_TIMEOUT: Self = Self {
         property: "untethered.resting.timeout",
         env: "AERON_UNTETHERED_RESTING_TIMEOUT",
@@ -2914,7 +2914,7 @@ impl Setting {
         env: "AERON_CLIENT_LIVENESS_TIMEOUT",
     };
     /// `aeron.nak.unicast.delay` (`AERON_NAK_UNICAST_DELAY`,
-    /// `aeronmd.h:661`; read at `aeron_driver_context.c:952-956`).
+    /// `aeronmd.h:678`; read at `aeron_driver_context.c:982-986`).
     const NAK_UNICAST_DELAY: Self = Self {
         property: "nak.unicast.delay",
         env: "AERON_NAK_UNICAST_DELAY",
@@ -2924,12 +2924,12 @@ impl Setting {
         property: "file.page.size",
         env: "AERON_FILE_PAGE_SIZE",
     };
-    /// `aeron.timer.interval` (`:409`).
+    /// `aeron.timer.interval` (`:412`).
     const TIMER_INTERVAL: Self = Self {
         property: "timer.interval",
         env: "AERON_TIMER_INTERVAL",
     };
-    /// `aeron.driver.termination.validator` (`:567`).
+    /// `aeron.driver.termination.validator` (`:574`).
     const TERMINATION_VALIDATOR: Self = Self {
         property: "driver.termination.validator",
         env: "AERON_DRIVER_TERMINATION_VALIDATOR",
@@ -2939,7 +2939,7 @@ impl Setting {
         property: "driver.timeout",
         env: "AERON_DRIVER_TIMEOUT",
     };
-    /// `aeron.counters.free.to.reuse.timeout` (`:525`). Zero is legal and means
+    /// `aeron.counters.free.to.reuse.timeout` (`:530`). Zero is legal and means
     /// a reclaimed counter is immediately reusable.
     const COUNTER_FREE_TO_REUSE_TIMEOUT: Self = Self {
         property: "counters.free.to.reuse.timeout",
@@ -3037,7 +3037,7 @@ impl Setting {
     /// all, because withholding everything stops the frames arriving long before
     /// a frame budget is used up. The reference reaches for a time in the same
     /// place — its composite predicate drops `SETUP`s "until
-    /// `g_setup_drop_until_ns`" (`…_resilience_test.cpp:1948-1950`).
+    /// `g_setup_drop_until_ns`" (`…_resilience_test.cpp:1951-1953`).
     const RECEIVE_LOSS_UNTIL_MILLIS: Self = Self {
         property: "debug.receive.data.loss.until.millis",
         env: "DEEPMSG_DEBUG_RECEIVE_DATA_LOSS_UNTIL_MILLIS",
@@ -3108,7 +3108,7 @@ pub enum ConfigError {
     /// call — was named, and this build loads no code (ADR-0002).
     ///
     /// The reference loads it and fails its context init when it cannot
-    /// (`aeron_driver_context.c:539-546`, `:555-561`), so a deployment that
+    /// (`aeron_driver_context.c:546-553`, `:572-578`), so a deployment that
     /// names one of these gets a driver that does not start there either. What
     /// is different here is that it can never start, and saying so is the
     /// point: a setting that is quietly dropped is a deployment that believes
@@ -3205,7 +3205,7 @@ pub enum ConfigError {
     },
     /// A transport bindings name this build does not hold, which for the
     /// reference is a driver that does not start
-    /// (`aeron_driver_context.c:1258-1270` is a `goto error`).
+    /// (`aeron_driver_context.c:1288-1300` is a `goto error`).
     UnknownTransportBindings {
         /// The setting, by property name.
         name: &'static str,
@@ -3215,7 +3215,7 @@ pub enum ConfigError {
     /// `dpdk` named as the media in a build without the feature.
     ///
     /// The reference's own answer to a bindings name it does not hold is a
-    /// driver that does not start (`aeron_driver_context.c:1258-1270`), and so
+    /// driver that does not start (`aeron_driver_context.c:1288-1300`), and so
     /// is this — but the message has to say which of the two it was, because
     /// "unknown name" sends a reader looking for a typo.
     DpdkNotInThisBuild {
@@ -3250,7 +3250,7 @@ pub enum ConfigError {
     },
     /// An interface was named for the driver's own resolver without a name for
     /// the driver to answer to, which the reference refuses
-    /// (`aeron_driver_context.c:601-608`).
+    /// (`aeron_driver_context.c:608-615`).
     ResolverNameRequired,
     /// An `aeron.threading.mode` the reference does not know
     /// (`aeron_config_parse_threading_mode`, `aeron_driver_context.c:45-71`).
@@ -3269,7 +3269,7 @@ pub enum ConfigError {
     },
     /// An idle strategy name the reference's own table does not have, which
     /// for the reference is a driver that does not start
-    /// (`aeron_driver_context.c:1152-1158`).
+    /// (`aeron_driver_context.c:1182-1188`).
     UnknownIdleStrategy {
         /// The slot, by property name.
         name: &'static str,
@@ -3282,9 +3282,9 @@ pub enum ConfigError {
         value: String,
     },
     /// A wildcard port range the reference's parser would reject
-    /// (`aeron_parse_port_range`, `aeron_port_manager.c:176-211`) — which for
+    /// (`aeron_parse_port_range`, `aeron_port_manager.c:181-216`) — which for
     /// the reference is a driver that does not start
-    /// (`aeron_driver_context.c:1062-1066`).
+    /// (`aeron_driver_context.c:1092-1096`).
     PortRange {
         /// The setting, by property name.
         name: &'static str,
@@ -3470,7 +3470,7 @@ where
 ///
 /// Three answers, and the middle one is the reference's own: a name this build
 /// does not hold is a driver that does not start
-/// (`aeron_driver_context.c:1258-1270` is a `goto error`). `dpdk` is such a
+/// (`aeron_driver_context.c:1288-1300` is a `goto error`). `dpdk` is such a
 /// name in a build without the feature, and the message says which of the two
 /// it was rather than pretending the name is unknown.
 ///
@@ -3513,7 +3513,7 @@ fn parse_media(setting: &Setting, value: &str) -> Result<MediaSelection, ConfigE
 /// `true` in a build without the feature is refused the same way a
 /// `media=dpdk` name is, and for the same reason: the reference's answer to a
 /// bindings name it does not hold is a driver that does not start
-/// (`aeron_driver_context.c:1258-1270`).
+/// (`aeron_driver_context.c:1288-1300`).
 ///
 /// # Errors
 ///
@@ -4248,7 +4248,7 @@ fn parse_size64(setting: &Setting, value: &str) -> Result<usize, ConfigError> {
 /// Parse a count and refuse it outside `min..=max`.
 ///
 /// The reference *clamps* — its setters run the value through
-/// `aeron_driver_context_clamp_value` (`aeron_driver_context.c:3339-3346`) —
+/// `aeron_driver_context_clamp_value` (`aeron_driver_context.c:3440-3447`) —
 /// and this refuses instead, which is the divergence `docs/compat.md` records
 /// for every other bounded setting here: a value that means something other
 /// than what it spells is a typo rather than a configuration.
@@ -4384,11 +4384,11 @@ pub(crate) fn cubic_duration(value: &str) -> Option<i64> {
 
 /// One slot's idle strategy from its two settings — the name and the init args
 /// beside it, which the reference reads separately
-/// (`aeron_driver_context.c:1150-1200`).
+/// (`aeron_driver_context.c:1180-1230`).
 ///
 /// The name is checked **here**, at resolve time, because the reference checks
 /// it at the same point and refuses to start over it: an unknown name makes its
-/// loader return null and its context jump to the error arm (`:1152-1158`). A
+/// loader return null and its context jump to the error arm (`:1182-1188`). A
 /// typo in an idle strategy name is not a driver that idles differently.
 fn idle_strategy(
     get: &impl Fn(&Setting) -> Option<String>,
@@ -4405,7 +4405,7 @@ fn idle_strategy(
     // strategy to its own fallback.
     //
     // That middle rung is the reference's and is conditional on the name env
-    // var (`aeron_driver_context.c:1205-1207`). Naming `sleep-ns` while naming
+    // var (`aeron_driver_context.c:1235-1237`). Naming `sleep-ns` while naming
     // no arguments gives one **nanosecond** there too (`aeron_agent.c:56-59`),
     // so the condition must not be papered over: a named strategy keeps its own
     // default, and only the unnamed slot gets the slot's args.
@@ -4640,7 +4640,7 @@ mod tests {
         assert!(matches!(unknown, ConfigError::UnknownSupplier { .. }));
 
         // An interface with no name is the reference's own refusal
-        // (`aeron_driver_context.c:601-608`): a resolver that gossips has to
+        // (`aeron_driver_context.c:608-615`): a resolver that gossips has to
         // say what it is called.
         let nameless = resolve_with_env(
             &[("deepmsg.dir", "/tmp/aeron")],
@@ -4661,7 +4661,7 @@ mod tests {
     }
 
     /// `aeron.driver.connect` is a boolean like any other, and its default is
-    /// the reference's own `true` (`aeron_driver_context.c:247`).
+    /// the reference's own `true` (`aeron_driver_context.c:249`).
     #[test]
     fn the_driver_connect_setting_is_a_boolean_defaulting_to_true() {
         let unset = resolve(&[("deepmsg.dir", "/tmp/aeron")]).expect("a config");
@@ -4680,7 +4680,7 @@ mod tests {
     /// The two settings whose value is **code** are refused, and the refusal
     /// says which one: this build loads no libraries and looks up no symbols
     /// (ADR-0002), and the reference would not start over an unloadable one
-    /// either (`aeron_driver_context.c:539-546`, `:555-561`).
+    /// either (`aeron_driver_context.c:546-553`, `:572-578`).
     ///
     /// Quietly dropping them is the failure this prevents: a deployment that
     /// named interceptors or an agent hook would run without them and never
@@ -4698,7 +4698,7 @@ mod tests {
         // `dontCoalesceNaksOnReceiverByDefault` sends a bare `0`
         // (`CTestMediaDriver.java:449-452`), which is microseconds and below
         // the reference's floor: `AERON_NAK_UNICAST_DELAY_NS_MIN` is 1000
-        // (`aeron_driver_context.c:222`).
+        // (`aeron_driver_context.c:224`).
         let config = resolve_with_env(
             &[("deepmsg.dir", "/tmp/aeron")],
             &[("AERON_NAK_UNICAST_DELAY", "0")],
@@ -4742,7 +4742,7 @@ mod tests {
         );
 
         // A name the reference's table does not hold stops the driver, which is
-        // its own `goto error` (`aeron_driver_context.c:1283-1290`).
+        // its own `goto error` (`aeron_driver_context.c:1313-1320`).
         assert!(matches!(
             resolve_with_env(
                 &[("deepmsg.dir", "/tmp/aeron")],
@@ -4814,8 +4814,8 @@ mod tests {
 
     /// The three duty-cycle thresholds: one number doing two jobs. A pass longer
     /// than its slot's threshold is counted by `*_CYCLE_TIME_THRESHOLD_EXCEEDED`
-    /// (`aeron_driver_context.c:1031-1043`), and the same number is what that
-    /// counter's **label** says it is (`aeron_driver_conductor.c:889-935`).
+    /// (`aeron_driver_context.c:1061-1073`), and the same number is what that
+    /// counter's **label** says it is (`aeron_driver_conductor.c:930-976`).
     ///
     /// The value the harness sends is a **bare nanosecond count** —
     /// `String.valueOf(context.conductorCycleThresholdNs())`
@@ -4842,7 +4842,7 @@ mod tests {
         );
 
         // Unset, each is the reference's own hundred milliseconds
-        // (`aeron_driver_context.c:236-238`).
+        // (`aeron_driver_context.c:238-240`).
         let defaults = resolve(&[("deepmsg.dir", "/tmp/aeron")]).expect("a config");
         assert_eq!(
             CYCLE_THRESHOLD_NS_DEFAULT,
@@ -4863,7 +4863,7 @@ mod tests {
     /// (`aeron_congestion_control.c:392-402`), and the supplier's own name is
     /// the one cubic setting that fails the *driver*: the reference's load
     /// returns `NULL` and its context init goes to `error`
-    /// (`aeron_driver_context.c:579-585`).
+    /// (`aeron_driver_context.c:586-592`).
     #[test]
     fn the_cubic_settings_are_carried_and_the_supplier_name_is_checked() {
         let config = resolve(&[
@@ -5337,7 +5337,7 @@ mod tests {
 
         // And a window the timeout tier cannot honour: the reference refuses
         // `client_liveness_timeout_ns <= timer_interval_ns`
-        // (`aeron_driver_context.c:1526-1533`).
+        // (`aeron_driver_context.c:1570-1577`).
         assert!(matches!(
             resolve(&[
                 ("deepmsg.dir", "/tmp/deepmsg"),
@@ -5358,7 +5358,7 @@ mod tests {
     }
 
     /// `aeron.publication.unblock.timeout`, and the first of the two rules in
-    /// `aeron_driver_validate_unblock_timeout` (`aeron_driver_context.c:1514-1537`):
+    /// `aeron_driver_validate_unblock_timeout` (`aeron_driver_context.c:1558-1581`):
     /// the window has to outlast the liveness window, because a client the
     /// driver has not yet given up on may still be about to commit its claim.
     #[test]
@@ -5398,7 +5398,7 @@ mod tests {
 
     /// `aeron.driver.stream.session.limit` had a value and no name: the
     /// dispatcher already refuses a stream beyond it
-    /// (`aeron_data_packet_dispatcher.c:489-493`), and nothing could set it.
+    /// (`aeron_data_packet_dispatcher.c:494-498`), and nothing could set it.
     #[test]
     fn the_stream_session_limit_answers_to_its_two_names() {
         let config = resolve_with_env(
@@ -5472,7 +5472,7 @@ mod tests {
     #[test]
     fn the_storage_check_answers_to_the_references_names() {
         // On by default, and the warning level ten of the reference's default
-        // term lengths (`aeron_driver_context.c:179-183`, `:457`, `:492`).
+        // term lengths (`aeron_driver_context.c:179-183`, `:458`, `:509`).
         let config = DriverConfig::default();
         assert!(config.perform_storage_checks);
         assert_eq!(160 * 1024 * 1024, config.low_file_store_warning_threshold);
@@ -5495,7 +5495,7 @@ mod tests {
     #[test]
     fn the_counter_reuse_timeout_answers_to_the_references_names() {
         // The reference's environment name is not the property name in
-        // capitals, which is why the table carries both (`aeronmd.h:525`).
+        // capitals, which is why the table carries both (`aeronmd.h:542`).
         let by_property = resolve(&[
             ("deepmsg.dir", "/tmp/deepmsg"),
             ("aeron.counters.free.to.reuse.timeout", "5s"),
@@ -5511,7 +5511,7 @@ mod tests {
         assert_eq!(250_000_000, by_env.counter_free_to_reuse_ns);
 
         // Zero is legal and means "reusable at once"; the reference accepts it
-        // (`aeron_driver_context.c:883-890` parses from a floor of zero).
+        // (`aeron_driver_context.c:913-920` parses from a floor of zero).
         let zero = resolve(&[
             ("deepmsg.dir", "/tmp/deepmsg"),
             ("deepmsg.counters.free.to.reuse.timeout", "0ns"),
@@ -5523,7 +5523,7 @@ mod tests {
     #[test]
     fn the_two_io_vector_capacities_answer_to_the_references_names() {
         // The reference's own defaults, which are four each
-        // (`aeron_driver_context.c:240-241`, `:523-524`). This build answered
+        // (`aeron_driver_context.c:242-243`, `:528-529`). This build answered
         // sixteen to both before it read the setting at all.
         let defaults = DriverConfig::default();
         assert_eq!(4, defaults.receiver_io_vector_capacity);
@@ -5532,7 +5532,7 @@ mod tests {
         // By property, and by the environment variable each becomes: `aeronmd`
         // turns `aeron.foo.bar` into `AERON_FOO_BAR`
         // (`aeron-client/src/main/c/util/aeron_properties_util.c:151-172`), and
-        // the context reads the variable (`aeron_driver_context.c:1084-1097`).
+        // the context reads the variable (`aeron_driver_context.c:1114-1127`).
         let by_property = resolve(&[
             ("deepmsg.dir", "/tmp/deepmsg"),
             ("aeron.receiver.io.vector.capacity", "16"),
@@ -5554,9 +5554,9 @@ mod tests {
         assert_eq!(1, by_env.sender_io_vector_capacity);
 
         // The reference clamps to `1..=AERON_DRIVER_*_IO_VECTOR_LENGTH_MAX`
-        // (`aeron_driver_context.c:3348-3371`); this refuses, which is the
+        // (`aeron_driver_context.c:3449-3472`); this refuses, which is the
         // divergence `docs/compat.md` records for every bounded setting here.
-        for value in ["0", "17"] {
+        for value in ["0", "65"] {
             for capacity in [
                 "aeron.receiver.io.vector.capacity",
                 "aeron.sender.io.vector.capacity",
@@ -5628,8 +5628,8 @@ mod tests {
                 ("AERON_DIR_DELETE_ON_START", "true"),
                 // The network side's, which are the ones a deployment sets to
                 // size a UDP stream: each name is the reference's own
-                // (`aeronmd.h:137`, `:193`, `:217`, `:233`, `:241`, `:331`,
-                // `:265`, `:257`, `:677`, `:178`).
+                // (`aeronmd.h:137`, `:193`, `:217`, `:233`, `:241`, `:348`,
+                // `:265`, `:257`, `:694`, `:178`).
                 ("AERON_TERM_BUFFER_LENGTH", "1m"),
                 ("AERON_MTU_LENGTH", "2048"),
                 ("AERON_PUBLICATION_TERM_WINDOW_LENGTH", "64k"),
@@ -5709,7 +5709,7 @@ mod tests {
     fn the_network_settings_refuse_what_the_reference_refuses() {
         // Each of these is bounded in `aeron_driver_context.c` where it is
         // read, and the bound is the reference's rather than this build's:
-        // `min`/`max` arguments (`:712-767`, `:806-839`, `:916-921`).
+        // `min`/`max` arguments (`:719-774`, `:806-839`, `:957-962`).
         for (property, value) in [
             ("term.buffer.length", "512"),         // below 1024
             ("mtu.length", "16"),                  // below the data header
@@ -5868,7 +5868,7 @@ mod tests {
     /// `AERON_TO_CONDUCTOR_BUFFER_LENGTH_ENV_VAR` is
     /// `"AERON_CONDUCTOR_BUFFER_LENGTH"` (`aeronmd.h:97`), and the property
     /// beside it is `aeron.conductor.buffer.length`
-    /// (`aeron_driver_context.h:208`, `Configuration.java:182`). Reading the
+    /// (`aeron_driver_context.h:208`, `Configuration.java:183`). Reading the
     /// macro as the property left these answering to names that appear nowhere
     /// in the reference, so a deployment writing the real one — as `-Daeron.`
     /// or as `-Ddeepmsg.` — silently got the default.
@@ -5929,7 +5929,7 @@ mod tests {
 
     /// The two supplier settings name the reference's **symbols**, and a name
     /// its table does not hold is a driver that does not start
-    /// (`aeron_driver_context.c:563-580`).
+    /// (`aeron_driver_context.c:570-587`).
     #[test]
     fn the_transport_bindings_names_serve_default_and_refuse_the_rest() {
         for property in [
@@ -6428,7 +6428,7 @@ mod tests {
 
         // The short name beside the symbol in the same table is the same
         // supplier, and the name `fc=` uses is not on that table at all
-        // (`aeron_flow_control.c:43-64` against `aeronmd.h:286-289`).
+        // (`aeron_flow_control.c:43-64` against `aeronmd.h:303-306`).
         assert_eq!(
             Supplier::Tagged,
             resolve(&[
@@ -6629,7 +6629,7 @@ mod tests {
     }
 
     /// Five slots default to `backoff` and the native resource agent to
-    /// `sleep-ns` (`aeron_driver_context.c:1143-1148`), which is the one place
+    /// `sleep-ns` (`aeron_driver_context.c:1173-1178`), which is the one place
     /// the reference's defaults differ between slots.
     #[test]
     fn every_slot_has_its_own_idle_strategy_and_its_own_default() {
@@ -6653,7 +6653,7 @@ mod tests {
             "the one slot whose default arguments are not the strategy's own. \
              Sleeping with none sleeps a nanosecond (`aeron_agent.c:56-59`), \
              which is a busy spin wearing a sleep's name; the reference's \
-             caller supplies `1ms` instead (`aeron_driver_context.c:1205-1207`)"
+             caller supplies `1ms` instead (`aeron_driver_context.c:1235-1237`)"
         );
         assert!(matches!(
             config.native_resource_agent_idle.strategy(),
@@ -6665,10 +6665,10 @@ mod tests {
     /// hands the slot back to that strategy's own default arguments.
     ///
     /// The reference's caller injects `"1ms"` only while the name is unset
-    /// (`aeron_driver_context.c:1205-1207`), so a named `sleep-ns` sleeps one
+    /// (`aeron_driver_context.c:1235-1237`), so a named `sleep-ns` sleeps one
     /// nanosecond there (`aeron_agent.c:56-59`), and Java reaches the same
     /// place by another road: its one-millisecond strategy is built outright
-    /// only when the property is empty (`Configuration.java:2081-2089`). The
+    /// only when the property is empty (`Configuration.java:2229-2237`). The
     /// condition is the reference's behavior, not an artifact, so it is kept.
     #[test]
     fn naming_the_native_resource_agents_strategy_drops_the_slots_own_arguments() {
@@ -6689,7 +6689,7 @@ mod tests {
     ///
     /// This is the one place the slot parts with the reference, which reads
     /// `AERON_…_INIT_ARGS` only when the name variable is set and otherwise
-    /// overwrites it with `"1ms"` (`aeron_driver_context.c:1205-1207`). A
+    /// overwrites it with `"1ms"` (`aeron_driver_context.c:1235-1237`). A
     /// caller who wrote arguments gets them. Recorded in `docs/compat.md`.
     #[test]
     fn arguments_without_a_name_are_honoured_rather_than_overwritten() {
@@ -6712,7 +6712,7 @@ mod tests {
     /// The names are the reference's environment variables, two of which are
     /// not what the slot is called: the shared-network slot has no underscore
     /// between the words, and the native resource agent's carries a `DRIVER_`
-    /// infix (`aeronmd.h:441`, `:497`).
+    /// infix (`aeronmd.h:458`, `:514`).
     #[test]
     fn the_idle_strategy_names_are_the_references_even_where_they_are_odd() {
         let config = resolve_with_env(
@@ -6756,7 +6756,7 @@ mod tests {
     }
 
     /// An idle strategy name the reference's table does not have is a driver
-    /// that does not start, on both sides (`aeron_driver_context.c:1152-1158`),
+    /// that does not start, on both sides (`aeron_driver_context.c:1182-1188`),
     /// and malformed init args are the same kind of refusal
     /// (`aeron_agent.c:186-248`).
     #[test]

@@ -465,7 +465,7 @@ fn a_client_asks_for_a_snapshot() {
         "test-service",
         // The reference's default authorisation service allows the backup and
         // standby commands and nothing else, so a SNAPSHOT request is refused
-        // with UNAUTHORISED_ACCESS (`ConsensusModule.java:813`, `:1352`, and
+        // with UNAUTHORISED_ACCESS (`ConsensusModule.java:820`, `:1366`, and
         // `ClusterTest.shouldRejectTakeSnapshotRequestWithAnAuthorisationError`);
         // the case that takes one says `ALLOW_ALL`
         // (`ClusterTest.shouldTakeASnapshotAfterReceivingAdminRequestOfTypeSnapshot`).
@@ -508,7 +508,7 @@ fn a_client_asks_for_a_snapshot() {
     let responses = session.received.borrow().admin_responses.clone();
     // The reference's own listener asserts the same three things: the type, the
     // code, and that an accepted request carries no message
-    // (`ClusterTest.injectAdminResponseEgressListener`, `:2103`).
+    // (`ClusterTest.injectAdminResponseEgressListener`, `:2138`).
     assert!(
         responses.iter().any(|response| response.request_type
             == deepmsg_codec_cluster::admin_request_type::AdminRequestType::SNAPSHOT
@@ -533,7 +533,7 @@ fn a_client_asks_for_a_snapshot() {
 /// after it answers.
 ///
 /// The Java side is a probe class loaded by name
-/// (`aeron.cluster.authenticator.supplier`, `ConsensusModule.java:807`); when
+/// (`aeron.cluster.authenticator.supplier`, `ConsensusModule.java:814`); when
 /// the probe is not in the fork the fixture skips, which is the suite's
 /// convention for a missing reference piece.
 #[test]

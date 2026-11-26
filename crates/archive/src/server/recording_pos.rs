@@ -5,7 +5,7 @@
 //! whose **value** is the position the recording has reached. Everything that
 //! asks about a live recording asks this counter: the reference's own client,
 //! `AeronStat`, and the C system tests, which find it by session id and read
-//! the recording id back out of its key (`aeron_archive_test.cpp:260-286`).
+//! the recording id back out of its key (`aeron_archive_test.cpp:264-291`).
 //!
 //! # The two layouts, which are byte contracts
 //!
@@ -40,18 +40,18 @@
 //! };
 //! ```
 //!
-//! (`aeron_archive_recording_pos.c:24-30`) and reads the identity from
-//! `sizeof(struct)` — offset **16** — onwards (`:149-152`). So 0/8/12/16 is not
+//! (`aeron-client/src/main/c/aeron_counters.h:213-221`) and reads the identity from
+//! `sizeof(struct)` — offset **16** — onwards (`:201-205`). So 0/8/12/16 is not
 //! this module's reading of one file; it is where two implementations
 //! independently agree the fields are.
 //!
 //! # The three truncations, and why they are the shape they are
 //!
 //! The source identity is cut to `MAX_KEY_LENGTH - 16 - 8` = **88** bytes
-//! (`:106-107`), which is what is left of the key region once the two fixed
+//! (`:146-147`), which is what is left of the key region once the two fixed
 //! ends are taken out. The channel is cut to
 //! `MAX_LABEL_LENGTH - label-so-far - lengthOfArchiveIdLabel(archiveId)`
-//! (`:123-127`) — the **suffix is measured, not guessed**, because it carries
+//! (`:163-167`) — the **suffix is measured, not guessed**, because it carries
 //! the archive id and so its length depends on the id's digits. Both cuts are
 //! byte cuts: Agrona writes one byte per char
 //! (`putStringWithoutLengthAscii`), and a channel is ASCII.
@@ -59,7 +59,7 @@
 //! # What this module does not do
 //!
 //! Nothing here is allocated at archive start. The counter belongs to a
-//! *recording*, so it appears when one does (`ArchiveConductor.java:2021-2030`)
+//! *recording*, so it appears when one does (`ArchiveConductor.java:2043-2052`)
 //! and is given back when one ends (`RecordingSession.java:117-121`).
 
 use std::time::Duration;
@@ -76,7 +76,7 @@ use super::counters::{
 };
 
 /// `Aeron.NULL_VALUE`, which is what the reference's two finders take to mean
-/// "any archive" (`RecordingPos.java:174`, `:230`).
+/// "any archive" (`RecordingPos.java:160`, `:202`).
 pub const ANY_ARCHIVE_ID: i64 = layout::NULL_VALUE;
 
 /// `RecordingPos.NAME` and the separator after it (`:69`, `:116`).
@@ -212,10 +212,10 @@ pub fn parse_key(key: &[u8]) -> Option<RecordedIdentity> {
 }
 
 /// The counter for a recording, or `None` (`RecordingPos.findCounterIdByRecording`,
-/// `:157-188`).
+/// `:212-243`).
 ///
 /// `archive_id` of [`ANY_ARCHIVE_ID`] matches any archive, which is the
-/// reference's deprecated two-argument form (`:143-146`).
+/// reference's deprecated two-argument form (`:184-187`).
 #[must_use]
 pub fn find_counter_id_by_recording<Access>(
     counters: &CountersReader<'_, Access>,
@@ -228,7 +228,7 @@ pub fn find_counter_id_by_recording<Access>(
 }
 
 /// The counter for a publication session, or `None`
-/// (`RecordingPos.findCounterIdBySession`, `:213-244`).
+/// (`RecordingPos.findCounterIdBySession`, `:185-216`).
 ///
 /// This is how the C harness finds a recording it has just started: it knows
 /// the session id off its own publication and nothing else
@@ -247,7 +247,7 @@ pub fn find_counter_id_by_session<Access>(
 /// The walk both finders make: allocated, type 100, and the key agreeing.
 ///
 /// [`CountersReader::for_each`] stops at the first free record, which is what
-/// the reference's own walk does (`:181-184`) rather than scanning the region.
+/// the reference's own walk does (`:167-170`) rather than scanning the region.
 fn find<Access>(
     counters: &CountersReader<'_, Access>,
     archive_id: i64,
@@ -279,7 +279,7 @@ fn find<Access>(
 
 /// A recording session's position counter.
 ///
-/// Made when the image arrives (`ArchiveConductor.java:2021-2030`), written
+/// Made when the image arrives (`ArchiveConductor.java:2043-2052`), written
 /// every turn the recording wrote (`RecordingSession.java:240`), and given back
 /// when the session ends (`:120`).
 ///
@@ -466,7 +466,7 @@ mod tests {
     const ARCHIVE_ID: i64 = 42;
 
     /// The four offsets, which the C reader's packed key struct pins to
-    /// 0/8/12/16 as well (`aeron_archive_recording_pos.c:24-30`, `:149-152`) —
+    /// 0/8/12/16 as well (`aeron-client/src/main/c/aeron_counters.h:213-221`, `:201-205`) —
     /// so this is the one test that fails if either side moves.
     #[test]
     fn the_key_is_the_four_fields_in_the_references_order() {

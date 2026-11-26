@@ -351,7 +351,7 @@ fn the_reference_client_publishes_to_our_driver_over_udp_and_reads_it_back() {
     // and limit, and the NAKs its sender answers — and `rcv-channel` carries
     // the address the endpoint is *bound* to, which is the port the channel
     // named and is only readable from that label
-    // (`aeron_driver_conductor.c:2157-2165`).
+    // (`aeron_driver_conductor.c:2208-2216`).
     if let Some(aeron_stat) = driver::locate_aeron_stat() {
         let text = String::from_utf8_lossy(
             &Command::new(&aeron_stat)
@@ -480,7 +480,7 @@ fn the_reference_client_publishes_to_our_driver_over_udp_and_reads_it_back() {
     // the transport: the IPC path sends the constant `aeron:ipc`
     // (`crates/driver/src/ipc_publications.rs`), while a network image's is
     // **the address its frames come from**, formatted the way the reference
-    // formats it (`aeron_publication_image.c:336-338`). So over UDP this field
+    // formats it (`aeron_publication_image.c:341-343`). So over UDP this field
     // is an address — the send endpoint's, which the kernel chose — and the two
     // lines agree on it because they are the same image.
     let appeared = token(&received, "Available image", "from ").expect("a source identity");

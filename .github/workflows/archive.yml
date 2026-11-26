@@ -37,7 +37,7 @@ name: archive
 # The 1.53.2 four were the same four the fixes were for —
 # the persistent-subscription suite's drop waits race the flood that is meant to
 # over-run them, on a driver whose over-run gate follows the subscriber's *read*
-# position (`aeron_publication_image.c:983`):
+# position (`aeron_publication_image.c:988`):
 #
 #   * `AeronArchivePersistentSubscriptionTest.canFallbackToReplayAfterStartingFromLive`
 #   * `AeronArchivePersistentSubscriptionTest.cannotFallbackToReplayWhenRecordingHasBeenRemoved`
@@ -54,7 +54,7 @@ name: archive
 # and this build's archive subscribed as soon as it found the CnC file: it read
 # the one the **previous** case left behind — published, with the shutdown marker
 # that driver wrote on its way out
-# (`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`) — and was refused. The
+# (`aeron-driver/src/main/c/aeron_driver_conductor.c:3590`) — and was refused. The
 # reference's client waits for a **live** driver at connect instead, which is the
 # fourth step of `aeron_client_connect_to_driver` (`aeronc.c:136-168`: a heartbeat
 # older than `driver_timeout_ms` is answered by unmapping the file and looking
@@ -69,7 +69,7 @@ name: archive
 # file. `shouldCloseCleanlyInDifferentStates` first drives a persistent
 # subscription to live and records the states it *passed through*, then creates
 # a fresh one for each recorded state and waits 15 s to see that state again
-# (`executeUntil`, `aeron_archive_persistent_subscription_test.cpp:762-780`).
+# (`executeUntil`, `aeron_archive_persistent_subscription_test.cpp:764-782`).
 # Two things make that unsound: the list is timing-dependent — measured on the
 # development machine, three different lists in six runs, the same shapes with
 # this build and with the reference's own Java archive — and the brief states

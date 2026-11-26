@@ -2,7 +2,7 @@
 //!
 //! Mirrors the reference's `aeron_subscribable_t` and `aeron_tetherable_position_t`
 //! (`aeron-driver/src/main/c/aeron_driver_common.h:80-111`) and the operations
-//! over them (`aeron_driver_conductor.c:3497-3691`). It is a *reusable*
+//! over them (`aeron_driver_conductor.c:3594-3788`). It is a *reusable*
 //! structure there — a network publication's images are added to the same kind
 //! of set as an IPC publication's subscribers — which is why it is its own
 //! module here rather than a `Vec` inside the IPC publication.
@@ -11,8 +11,8 @@
 //!
 //! `length` is how many positions the set holds; `inactive_count` is how many of
 //! them are in a state the publication should ignore (`RESTING` or `CLOSED` —
-//! `is_active_state` at `:3657-3660`). Everything that decides whether the
-//! publication has a reader asks `length > inactive_count` (`:3652-3655`), and
+//! `is_active_state` at `:3754-3757`). Everything that decides whether the
+//! publication has a reader asks `length > inactive_count` (`:3749-3752`), and
 //! the publisher limit takes its minimum over the *active* ones only. Keeping
 //! the two in step is what [`Subscribable::set_state`] exists for, and getting it
 //! wrong shows up as a publication that either stalls with readers attached or
@@ -21,8 +21,8 @@
 //! # The hooks are called at a particular moment
 //!
 //! Adding a position calls the add hook before the position counts
-//! (`:3515-3517`); removing one calls the remove hook **before** the position
-//! leaves the array (`:3533-3537`), which is what makes IPC's `is_connected`
+//! (`:3612-3614`); removing one calls the remove hook **before** the position
+//! leaves the array (`:3630-3634`), which is what makes IPC's `is_connected`
 //! rule work: the hook sees one working position and knows it is the last.
 //! [`SubscribableHooks::position_removed`] is therefore passed the count as it
 //! was *before* the removal, because that is what the reference's hook can see.
@@ -31,7 +31,7 @@ use deepmsg_cnc::layout::NULL_COUNTER_ID;
 use deepmsg_cnc::{CounterManager, CounterRegions};
 
 /// What the untethered state machine decided about one reader
-/// (`aeron_publication_image_check_untethered_subscriptions`, `:1165-1283`,
+/// (`aeron_publication_image_check_untethered_subscriptions`, `:1206-1324`,
 /// and its two siblings on the publication side).
 ///
 /// The three events are the three things a *client* hears: an image it may no
@@ -83,7 +83,7 @@ impl TetherState {
     /// Whether a publication with this position should treat it as a reader.
     ///
     /// The reference's `aeron_driver_subscribable_is_active_state`
-    /// (`aeron_driver_conductor.c:3657-3660`): everything that is not resting or
+    /// (`aeron_driver_conductor.c:3754-3757`): everything that is not resting or
     /// closed counts — including [`TetherState::Linger`], which is the point of
     /// a grace state.
     pub const fn is_active(self) -> bool {
@@ -153,7 +153,7 @@ pub struct StateChange {
 #[derive(Debug)]
 pub struct Subscribable {
     /// The publication this set belongs to, as `ON_UNAVAILABLE_IMAGE` names it
-    /// (`aeron_ipc_publication.c:144-151` sets it to the registration id).
+    /// (`aeron_ipc_publication.c:149-156` sets it to the registration id).
     pub correlation_id: i64,
     positions: Vec<TetherablePosition>,
     /// How many of `positions` are resting or closed.
@@ -181,12 +181,12 @@ impl Subscribable {
     }
 
     /// How many positions are not resting or closed
-    /// (`aeron_driver_conductor.c:3647-3650`).
+    /// (`aeron_driver_conductor.c:3744-3747`).
     pub fn working_position_count(&self) -> usize {
         self.positions.len() - self.inactive_count
     }
 
-    /// Whether the publication has a reader at all (`:3652-3655`).
+    /// Whether the publication has a reader at all (`:3749-3752`).
     pub fn has_working_positions(&self) -> bool {
         !self.positions.is_empty() && self.working_position_count() > 0
     }
@@ -200,7 +200,7 @@ impl Subscribable {
     ///
     /// Counters are per (subscription, publication) pair, so this is how a
     /// caller holding a counter id — an unlink, a stale-counter sweep — finds
-    /// the reader it belongs to (`:3525-3545` searches the same way).
+    /// the reader it belongs to (`:3622-3642` searches the same way).
     pub fn find_by_counter(&self, counter_id: i32) -> Option<&TetherablePosition> {
         self.positions
             .iter()
@@ -216,7 +216,7 @@ impl Subscribable {
     }
 
     /// Add a reader at `counter_id`, as `link_subscribable` does
-    /// (`aeron_driver_conductor.c:3497-3523`).
+    /// (`aeron_driver_conductor.c:3594-3620`).
     ///
     /// The hook runs **before** the position counts, which is the reference's
     /// order: a publication that has just been handed a reader is already
@@ -231,7 +231,7 @@ impl Subscribable {
     }
 
     /// Remove the position reading through `counter_id`
-    /// (`aeron_driver_conductor.c:3525-3545`).
+    /// (`aeron_driver_conductor.c:3622-3642`).
     ///
     /// Returns whether one was there. The reference's version is a no-op
     /// otherwise, and it removes by swapping the last position into the hole —
@@ -262,7 +262,7 @@ impl Subscribable {
 
     /// Empty the set, for a caller that has already given every reader's
     /// counter back (`aeron_ipc_publication_reject`'s `aeron_free` of the
-    /// array, `aeron_ipc_publication.c:263-271`).
+    /// array, `aeron_ipc_publication.c:268-276`).
     ///
     /// Unlike [`Self::remove_position`] this runs no hook: the reference does
     /// not either — it frees the array the positions lived in — and the
@@ -276,13 +276,13 @@ impl Subscribable {
     /// Take a position's counter away while leaving the position where it is,
     /// which is what a closed reader becomes
     /// (`tetherable_position->counter_id = AERON_NULL_COUNTER_ID`,
-    /// `aeron_ipc_publication.c:423-426` and its two siblings).
+    /// `aeron_ipc_publication.c:428-431` and its two siblings).
     ///
     /// The counter has already been given back by the caller; this is what
     /// stops anyone giving it back twice. The reference leaves the position in
     /// the set — its state is what keeps it out of the way — and the teardown
     /// that frees every reader's counter walks the whole set
-    /// (`aeron_ipc_publication.c:205-208`), so an id that is still there
+    /// (`aeron_ipc_publication.c:210-213`), so an id that is still there
     /// would be freed a second time.
     ///
     /// Returns the position as it was, so a caller can name the counter in the
@@ -300,7 +300,7 @@ impl Subscribable {
     }
 
     /// Move a position to another state, keeping the inactive count in step
-    /// (`aeron_driver_conductor.c:3619-3645`).
+    /// (`aeron_driver_conductor.c:3716-3742`).
     ///
     /// # Errors
     ///
@@ -365,7 +365,7 @@ impl Subscribable {
     /// is none.
     ///
     /// This is the input the publisher limit is computed from
-    /// (`aeron_ipc_publication.c:299-312` reads the same field with an acquire,
+    /// (`aeron_ipc_publication.c:304-317` reads the same field with an acquire,
     /// because the client is the one writing it).
     pub fn min_active_position(
         &self,

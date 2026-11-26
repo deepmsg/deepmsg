@@ -2,9 +2,9 @@
 //!
 //! `INVOKER` is the mode that gives the driver no runner threads at all — the
 //! reference builds the same single runner for it as for `SHARED`
-//! (`aeron_driver.c:1003-1022`, one `case` arm for both) — and what makes it a
+//! (`aeron_driver.c:1043-1062`, one `case` arm for both) — and what makes it a
 //! *working* driver is a caller with a manual main loop
-//! (`aeron_driver_main_do_work`, `:1252-1261`). This file is that loop, over a
+//! (`aeron_driver_main_do_work`, `:1407-1416`). This file is that loop, over a
 //! client of this build's, with both ends in one process: it is the one place
 //! where [`Driver::do_work`] is called by something other than [`Driver::run`].
 //!
@@ -79,9 +79,9 @@ fn round_trip(dir: PathBuf) -> bool {
 /// The client runs on a thread of its own because its calls **wait** for the
 /// driver's replies: one thread would deadlock, and the thing under test here
 /// is the driver's pass, not the client's patience. The driver's loop is the
-/// reference's (`aeron_driver_main_do_work`, `aeron_driver.c:1252-1261`), which
+/// reference's (`aeron_driver_main_do_work`, `aeron_driver.c:1407-1416`), which
 /// under `INVOKER` is a pass of all four pieces — sender, receiver, native
-/// resource agent, conductor (`:723-734`).
+/// resource agent, conductor (`:753-764`).
 #[test]
 fn an_invoker_driver_is_driven_by_its_caller() {
     let temp = TempDir::new();

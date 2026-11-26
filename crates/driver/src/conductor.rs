@@ -1,7 +1,7 @@
 //! The conductor: the duty cycle that owns the CnC file.
 //!
 //! One call to [`Conductor::do_work`] is one pass of the reference's loop
-//! (`aeron-driver/src/main/c/aeron_driver_conductor.c:3369-3407`), which runs
+//! (`aeron-driver/src/main/c/aeron_driver_conductor.c:3466-3504`), which runs
 //! at two rates on purpose:
 //!
 //! | tier | every | what it does here |
@@ -20,9 +20,9 @@
 //! The conductor owns the counters, the clients and the to-clients ring, and
 //! the three are one story: a client exists because a command named it, its
 //! liveness is a counter, and its departure is announced on the ring. The
-//! reference spreads that across `get_or_add_client` (`:982-1035`),
-//! `aeron_client_on_time_event` (`:1038-1056`) and `client_transmit`
-//! (`:2233-2241`); here the client half is [`crate::clients`], the counter half
+//! reference spreads that across `get_or_add_client` (`:1023-1076`),
+//! `aeron_client_on_time_event` (`:1079-1097`) and `client_transmit`
+//! (`:2296-2304`); here the client half is [`crate::clients`], the counter half
 //! is [`crate::system_counters`], and this module is the wiring between them.
 //!
 //! # The cycle time counters
@@ -115,7 +115,7 @@ pub const CLOCK_UPDATE_INTERVAL_NS: i64 = 1_000_000;
 
 /// A millisecond in nanoseconds, for the settings the reference holds in
 /// nanoseconds and the resolver counts in milliseconds
-/// (`aeron_driver_name_resolver.c:455-461`).
+/// (`aeron_driver_name_resolver.c:456-462`).
 const NANOS_PER_MILLI: i64 = 1_000_000;
 
 /// A command in the control protocol.
@@ -224,7 +224,7 @@ pub enum ConductorError {
     /// The sender thread could not be started.
     Sender(std::io::Error),
     /// The loss report file could not be created or mapped — the reference
-    /// fails its driver init for the same reason (`aeron_driver.c:888`).
+    /// fails its driver init for the same reason (`aeron_driver.c:928`).
     LossReport(std::io::Error),
     /// The ready version could not be stored.
     Publish(CncCreateError),
@@ -247,7 +247,7 @@ pub enum ConductorError {
     /// see [`crate::name_resolver::Supplier`]. The reference fails its context
     /// init for a name its table does not hold, and its agent records a
     /// resolver that will not start and carries on
-    /// (`aeron_driver_native_resource_agent.c:233-251`); this build refuses the
+    /// (`aeron_driver_native_resource_agent.c:238-256`); this build refuses the
     /// start, because a driver whose resolver is not the one it was configured
     /// with is a driver that resolves something else.
     Resolver(String),
@@ -293,7 +293,7 @@ impl std::error::Error for ConductorError {
 /// written straight into system counter 15, because the counter needs a borrow
 /// this sink holds mutably; [`Conductor::flush_broadcast_failures`] applies it
 /// once the sink is gone. A failure here is not fatal — the reference logs it
-/// and carries on (`aeron_driver_conductor.c:2233-2241`), and the failure mode
+/// and carries on (`aeron_driver_conductor.c:2296-2304`), and the failure mode
 /// that matters, a client whose response never arrived, is a client timeout.
 struct Transmit<'a> {
     transmitter: &'a mut ToClientsTransmitter,
@@ -321,7 +321,7 @@ impl Transmit<'_> {
     /// The code is the one the log is written under — for an `ON_ERROR` that
     /// is the **protocol** code the client is told, not the negated code a
     /// recording site set, because the reference's `log_explicit_error` is
-    /// handed the former (`aeron_driver_conductor.c:2369` takes `code`, not
+    /// handed the former (`aeron_driver_conductor.c:2432` takes `code`, not
     /// `errcode`).
     fn record_fault(&mut self, error_code: i32, description: String) {
         self.faults.push((error_code, description));
@@ -355,7 +355,7 @@ impl ClientEvents for Transmit<'_> {
     /// `aeron_driver_conductor_on_error` transmits the response and then falls
     /// through to its own `log_error:` label, which records the error and
     /// raises the errors counter for every code but one
-    /// (`aeron_driver_conductor.c:2366-2370`). So an `ON_ERROR` a client sees
+    /// (`aeron_driver_conductor.c:2429-2433`). So an `ON_ERROR` a client sees
     /// is always an entry in the distinct error log and a bump of counter 15
     /// — the two halves are one act, and this is where this build keeps them
     /// together.
@@ -376,9 +376,9 @@ impl ClientEvents for Transmit<'_> {
     ///
     /// The entry is written *before* the message and in a different shape from
     /// an `ON_ERROR`'s: the reference builds one line of its own
-    /// (`aeron_driver_conductor.c:2269-2287`) and hands it to
+    /// (`aeron_driver_conductor.c:2332-2350`) and hands it to
     /// `aeron_driver_conductor_log_explicit_error`, which records it verbatim
-    /// and raises the errors counter (`:1203-1211`). There is no `AERON_SET_ERR`
+    /// and raises the errors counter (`:1355-1363`). There is no `AERON_SET_ERR`
     /// site in it, so unlike every other entry this one has no `[func,
     /// file:line]` half — the line itself is the whole of what is recorded.
     ///
@@ -442,7 +442,7 @@ impl ClientEvents for Transmit<'_> {
 /// Count a command whose payload is shorter than its own header, and describe
 /// it for the error log in the reference adapter's words
 /// Ask the sender to let an endpoint go once the last publication on it has
-/// (`media/aeron_send_channel_endpoint.c:323-330`: the reference marks it
+/// (`media/aeron_send_channel_endpoint.c:316-323`: the reference marks it
 /// CLOSING and asks, and the endpoint's own delete gives the counters back).
 fn try_remove_send_endpoint(
     endpoints: &mut crate::send_endpoints::SendChannelEndpoints,
@@ -455,7 +455,7 @@ fn try_remove_send_endpoint(
 }
 
 /// The line the reference's conductor appends when a channel will not parse
-/// (`aeron_driver_conductor.c:4686-4687` for a publication, `:5173-5174` for a
+/// (`aeron_driver_conductor.c:4783-4784` for a publication, `:5270-5271` for a
 /// subscription), with the **empty message** its `AERON_APPEND_ERR("%s", "")`
 /// writes — which is why the line ends in a space.
 ///
@@ -466,7 +466,7 @@ fn channel_parse_append(function: &str, line: u32) -> String {
     format!("[{function}, aeron_driver_conductor.c:{line}] \n")
 }
 
-/// (`aeron_driver_conductor.c:3231-3235`).
+/// (`aeron_driver_conductor.c:3328-3332`).
 ///
 /// The code is recorded negated because the reference's `AERON_SET_ERR` is
 /// given `-AERON_ERROR_CODE_MALFORMED_COMMAND` there and the log keeps
@@ -488,7 +488,7 @@ fn malformed_command(
             -ERROR_CODE_MALFORMED_COMMAND,
             "aeron_driver_conductor_on_command",
             "aeron_driver_conductor.c",
-            3232,
+            3329,
             &format!("command={type_id} too short: length={payload_len}"),
         ),
     );
@@ -499,7 +499,7 @@ fn malformed_command(
 /// The bytes belong to the command ring and are overwritten by the next read,
 /// so a command that is going to wait has to be **owned** — which is what the
 /// reference does too, `memcpy`-ing the original command into the async one
-/// (`aeron_driver_conductor.c:4097-4106`).
+/// (`aeron_driver_conductor.c:4194-4203`).
 struct ParkedCommand {
     /// The command's type id, so it can be decoded again on the way out.
     type_id: i32,
@@ -545,7 +545,7 @@ impl ParkedCommand {
 }
 
 /// A send endpoint whose name the sender has asked about again
-/// (`aeron_driver_conductor_on_re_resolve_endpoint`, `:6890-6938`).
+/// (`aeron_driver_conductor_on_re_resolve_endpoint`, `:6986-7034`).
 ///
 /// The resolution is the **agent's**, like every other one in this build: the
 /// entry is submitted and waits here until its answer lands, which is what
@@ -554,14 +554,14 @@ struct PendingReResolution {
     endpoint_id: u64,
     endpoint_name: String,
     /// What the endpoint has now, to compare the answer against
-    /// (`:6932-6938`).
+    /// (`:7028-7034`).
     existing: Option<SocketAddr>,
     /// Where the answer will arrive, once it has been asked for.
     answer: Option<ResolutionCell<SocketAddr>>,
 }
 
 /// The same for a **control** name the receiver has asked about again
-/// (`aeron_driver_conductor_on_re_resolve_control`, `:6957-6990`).
+/// (`aeron_driver_conductor_on_re_resolve_control`, `:7053-7086`).
 struct PendingControlReResolution {
     endpoint_id: u64,
     destination: crate::media::receive_endpoint::DestinationId,
@@ -589,7 +589,7 @@ pub struct Conductor {
     system_counters: SystemCounters,
     /// The client command that is waiting on the agent, if there is one — the
     /// reference's `conductor->client_command`
-    /// (`aeron_driver_conductor.c:3293-3320`).
+    /// (`aeron_driver_conductor.c:3390-3417`).
     ///
     /// One slot, and while it is occupied the conductor reads **no** further
     /// client commands. What it does not do is stop: its duty cycle, its
@@ -611,7 +611,7 @@ pub struct Conductor {
     /// The end every manager asks the native resource agent through — the
     /// driver's **one** agent, which creates log buffers, parses channels and
     /// resolves names. The reference has one too, driven from its conductor's
-    /// duty cycle (`aeron_driver_conductor.c:4042-4067`).
+    /// duty cycle (`aeron_driver_conductor.c:4139-4164`).
     agent_handle: AgentHandle,
     /// What that agent has finished, raised or failed: this is where its
     /// completions are taken off and routed.
@@ -628,14 +628,14 @@ pub struct Conductor {
     /// The subscriptions reading them.
     subscriptions: IpcSubscriptions,
     /// The send endpoints a network publication shares, one per canonical
-    /// channel (`aeron_driver_conductor.c:1961-2030`).
+    /// channel (`aeron_driver_conductor.c:2012-2081`).
     send_endpoints: SendChannelEndpoints,
     /// The publications that send over UDP.
     network_publications: NetworkPublications,
     /// How anything reaches the sender, whose work the driver runs.
     sender: SenderProxy,
     /// The receive endpoints a subscription listens on, one per canonical
-    /// channel (`aeron_driver_conductor.c:2046-2115`).
+    /// channel (`aeron_driver_conductor.c:2097-2166`).
     receive_endpoints: ReceiveChannelEndpoints,
     /// The images built from datagrams.
     images: PublicationImages,
@@ -655,7 +655,7 @@ pub struct Conductor {
     last_cycle_ns: i64,
     /// The command ring's consumer position as of the last pass that saw it
     /// move, and when that was — the two halves of the stall detector
-    /// (`aeron_driver_conductor.c:3246-3266`).
+    /// (`aeron_driver_conductor.c:3343-3363`).
     last_command_consumer_position: i64,
     time_of_last_position_change_ns: i64,
     now_ms: i64,
@@ -713,11 +713,11 @@ impl Conductor {
     ///
     /// The order here is the reference's, and it is the reason
     /// [`CncFile::publish`] is a separate step: allocate the counters the file
-    /// must carry (`aeron_driver_conductor.c:697-718`), burn a correlation id
-    /// (`aeron-driver/src/main/c/aeron_driver.c:970` — which is why the first
+    /// must carry (`aeron_driver_conductor.c:738-759`), burn a correlation id
+    /// (`aeron-driver/src/main/c/aeron_driver.c:1010` — which is why the first
     /// client sees id 1 rather than 0), publish the driver's liveness on the
-    /// to-driver ring (`:971`), and only then store the ready version (`:972`)
-    /// and flush it (`:973`).
+    /// to-driver ring (`:1011`), and only then store the ready version (`:1012`)
+    /// and flush it (`:1013`).
     ///
     /// # Errors
     ///
@@ -733,7 +733,7 @@ impl Conductor {
     /// The same, **without** starting anything: the caller takes the agents
     /// ([`Conductor::take_agents`]) and decides who runs them.
     ///
-    /// That decision is `aeron.threading.mode`'s (`aeron_driver.c:1003-1122`) —
+    /// That decision is `aeron.threading.mode`'s (`aeron_driver.c:1043-1162`) —
     /// one thread each, one for the network pair, one for everything, or none
     /// at all — so a driver that reads the setting builds its conductor here
     /// and places the work itself.
@@ -762,8 +762,8 @@ impl Conductor {
 
         // The loss report file, before the counters are allocated: the
         // reference creates it between the CnC file and the conductor's init
-        // (`aeron-driver/src/main/c/aeron_driver.c:888` then `:913`) and counts
-        // its length in `Bytes currently mapped` (`:948`) — which is a counter,
+        // (`aeron-driver/src/main/c/aeron_driver.c:928` then `:953`) and counts
+        // its length in `Bytes currently mapped` (`:988`) — which is a counter,
         // so it has to be known first.
         let loss_report = Arc::new(
             crate::sys::loss_report_length(config)
@@ -794,7 +794,7 @@ impl Conductor {
             #[allow(clippy::cast_possible_wrap)] // a file length, far below i64::MAX
             let bytes_mapped = cnc.file_length() as i64;
             // The loss report is mapped too, and the counter says what this
-            // driver has mapped — both files (`aeron_driver.c:948`).
+            // driver has mapped — both files (`aeron_driver.c:988`).
             #[allow(clippy::cast_possible_wrap)]
             let bytes_mapped = bytes_mapped + loss_report.length() as i64;
             system_counters::allocate_all(
@@ -845,7 +845,7 @@ impl Conductor {
         // The resolver the settings named, built where the counters and the
         // clock are in hand — the reference builds it in the native resource
         // agent's init, from the context, and runs it on that agent's thread
-        // (`aeron_driver_native_resource_agent.c:299-320`, `:260`).
+        // (`aeron_driver_native_resource_agent.c:304-325`, `:265`).
         let resolver = {
             let regions = cnc
                 .counter_regions()
@@ -859,7 +859,7 @@ impl Conductor {
                 socket_sndbuf: usize::try_from(config.socket_so_sndbuf).unwrap_or(0),
                 // The four intervals are settings in nanoseconds and the
                 // resolver counts milliseconds, which is the reference's own
-                // division (`aeron_driver_name_resolver.c:455-461`).
+                // division (`aeron_driver_name_resolver.c:456-462`).
                 neighbor_timeout_ms: config.resolver_neighbor_timeout_ns / NANOS_PER_MILLI,
                 self_resolution_interval_ms: config.resolver_self_resolution_interval_ns
                     / NANOS_PER_MILLI,
@@ -883,7 +883,7 @@ impl Conductor {
         };
 
         // The id the driver burns at startup belongs to the same counter a
-        // client takes its client id from (`aeron-driver/src/main/c/aeron_driver.c:970`),
+        // client takes its client id from (`aeron-driver/src/main/c/aeron_driver.c:1010`),
         // which is why the first client sees id 1 rather than 0. The ring was
         // proved readable twenty lines above, so a `None` here means the file
         // changed underneath this process — and starting anyway would hand that
@@ -894,7 +894,7 @@ impl Conductor {
 
         // Where the command ring stands now, so that the stall detector starts
         // from a position rather than from zero: the reference seeds the same
-        // field the same way (`aeron_driver_conductor.c:829`).
+        // field the same way (`aeron_driver_conductor.c:870`).
         let last_command_consumer_position = cnc
             .to_driver_region()
             .and_then(|region| commands.consume_position(&region))
@@ -904,12 +904,12 @@ impl Conductor {
         // it for its log buffers through a handle, and this is where its
         // completions are taken and routed — the reference has one agent for
         // the whole driver as well (`aeron_driver_native_resource_agent.c`), and
-        // its conductor drives it (`aeron_driver_conductor.c:4042-4067`).
+        // its conductor drives it (`aeron_driver_conductor.c:4139-4164`).
         //
         // Its thread is **not** started here any more: the three agents go to
         // whoever runs them, and the caller decides that. The reference draws
         // the same line — `aeron_driver_create` signals the CnC ready
-        // (`aeron_driver.c:972`) and `aeron_driver_start` starts the runners
+        // (`aeron_driver.c:1012`) and `aeron_driver_start` starts the runners
         // (`:1206`) — so a client may see a ready file a moment before the work
         // behind it is running, which is a window both drivers have.
         let crate::native_resource_agent::AgentParts {
@@ -935,7 +935,7 @@ impl Conductor {
         // The heartbeat and the ready version, *before* the file is shared:
         // `publish` updates the in-memory metadata as well as the mapping, and
         // after the `Arc` below there is no longer a mutable reference to it.
-        // The order is the contract (`aeron-driver/src/main/c/aeron_driver.c:971-972`)
+        // The order is the contract (`aeron-driver/src/main/c/aeron_driver.c:1011-1012`)
         // and it is enforced inside `publish`, which refuses a file whose
         // heartbeat is still zero.
         {
@@ -1041,7 +1041,7 @@ impl Conductor {
             publications,
             subscriptions: IpcSubscriptions::new(),
             send_endpoints: {
-                // The supplier (`aeron_driver_context.c:2979-2989`), set at
+                // The supplier (`aeron_driver_context.c:3055-3065`), set at
                 // start-up: every endpoint made from here on carries a loss
                 // generator of its own. Nothing is attached unless the driver
                 // was configured to inject loss.
@@ -1051,12 +1051,12 @@ impl Conductor {
                 }
                 // The range the manager hands ports out of, set once at
                 // start-up (`aeron_wildcard_port_manager_set_range`, called
-                // from the context's own init, `aeron_driver_context.c:1058-1069`).
+                // from the context's own init, `aeron_driver_context.c:1088-1099`).
                 endpoints.set_port_range(config.sender_wildcard_port_range);
                 // And whether its endpoints connect their sockets, which is
-                // the context's too (`:527`).
+                // the context's too (`:532`).
                 endpoints.set_connect_enabled(config.connect_enabled);
-                // And what they open their sockets on (`:1258-1263`).
+                // And what they open their sockets on (`:1288-1293`).
                 endpoints.set_transport_bindings(config.transport_bindings.clone());
                 endpoints
             },
@@ -1065,7 +1065,7 @@ impl Conductor {
             receive_endpoints: {
                 // The receiver's range, set once at start-up beside the
                 // sender's (`aeron_wildcard_port_manager_set_range`, called
-                // from the context's own init, `aeron_driver_context.c:1071-1081`).
+                // from the context's own init, `aeron_driver_context.c:1101-1111`).
                 let mut endpoints = ReceiveChannelEndpoints::new();
                 endpoints.set_port_range(config.receiver_wildcard_port_range);
                 endpoints
@@ -1078,7 +1078,7 @@ impl Conductor {
             clock,
             clock_update_deadline_ns: now_ns.saturating_add(CLOCK_UPDATE_INTERVAL_NS),
             // Seeded to now, so the first pass runs the timeout tier: the
-            // reference does the same (`aeron_driver_conductor.c:824`), and it
+            // reference does the same (`aeron_driver_conductor.c:865`), and it
             // means the heartbeat is set before anything can read the version.
             timeout_check_deadline_ns: now_ns,
             last_cycle_ns: now_ns,
@@ -1115,7 +1115,7 @@ impl Conductor {
         // is built from — against the epoch. The reference keeps the same two
         // apart: a monotonic `nano_clock` for the driver's timing, and a
         // realtime reading taken once per millisecond for the cache
-        // (`aeron_driver_conductor.c:3276-3280`).
+        // (`aeron_driver_conductor.c:3373-3377`).
         let now_ns = clock::monotonic_nano_time();
         let mut work_count = 0;
 
@@ -1197,7 +1197,7 @@ impl Conductor {
     /// Give up the three agents, for a caller that will place them itself.
     ///
     /// That is `aeron.threading.mode`'s decision and not the conductor's, so a
-    /// driver takes them here before it starts anything (`aeron_driver.c:1003-1122`
+    /// driver takes them here before it starts anything (`aeron_driver.c:1043-1162`
     /// is the placement, `aeron_driver_init` above it is this).
     pub(crate) fn take_agents(&mut self) -> Option<AgentStates> {
         self.agents.take()
@@ -1220,7 +1220,7 @@ impl Conductor {
 
     /// Write every publication's `pub-pos`, recompute its `pub-lmt` from its
     /// readers, and clean what they have finished with
-    /// (`aeron_driver_conductor.c:3401-3404`, at the end of the reference's own
+    /// (`aeron_driver_conductor.c:3498-3501`, at the end of the reference's own
     /// duty cycle).
     ///
     /// This is what makes an IPC publication *run*: nothing else writes
@@ -1280,7 +1280,7 @@ impl Conductor {
     ///
     /// The reference runs this from its own `do_work`, over its network
     /// publications and then over its IPC ones
-    /// (`aeron_driver_conductor.c:3395-3404`) — which is this position, after
+    /// (`aeron_driver_conductor.c:3492-3501`) — which is this position, after
     /// the driver commands and immediately before the IPC half that
     /// [`Self::update_publication_limits`] already is.
     fn network_publication_limits(&mut self) -> usize {
@@ -1306,7 +1306,7 @@ impl Conductor {
     /// and hand each to the manager that asked for it.
     ///
     /// The reference drives one agent from its conductor's duty cycle
-    /// (`aeron_driver_conductor.c:4042-4067`), which is the shape this is: the
+    /// (`aeron_driver_conductor.c:4139-4164`), which is the shape this is: the
     /// agent is the driver's, so nobody else drains it. Which manager a
     /// completion belongs to is the **path** it names — the create was asked
     /// for with that path, and the asking manager's pending list still has it.
@@ -1525,7 +1525,7 @@ impl Conductor {
 
                     // The image's counters belong to the client that asked for
                     // the subscription, not to the driver
-                    // (`aeron_driver_conductor.c:6652`, `:6667`, `:6682`, each
+                    // (`aeron_driver_conductor.c:6745`, `:6760`, `:6775`, each
                     // passing `subscription_link->client_id`). The reference
                     // carries the link on the command itself; here the link is
                     // the one this image is for — the same stream, and either
@@ -1536,7 +1536,7 @@ impl Conductor {
                     // The link is also where `group=` was left, for the same
                     // reason the reference keeps it there: the `SETUP` that
                     // creates this image arrives long after the subscription
-                    // that will read it (`aeron_driver_conductor.c:6702-6703`).
+                    // that will read it (`aeron_driver_conductor.c:6795-6796`).
                     // With no link there is nobody's `group=` to read, so the
                     // driver's own consideration stands.
                     let link = self.subscriptions.links().iter().find(|link| {
@@ -1564,8 +1564,8 @@ impl Conductor {
                         control_address,
                         // The window this receiver offers and the socket it
                         // offers it through, both read off the *endpoint's*
-                        // channel (`aeron_driver_conductor.c:6496-6497`,
-                        // `:6506`).
+                        // channel (`aeron_driver_conductor.c:6593-6594`,
+                        // `:6601`).
                         ReceiveChannelEndpoints::initial_window_length(
                             &self.config,
                             &entry.channel,
@@ -1593,7 +1593,7 @@ impl Conductor {
                 }
                 ReceiverEvent::ImageLingering { registration_id } => {
                     // The image has left `DRAINING` for `LINGER`
-                    // (`aeron_publication_image.c:1351-1358`). The receiver runs
+                    // (`aeron_publication_image.c:1377-1384`). The receiver runs
                     // the state machine; this records the one transition the
                     // conductor's own match reads, and records it **before** the
                     // announcement below, because the two are one moment in the
@@ -1690,7 +1690,7 @@ impl Conductor {
                 } => {
                     // The channel is the *subscription's*, which is what the
                     // reference's image-transition path sends
-                    // (`aeron_driver_conductor.c:1657-1663`).
+                    // (`aeron_driver_conductor.c:1698-1704`).
                     let channel = self
                         .subscriptions
                         .links()
@@ -1827,10 +1827,10 @@ impl Conductor {
 
     /// Tell the publications a receiver refused, in the words that receiver
     /// used (`aeron_driver_conductor_on_publication_error`,
-    /// `aeron_driver_conductor.c:2263-2323`).
+    /// `aeron_driver_conductor.c:2326-2386`).
     ///
     /// The handler is the same one the IPC path reaches through
-    /// `aeron_ipc_publication_reject` (`aeron_ipc_publication.c:249`) — one
+    /// `aeron_ipc_publication_reject` (`aeron_ipc_publication.c:254`) — one
     /// function, two ways in, which is why the response is built here from the
     /// same [`PublicationError`] either way.
     fn flush_publication_errors(&mut self) -> usize {
@@ -1871,7 +1871,7 @@ impl Conductor {
         // publication can have several, and the reference releases the links a
         // dying client held rather than the resource
         // (`aeron_driver_conductor_client_remove`'s publication links,
-        // `aeron_driver_conductor.c:1220-1241`).
+        // `aeron_driver_conductor.c:1261-1282`).
         let orphans: Vec<i64> = self
             .network_publications
             .publications()
@@ -1890,7 +1890,7 @@ impl Conductor {
             // The dead client's holds are gone, so the publication ends the
             // same way one whose clients left alive does: it lingers while it
             // has readers, and the release waits for that
-            // (`aeron_driver_conductor.c:1220-1241`, which drops the links and
+            // (`aeron_driver_conductor.c:1261-1282`, which drops the links and
             // lets the publication's own `DECREF` do the rest).
             let _ = self.sender.end_publication(registration_id);
             self.awaiting_drain.insert(registration_id);
@@ -1946,7 +1946,7 @@ impl Conductor {
 
     /// Give back everything a receive endpoint held, once the receiver has let
     /// it go (`aeron_receive_channel_endpoint_has_receiver_released`, which is
-    /// what the conductor waits for — `aeron_driver_conductor.c:1560`).
+    /// what the conductor waits for — `aeron_driver_conductor.c:1601`).
     ///
     /// The counters are the conductor's to free because the region is: the
     /// receiver could only say which numbers were its.
@@ -1975,7 +1975,7 @@ impl Conductor {
     /// receiver says the destination is gone — the socket closed with it —
     /// which is where the reference gives it back too
     /// (`aeron_receive_destination_delete`,
-    /// `media/aeron_receive_destination.c:152-156`). The conductor hears about
+    /// `media/aeron_receive_destination.c:158-162`). The conductor hears about
     /// a removal a command earlier than this, when it *asks*; giving the port
     /// back then would hand it to a second reader while the first still has it
     /// bound.
@@ -1998,18 +1998,18 @@ impl Conductor {
         1
     }
 
-    /// `aeron_driver_conductor_image_transition_to_linger` (`:1642-1675`) and
+    /// `aeron_driver_conductor_image_transition_to_linger` (`:1683-1716`) and
     /// the two calls the reference makes in the **same conductor turn** as the
-    /// image leaves `DRAINING` (`aeron_publication_image.c:1351-1358`).
+    /// image leaves `DRAINING` (`aeron_publication_image.c:1377-1384`).
     ///
     /// The three things the reference does here, in this order:
     ///
     /// 1. the image leaves the receiver's dispatcher
-    ///    (`aeron_driver_receiver_proxy_on_remove_publication_image`, `:1354`),
+    ///    (`aeron_driver_receiver_proxy_on_remove_publication_image`, `:1380`),
     ///    which is where `IMAGE_COOL_DOWN` is left behind for the session
-    ///    (`aeron_data_packet_dispatcher.c:323-355`): a frame from it no longer
-    ///    elicits a `SETUP` (`:410-413`) and a `SETUP` creates nothing
-    ///    (`:503-506`) until the cool-down is cleared;
+    ///    (`aeron_data_packet_dispatcher.c:328-360`): a frame from it no longer
+    ///    elicits a `SETUP` (`:415-418`) and a `SETUP` creates nothing
+    ///    (`:508-511`) until the cool-down is cleared;
     /// 2. `rejoin` is read off the subscriptions that read the image — the
     ///    **last** linked one wins and `true` is the initial value, exactly as
     ///    its loop leaves it (`:1649-1664`) — and the cool-down is cleared when
@@ -2030,9 +2030,9 @@ impl Conductor {
             return 0;
         };
 
-        // `aeron_driver_receiver_proxy_on_remove_publication_image` (`:1354`):
+        // `aeron_driver_receiver_proxy_on_remove_publication_image` (`:1380`):
         // the dispatcher forgets the image and leaves `IMAGE_COOL_DOWN` behind
-        // (`aeron_data_packet_dispatcher.c:323-355`). **Detach**, not remove:
+        // (`aeron_data_packet_dispatcher.c:328-360`). **Detach**, not remove:
         // this build's image state machine runs in the receiver, so an image
         // taken out of that list here would never reach `DONE` and never be
         // released (`ReceiverCommand::DetachImage`).
@@ -2057,7 +2057,7 @@ impl Conductor {
     }
 
     /// Tell every subscription reading this image that it is gone
-    /// (`aeron_driver_conductor_image_transition_to_linger`, `:1642-1675`: the
+    /// (`aeron_driver_conductor_image_transition_to_linger`, `:1683-1716`: the
     /// `on_unavailable_image` call inside its loop).
     ///
     /// The readers stay **linked** afterwards. The reference lets go of an
@@ -2134,7 +2134,7 @@ impl Conductor {
 
         // An endpoint whose last image has just gone is one to try again on:
         // the reference asks both times — here, and where a subscription
-        // leaves (`aeron_publication_image.c:1380`).
+        // leaves (`aeron_publication_image.c:1406`).
         if let Some(region) = self.cnc.counter_regions() {
             crate::ipc_subscriptions::try_remove_endpoint(
                 image.endpoint_id,
@@ -2160,7 +2160,7 @@ impl Conductor {
             // leave behind. `aeron_publication_image_close` gives back the high
             // water mark, the position **and** the NAK count, in that order and
             // in one function
-            // (`aeron-driver/src/main/c/aeron_publication_image.c:410-412`);
+            // (`aeron-driver/src/main/c/aeron_publication_image.c:415-417`);
             // ours freed the first two and dropped this one.
             //
             // A slot nobody gives back is a slot the pool does not have for the
@@ -2260,7 +2260,7 @@ impl Conductor {
         // A low-space warning an image's create raised is not recorded here any
         // more: with one agent they all reach `record_storage_warnings`, which
         // is where the reference puts them — its own words, under
-        // `-STORAGE_SPACE` (`aeron_driver_context.c:1368-1377`). This block used
+        // `-STORAGE_SPACE` (`aeron_driver_context.c:1412-1421`). This block used
         // to say the same thing as a `GENERIC_ERROR` fault, because an image's
         // warning had no other way out of its manager.
         created.len()
@@ -2320,7 +2320,7 @@ impl Conductor {
                     // The image that owed this publication a response setup has
                     // now been answered — the publication has a live receiver,
                     // which is the end of the handshake — so it stops saying
-                    // the session (`aeron_driver_conductor.c:7117-7131`).
+                    // the session (`aeron_driver_conductor.c:7213-7227`).
                     //
                     // The reference sweeps every image and clears each match
                     // rather than stopping at the first, and clears whether or
@@ -2455,8 +2455,8 @@ impl Conductor {
     ///
     /// The heartbeat becomes `NULL_VALUE` rather than simply stopping: a
     /// client has to be able to tell "stopped on purpose" from "stopped being
-    /// heard from" (`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`,
-    /// flushed at `:3494`). The reference does not reap its clients on the way
+    /// heard from" (`aeron-driver/src/main/c/aeron_driver_conductor.c:3590`,
+    /// flushed at `:3591`). The reference does not reap its clients on the way
     /// out either — a client discovers the driver is gone from *this* field,
     /// not from a message — so neither does this.
     ///
@@ -2465,8 +2465,8 @@ impl Conductor {
     /// The error from flushing the mapping, if any.
     pub fn close(&mut self) -> std::io::Result<()> {
         // The counters the driver owns go first (`aeron_system_counters_close`,
-        // called at `aeron_driver_conductor.c:3487`), and the heartbeat is
-        // nulled after (`:3493`). It is why a driver that stopped on purpose
+        // called at `aeron_driver_conductor.c:3584`), and the heartbeat is
+        // nulled after (`:3590`). It is why a driver that stopped on purpose
         // leaves forty-six *reclaimed* slots behind, and why a capture of a
         // stopped driver is a different file from one of a running driver —
         // the golden fixture is the running one.
@@ -2486,7 +2486,7 @@ impl Conductor {
 
         // The publications go first: each one gives its counters back and
         // hands its log buffer to the agent, which is the order the reference
-        // closes in (`:3427-3436`) and the reason its shutdown leaves no
+        // closes in (`:3524-3533`) and the reason its shutdown leaves no
         // publication counters behind.
         self.publications
             .close(&mut self.counters, &regions, self.now_ms);
@@ -2527,11 +2527,11 @@ impl Conductor {
         //
         // The reference disagrees with itself, and both halves were read. The C
         // driver frees them at the end of its shutdown
-        // (`aeron-driver/src/main/c/aeron_system_counters.c:119-125`, called
-        // from `aeron_driver_conductor.c:3487`). The Java driver refuses to:
+        // (`aeron-driver/src/main/c/aeron_system_counters.c:124-130`, called
+        // from `aeron_driver_conductor.c:3584`). The Java driver refuses to:
         // `MediaDriver.Context.close` disconnects the counter from its manager
         // before closing it, which is exactly what makes that close not a
-        // release (`aeron-driver/src/main/java/io/aeron/driver/MediaDriver.java:757-762`).
+        // release (`aeron-driver/src/main/java/io/aeron/driver/MediaDriver.java:763-768`).
         // This driver follows Java, and the tie is broken on what each answer
         // costs: returning the slots buys nothing — the process is ending, and
         // the allocator's state is this process's memory rather than the file's
@@ -2543,7 +2543,7 @@ impl Conductor {
         // The C driver survives the same race on luck rather than on design: its
         // shutdown reaches its free later because it deletes a log file per
         // image on the way (`aeron_driver_conductor_delete_log_buffer`,
-        // `aeron_driver_conductor.c:3483`).
+        // `aeron_driver_conductor.c:3580`).
         debug_assert_eq!(
             system_counters::COUNT,
             self.system_counters.len(),
@@ -2553,7 +2553,7 @@ impl Conductor {
         // The distinct error log's *process* half needs no line here: the
         // observation table and the next offset are this build's own memory,
         // and dropping the conductor is what gives them back
-        // (`aeron_distinct_error_log_close`, `aeron_driver_conductor.c:3489`).
+        // (`aeron_distinct_error_log_close`, `aeron_driver_conductor.c:3586`).
         // The region is the file's, and the file is left as it stands — a
         // stopped driver's log is what a tool reads afterwards.
         self.running = false;
@@ -2563,7 +2563,7 @@ impl Conductor {
 
     /// Drain at most [`COMMAND_DRAIN_LIMIT`] commands and act on them.
     /// One step of a parked command: the answer, or another pass of waiting
-    /// (`aeron_driver_conductor.c:3293-3320` — the reference's
+    /// (`aeron_driver_conductor.c:3390-3417` — the reference's
     /// `client_command->execute` returning `RUNNING`).
     ///
     /// Nothing here blocks. The answer is either in the cell the agent filled
@@ -2597,7 +2597,7 @@ impl Conductor {
 
     /// Run a command whose channel the agent has parsed — the state the
     /// reference calls `ADD_NETWORK_PUBLICATION_STATE_VALIDATE`
-    /// (`aeron_driver_conductor.c:4135`), reached from
+    /// (`aeron_driver_conductor.c:4232`), reached from
     /// `AERON_DRIVER_NATIVE_RESOURCE_AGENT_COMMAND_STATE_SUCCEEDED`.
     fn complete_parked_command(
         &mut self,
@@ -2752,7 +2752,7 @@ impl Conductor {
     }
 
     /// Answer a command whose channel the agent could not parse
-    /// (`aeron_driver_conductor_set_error_from_result`, `:2851`, reached from
+    /// (`aeron_driver_conductor_set_error_from_result`, `:2914`, reached from
     /// `AERON_DRIVER_NATIVE_RESOURCE_AGENT_COMMAND_STATE_FAILED`).
     fn fail_parked_command(
         &mut self,
@@ -2810,7 +2810,7 @@ impl Conductor {
         // resolve is the reference's three lines, code line first — and a
         // channel that would not parse is described by what the parse left
         // behind plus this command's own site, exactly as the inline paths do
-        // it (`aeron_driver_conductor.c:2344-2352`).
+        // it (`aeron_driver_conductor.c:2407-2415`).
         let description = match &error {
             UdpChannelError::Uri(uri_error) => match uri_error.parse_failure(&channel) {
                 Some(uri_lines) => format!(
@@ -2826,7 +2826,7 @@ impl Conductor {
     }
 
     fn process_commands(&mut self, now_ns: i64) -> usize {
-        // The client command slot (`aeron_driver_conductor.c:3293-3320`):
+        // The client command slot (`aeron_driver_conductor.c:3390-3417`):
         // while one command is parked the conductor reads **no** other — a
         // slot is one command wide — and the parked one takes its next step
         // instead. Everything else in the pass carries on, which is what the
@@ -2883,7 +2883,7 @@ impl Conductor {
         // A destination command whose parse landed re-enters the destination
         // loop, which is where its state machine lives — and the conductor
         // reads nothing new while it is here, the same slot discipline as
-        // everywhere else (`:3293-3320`).
+        // everywhere else (`:3390-3417`).
         let mut pending_destination_commands: Vec<(i32, Vec<u8>)> =
             self.resumed_destination.take().into_iter().collect();
 
@@ -2915,7 +2915,7 @@ impl Conductor {
                     }
                 }
                 // A keepalive refreshes a client this driver knows and is
-                // nothing at all for one it does not (`:5269-5280`). The
+                // nothing at all for one it does not (`:5366-5377`). The
                 // reference C client never sends it — it writes the counter —
                 // so this is for other clients, and for a client that wants to
                 // say it is alive without allocating anything.
@@ -2932,12 +2932,12 @@ impl Conductor {
                 },
                 // Nothing is freed here: the heartbeat is zeroed so the next
                 // timeout tier collects the client, which is also what stops
-                // that tier from announcing a timeout (`:6321-6331`).
+                // that tier from announcing a timeout (`:6418-6428`).
                 // A publication: parse the URI, resolve its parameters against
                 // the driver's settings, and either share an existing
                 // publication or ask the agent for a log buffer. The reply
                 // follows from whichever of those happened
-                // (`aeron_driver_conductor.c:3956-4080`).
+                // (`aeron_driver_conductor.c:4053-4177`).
                 command @ (Command::AddPublication | Command::AddExclusivePublication) => {
                     let is_exclusive = matches!(command, Command::AddExclusivePublication);
 
@@ -2952,7 +2952,7 @@ impl Conductor {
                             // Which collection serves this depends on what
                             // the URI names, and *only* on that: the reference
                             // parses the channel and then follows one of two
-                            // paths (`aeron_driver_conductor.c:4113-4135`), and
+                            // paths (`aeron_driver_conductor.c:4210-4232`), and
                             // a channel this build does not serve is refused by
                             // the collection that would have had it.
                             //
@@ -2960,7 +2960,7 @@ impl Conductor {
                             // all: the reference's add command is a state
                             // machine whose first state asks the native resource
                             // agent to parse the channel and waits for it
-                            // (`:4113-4132`, `AERON_DRIVER_NATIVE_RESOURCE_AGENT_COMMAND_STATE_PENDING`),
+                            // (`:4210-4229`, `AERON_DRIVER_NATIVE_RESOURCE_AGENT_COMMAND_STATE_PENDING`),
                             // so the command is parked and the conductor reads
                             // no other client command until the answer is in —
                             // while its duty cycle, its heartbeat and the
@@ -2989,7 +2989,7 @@ impl Conductor {
                                     &mut transmit,
                                     // The IPC path resolves a tag against the
                                     // network publications all the same
-                                    // (`aeron_driver_uri.c:163` is handed the
+                                    // (`aeron_driver_uri.c:168` is handed the
                                     // conductor, and both paths call it).
                                     |tag| network_publications.find_by_tag(tag),
                                 ),
@@ -3000,7 +3000,7 @@ impl Conductor {
                                 // from what failed rather than from where: a
                                 // channel it cannot parse is a different
                                 // answer from one whose parameters do not add
-                                // up (`aeron_driver_conductor.c:2344-2352`).
+                                // up (`aeron_driver_conductor.c:2407-2415`).
                                 *publication_failures += 1;
                                 // A channel that will not parse is described
                                 // by what the parse left behind plus this
@@ -3028,7 +3028,7 @@ impl Conductor {
                 }
                 // A publication's client letting go of it. The revocation
                 // flag is set on the publication's own byte and acted on at
-                // the next timeout tier (`aeron_driver_conductor.c:4705-4735`).
+                // the next timeout tier (`aeron_driver_conductor.c:4802-4832`).
                 Command::RemovePublication => match decode_remove_publication(payload) {
                     Some(request) => {
                         let link =
@@ -3048,8 +3048,8 @@ impl Conductor {
                                 // removal that does not finish here: the sender
                                 // owns it, and it has one more thing to say —
                                 // `REVOKED` — which takes at least a heartbeat
-                                // (`aeron_network_publication.c:1244-1280`, then
-                                // LINGER at `:1327-1340`). Its release waits for
+                                // (`aeron_network_publication.c:1263-1299`, then
+                                // LINGER at `:1348-1361`). Its release waits for
                                 // the sender to report it drained.
                                 let mut is_draining = false;
 
@@ -3058,7 +3058,7 @@ impl Conductor {
                                     // the IPC registry here, the sender's own
                                     // list otherwise — and the reference reaches
                                     // it the same way in both: through the
-                                    // resource its link holds (`:4716-4719`).
+                                    // resource its link holds (`:4813-4816`).
                                     let registration_id = link.publication_registration_id;
 
                                     if network_publications.find(registration_id).is_some() {
@@ -3090,7 +3090,7 @@ impl Conductor {
                                     // lingering: a publication with no clients
                                     // left writes where its stream stopped and
                                     // lingers while it still has readers
-                                    // (`DECREF`-to-zero, `:4705-4735` then
+                                    // (`DECREF`-to-zero, `:4802-4832` then
                                     // `media/aeron_network_publication.c:1048-1069`).
                                     // The end of that linger is what the
                                     // release waits for, and the **endpoint**
@@ -3109,7 +3109,7 @@ impl Conductor {
                             None => {
                                 *publication_failures += 1;
                                 // The reference's text names both ids
-                                // (`aeron_driver_conductor.c:4734`), so a
+                                // (`aeron_driver_conductor.c:4831`), so a
                                 // client — or an operator reading its logs —
                                 // is told *whose* publication nobody had.
                                 let unknown = format!(
@@ -3127,7 +3127,7 @@ impl Conductor {
                     None => malformed_command(type_id, payload.len(), malformed, &mut transmit),
                 },
                 // A subscription going away: its positions are detached and
-                // its counters come back (`aeron_driver_conductor.c:5199-5267`)
+                // its counters come back (`aeron_driver_conductor.c:5296-5364`)
                 // — silently, which is the reference's answer in C and in
                 // Java alike: neither announces the images a removal takes
                 // away, so the acknowledgement is the whole event stream.
@@ -3154,7 +3154,7 @@ impl Conductor {
                         } else {
                             *subscription_failures += 1;
                             // The same two ids as the publication's text
-                            // (`aeron_driver_conductor.c:5258`).
+                            // (`aeron_driver_conductor.c:5355`).
                             let unknown = format!(
                                 "unknown subscription client_id={} registration_id={}",
                                 request.correlated.client_id, request.registration_id,
@@ -3170,7 +3170,7 @@ impl Conductor {
                 },
                 // A subscription: parse the URI, register the client, answer
                 // it, and then give it every publication it already matches
-                // (`aeron_driver_conductor.c:4741-4824`).
+                // (`aeron_driver_conductor.c:4838-4921`).
                 Command::AddSubscription => match decode_add_subscription(payload) {
                     Some(request) => {
                         let now = Now {
@@ -3185,7 +3185,7 @@ impl Conductor {
                         // prefix is not a transport — what follows it is an
                         // ordinary UDP channel, parsed as such
                         // (`aeron_driver_conductor_on_add_spy_subscription`,
-                        // `aeron_driver_conductor.c:4926-4966`, whose own
+                        // `aeron_driver_conductor.c:5023-5063`, whose own
                         // dispatch is a string comparison on the prefix).
                         let subscription_result = if is_spy_channel(request.channel) {
                             subscriptions.add_spy_subscription(
@@ -3202,7 +3202,7 @@ impl Conductor {
                             match ChannelUri::parse(request.channel) {
                                 // The same parking the publication path does,
                                 // for the same reason
-                                // (`aeron_driver_conductor.c:4741-4824`'s first
+                                // (`aeron_driver_conductor.c:4838-4921`'s first
                                 // state is the agent's parse).
                                 Ok(uri) if uri.transport() == Transport::Udp => {
                                     *parked_command = Some(ParkedCommand::new(
@@ -3262,7 +3262,7 @@ impl Conductor {
 
                         // Registering the client is this command's first act,
                         // and it is what announces the client's heartbeat
-                        // counter under the client id (`:1030`).
+                        // counter under the client id (`:1070`).
                         let Some(record) = clients.get_or_add(
                             client_id,
                             now_ms,
@@ -3274,7 +3274,7 @@ impl Conductor {
                             *counter_failures += 1;
                             // The reference appends "Failed to add client" and
                             // returns -1, which the dispatcher turns into
-                            // `ON_ERROR` (`:3226`, `:6171-6178`).
+                            // `ON_ERROR` (`:3323`, `:6268-6275`).
                             transmit.error(
                                 registration_id,
                                 ERROR_CODE_GENERIC_ERROR,
@@ -3349,7 +3349,7 @@ impl Conductor {
                                 // Acknowledge, then announce, then free — the
                                 // reference's order, and the reason its
                                 // `removeCounter` unblocks while the counter is
-                                // still being returned (`:6221-6235`).
+                                // still being returned (`:6318-6332`).
                                 transmit.operation_succeeded(command.correlated.correlation_id);
                                 transmit.counter_unavailable(link.registration_id, link.counter_id);
                                 counters.free(&counter_regions, link.counter_id, now_ms);
@@ -3372,7 +3372,7 @@ impl Conductor {
                 // **image** answers that registration id the driver looks among
                 // its **IPC publications**, because for `aeron:ipc` what a
                 // subscriber was handed *is* the publication
-                // (`aeron_driver_conductor.c:6367-6398`). Both branches are
+                // (`aeron_driver_conductor.c:6464-6495`). Both branches are
                 // answered the same way afterwards — the rejections counter,
                 // then `ON_OPERATION_SUCCEEDED` — and only a client that named
                 // neither hears an error.
@@ -3383,8 +3383,8 @@ impl Conductor {
                     Err(RejectImageError::ReasonTooLong { correlated }) => {
                         // The handler's refusal, which the dispatch turns into
                         // an `ON_ERROR` on the command's own correlation id
-                        // (`aeron_driver_conductor.c:6357-6364`, then its
-                        // `result < 0` at `:3224-3227`).
+                        // (`aeron_driver_conductor.c:6454-6461`, then its
+                        // `result < 0` at `:3321-3324`).
                         transmit.error(
                             correlated.correlation_id,
                             ERROR_CODE_GENERIC_ERROR,
@@ -3401,7 +3401,7 @@ impl Conductor {
                             // exists, and the receiver is what has the
                             // connections to send an `ERR` frame down
                             // (`aeron_driver_receiver_proxy_on_invalidate_image`,
-                            // `aeron_driver_receiver_proxy.c:252-274`).
+                            // `aeron_driver_receiver_proxy.c:257-279`).
                             let _ =
                                 receiver
                                     .invalidate_image(image_correlation_id, request.reason.to_vec());
@@ -3453,7 +3453,7 @@ impl Conductor {
                 // The one thing that makes it static is the owner id: the
                 // reference allocates it with `AERON_NULL_VALUE` and does *not*
                 // put it in the client's list of counters
-                // (`aeron_driver_conductor.c:6300-6312`), which is the whole of
+                // (`aeron_driver_conductor.c:6397-6409`), which is the whole of
                 // why a client that dies does not take it with it. Pushing a
                 // `CounterLink` here would look harmless and would free a
                 // counter the driver is meant to keep — `Clients::reap` walks
@@ -3464,7 +3464,7 @@ impl Conductor {
                         let correlation_id = command.correlated.correlation_id;
 
                         // Registering the client is this command's first act,
-                        // the same as `ADD_COUNTER`'s (`:6259`).
+                        // the same as `ADD_COUNTER`'s (`:6356`).
                         let Some(_record) = clients.get_or_add(
                             client_id,
                             now_ms,
@@ -3483,7 +3483,7 @@ impl Conductor {
                         };
 
                         // An id and a type id that already name a counter: the
-                        // answer depends on who owns it (`:6265-6281`). One with
+                        // answer depends on who owns it (`:6362-6378`). One with
                         // an owner is somebody's, and a static counter may not be
                         // put in its place; one without is a static counter
                         // already, and this call is a client asking for the one
@@ -3527,7 +3527,7 @@ impl Conductor {
                                     *counter_failures += 1;
                                     // The reference returns `-1` here with no
                                     // `AERON_SET_ERR` of its own
-                                    // (`aeron_driver_conductor.c:6300-6304`),
+                                    // (`aeron_driver_conductor.c:6397-6401`),
                                     // so its client is answered with whatever
                                     // the thread's error slot last held — a
                                     // value it does not define and this build
@@ -3571,7 +3571,7 @@ impl Conductor {
                         Some(request) => {
                             let stream_id = request.stream_id;
 
-                            // `outer: while (true)` (`aeron_driver_conductor.c:6422-6450`).
+                            // `outer: while (true)` (`aeron_driver_conductor.c:6519-6547`).
                             //
                             // It terminates, and the argument is worth having
                             // because the loop has no counter: every turn moves
@@ -3628,7 +3628,7 @@ impl Conductor {
                                 -ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID,
                                 "aeron_driver_conductor_on_command",
                                 "aeron_driver_conductor.c",
-                                3219,
+                                3316,
                                 &format!("command={unknown_type_id} unknown"),
                             ),
                         );
@@ -3691,9 +3691,9 @@ impl Conductor {
         //
         // `REMOVE_DESTINATION_BY_ID` first, because it is the one command in the
         // family whose failures the reference answers **nothing** to: it calls
-        // its handler without taking the result (`:3188-3200`), so the error for
-        // a publication it cannot find (`:5562-5578`) never reaches the
-        // `result < 0` that would send an `ON_ERROR` (`:3222-3225`). The client
+        // its handler without taking the result (`:3285-3297`), so the error for
+        // a publication it cannot find (`:5659-5675`) never reaches the
+        // `result < 0` that would send an `ON_ERROR` (`:3319-3322`). The client
         // waits and times out. The silence is reproduced rather than improved
         // on, so a lookup that finds nothing here answers nothing either, and
         // `docs/compat.md` carries the line for it.
@@ -3701,7 +3701,7 @@ impl Conductor {
             let command = Command::from_type_id(type_id);
 
             // A receive destination is triaged by the prefix of the channel it
-            // names (`aeron_driver_conductor.c:3051-3065`): `aeron:ipc` is one
+            // names (`aeron_driver_conductor.c:3114-3128`): `aeron:ipc` is one
             // kind of destination, `aeron-spy:` another, and everything else is
             // a network one.
             if Command::AddReceiveDestination == command
@@ -3770,7 +3770,7 @@ impl Conductor {
                 // local read of a publication to a multi-destination
                 // subscription, which is the third way a spy link is made
                 // (`aeron_driver_conductor_execute_add_receive_spy_destination`,
-                // `:5704-5806`, and its removal at `:6024-6065`).
+                // `:5801-5903`, and its removal at `:6121-6162`).
                 if is_spy_channel(request.channel) {
                     let now = Now {
                         ms: now_ms,
@@ -3827,7 +3827,7 @@ impl Conductor {
                 // The network branch. A destination is added to the
                 // **subscription** the client named — that is what its
                 // registration id is — and through it to the endpoint that
-                // subscription reads on (`aeron_driver_conductor.c:5879-5910`).
+                // subscription reads on (`aeron_driver_conductor.c:5976-6007`).
                 let Some(link) = subscriptions.find_mds(request.registration_id) else {
                     transmit.error(
                         request.correlation_id,
@@ -3860,7 +3860,7 @@ impl Conductor {
                     continue;
                 };
 
-                // `:5889`: what a destination may not name, checked on the
+                // `:5986`: what a destination may not name, checked on the
                 // parse and before the socket — `mtu`, `rcv-wnd`, either
                 // buffer, the response correlation, and `control-mode=response`.
                 // A destination is a place inside a subscription's channel,
@@ -3956,7 +3956,7 @@ impl Conductor {
                     let _ = receiver.add_destination(endpoint_id, Box::new(destination));
                     // The endpoint's destination list is on the receiver's
                     // thread; the agreement check that reads it is here, so
-                    // the count is kept here too (`aeron_driver_conductor.c:2184`
+                    // the count is kept here too (`aeron_driver_conductor.c:2235`
                     // asks `1 == endpoint->destinations.length`).
                     receive_endpoints.attach_destination(endpoint_id);
                 } else {
@@ -4020,7 +4020,7 @@ impl Conductor {
             // on with its pass. The address is `None` for a name that did not
             // answer — the reference's `AF_UNSPEC`, kept on purpose so that a
             // name which answers later answers *this* destination
-            // (`:5337-5343`).
+            // (`:5434-5440`).
             let Some(parsed) = agent_parsed_channel.take() else {
                 *parked_command = Some(ParkedCommand::send_destination(
                     type_id,
@@ -4053,7 +4053,7 @@ impl Conductor {
             if outcome.is_err() {
                 // The sender has gone; the client is answered anyway, because
                 // the reference answers before the sender applies anything
-                // (`:5366-5367`) and a client that is told nothing hangs.
+                // (`:5463-5464`) and a client that is told nothing hangs.
                 transmit.record_fault(
                     ERROR_CODE_GENERIC_ERROR,
                     format!("destination command for publication {registration_id}"),
@@ -4077,7 +4077,7 @@ impl Conductor {
     ///
     /// The reference asks the question on its timeout tier
     /// (`aeron_driver_conductor_on_check_for_blocked_driver_commands`,
-    /// `:3246-3266`): if the consumer position has not moved while the
+    /// `:3343-3363`): if the consumer position has not moved while the
     /// producer's is ahead of it, and that has been true for a whole client
     /// liveness window, try to break it and count the break in system counter
     /// 20.
@@ -4124,7 +4124,7 @@ impl Conductor {
 
     /// The publications' turn: advance the ones on their way out, revoke the
     /// ones whose clients asked, and remove the ones that are done
-    /// (`aeron_driver_conductor_on_check_managed_resources`, `:1691-1712`,
+    /// (`aeron_driver_conductor_on_check_managed_resources`, `:1732-1753`,
     /// which the reference runs on the same tier).
     fn check_publications(&mut self, now_ns: i64) -> usize {
         let Some(counter_regions) = self.cnc.counter_regions() else {
@@ -4157,8 +4157,8 @@ impl Conductor {
     /// The client pool's turn: announce whoever has gone quiet, and then
     /// reclaim them.
     ///
-    /// Two phases, in the reference's order (`aeron_driver_conductor.c:1038-1056`
-    /// then `:1692-1712`): the announcements of *every* expired client precede
+    /// Two phases, in the reference's order (`aeron_driver_conductor.c:1079-1097`
+    /// then `:1733-1753`): the announcements of *every* expired client precede
     /// the reclamation of any of them, which is visible on the ring whenever
     /// two clients expire in the same tick.
     fn check_clients(&mut self) -> usize {
@@ -4214,18 +4214,18 @@ impl Conductor {
     ///
     /// Each one is an error the reference records: `client_transmit` appends
     /// "failed to transmit message" and logs it, and logging is what bumps the
-    /// errors system counter (`aeron_driver_conductor.c:2233-2241` feeding
+    /// errors system counter (`aeron_driver_conductor.c:2296-2304` feeding
     /// `:1203-1215`). They are counted during the pass and recorded after it,
     /// because the pass holds the event region mutably; the order within a
     /// pass is not observable from outside it.
     ///
     /// The code recorded is zero, which is what the reference records too:
     /// `AERON_APPEND_ERR` appends text without setting a code
-    /// (`util/aeron_error.c:380-388`, whose Windows twin's comment says the
-    /// same at `:498-501`), and the last thing a recorded error did was clear
-    /// the state (`:389-397`).
+    /// (`util/aeron_error.c:399-407`, whose Windows twin's comment says the
+    /// same at `:517-520`), and the last thing a recorded error did was clear
+    /// the state (`:408-416`).
     ///
-    /// This reverses the P1-1 review's D4, which read `:2233-2241` as "touches
+    /// This reverses the P1-1 review's D4, which read `:2296-2304` as "touches
     /// no counter" and removed the increment — the counter it leaves alone is
     /// a *different* one from the errors counter its own `log_error` raises.
     fn flush_broadcast_failures(&mut self) {
@@ -4245,7 +4245,7 @@ impl Conductor {
     /// bump of the errors system counter — the bump **always**, even for an
     /// entry the log could not hold
     /// (`aeron_driver_conductor_log_explicit_error`,
-    /// `aeron_driver_conductor.c:1203-1215`).
+    /// `aeron_driver_conductor.c:1244-1256`).
     fn log_error(&mut self, error_code: i32, description: &str) {
         self.record_entry(error_code, description);
 
@@ -4260,10 +4260,10 @@ impl Conductor {
     /// An `ON_ERROR` is recorded under the **protocol** code the client was
     /// told, not the negated one a recording site set: the reference hands
     /// `log_explicit_error` the `code` it composed, not the `errcode`
-    /// (`aeron_driver_conductor.c:2369`). One code the reference refuses to
+    /// (`aeron_driver_conductor.c:2432`). One code the reference refuses to
     /// record is skipped — the transient "resource temporarily unavailable"
     /// is answered but kept out of the log, and so raises no counter either
-    /// (`:2367`).
+    /// (`:2430`).
     fn record_pending_faults(&mut self) {
         for (error_code, description) in std::mem::take(&mut self.pending_log_errors) {
             if ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE == error_code {
@@ -4280,7 +4280,7 @@ impl Conductor {
     /// (`aeron_distinct_error_log.c:183-191`), so every path that records
     /// reports a failure to record the same way — including the ones whose
     /// callers ignore the return value, such as the storage warning
-    /// (`aeron_driver_context.c:1374`).
+    /// (`aeron_driver_context.c:1418`).
     fn record_entry(&mut self, error_code: i32, description: &str) {
         let Some(region) = self.cnc.error_log_writable() else {
             return;
@@ -4306,7 +4306,7 @@ impl Conductor {
 
     /// Take the agent's storage warnings and record them
     /// (`aeron_driver_context_run_storage_checks`'s second half,
-    /// `aeron_driver_context.c:1368-1377`).
+    /// `aeron_driver_context.c:1412-1421`).
     ///
     /// The warning is the reference's own words, and the two numbers are
     /// printed the way its `PRId64` prints the `uint64_t` values it passes —
@@ -4316,7 +4316,7 @@ impl Conductor {
     /// Take what the agent could not do and record it.
     ///
     /// The reference's agent writes these into the shared error log itself
-    /// (`aeron_driver_native_resource_agent.c:233-251` for a resolver that
+    /// (`aeron_driver_native_resource_agent.c:238-256` for a resolver that
     /// would not start); the log is a process-local structure whose only writer
     /// is the conductor here, so they are handed over the way the storage
     /// warnings already are — and the difference is invisible in the file.
@@ -4341,12 +4341,12 @@ impl Conductor {
             );
             // Negated, because the reference's `AERON_SET_ERR` was given
             // `-AERON_ERROR_CODE_STORAGE_SPACE` and the log keeps what that
-            // left (`:1370-1372`).
+            // left (`:1414-1416`).
             let description = compose_description(
                 -ERROR_CODE_STORAGE_SPACE,
                 "aeron_driver_context_run_storage_checks",
                 "aeron_driver_context.c",
-                1370,
+                1414,
                 &message,
             );
             self.record_distinct(-ERROR_CODE_STORAGE_SPACE, &description);
@@ -4358,13 +4358,13 @@ impl Conductor {
     /// This is the reference's direct
     /// `aeron_distinct_error_log_record(context->error_log, …)` — the calls
     /// that do **not** go through `log_explicit_error`
-    /// (`aeron_driver_conductor.c:1203-1215`), and so raise no errors
+    /// (`aeron_driver_conductor.c:1244-1256`), and so raise no errors
     /// counter. A caller that failed as well as warned uses
     /// [`Conductor::log_error`]; this is for the paths the reference
     /// recorded without deciding anything had failed.
     fn record_distinct(&mut self, error_code: i32, description: &str) {
         // What an entry that does not fit costs is the *return value*: this
-        // path's caller does not look at it (`aeron_driver_context.c:1374`)
+        // path's caller does not look at it (`aeron_driver_context.c:1418`)
         // and no counter moves for a recorded error either. The complaint on
         // stderr still happens, because it is the recorder that makes it.
         self.record_entry(error_code, description);
@@ -4420,7 +4420,7 @@ impl Conductor {
 }
 
 /// The reference's conversion of the configured reuse timeout
-/// (`aeron_driver_conductor.c:696-701`): milliseconds, and at least one when a
+/// (`aeron_driver_conductor.c:737-742`): milliseconds, and at least one when a
 /// timeout was asked for at all. Zero means "reusable at once".
 fn free_to_reuse_ms(nanoseconds: i64) -> i64 {
     if nanoseconds <= 0 {
@@ -4432,12 +4432,12 @@ fn free_to_reuse_ms(nanoseconds: i64) -> i64 {
 
 impl Conductor {
     /// Resolve the names the sender asked about again, and tell it what changed
-    /// (`aeron_driver_conductor_execute_re_resolve_endpoint`, `:6890-6938`).
+    /// (`aeron_driver_conductor_execute_re_resolve_endpoint`, `:6986-7034`).
     ///
     /// The resolution is the **wrapper**'s, not the resolver's alone
     /// (`aeron_name_resolver_resolve_host_and_port`): what a re-resolution
     /// answers with is an address with the port the channel named, which is
-    /// what the endpoint compares against the one it has (`:6932-6938`) and
+    /// what the endpoint compares against the one it has (`:7028-7034`) and
     /// what it reconnects to.
     ///
     /// A name that resolves to **the address the endpoint already has** is not
@@ -4447,7 +4447,7 @@ impl Conductor {
     ///
     /// A name that will not resolve is an **error a deployment can see**: the
     /// counter and the log entry, both, which is what the reference's
-    /// `set_error_from_result` plus `AERON_APPEND_ERR` do (`:6905-6911`) and
+    /// `set_error_from_result` plus `AERON_APPEND_ERR` do (`:7001-7007`) and
     /// what `shouldReportErrorOnReResolveFailure` waits for.
     fn re_resolve_endpoints(&mut self) -> usize {
         if self.pending_re_resolutions.is_empty() {
@@ -4455,7 +4455,7 @@ impl Conductor {
         }
 
         // One at a time, like the reference's single driver-command slot
-        // (`aeron_driver_conductor.c:3327-3341`): the head is asked for, and
+        // (`aeron_driver_conductor.c:3424-3438`): the head is asked for, and
         // the next one waits until its answer is in.
         let agent = self.agent_handle.clone();
         let mut entry = self.pending_re_resolutions.remove(0);
@@ -4513,9 +4513,9 @@ impl Conductor {
                     // carries, not the generic code it used to be recorded
                     // under: the reference's re-resolve command takes its
                     // failure's code from the result the agent filled in
-                    // (`aeron_driver_conductor.c:6900-6911`), and a name that
+                    // (`aeron_driver_conductor.c:6996-7007`), and a name that
                     // will not resolve arrives there as `-9`
-                    // (`:2333-2338` turns it back into the positive code the
+                    // (`:2396-2401` turns it back into the positive code the
                     // client is told and the log records).
                     self.pending_log_errors
                         .push((error.error_code(), error.to_string()));
@@ -4528,7 +4528,7 @@ impl Conductor {
 
     /// Resolve the **control** names the receiver asked about again, and tell
     /// it what changed
-    /// (`aeron_driver_conductor_execute_re_resolve_control`, `:6957-6990`).
+    /// (`aeron_driver_conductor_execute_re_resolve_control`, `:7053-7086`).
     ///
     /// The same shape as [`Self::re_resolve_endpoints`] with one word changed:
     /// the name is the channel's `control=`, the wrapper is asked with that
@@ -4578,7 +4578,7 @@ impl Conductor {
                     // is on another thread and a **tag match** is measured
                     // against where the endpoint answers control frames now
                     // (`aeron_receive_channel_endpoint_matches_tag`,
-                    // `media/aeron_receive_channel_endpoint.c:668-689`).
+                    // `media/aeron_receive_channel_endpoint.c:673-694`).
                     if let Some(entry) = self.receive_endpoints.get_mut(endpoint_id) {
                         entry.control_addr = Some(address);
                     }
@@ -4881,7 +4881,7 @@ mod tests {
     /// belongs to the *sender* — `try_remove_send_endpoint` sends it a command
     /// and the conductor frees the endpoint's `snd-channel` counter when the
     /// confirmation comes back, a pass or two later
-    /// (`aeron_send_channel_endpoint_delete`, `:250-266`). Asserting the moment
+    /// (`aeron_send_channel_endpoint_delete`, `:243-259`). Asserting the moment
     /// the client was answered read a count that had not finished moving, which
     /// is what made this test fail under load and never on its own.
     fn await_counter_frees(conductor: &mut Conductor, before: usize, expected: usize) -> usize {
@@ -4961,7 +4961,7 @@ mod tests {
     /// Wait for a counter to reach a value.
     ///
     /// A count is not part of the frame it counts. The receiver sends the `ERR`
-    /// and *then* increments — `aeron_receive_channel_endpoint.c:493-506` sends
+    /// and *then* increments — `aeron_receive_channel_endpoint.c:498-511` sends
     /// and bumps afterwards, and
     /// `ReceiveChannelEndpoint::send_error_frame` keeps that order — so a test
     /// that already holds the frame its socket received is still ahead of the
@@ -5064,7 +5064,7 @@ mod tests {
         assert_eq!(
             Some(1),
             ring.next_correlation_id(),
-            "the driver takes one at startup (`aeron_driver.c:970`)"
+            "the driver takes one at startup (`aeron_driver.c:1010`)"
         );
     }
 
@@ -5255,7 +5255,7 @@ mod tests {
     }
 
     /// `ADD_RCV_DESTINATION` is triaged by the prefix of the channel it names
-    /// (`:3051-3065`): `aeron:ipc`, `aeron-spy:`, or a network channel.
+    /// (`:3114-3128`): `aeron:ipc`, `aeron-spy:`, or a network channel.
     ///
     /// All three are **served** and each is its own branch: `aeron:ipc` and
     /// `aeron-spy:` are local reads added to a multi-destination subscription
@@ -5373,13 +5373,13 @@ mod tests {
         // And the fault reaches the distinct error log in the adapter's
         // words — the composition the reference's `AERON_SET_ERR` builds —
         // with the errors counter bumped to match
-        // (`aeron_driver_conductor.c:3218-3221`).
+        // (`aeron_driver_conductor.c:3315-3318`).
         let mut errors = Vec::new();
         let log = conductor.cnc.error_log().expect("the error log");
         assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
         assert_eq!(
             "(-6) unknown command type id\n\
-             [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3219] \
+             [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3316] \
              command=127 unknown\n",
             errors[0].text
         );
@@ -5720,7 +5720,7 @@ mod tests {
 
         // A second removal finds nothing, and so does one from a stranger —
         // and each is *answered*, so the client that asked is not left waiting
-        // for a deadline (`aeron_driver_conductor.c:6244-6252`).
+        // for a deadline (`aeron_driver_conductor.c:6341-6349`).
         send(&conductor, 0x0A, &remove_counter_payload(7, 6, 99));
         conductor.do_work();
         send(&conductor, 0x0A, &remove_counter_payload(8, 7, 99));
@@ -5759,14 +5759,14 @@ mod tests {
 
         // And the fault reaches the distinct error log in the reference
         // adapter's words — composed, as its `AERON_SET_ERR` composes — with
-        // the errors counter bumped to match (`aeron_driver_conductor.c:3231-3235`).
+        // the errors counter bumped to match (`aeron_driver_conductor.c:3328-3332`).
         let mut errors = Vec::new();
         let log = conductor.cnc.error_log().expect("the error log");
         assert_eq!(1, log.read(i64::MIN, &mut errors).entries);
         assert_eq!(
             format!(
                 "(-7) malformed command\n\
-                 [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3232] \
+                 [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3329] \
                  command=9 too short: length={}\n",
                 payload.len()
             ),
@@ -5784,7 +5784,7 @@ mod tests {
         // `client_transmit` failure is logged like any driver error, and
         // logging is what bumps the errors counter — one bump per refused
         // message, with the distinct log collapsing them into one entry
-        // (`aeron_driver_conductor.c:2233-2241` feeding `:1203-1215`).
+        // (`aeron_driver_conductor.c:2296-2304` feeding `:1244-1256`).
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
         conductor.pending_broadcast_failures = 3;
 
@@ -5806,7 +5806,7 @@ mod tests {
 
     #[test]
     fn a_low_space_warning_is_recorded_without_counting_and_the_log_buffer_lands() {
-        // The storage check's second half (`aeron_driver_context.c:1368-1377`):
+        // The storage check's second half (`aeron_driver_context.c:1412-1421`):
         // a filesystem that can hold the log buffer but sits at or below the
         // threshold gets a warning in the distinct error log — written
         // directly, not through `log_explicit_error`, so the errors counter
@@ -5852,7 +5852,7 @@ mod tests {
         assert!(
             errors[0].text.starts_with(
                 "(-12) insufficient storage space\n\
-                 [aeron_driver_context_run_storage_checks, aeron_driver_context.c:1370] \
+                 [aeron_driver_context_run_storage_checks, aeron_driver_context.c:1414] \
                  WARNING: space is running low: threshold=9223372036854775807 usable="
             ),
             "the reference's composition and words, with the threshold it was given: {}",
@@ -5875,11 +5875,11 @@ mod tests {
     #[test]
     fn a_refused_log_buffer_is_answered_and_recorded() {
         // The refusal half of the same check, end to end. A filesystem that
-        // cannot hold the log refuses it (`aeron_driver_context.c:1360-1366`),
-        // the agent reports the failure (`:432-436`), the publication's state
-        // machine turns it into ERROR (`aeron_driver_conductor.c:4064-4067`)
+        // cannot hold the log refuses it (`aeron_driver_context.c:1404-1410`),
+        // the agent reports the failure (`:435-439`), the publication's state
+        // machine turns it into ERROR (`aeron_driver_conductor.c:4161-4164`)
         // and the conductor answers the client *and* records the error, in one
-        // act (`:3304-3315` → `on_error`'s own `log_error:` label, `:2366-2370`).
+        // act (`:3401-3412` → `on_error`'s own `log_error:` label, `:2429-2433`).
         //
         // A directory that is gone is a filesystem that reports nothing
         // usable, which is how this build's `usable_fs_space` reads one — the
@@ -6599,7 +6599,7 @@ mod tests {
         // All three of the image's own counters go back to the pool. The third
         // is the one that did not: a released image left its `rcv-naks-sent`
         // allocated for the life of the driver, and the reference frees all
-        // three in one function (`aeron_publication_image.c:410-412`).
+        // three in one function (`aeron_publication_image.c:415-417`).
         let regions = counter_regions(&conductor);
         let counters = regions.reader();
 
@@ -6625,10 +6625,10 @@ mod tests {
     /// behind**, so the same session's `SETUP` makes no second image.
     ///
     /// The cool-down is left by the image's removal
-    /// (`aeron_data_packet_dispatcher.c:323-355`) and a `SETUP` in it creates
-    /// nothing (`:503-506`). What clears it is the same conductor turn that
+    /// (`aeron_data_packet_dispatcher.c:328-360`) and a `SETUP` in it creates
+    /// nothing (`:508-511`). What clears it is the same conductor turn that
     /// tells the readers the image is gone, off the links **still linked** at
-    /// that moment (`aeron_driver_conductor.c:1649-1674`) — so a subscription
+    /// that moment (`aeron_driver_conductor.c:1690-1715`) — so a subscription
     /// that says `rejoin=false` never clears it. That is what stops a cluster
     /// client's egress subscription from re-joining the image it just lost and
     /// silently skipping every message in between (P3-3c criterion 4).
@@ -6639,7 +6639,7 @@ mod tests {
 
     /// The other half, and the half #133 added: a subscription that **does**
     /// rejoin clears the cool-down in the same turn
-    /// (`aeron_driver_conductor.c:1664-1674`), so a publisher still sending is
+    /// (`aeron_driver_conductor.c:1705-1715`), so a publisher still sending is
     /// heard again. Without it an image a partition killed is never replaced and
     /// the cluster stays deaf.
     #[test]
@@ -6761,7 +6761,7 @@ mod tests {
     /// sessions — the whole point of speculating rather than picking one — and
     /// a URI that names a session gets exactly that one. Both are what the
     /// reference does with the same `SessionIds` the IPC path uses
-    /// (`aeron_driver_conductor.c:4455-4478`).
+    /// (`aeron_driver_conductor.c:4552-4575`).
     #[test]
     fn network_publications_speculate_a_session_each_and_honour_a_named_one() {
         let temp = TempDir::new();
@@ -6895,7 +6895,7 @@ mod tests {
         // the endpoint go: the `snd-channel` status — the last one holding that
         // port — and the `snd-local-sockaddr` indicator. The second is the one
         // `aeron_send_channel_endpoint_delete` frees beside the first
-        // (`aeron_send_channel_endpoint.c:255-268`) and this build used to
+        // (`aeron_send_channel_endpoint.c:248-261`) and this build used to
         // leave behind, which is how a subscription could end up reporting a
         // dead socket's port (`records/P3-6c.md` §28; its own case is
         // `receive_endpoint_lifecycle::a_released_send_endpoint_leaves_no_address_behind`).
@@ -6921,7 +6921,7 @@ mod tests {
     /// publication — the same log buffer, the same counters, the same sender —
     /// and an explicit parameter that disagrees is a refusal rather than a
     /// second publication (`aeron_confirm_publication_match`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1105-1178`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1146-1219`).
     #[test]
     fn two_udp_publications_on_one_stream_share_and_a_named_mtu_must_agree() {
         let temp = TempDir::new();
@@ -6999,7 +6999,7 @@ mod tests {
     /// Two publications on one endpoint and stream that name **different**
     /// `response-correlation-id`s are two publications
     /// (`aeron_driver_conductor_find_shared_network_publication_by_endpoint`,
-    /// `:1851-1875`, whose third clause is the correlation id).
+    /// `:1892-1916`, whose third clause is the correlation id).
     ///
     /// Sharing them is not a smaller version of the same thing: each one is the
     /// answer to a different request, and the publication a client is handed is
@@ -7020,7 +7020,7 @@ mod tests {
 
         // The subscriptions the publications answer. A publication that names a
         // `response-correlation-id` has to name one this driver holds
-        // (`:631-656`), and it is having *two* of them that makes the two
+        // (`:672-697`), and it is having *two* of them that makes the two
         // publications two.
         let mut requests = Vec::new();
         for correlation_id in [51, 52] {
@@ -7037,7 +7037,7 @@ mod tests {
             // The reply carries the correlation id, the stream and the channel
             // status and nothing else (`aeron_subscription_ready_t`) — a
             // subscription's registration id **is** the correlation id of the
-            // command that asked for it (`:5156`, which passes it straight
+            // command that asked for it (`:5253`, which passes it straight
             // through).
             let _ready = await_event(
                 &mut conductor,
@@ -7569,7 +7569,7 @@ mod tests {
         // of the parameter — so the reference gets as far as parsing the
         // value, where its reader returns a bare `-1` and the conductor's
         // error composition turns that into the generic code
-        // (`aeron_driver_conductor.c:2326-2341`). A driver that answered the
+        // (`aeron_driver_conductor.c:2389-2404`). A driver that answered the
         // invalid-channel code here would move the goalposts for a client
         // that branches on the two codes differently.
         let temp = TempDir::new();
@@ -7962,7 +7962,7 @@ mod tests {
 
         // And the reader was told, at the moment the publication finished
         // draining: it holds a mapping of a log buffer that is about to be
-        // deleted (`aeron_ipc_publication.c:561-577`). The channel in that
+        // deleted (`aeron_ipc_publication.c:587-603`). The channel in that
         // message is the *constant*, not the one the client subscribed with.
         let events = drain(&cnc, &mut receiver);
         let unavailable = events
@@ -8019,7 +8019,7 @@ mod tests {
         // The removal is silent in the reference, in C and in Java alike:
         // no image is announced as gone, and the acknowledgement — which the
         // reference sends only after the unlinking — is the whole event
-        // stream (`aeron_driver_conductor.c:5199-5267`).
+        // stream (`aeron_driver_conductor.c:5296-5364`).
         let events = drain(&cnc, &mut receiver);
         assert_eq!(1, events.len(), "the acknowledgement, and nothing else");
         assert_eq!(
@@ -8075,7 +8075,7 @@ mod tests {
         assert_eq!(
             &b"unknown publication client_id=7 registration_id=99"[..],
             &errors[0].1[16..],
-            "the reference's text names both ids (aeron_driver_conductor.c:4734)"
+            "the reference's text names both ids (aeron_driver_conductor.c:4831)"
         );
         assert_eq!(
             deepmsg_cnc::command::ERROR_CODE_UNKNOWN_SUBSCRIPTION,
@@ -8091,7 +8091,7 @@ mod tests {
 
         // Answering with an `ON_ERROR` is also recording it: the reference's
         // `on_error` falls through to its own `log_error:` label, so the two
-        // halves are one act (`aeron_driver_conductor.c:2366-2370`). Two
+        // halves are one act (`aeron_driver_conductor.c:2429-2433`). Two
         // answers, two entries, two bumps of the errors counter — and the
         // entry holds the same words the client was handed, because the
         // reference hands `log_explicit_error` the message it just sent.
@@ -8142,7 +8142,7 @@ mod tests {
         // `aeron_driver_conductor_on_error` skips its own `log_error:` label
         // for `RESOURCE_TEMPORARILY_UNAVAILABLE` — a transient condition is
         // answered but not recorded, and so raises no counter either
-        // (`aeron_driver_conductor.c:2367-2370`). No command this build
+        // (`aeron_driver_conductor.c:2430-2433`). No command this build
         // serves reaches that code yet, so the decision is exercised where it
         // is made.
         let (_temp, mut conductor) = running(TerminationPolicy::Deny);
@@ -8394,7 +8394,7 @@ mod tests {
         // A pair that already names a counter **somebody owns** is refused
         // rather than handed over: a static counter has no owner, so taking a
         // live counter's id would leave two clients believing different things
-        // about one slot (`aeron_driver_conductor.c:6270-6281`).
+        // about one slot (`aeron_driver_conductor.c:6367-6378`).
         let (_temp, mut conductor, cnc, mut receiver, _pending) = publishing_and_subscribed();
         drain(&cnc, &mut receiver);
 
@@ -8548,7 +8548,7 @@ mod tests {
         for (index, (addition, named)) in [
             ("|control-mode=response", "isResponse=true"),
             // `rejoin` is the driver's default **true** (`REJOIN_STREAM_DEFAULT`,
-            // `aeron_driver_context.c:462`), so it is the `false` that clashes.
+            // `aeron_driver_context.c:465`), so it is the `false` that clashes.
             ("|rejoin=false", "rejoin=false"),
         ]
         .into_iter()
@@ -8837,7 +8837,7 @@ mod tests {
         );
 
         // Naming a session is not an allocation, so it must not have moved the
-        // cursor onto it (`aeron_driver_conductor.c:1071-1075`, whose advance is
+        // cursor onto it (`aeron_driver_conductor.c:1112-1116`, whose advance is
         // for speculated ids only) — otherwise the id below would be skipped by
         // accident and this test would prove nothing.
         assert_eq!(
@@ -8877,7 +8877,7 @@ mod tests {
         // The cursor moved past what was handed out, so the next ask does not
         // repeat the last answer — which is all the driver promises, and why
         // the reference advances *before* it checks for a clash
-        // (`aeron_driver_conductor.c:6425-6426`).
+        // (`aeron_driver_conductor.c:6522-6523`).
         assert_eq!(
             cursor.wrapping_add(2),
             conductor.publications().session_ids().cursor()
@@ -8895,7 +8895,7 @@ mod tests {
     #[test]
     fn the_session_id_answering_skips_a_network_publication_too() {
         // The reference walks **both** lists, IPC first and then network
-        // (`aeron_driver_conductor.c:6429-6444`), and the second walk is the one
+        // (`aeron_driver_conductor.c:6526-6541`), and the second walk is the one
         // easy to leave out: a driver that only checked its IPC publications
         // would hand a client a session id a network publication on that stream
         // already holds — and the client would then be refused by the create's
@@ -8955,7 +8955,7 @@ mod tests {
     /// The record's shape is checked before anything else, and a reason of four
     /// characters is the shortest one that makes the record
     /// `sizeof(aeron_reject_image_command_t)` — 40 bytes
-    /// (`aeron_driver_conductor.c:3177-3180`).
+    /// (`aeron_driver_conductor.c:3274-3277`).
     fn reject_image_payload(
         client_id: i64,
         correlation_id: i64,
@@ -9165,7 +9165,7 @@ mod tests {
         assert_eq!(
             b"Unable to resolve image for correlationId=12345",
             &payload[16..],
-            "the reference's words (aeron_driver_conductor.c:6389-6392)"
+            "the reference's words (aeron_driver_conductor.c:6486-6489)"
         );
 
         assert_eq!(
@@ -9211,7 +9211,7 @@ mod tests {
         assert_eq!(
             b"Invalidation reason_text must be 1023 bytes or less",
             &payload[16..],
-            "the reference's words (aeron_driver_conductor.c:6357-6364)"
+            "the reference's words (aeron_driver_conductor.c:6454-6461)"
         );
 
         // The publication is untouched: the bound was refused before the
@@ -9232,7 +9232,7 @@ mod tests {
         // 36 bytes is `offsetof(reason_text)` and not `sizeof` — the record the
         // reference's own Java client would send for an empty reason, and one
         // its dispatch refuses before any handler sees it
-        // (`aeron_driver_conductor.c:3177-3180`).
+        // (`aeron_driver_conductor.c:3274-3277`).
         send(
             &conductor,
             deepmsg_cnc::command::REJECT_IMAGE_TYPE_ID,
@@ -9626,7 +9626,7 @@ mod tests {
         // Waited for rather than read on the spot: the datagram is in this
         // socket before the receiver thread has bumped the count for it, since
         // the send comes first and the increment second — the reference's
-        // order (`aeron_receive_channel_endpoint.c:493-506`) — and a machine
+        // order (`aeron_receive_channel_endpoint.c:498-511`) — and a machine
         // with more runnable threads than cores stretches the space between
         // them far enough for this test to lose the race.
         assert_eq!(
@@ -9881,7 +9881,7 @@ mod tests {
     ///
     /// Three subscriptions on one publication, because all three outcomes have
     /// the same precondition: **"behind" is relative to the fastest reader**
-    /// (`aeron_ipc_publication.c:357-360`), so a lone reader is never put aside
+    /// (`aeron_ipc_publication.c:362-365`), so a lone reader is never put aside
     /// however slowly it reads. One reader that keeps up is what makes the
     /// other two late.
     #[test]
@@ -9900,7 +9900,7 @@ mod tests {
 
         // The publication's channel carries the window the limit is measured
         // against and the three timeouts. For a publication's own readers both
-        // come from *its* URI (`aeron_driver_uri.c:420-442`), not from the
+        // come from *its* URI (`aeron_driver_uri.c:425-447`), not from the
         // readers' — which is what makes this one channel a configuration for
         // all of them.
         // The three stages are long enough to be *observed*: a reader that is
@@ -10040,7 +10040,7 @@ mod tests {
         let cnc = CncFile::open_writable(&temp.0, std::time::Duration::from_secs(5))
             .expect("the file, from the test's side");
 
-        // A clean stop writes the sentinel (`aeron_driver_conductor.c:3493`):
+        // A clean stop writes the sentinel (`aeron_driver_conductor.c:3590`):
         // a client that reads it knows the driver left on purpose rather than
         // being killed, and those are different errors.
         drop(driver);
@@ -10126,7 +10126,7 @@ mod tests {
         // Add: the command, the driver's reply, and the handle the reply
         // named — whose registration id is the correlation id the request
         // used, the same binding the reference's `on_counter_ready` makes
-        // (`aeron_client_conductor.c:850-895`).
+        // (`aeron_client_conductor.c:888-933`).
         let counter = client
             .add_counter(
                 100,
@@ -10489,7 +10489,7 @@ mod tests {
         // Fill the first term. Each message is small enough for the window a
         // single reader opens, and the reader reports the position it has read
         // — which is what lets the publisher get past one window at all
-        // (`aeron_ipc_publication.c:296-313` computes the limit from it).
+        // (`aeron_ipc_publication.c:301-318` computes the limit from it).
         let small = vec![b'a'; 1024];
         let mut written = 0;
 
@@ -10537,7 +10537,7 @@ mod tests {
         // One poll with a fragment limit far above what two terms hold
         // together. What it delivers must all lie in **one term**: the
         // reference fixes the partition at the poll's entry and stops the scan
-        // at that term's end (`aeron_image.c:266-273`), and a caller that
+        // at that term's end (`aeron_image.c:270-277`), and a caller that
         // throttles by counting fragments is entitled to the same numbers.
         let mut positions = Vec::new();
         let read = image.poll(100_000, |fragment| positions.push(fragment.position()));
@@ -10708,7 +10708,7 @@ mod tests {
     /// The resolver the settings named is **built and started** by the
     /// conductor, and it is where its counters come from: the neighbor list and
     /// the cache, with the labels a reader finds them by
-    /// (`aeron_driver_name_resolver.c:234-243`, `:490-497`).
+    /// (`aeron_driver_name_resolver.c:234-243`, `:491-498`).
     #[test]
     fn a_driver_resolver_is_built_from_the_settings() {
         let temp = TempDir::new();
@@ -10743,7 +10743,7 @@ mod tests {
         );
 
         // And the settings' own name reaches the counter a reader tells two
-        // drivers apart by (`aeron_driver_conductor.c:848-856`).
+        // drivers apart by (`aeron_driver_conductor.c:889-897`).
         assert_eq!(
             "Resolution changes: driverName=A",
             reader
@@ -10755,7 +10755,7 @@ mod tests {
 
     /// A resolver that cannot be built is a driver that does not start, which
     /// is stricter than the reference — its agent records the failure and runs
-    /// on (`aeron_driver_native_resource_agent.c:233-251`). A driver whose
+    /// on (`aeron_driver_native_resource_agent.c:238-256`). A driver whose
     /// resolver is not the one it was configured with resolves something else,
     /// which is not a state worth starting in. `docs/compat.md` records it.
     #[test]

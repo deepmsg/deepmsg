@@ -41,8 +41,8 @@ const _: () = assert!(VERSION_AND_METADATA_LENGTH == 128);
 
 /// Offset of `cnc_version` (`int32`, volatile). Zero means "not published
 /// yet": the driver fills every other field first and then stores this one
-/// with a release (`aeron_driver_context.h:456`, called from
-/// `aeron_driver.c:972` before any agent thread starts).
+/// with a release (`aeron_driver_context.h:464`, called from
+/// `aeron_driver.c:1012` before any agent thread starts).
 pub const CNC_VERSION_OFFSET: usize = 0;
 
 /// Offset of `to_driver_buffer_length` (`int32`) — the MPSC command ring.
@@ -201,7 +201,7 @@ pub const fn ring_capacity_is_valid(capacity: usize, minimum: usize) -> bool {
 pub const PADDING_MSG_TYPE_ID: i32 = -1;
 
 // ---------------------------------------------------------------------------
-// Counters — `aeron-client/src/main/c/aeronc.h:849-870`.
+// Counters — `aeron-client/src/main/c/aeronc.h:852-873`.
 // ---------------------------------------------------------------------------
 
 /// Stride of the counters **metadata** region, and the stride of enumeration.
@@ -223,7 +223,7 @@ pub const COUNTER_OWNER_ID_OFFSET: usize = 16;
 pub const COUNTER_REFERENCE_ID_OFFSET: usize = 24;
 
 /// Value written into the to-driver ring's consumer heartbeat by a driver
-/// shutting down cleanly (`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`,
+/// shutting down cleanly (`aeron-driver/src/main/c/aeron_driver_conductor.c:3590`,
 /// `AERON_NULL_VALUE` at `aeron-client/src/main/c/aeronc.h:30`). A heartbeat
 /// of `-1` therefore means "was alive, stopped on purpose", which is a
 /// different thing from "never started" (zero) or "died" (a stale timestamp).
@@ -236,7 +236,7 @@ pub const COUNTER_STATE_OFFSET: usize = 0;
 pub const COUNTER_TYPE_ID_OFFSET: usize = 4;
 
 /// `free_for_reuse_deadline_ms` within a metadata record (`int64`, volatile) —
-/// `aeron-client/src/main/c/aeronc.h:861`.
+/// `aeron-client/src/main/c/aeronc.h:864`.
 ///
 /// Two values are meaningful and the rest are timestamps: [`COUNTER_NOT_FREE_TO_REUSE`]
 /// for an allocated record, and `now_ms + timeout` for a reclaimed one. Only a
@@ -269,22 +269,22 @@ pub const COUNTER_STATE_ALLOCATED: i32 = 1;
 pub const COUNTER_STATE_RECLAIMED: i32 = -1;
 
 /// The `free_for_reuse_deadline_ms` of a live counter: "not on the free list,
-/// and not headed there" (`aeron-client/src/main/c/aeronc.h:893`,
+/// and not headed there" (`aeron-client/src/main/c/aeronc.h:896`,
 /// `AERON_COUNTER_NOT_FREE_TO_REUSE`).
 pub const COUNTER_NOT_FREE_TO_REUSE: i64 = i64::MAX;
 
 /// What a value record's `registration_id` is reset to when its slot is
-/// recycled (`aeron-client/src/main/c/aeronc.h:890`,
+/// recycled (`aeron-client/src/main/c/aeronc.h:893`,
 /// `AERON_COUNTER_REGISTRATION_ID_DEFAULT`).
 pub const COUNTER_REGISTRATION_ID_DEFAULT: i64 = 0;
 
-/// The reset value of `owner_id` on recycle (`aeron-client/src/main/c/aeronc.h:894`).
+/// The reset value of `owner_id` on recycle (`aeron-client/src/main/c/aeronc.h:897`).
 pub const COUNTER_OWNER_ID_DEFAULT: i64 = 0;
 
-/// The reset value of `reference_id` on recycle (`aeron-client/src/main/c/aeronc.h:895`).
+/// The reset value of `reference_id` on recycle (`aeron-client/src/main/c/aeronc.h:898`).
 pub const COUNTER_REFERENCE_ID_DEFAULT: i64 = 0;
 
-/// "No counter", as a counter id (`aeron-client/src/main/c/aeronc.h:896`,
+/// "No counter", as a counter id (`aeron-client/src/main/c/aeronc.h:899`,
 /// `AERON_NULL_COUNTER_ID`). Distinct from [`NULL_VALUE`], which is a *value*
 /// sentinel and also `-1` — the two coincide numerically and mean different
 /// things, so the names are kept apart here as they are in the reference.

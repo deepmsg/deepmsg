@@ -146,7 +146,7 @@ fn entries(output: &str) -> Vec<(i32, String)> {
         // The text runs to the blank line the print puts after it — which is
         // also what keeps the footer (`N distinct errors observed.`) out of
         // the last entry. The reference's recorded descriptions are composed
-        // of two lines (`aeron_error.c:326-375`), and only the first carries
+        // of two lines (`aeron_error.c:346-395`), and only the first carries
         // the print's one-space indent.
         let mut text = String::new();
         while lines
@@ -385,14 +385,14 @@ fn error_stat_reads_what_both_drivers_record_for_an_unknown_command() {
     // The reference's viewer reads both files, and both drivers record the
     // same composition: the negated code with its description, then the
     // recording site and the message — the shape `AERON_SET_ERR` leaves in
-    // the per-thread buffer (`aeron_error.c:326-375`), carried into the log
+    // the per-thread buffer (`aeron_error.c:346-395`), carried into the log
     // verbatim. The final newline is a line boundary in the print, so
     // `entries` strips it.
     let expected = vec![(
         1,
         format!(
             "(-6) unknown command type id\n\
-             [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3219] \
+             [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3316] \
              command={UNKNOWN_COMMAND_TYPE} unknown"
         ),
     )];
@@ -437,7 +437,7 @@ fn our_reader_reads_the_reference_error_log_and_matches_error_stat() {
     assert_eq!(
         format!(
             "(-6) unknown command type id\n\
-             [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3219] \
+             [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3316] \
              command={UNKNOWN_COMMAND_TYPE} unknown\n"
         ),
         entry.text,

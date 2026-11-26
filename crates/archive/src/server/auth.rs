@@ -5,7 +5,7 @@
 //! *whether a client gets a session at all*, and
 //! `aeron.archive.authorisation.service.supplier` names the one that decides
 //! *what a session that got one may do*. The reference loads both by
-//! reflection (`Archive.java:956-1008`) — `Class.forName(...).getConstructor()
+//! reflection (`Archive.java:1018-1070`) — `Class.forName(...).getConstructor()
 //! .newInstance()`, with any failure rethrown unchecked, which ends the archive
 //! before it serves anything.
 //!
@@ -20,7 +20,7 @@
 //! # The two names that matter, and why the sample one is here
 //!
 //! The reference's default is `io.aeron.security.DefaultAuthenticatorSupplier`
-//! (`Archive.java:597`), which authenticates whoever asks. The archive test
+//! (`Archive.java:626`), which authenticates whoever asks. The archive test
 //! harness does not use it: both harnesses pass
 //! `-Daeron.archive.authenticator.supplier=io.aeron.samples.archive.SampleAuthenticatorSupplier`
 //! (`aeron-archive/src/test/c/TestArchive.h:50`,
@@ -31,7 +31,7 @@
 //! # One authenticator, every session
 //!
 //! The reference's conductor builds one and hands it to every session it makes
-//! (`ArchiveConductor.java:514`), which is why [`SampleAuthenticator`]
+//! (`ArchiveConductor.java:513`), which is why [`SampleAuthenticator`]
 //! keeps its state keyed by session id and why
 //! [`Authenticator`](crate::server::control_session::Authenticator) is lent to
 //! a session for a call rather than owned by one.
@@ -53,7 +53,7 @@ use std::collections::HashMap;
 
 use crate::server::control_session::Answer;
 
-/// `Archive.Configuration.AUTHENTICATOR_SUPPLIER_DEFAULT` (`Archive.java:597`).
+/// `Archive.Configuration.AUTHENTICATOR_SUPPLIER_DEFAULT` (`Archive.java:626`).
 pub const DEFAULT_AUTHENTICATOR_SUPPLIER: &str = "io.aeron.security.DefaultAuthenticatorSupplier";
 
 /// The supplier both archive harnesses configure
@@ -71,7 +71,7 @@ pub const DENY_ALL_NAME: &str = "DENY_ALL";
 ///
 /// The reference's answer to an unknown name is `ClassNotFoundException` out of
 /// `Class.forName`, rethrown unchecked by `LangUtil.rethrowUnchecked`
-/// (`Archive.java:966-969`) — the archive never starts. This is the same
+/// (`Archive.java:1028-1031`) — the archive never starts. This is the same
 /// refusal as a value, so that the binary that meets it can say which name it
 /// was.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,7 +113,7 @@ impl std::error::Error for AuthError {}
 ///
 /// **One of these serves every session.** The reference's conductor keeps a
 /// single instance and hands it to each `ControlSession` it makes
-/// (`ArchiveConductor.java:514`), and its hooks are all keyed by session id
+/// (`ArchiveConductor.java:513`), and its hooks are all keyed by session id
 /// because of it — so this is lent to a session for a call rather than owned by
 /// one, the same way the publications an egress writes through are.
 pub trait Authenticator: Send {
@@ -159,7 +159,7 @@ pub trait AuthorisationService: Send {
 
 /// `AuthorisationService.ALLOW_ALL` (`AuthorisationService.java:29`), which is
 /// what the archive's default supplier builds
-/// (`Archive.java:610-611`).
+/// (`Archive.java:639-640`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AllowAll;
 
@@ -196,7 +196,7 @@ impl AuthorisationService for Box<dyn AuthorisationService> {
 ///
 /// An empty name is the default, which is what the reference's
 /// `System.getProperty(name, AUTHENTICATOR_SUPPLIER_DEFAULT)` gives when the
-/// property is absent (`Archive.java:958-959`).
+/// property is absent (`Archive.java:1020-1021`).
 ///
 /// # Errors
 ///
@@ -216,7 +216,7 @@ pub fn authenticator(supplier: &str) -> Result<Box<dyn Authenticator>, AuthError
 ///
 /// The reference's property has **no default class**: absent or empty means its
 /// own `DEFAULT_AUTHORISATION_SERVICE_SUPPLIER`, a supplier that returns
-/// [`AllowAll`] (`Archive.java:602-611`). A name that is not one of the two
+/// [`AllowAll`] (`Archive.java:631-640`). A name that is not one of the two
 /// tokens is loaded by reflection there and refused here.
 ///
 /// # Errors
@@ -414,7 +414,7 @@ mod tests {
     }
 
     /// An absent property is the default, which is what the reference's
-    /// `System.getProperty(name, default)` reads (`Archive.java:958-959`).
+    /// `System.getProperty(name, default)` reads (`Archive.java:1020-1021`).
     #[test]
     fn an_absent_name_is_the_default_authenticator() {
         let mut authenticator = authenticator("").expect("the default");
@@ -578,7 +578,7 @@ mod tests {
 
     /// The authorisation service's own default is the empty name, and its two
     /// tokens are the reference's special cases
-    /// (`Archive.java:985-997`).
+    /// (`Archive.java:1047-1059`).
     #[test]
     fn the_authorisation_service_names_resolve() {
         assert!(

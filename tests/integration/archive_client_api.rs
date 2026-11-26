@@ -42,7 +42,7 @@
 //!   case: `wait_for_response` re-checks the poller's correlation id after every
 //!   poll, and a `RecordingSignalEvent` carries the correlation id of the
 //!   request that **caused** it — for a START, the start-recording request
-//!   (`ArchiveConductor.java:2046`) — never the id of a query in flight. So an
+//!   (`ArchiveConductor.java:2068`) — never the id of a query in flight. So an
 //!   early return finds a correlation id that is not its own and polls again.
 //!   The dispatch-and-continue is what makes a signal arrive at all; the
 //!   correlation check is what makes an early return survivable.
@@ -689,8 +689,8 @@ fn a_caller_can_offer_a_request_itself_and_read_its_answer() {
 /// (`:4891-4910`) — has no counterpart here, and its absence is on purpose.** It
 /// asserts that `aeron_error_code_str` answers with something other than
 /// `"unknown error code"` for each of the seventeen client codes, and that table
-/// lives in Aeron's *client* (`aeron_archive_client_error.h:8+` defines the
-/// codes, `util/aeron_error.c:252+` is the switch) because in C an error **is**
+/// lives in Aeron's *client* (`aeron_archive_client_error.h:9+` defines the
+/// codes, `util/aeron_error.c:272+` is the switch) because in C an error **is**
 /// an `int`. This build's errors are typed: `ArchiveError::Refused` carries the
 /// wire code, the client code and the archive's own text, and printing one says
 /// what happened without a lookup (`crates/archive/src/client/archive.rs:259-270`).
@@ -1532,7 +1532,7 @@ fn a_publication_can_be_added_recorded_and_replayed() {
 /// the archive's own `aeron.archive.replication.channel` is **not** set by
 /// [`archive::PROPERTIES`], and a request that names none is refused for it.
 /// The channel the copy itself runs over, and it is **UDP** for the reason the
-/// reference's own fixture is (`aeron_archive_test.cpp:449`:
+/// reference's own fixture is (`aeron_archive_test.cpp:454`:
 /// `aeron:udp?endpoint=localhost:8012`): `REPLAY` puts the destination
 /// subscription's **resolved endpoint** on the channel it asks the source to
 /// replay onto (`ReplicationSession.java:668-690`), and an IPC subscription has
@@ -1575,15 +1575,15 @@ const REPLICATION_CHANNEL: &str = "aeron:udp?endpoint=localhost:0";
 ///    recording to exist, and the only one that says anything about the copy
 ///    rather than about the request.
 /// 4. **A stop for an id no session is registered under is a `false`** — the
-///    whole point of the `try_` form (`aeron_archive_client.c:1816-1844`), and
-///    the C fixture's own assertion (`aeron_archive_test.cpp:2861-2871`). It is
+///    whole point of the `try_` form (`aeron_archive_client.c:1869-1897`), and
+///    the C fixture's own assertion (`aeron_archive_test.cpp:2876-2886`). It is
 ///    also the one that can be got wrong by being *helpful*: a stop that
 ///    answered `OK` for an unknown id would make every `tryStopReplication`
 ///    claim it had stopped something.
 ///
 /// The last two assertions are the same claim from the other side: an id that
 /// **is** registered stops, and then does not, because a stop gives the id up
-/// (`ArchiveConductor.java:1482`) while the session goes on being driven until
+/// (`ArchiveConductor.java:1489`) while the session goes on being driven until
 /// its own close (`ReplicationSession.java:196-211`).
 #[test]
 fn the_four_replication_round_trips() {
@@ -1938,7 +1938,7 @@ fn a_stopped_recording(archive: &mut Archive, client: &mut Client) -> RecordingD
 
     // ★ **And that the row has data in it, which is not the same as having a
     // row.** The row is written when the `startRecording` *request* is answered,
-    // before any image exists (`ArchiveConductor.java:570` against `:2046-2051`),
+    // before any image exists (`ArchiveConductor.java:569` against `:2068-2073`),
     // so a caller that stops a recording the moment its row appears can stop one
     // that never read a byte — and an empty recording is exactly what a
     // replication's descriptor calls "already in sync" (`:393-398`) and never
@@ -2143,7 +2143,7 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
     // any of them.** The row is made empty — `addNewRecording(startPosition,
     // startPosition, …)` (`ReplicationSession.java:336-350`) — the `EXTEND`
     // state then writes `NULL_POSITION` over its stop because the copy is live
-    // from then on (`Catalog.extendRecording`, `Catalog.java:653-659`), and
+    // from then on (`Catalog.extendRecording`, `Catalog.java:656-662`), and
     // once the replay is feeding it the stop is wherever the copy has got to.
     // All three are the reference's own behaviour, and all three are reachable
     // *before a client can see the row at all*: the session's states run inside
@@ -2200,7 +2200,7 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
     );
 
     // **And EXTEND makes one.** `SRC_RECORDING_POSITION` asks the source where
-    // its recording got to (`:484-524`), and `EXTEND` (`:525-568`) turns the
+    // its recording got to (`:484-524`), and `EXTEND` (`:528-571`) turns the
     // destination's row into a recording: a subscription on the **replication**
     // channel, carrying the two parameters that make it *this* copy.
     //
@@ -2239,9 +2239,9 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
     // takes — is the session's own construction and is judged where it is
     // built (`the_extensions_signal` says why it cannot be judged here).
     // **And the session ends by saying so.** `REPLICATE` sends `SYNC` when the
-    // copy has caught up with where the source's recording stopped (`:784-800`),
+    // copy has caught up with where the source's recording stopped (`:787-803`),
     // and `close()` sends `REPLICATE_END` **once** — the signal the reference's
-    // own fixture waits on (`aeron_archive_test.cpp:3001-3006`).
+    // own fixture waits on (`aeron_archive_test.cpp:3018-3023`).
     //
     // The wait goes through a wait that **dispatches**. A bare `client.poll()`
     // reads the driver's replies and nothing else; archive signals are handed to
@@ -2367,7 +2367,7 @@ fn a_replicate_fetches_its_source_descriptor_and_extends_the_destination() {
 /// the one the reference's own suite puts in front of it (`TestArchive.h` starts
 /// one archive, `startDestArchive` the other): two archives, **two processes,
 /// two directories**. A replication session derives its response channel from
-/// the **destination's** control channel (`Archive.java:1519-1541`), so that
+/// the **destination's** control channel (`Archive.java:1587-1609`), so that
 /// channel cannot be IPC — the source is another process, and the answers have
 /// to cross a socket. That is the shape the plan's §8 settled on, and the shape
 /// nothing had measured until there was an archive to measure it against.
@@ -2423,7 +2423,7 @@ fn a_replication_reaches_an_archive_in_another_process() {
     // the replication will dial: a *network* publication that names a
     // response-correlation-id has to name a **network** response subscription,
     // and the driver refuses it otherwise
-    // (`aeron_driver_conductor_validate_response_subscription`, `:631-651`) —
+    // (`aeron_driver_conductor_validate_response_subscription`, `:660-680`) —
     // which is a rule about the driver, not about this test.
     let mut source_archive = Archive::connect(
         &context(),
@@ -2626,8 +2626,8 @@ fn a_replication_reaches_an_archive_in_another_process() {
 /// **destination** archive has the session open: the source's catalog is read
 /// afterwards, in `ReplicationSession`'s own turn. A source recording that is
 /// not there makes that turn answer with an `ERROR` control response under the
-/// **replication's** correlation id (`ReplicationSession.error`, `:923-926`;
-/// the refusal itself is `:895-899`'s `unknown src recording id`).
+/// **replication's** correlation id (`ReplicationSession.error`, `:985-988`;
+/// the refusal itself is `:957-961`'s `unknown src recording id`).
 ///
 /// That answer arrives on the same subscription and in the same slot as a
 /// replication's progress signals, so a caller that asks only for signals reads
@@ -2635,7 +2635,7 @@ fn a_replication_reaches_an_archive_in_another_process() {
 /// waits for ever, because every leader heartbeat refreshes the deadline it is
 /// waiting under. `Archive::poll_recording_event` hands the refusal over
 /// instead; the cluster and the backup turn it into a counted error
-/// (`ConsensusModuleAgent.java:2074-2098`,
+/// (`ConsensusModuleAgent.java:2090-2114`,
 /// `ClusterBackupAgent.java:1063-1088`).
 #[test]
 fn a_refused_replication_is_an_error_and_not_a_silence() {
@@ -3024,7 +3024,7 @@ fn a_live_replication_merges_into_the_stream_it_is_copying() {
 
     // The channel the **archive records**: a subscriber of the dynamic
     // publication, which is an endpoint of its own and the control address to
-    // talk to (`aeron_udp_channel.c:465-487`).
+    // talk to (`aeron_udp_channel.c:486-508`).
     let recording_channel =
         format!("aeron:udp?endpoint={source_endpoint}|control={control}|term-length=64k");
 
@@ -3066,7 +3066,7 @@ fn a_live_replication_merges_into_the_stream_it_is_copying() {
 
     // **The replicate**, with a live destination and no stop position — the
     // shape `onRecordingDescriptor` sends to `SRC_RECORDING_POSITION`
-    // (`:380-399`) and the only one that reaches the live pair.
+    // (`:381-400`) and the only one that reaches the live pair.
     let mut params = ReplicationParams::new();
     params.replication_channel = REPLICATION_CHANNEL.to_owned();
     params.live_destination = live_destination.clone();
@@ -3100,7 +3100,7 @@ fn a_live_replication_merges_into_the_stream_it_is_copying() {
     // tag of `-1`. This build leaves the parameter out, which is how the
     // reference's own client library says "no tags"
     // (`ChannelUriStringBuilder.tags(Long, Long)`,
-    // `ChannelUriStringBuilder.java:1250-1264`); the reasoning and the
+    // `ChannelUriStringBuilder.java:1253-1267`); the reasoning and the
     // measurements are in `docs/compat.md`.
     let mut subscriptions: Vec<RecordingSubscriptionDescriptor> = Vec::new();
 
@@ -3229,7 +3229,7 @@ fn a_live_replication_merges_into_the_stream_it_is_copying() {
 
 /// **An extend whose image does not join where the recording stopped is
 /// refused, by name** — `validateImageForExtendRecording`
-/// (`ArchiveConductor.java:2155-2194`: the image's join position, initial term,
+/// (`ArchiveConductor.java:2190-2229`: the image's join position, initial term,
 /// term length and MTU must be the recording's, or the bytes would be appended
 /// at a position the segments do not describe).
 ///

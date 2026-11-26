@@ -25,8 +25,8 @@ pub const CLIENT_CLOSE_TYPE_ID: i32 = 0x0B;
 /// A client sends this when it closes. The driver marks the client closed and
 /// zeroes its heartbeat counter
 /// (`aeron_driver_conductor_on_client_close`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:6321-6331`, reached from
-/// the type-id dispatch at `:3135`), which is what stops it being waited on —
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:6418-6428`, reached from
+/// the type-id dispatch at `:3215`), which is what stops it being waited on —
 /// so a client that says it is going away is collected rather than timed out.
 /// There is no reply.
 ///
@@ -209,7 +209,7 @@ pub const ADD_SUBSCRIPTION_HEADER_LENGTH: usize = 32;
 ///
 /// The channel is **not** a NUL-terminated string on the wire: it is
 /// `channel_length` raw bytes immediately after the header, and the driver
-/// reads exactly that many (`aeron_driver_conductor.c:2959-2964`).
+/// reads exactly that many (`aeron_driver_conductor.c:3022-3027`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddSubscription<'c> {
     /// The client this belongs to. The driver does not validate it against a
@@ -301,7 +301,7 @@ pub const ON_PUBLICATION_READY_TYPE_ID: i32 = 0x0F03;
 /// The same payload as [`ON_PUBLICATION_READY_TYPE_ID`] — the type id is how a
 /// client tells whether the log buffer it just mapped is one it may share, and
 /// the driver picks it from the command it is answering
-/// (`aeron_driver_conductor.c:2395-2399`).
+/// (`aeron_driver_conductor.c:2458-2462`).
 pub const ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID: i32 = 0x0F06;
 
 /// The fixed part of `ON_PUBLICATION_READY`, before the log path.
@@ -425,7 +425,7 @@ pub const ERROR_CODE_NOT_SUPPORTED: i32 = 8;
 /// reference's `aeron_driver_conductor_on_error` derives from the negated code
 /// its resolver set: `AERON_SET_ERR(-AERON_ERROR_CODE_UNKNOWN_HOST, …)` leaves
 /// `aeron_errcode()` at `-9`, and the conductor sends `-os_errno`
-/// (`aeron_driver_conductor.c:2333-2338`).
+/// (`aeron_driver_conductor.c:2396-2401`).
 ///
 /// The sign is the whole reason this code is worth its own constant: the
 /// **description** the driver records starts with the code's own text
@@ -449,7 +449,7 @@ pub const ERROR_CODE_GENERIC_ERROR: i32 = 11;
 /// The code the reference composes for a log buffer the filesystem could not
 /// hold — whether the kernel refused with `ENOSPC` or the driver's own
 /// pre-creation check decided there was no room
-/// (`aeron_driver_conductor.c:2326-2341`).
+/// (`aeron_driver_conductor.c:2389-2404`).
 pub const ERROR_CODE_STORAGE_SPACE: i32 = 12;
 
 /// `AERON_ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID` (`aeron_client_error.h:16`).
@@ -458,7 +458,7 @@ pub const ERROR_CODE_STORAGE_SPACE: i32 = 12;
 /// does not define — not sent as an `ON_ERROR`, but recorded in the distinct
 /// error log, **negated**, because the adapter passes
 /// `-AERON_ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID` to `AERON_SET_ERR` and the log
-/// keeps whatever that left (`aeron_driver_conductor.c:3218-3221`).
+/// keeps whatever that left (`aeron_driver_conductor.c:3315-3318`).
 pub const ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID: i32 = 6;
 
 /// `AERON_ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE` (`aeron_client_error.h:20`).
@@ -466,7 +466,7 @@ pub const ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID: i32 = 6;
 /// The one code the driver answers a client with and then **keeps out of the
 /// distinct error log**: `aeron_driver_conductor_on_error` skips its own
 /// `log_explicit_error` for it, so no entry appears and the errors counter
-/// stays where it was (`aeron_driver_conductor.c:2367-2370`).
+/// stays where it was (`aeron_driver_conductor.c:2430-2433`).
 pub const ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE: i32 = 10;
 
 /// `AERON_ERROR_CODE_MALFORMED_COMMAND` (`aeron_client_error.h:17`).
@@ -474,7 +474,7 @@ pub const ERROR_CODE_RESOURCE_TEMPORARILY_UNAVAILABLE: i32 = 10;
 /// What the reference's command adapter reports for a command whose payload
 /// is shorter than its own header — recorded negated in the distinct error
 /// log, for the same reason as
-/// [`ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID`] (`aeron_driver_conductor.c:3231-3235`).
+/// [`ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID`] (`aeron_driver_conductor.c:3328-3332`).
 pub const ERROR_CODE_MALFORMED_COMMAND: i32 = 7;
 
 /// `AERON_ERROR_CODE_IMAGE_REJECTED` (`aeron_client_error.h:23`).
@@ -482,7 +482,7 @@ pub const ERROR_CODE_MALFORMED_COMMAND: i32 = 7;
 /// What a publication is told when its image was rejected — the code the driver
 /// puts on the `ON_PUBLICATION_ERROR` it owes the publisher, and the one the
 /// receiver puts on the `ERR` frame that carries the news across the wire
-/// (`aeron_receive_channel_endpoint.c:489` and `aeron_ipc_publication.c:245`).
+/// (`aeron_receive_channel_endpoint.c:494` and `aeron_ipc_publication.c:250`).
 pub const ERROR_CODE_IMAGE_REJECTED: i32 = 13;
 
 /// `AERON_ERROR_CODE_PUBLICATION_REVOKED` (`aeron_client_error.h:24`).
@@ -497,7 +497,7 @@ pub const ERROR_CODE_PUBLICATION_REVOKED: i32 = 14;
 /// a subscription whose options disagree with one already on the same endpoint
 /// and stream is refused with `AERON_SET_ERR(EINVAL, ...)`
 /// (`aeron_driver_conductor.c:323`), and `aeron_errcode()` returns whatever it
-/// was handed (`util/aeron_error.c:355`), so 22 is what reaches the client's
+/// was handed (`util/aeron_error.c:375`), so 22 is what reaches the client's
 /// `ON_ERROR`. Mirroring it means the number is a Linux one; the reference's is
 /// too, because the constant is `<errno.h>`'s.
 pub const ERROR_CODE_EINVAL: i32 = 22;
@@ -510,7 +510,7 @@ pub fn encode_operation_succeeded(correlation_id: i64) -> [u8; OPERATION_SUCCEED
 /// Encode `ON_ERROR`.
 ///
 /// The message is free text, **not** NUL-terminated, and its length is in the
-/// header (`aeron_driver_conductor.c:2244-2260`). Allocating here is fine: this
+/// header (`aeron_driver_conductor.c:2307-2323`). Allocating here is fine: this
 /// is an error path, and the reference keeps a kilobyte of stack for it.
 pub fn encode_error(correlation_id: i64, error_code: i32, message: &[u8]) -> Vec<u8> {
     #[allow(clippy::cast_possible_truncation)] // a message this build writes, far below i32::MAX
@@ -533,7 +533,7 @@ pub fn encode_error(correlation_id: i64, error_code: i32, message: &[u8]) -> Vec
 pub const ON_PUBLICATION_ERROR_TYPE_ID: i32 = 0x0F0C;
 
 /// `offsetof(aeron_publication_error_values_t, error_message)` — 68
-/// (`aeron-client/src/main/c/aeronc.h:73-88`, inside that header's own
+/// (`aeron-client/src/main/c/aeronc.h:76-91`, inside that header's own
 /// `#pragma pack(push) / pack(4)` region).
 ///
 /// The struct's three trailing members would land here under natural alignment
@@ -544,7 +544,7 @@ pub const ON_PUBLICATION_ERROR_TYPE_ID: i32 = 0x0F0C;
 pub const PUBLICATION_ERROR_HEADER_LENGTH: usize = 68;
 
 /// `AERON_RESPONSE_ADDRESS_TYPE_IPV4` / `_IPV6`
-/// (`aeron-client/src/main/c/aeronc.h:39-40`).
+/// (`aeron-client/src/main/c/aeronc.h:42-43`).
 pub const ADDRESS_TYPE_IPV4: i16 = 0x1;
 /// The same, for an address the driver took from an IPv6 socket.
 pub const ADDRESS_TYPE_IPV6: i16 = 0x2;
@@ -552,7 +552,7 @@ pub const ADDRESS_TYPE_IPV6: i16 = 0x2;
 /// The payload of `ON_PUBLICATION_ERROR`, before its message.
 ///
 /// The Rust spelling of `aeron_publication_error_values_t`
-/// (`aeron-client/src/main/c/aeronc.h:73-88`) with the same field order, which
+/// (`aeron-client/src/main/c/aeronc.h:76-91`) with the same field order, which
 /// is the part that matters: 68 bytes with `receiver_id` at 24 and
 /// `error_code` at 60, and a struct that transposed the address type and the
 /// port would give a client a publication error it reads as coming from
@@ -583,7 +583,7 @@ pub struct PublicationError<'a> {
     /// Why.
     pub error_code: i32,
     /// The words. Not NUL-terminated on the wire, and their length is in the
-    /// header (`aeron_driver_conductor.c:2321`).
+    /// header (`aeron_driver_conductor.c:2384`).
     pub message: &'a [u8],
 }
 
@@ -592,7 +592,7 @@ pub struct PublicationError<'a> {
 /// The reference builds its version of this in one place and calls the
 /// conductor's handler with it — a stack buffer that lives for the call
 /// (`aeron_driver_conductor_proxy_on_publication_error`,
-/// `aeron_driver_conductor_proxy.c:207-242`). Here the words come off a
+/// `aeron_driver_conductor_proxy.c:212-247`). Here the words come off a
 /// datagram the sender reuses on its next pass, so they have to be taken out of
 /// it before the frame is handed on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -637,10 +637,10 @@ impl OwnedPublicationError {
 /// Encode `ON_PUBLICATION_ERROR`.
 ///
 /// The response the reference builds is `offsetof(error_message)` long plus the
-/// message (`aeron_driver_conductor.c:2319-2323`), and the address is narrowed
+/// message (`aeron_driver_conductor.c:2382-2386`), and the address is narrowed
 /// from a `sockaddr_storage` into the sixteen bytes the client reads: four for
 /// IPv4, sixteen for IPv6, and a type of zero with everything blanked when the
-/// family is neither (`:2297-2315`).
+/// family is neither (`:2360-2378`).
 pub fn encode_publication_error(error: &PublicationError<'_>) -> Vec<u8> {
     #[allow(clippy::cast_possible_truncation)] // a message this build writes, far below i32::MAX
     let mut out = vec![0u8; PUBLICATION_ERROR_HEADER_LENGTH + error.message.len()];
@@ -704,7 +704,7 @@ pub struct PublicationBuffersReady<'a> {
 
 impl PublicationBuffersReady<'_> {
     /// The response's type id, which says whether the log buffer may be shared
-    /// (`aeron_driver_conductor.c:2395-2399`).
+    /// (`aeron_driver_conductor.c:2458-2462`).
     pub const fn type_id(is_exclusive: bool) -> i32 {
         if is_exclusive {
             ON_EXCLUSIVE_PUBLICATION_READY_TYPE_ID
@@ -718,7 +718,7 @@ impl PublicationBuffersReady<'_> {
     ///
     /// This is the one place the message differs from `ON_AVAILABLE_IMAGE`'s
     /// two padded strings. The reference transmits `sizeof + path_length`
-    /// bytes and nothing rounds that up (`aeron_driver_conductor.c:2418`), so
+    /// bytes and nothing rounds that up (`aeron_driver_conductor.c:2481`), so
     /// a decoder that expects padding reads the first four bytes of the *next*
     /// record as part of the path.
     pub fn encode(&self) -> Vec<u8> {
@@ -764,7 +764,7 @@ pub const IMAGE_MESSAGE_LENGTH: usize = 24;
 ///
 /// The counter a subscriber advances to say how far it has read. The driver
 /// reads it back to compute the publisher's limit
-/// (`aeron-driver/src/main/c/aeron_ipc_publication.c:289-317`), so a client
+/// (`aeron-driver/src/main/c/aeron_ipc_publication.c:294-322`), so a client
 /// that never advances it eventually stops the publisher for everyone.
 pub const SUBSCRIPTION_POSITION_TYPE_ID: i32 = 4;
 
@@ -899,7 +899,7 @@ pub enum Response<'a> {
     /// `ADD_STATIC_COUNTER` was answered: the counter exists, and it belongs to
     /// the driver rather than to this client
     /// (`aeron_driver_conductor_on_static_counter`,
-    /// `aeron_driver_conductor.c:6313`).
+    /// `aeron_driver_conductor.c:6410`).
     ///
     /// The client is told which counter it is and nothing else — there is no
     /// registration id here, because the client already knows the one it asked
@@ -916,7 +916,7 @@ pub enum Response<'a> {
     /// `GET_NEXT_AVAILABLE_SESSION_ID` was answered: this is the id to publish
     /// under on that stream
     /// (`aeron_driver_conductor_response_next_available_session_id`,
-    /// `aeron_driver_conductor.c:2526-2538`).
+    /// `aeron_driver_conductor.c:2589-2601`).
     ///
     /// The id is a *hint* and not a reservation: the driver moved its cursor
     /// past it as it answered, so a client that asks twice gets two different
@@ -935,7 +935,7 @@ pub enum Response<'a> {
     ///
     /// **Not an answer to a command**, so it carries no correlation id: it is
     /// matched by the publication's registration id instead, which the client
-    /// already knows (`aeron_driver_conductor.c:2263-2323`). Both ways in come
+    /// already knows (`aeron_driver_conductor.c:2326-2386`). Both ways in come
     /// out here — a client that rejected an image, and a driver whose own
     /// publication heard the `ERR` frame — which is why there is one message
     /// and not two.
@@ -979,7 +979,7 @@ pub enum Response<'a> {
 /// The *removal* message. There is no in-band "this counter is gone" value: a
 /// driver that frees a counter announces it with this type and the same
 /// twelve-byte payload `ON_COUNTER_READY` carries
-/// (`aeron_driver_conductor.c:2489-2500`). A client that reads a `-1` value as
+/// (`aeron_driver_conductor.c:2552-2563`). A client that reads a `-1` value as
 /// a removal is reading something the protocol does not say, which is why this
 /// constant exists here before a client uses it.
 pub const ON_UNAVAILABLE_COUNTER_TYPE_ID: i32 = 0x0F09;
@@ -1005,7 +1005,7 @@ pub fn encode_counter_update(correlation_id: i64, counter_id: i32) -> [u8; COUNT
 ///
 /// The client id goes in the one field the message has — the receiver reads it
 /// as the correlation id, because that is what the struct's first member is
-/// (`aeron_driver_conductor.c:2542-2554`).
+/// (`aeron_driver_conductor.c:2605-2617`).
 pub fn encode_client_timeout(client_id: i64) -> [u8; CLIENT_TIMEOUT_LENGTH] {
     client_id.to_le_bytes()
 }
@@ -1036,7 +1036,7 @@ pub const ADD_COUNTER_TYPE_ID: i32 = 0x09;
 /// The wire form is `aeron_counter_command_t` — a correlated head and an
 /// `int32 type_id` — followed by a key and a label, each with its own length
 /// and the key padded to four bytes
-/// (`aeron_client_conductor.c:2035-2052` writes exactly this shape).
+/// (`aeron_client_conductor.c:2085-2102` writes exactly this shape).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AddCounter<'a> {
     /// Who is asking, and what to answer with.
@@ -1060,7 +1060,7 @@ impl AddCounter<'_> {
     /// Write the payload into `out`, which must be exactly
     /// [`AddCounter::encoded_length`] bytes — the writing half of the shape
     /// the reference's own conductor writes
-    /// (`aeron_client_conductor.c:2035-2052`).
+    /// (`aeron_client_conductor.c:2085-2102`).
     pub fn encode_into(&self, out: &mut [u8]) -> bool {
         if out.len() != self.encoded_length() {
             return false;
@@ -1100,7 +1100,7 @@ const ADD_COUNTER_KEY_OFFSET: usize = CORRELATED_COMMAND_LENGTH + 4 + 4;
 /// taken with `get` rather than by slicing: these bytes come from another
 /// process, and a length field is the one place a hostile or buggy client can
 /// make arithmetic overflow. The reference checks only the fixed head
-/// (`aeron_driver_conductor.c:3096-3108`) and trusts the rest.
+/// (`aeron_driver_conductor.c:3159-3171`) and trusts the rest.
 pub fn decode_add_counter(payload: &[u8]) -> Option<AddCounter<'_>> {
     let correlated = decode_correlated(payload)?;
     let type_id = le_i32(payload, CORRELATED_COMMAND_LENGTH)?;
@@ -1177,7 +1177,7 @@ pub fn decode_remove_counter(payload: &[u8]) -> Option<RemoveCounter> {
 pub struct AddPublicationCommand<'a> {
     /// Who is asking. The driver does not check it against a registration —
     /// there is none — and creates a client record on first sight
-    /// (`aeron_driver_conductor.c:3733-3739`).
+    /// (`aeron_driver_conductor.c:3830-3836`).
     pub client_id: i64,
     /// Becomes the publication's registration id, names its log file, and is
     /// echoed back as the reply's `registration_id` — a *different* field from
@@ -1187,7 +1187,7 @@ pub struct AddPublicationCommand<'a> {
     pub stream_id: i32,
     /// The channel URI as raw bytes, **not** NUL-terminated: the driver reads
     /// exactly `channel_length` of them and parses those
-    /// (`aeron_driver_conductor.c:3964-3965`).
+    /// (`aeron_driver_conductor.c:4061-4062`).
     pub channel: &'a [u8],
 }
 
@@ -1221,7 +1221,7 @@ pub struct AddSubscriptionCommand<'a> {
     /// Becomes the subscription's registration id, and is what every image's
     /// `subscriber_registration_id` quotes.
     pub correlation_id: i64,
-    /// The field the driver never reads (`aeron_driver_conductor.c:4757-4760`
+    /// The field the driver never reads (`aeron_driver_conductor.c:4854-4857`
     /// stores nothing from it).
     pub registration_correlation_id: i64,
     /// The stream to read.
@@ -1260,7 +1260,7 @@ pub fn decode_add_subscription(payload: &[u8]) -> Option<AddSubscriptionCommand<
 pub struct RemovePublication {
     /// Who is asking. Unlike a subscription removal, this one is checked
     /// against the client's own link list
-    /// (`aeron_driver_conductor.c:4707-4709`).
+    /// (`aeron_driver_conductor.c:4804-4806`).
     pub correlated: Correlated,
     /// The client's correlation id for the `ADD_PUBLICATION` that made it.
     pub registration_id: i64,
@@ -1331,7 +1331,7 @@ pub const REMOVE_PUBLICATION_FLAG_REVOKE: i64 = 0x1;
 ///
 /// The command grew a `flags` word, and the reference accepts the older shape
 /// — a payload that ends where the flags would begin — by treating the flags as
-/// zero (`aeron_driver_conductor.c:2920-2948`). A decoder that insisted on 32
+/// zero (`aeron_driver_conductor.c:2983-3011`). A decoder that insisted on 32
 /// bytes would refuse a removal from a client built before the flags existed,
 /// and that client's publication would never go away.
 pub fn decode_remove_publication(payload: &[u8]) -> Option<RemovePublication> {
@@ -1357,7 +1357,7 @@ pub fn decode_remove_publication(payload: &[u8]) -> Option<RemovePublication> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RemoveSubscription {
     /// Who is asking. The reference does **not** check it: a subscription is
-    /// found by its registration id alone (`aeron_driver_conductor.c:5203`).
+    /// found by its registration id alone (`aeron_driver_conductor.c:5300`).
     pub correlated: Correlated,
     /// The client's correlation id for the `ADD_SUBSCRIPTION`.
     pub registration_id: i64,
@@ -1394,7 +1394,7 @@ pub const REJECT_IMAGE_HEADER_LENGTH: usize = CORRELATED_COMMAND_LENGTH + 8 + 8 
 /// its own four-byte alignment, and the dispatch is what compares a record
 /// against this rather than against `offsetof` — `length <
 /// sizeof(aeron_reject_image_command_t)` is its first shape check
-/// (`aeron_driver_conductor.c:3177-3180`) — so a record that carries the header
+/// (`aeron_driver_conductor.c:3274-3277`) — so a record that carries the header
 /// and nothing else is refused before the handler is called.
 ///
 /// That is not a hypothetical: the reference's own Java client sends
@@ -1407,7 +1407,7 @@ pub const REJECT_IMAGE_MINIMUM_LENGTH: usize = 40;
 /// (`aeron-client/src/main/c/protocol/aeron_udp_protocol.h:225`).
 ///
 /// The reference refuses a longer one with `"Invalidation reason_text must be
-/// 1023 bytes or less"` (`aeron_driver_conductor.c:6357-6364`), on the
+/// 1023 bytes or less"` (`aeron_driver_conductor.c:6454-6461`), on the
 /// **declared** length and before it looks at the bytes. It is the *handler*'s
 /// check and not the dispatch's, which is why the two refusals below are kept
 /// apart: this one comes back to the client as an `ON_ERROR`, and the shape
@@ -1418,11 +1418,11 @@ pub const MAX_REASON_TEXT_LENGTH: usize = 1023;
 ///
 /// The distinction is the reference's, and it is not cosmetic: a record too
 /// short or too truncated for the struct is the dispatch's
-/// `goto malformed_command` (`aeron_driver_conductor.c:3177-3185`), which
+/// `goto malformed_command` (`aeron_driver_conductor.c:3274-3282`), which
 /// records the command and answers the client **nothing**, while an over-long
-/// reason is refused inside the handler (`:6357-6364`), whose `-1` the dispatch
+/// reason is refused inside the handler (`:6454-6461`), whose `-1` the dispatch
 /// turns into an `ON_ERROR` on that command's correlation id
-/// (`:3224-3227`). A decoder that folded them together would have to make one
+/// (`:3321-3324`). A decoder that folded them together would have to make one
 /// of those two answers wrong.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectImageError {
@@ -1448,7 +1448,7 @@ pub enum RejectImageError {
 /// The command has **two** targets, and the second is easy to miss: a client
 /// rejects a network image, but if no image is found under that correlation id
 /// the driver goes looking among its **IPC publications** and rejects one of
-/// those instead (`aeron_driver_conductor.c:6374-6398`). So
+/// those instead (`aeron_driver_conductor.c:6471-6495`). So
 /// `image_correlation_id` is a *registration id* of whichever kind of resource
 /// the client was handed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1473,12 +1473,12 @@ pub struct RejectImage<'t> {
 /// order is what decides which one a record gets when it is several kinds of
 /// wrong at once:
 ///
-/// 1. `length < sizeof(aeron_reject_image_command_t)` (`:3177-3180`);
-/// 2. `length < offsetof(reason_text) + reason_length` (`:3182-3185`) — so a
+/// 1. `length < sizeof(aeron_reject_image_command_t)` (`:3274-3277`);
+/// 2. `length < offsetof(reason_text) + reason_length` (`:3279-3282`) — so a
 ///    negative declared length lands here too, the reference's `size_t`
 ///    arithmetic making the sum enormous;
 /// 3. and only then the handler's `AERON_ERROR_MAX_TEXT_LENGTH <
-///    reason_length` (`:6357-6364`).
+///    reason_length` (`:6454-6461`).
 ///
 /// A reason that declares more bytes than the record carries is refused rather
 /// than clamped, for the reason the other decoders do: the text is published to
@@ -1524,7 +1524,7 @@ pub fn decode_reject_image(payload: &[u8]) -> Result<RejectImage<'_>, RejectImag
 /// Encode `REJECT_IMAGE` for the driver.
 ///
 /// The **C** client's bytes (`aeron_client_conductor_reject_image`,
-/// `aeron-client/src/main/c/aeron_client_conductor.c:3627-3654`):
+/// `aeron-client/src/main/c/aeron_client_conductor.c:3712-3739`):
 /// `sizeof(aeron_reject_image_command_t)` plus the reason plus **one** NUL, with
 /// the declared length left as the reason's own. So the record is four bytes
 /// longer than `offsetof(reason_text)` plus the reason, and those four are the
@@ -1534,7 +1534,7 @@ pub fn decode_reject_image(payload: &[u8]) -> Result<RejectImage<'_>, RejectImag
 /// Java one computes `MINIMUM_SIZE + reason.length()`
 /// (`RejectImageFlyweight.computeLength`), which for an empty reason is **36**
 /// — a record its own C driver calls malformed before any handler sees it
-/// (`aeron_driver_conductor.c:3177-3180`). This is the C one's, which is never
+/// (`aeron_driver_conductor.c:3274-3277`). This is the C one's, which is never
 /// short.
 ///
 /// The correlated header **is** written, which the C client does not do: it
@@ -1598,7 +1598,7 @@ pub const STATIC_COUNTER_RESPONSE_LENGTH: usize = 8 + 4;
 ///
 /// A *static* counter is one the driver owns rather than the client: it is
 /// allocated with an owner id of [`layout::NULL_VALUE`]
-/// (`aeron_driver_conductor.c:6308-6309`) and is therefore not in the client's
+/// (`aeron_driver_conductor.c:6405-6406`) and is therefore not in the client's
 /// list of counters — so a client that dies does not take it with it, and
 /// nothing announces it as unavailable. That is the whole of what "static"
 /// means, and it is why the client cannot remove one.
@@ -1808,7 +1808,7 @@ pub const REMOVE_DESTINATION_BY_ID_TYPE_ID: i32 = 0x11;
 /// trailing `int32_t` is padded out to the struct's eight-byte alignment, and
 /// the URI would begin four bytes late — a driver reading at 28 would take four
 /// bytes of the URI's own tail as its first character
-/// (`aeron_driver_conductor.c:3012-3013` bounds the record by this same 28, and
+/// (`aeron_driver_conductor.c:3075-3076` bounds the record by this same 28, and
 /// the reference's own test helper copies a channel to
 /// `sizeof(aeron_destination_command_t)`,
 /// `aeron-driver/src/test/c/aeron_driver_conductor_test.h:536`).
@@ -2081,11 +2081,11 @@ pub fn decode_response(type_id: i32, payload: &[u8]) -> Response<'_> {
 }
 
 /// Decode `ON_PUBLICATION_ERROR`
-/// (`aeron_publication_error_values_t`, `aeron-client/src/main/c/aeronc.h:73-88`).
+/// (`aeron_publication_error_values_t`, `aeron-client/src/main/c/aeronc.h:76-91`).
 ///
 /// The address is the one field that is not a plain copy: the driver narrows a
 /// `sockaddr_storage` into sixteen bytes and says which family it was with a
-/// type beside it (`aeron_driver_conductor.c:2297-2315`), so a reader that
+/// type beside it (`aeron_driver_conductor.c:2360-2378`), so a reader that
 /// ignored the type would read four bytes of IPv4 as the head of an IPv6
 /// address. A type this build does not know is [`None`] rather than an error —
 /// the same rule as an unmodelled response, and the address is the least of
@@ -2147,7 +2147,7 @@ fn decode_publication_error(payload: &[u8]) -> Response<'_> {
 /// The fifteen bytes of address a publication error carries, as an address.
 ///
 /// The port arrives in host order — the driver converts it with `ntohs` on the
-/// way out (`aeron_driver_conductor.c:2302`) — which is the opposite of what the
+/// way out (`aeron_driver_conductor.c:2365`) — which is the opposite of what the
 /// wire does everywhere else and the reason this is one function rather than a
 /// literal.
 fn source_address(address_type: i16, port: u16, payload: &[u8]) -> Option<std::net::SocketAddr> {
@@ -2227,7 +2227,7 @@ fn decode_publication_ready(type_id: i32, payload: &[u8]) -> Response<'_> {
 /// length-prefixed log file path, then **padding to a four-byte boundary**,
 /// then a length-prefixed source identity — and the identity is the one string
 /// that is *not* padded, because nothing follows it
-/// (`on_available_image`, `aeron_driver_conductor.c:2550-2569`).
+/// (`on_available_image`, `aeron_driver_conductor.c:2613-2632`).
 ///
 /// [`ImageBuffersReady::encode`] and `decode_available_image` are the two
 /// halves of this and are tested against each other; a decoder that read the
@@ -2254,7 +2254,7 @@ pub struct ImageBuffersReady<'a> {
     pub log_file: &'a [u8],
     /// Where the stream comes from. For an IPC channel this is the constant
     /// `"aeron:ipc"` and not the channel the client wrote
-    /// (`aeron_driver_conductor.c:3612-3613` passes `AERON_IPC_CHANNEL`).
+    /// (`aeron_driver_conductor.c:3709-3710` passes `AERON_IPC_CHANNEL`).
     pub source_identity: &'a [u8],
 }
 
@@ -2301,7 +2301,7 @@ impl ImageBuffersReady<'_> {
 /// The channel that follows the fixed head is the **subscription's**, not the
 /// publication's — it is the channel the client subscribed with, echoed back —
 /// and it is not aligned and not NUL-terminated
-/// (`on_unavailable_image`, `aeron_driver_conductor.c:2550-2569`).
+/// (`on_unavailable_image`, `aeron_driver_conductor.c:2613-2632`).
 pub fn encode_unavailable_image(
     correlation_id: i64,
     subscription_registration_id: i64,
@@ -2581,7 +2581,7 @@ mod response_tests {
     fn an_add_counter_encodes_the_shape_the_decoder_reads() {
         // A key that is not a multiple of four, so the padding is exercised:
         // the reference writes the key, pads to four, then the label's length
-        // (`aeron_client_conductor.c:2035-2052`), and the decoder steps by the
+        // (`aeron_client_conductor.c:2085-2102`), and the decoder steps by the
         // aligned length.
         let command = AddCounter {
             correlated: Correlated {
@@ -3163,7 +3163,7 @@ mod response_tests {
         // 40 and 36, asserted together because the two numbers are one edit
         // away from each other and only the first is what the dispatch
         // compares a record against
-        // (`aeron_driver_conductor.c:3177-3180`).
+        // (`aeron_driver_conductor.c:3274-3277`).
         assert_eq!(40, REJECT_IMAGE_MINIMUM_LENGTH);
         assert_eq!(36, REJECT_IMAGE_HEADER_LENGTH);
     }
@@ -3195,7 +3195,7 @@ mod response_tests {
     fn refuses_a_reason_longer_than_the_reference_allows() {
         // `AERON_ERROR_MAX_TEXT_LENGTH + 1`, with all 1024 bytes present: the
         // dispatch's shape checks pass, so this reaches the handler's bound
-        // (`aeron_driver_conductor.c:6357-6364`) and is refused for *that*
+        // (`aeron_driver_conductor.c:6454-6461`) and is refused for *that*
         // reason and not for want of bytes.
         let mut payload = vec![0u8; REJECT_IMAGE_HEADER_LENGTH + 1024];
         payload[8..16].copy_from_slice(&9i64.to_le_bytes());
@@ -3232,7 +3232,7 @@ mod response_tests {
         // of them is *both* too truncated and over the bound, and the reference
         // answers the first: its truncation check is in the dispatch, above the
         // call, and the handler's bound is only ever reached by a record that
-        // got past it (`aeron_driver_conductor.c:3177-3185` before `:6357`).
+        // got past it (`aeron_driver_conductor.c:3274-3282` before `:6454`).
         let mut payload = vec![0u8; REJECT_IMAGE_HEADER_LENGTH];
         payload[32..36].copy_from_slice(&1024i32.to_le_bytes());
 
@@ -3292,7 +3292,7 @@ mod response_tests {
 
     #[test]
     fn a_reject_image_is_the_c_clients_bytes_and_not_the_java_ones() {
-        // `sizeof` + the reason + one NUL (`aeron_client_conductor.c:3630`),
+        // `sizeof` + the reason + one NUL (`aeron_client_conductor.c:3717`),
         // against the Java client's `MINIMUM_SIZE` + the reason. The difference
         // shows where it costs something: with no reason at all the Java form
         // is 36 bytes, which the driver's own dispatch refuses before any
@@ -3379,7 +3379,7 @@ mod response_tests {
         // The type is the only thing that says how many of the sixteen bytes
         // are an address, so a reader that ignored it reads the head of an IPv6
         // address as an IPv4 one — and a type this build does not know is no
-        // address rather than a guess (`aeron_driver_conductor.c:2312-2315`).
+        // address rather than a guess (`aeron_driver_conductor.c:2375-2378`).
         let mut payload = vec![0u8; PUBLICATION_ERROR_HEADER_LENGTH];
         payload[44..60]
             .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
@@ -3651,7 +3651,7 @@ mod response_tests {
         );
         // Four bytes of address and twelve of nothing: the client is given a
         // sixteen-byte field whatever the family is
-        // (`aeron_driver_conductor.c:2301-2304`).
+        // (`aeron_driver_conductor.c:2364-2367`).
         assert_eq!([127, 0, 0, 1], encoded[44..48]);
         assert_eq!([0u8; 12], encoded[48..60]);
         assert_eq!(13, i32::from_le_bytes(encoded[60..64].try_into().unwrap()));
@@ -3662,7 +3662,7 @@ mod response_tests {
     #[test]
     fn encodes_a_publication_error_with_no_source() {
         // The reference's third branch: no family, so no type, no port and a
-        // blank address (`aeron_driver_conductor.c:2312-2315`).
+        // blank address (`aeron_driver_conductor.c:2375-2378`).
         let error = PublicationError {
             registration_id: 11,
             destination_registration_id: -1,

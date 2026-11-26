@@ -13,7 +13,7 @@
 //!
 //! 101 is what an archive allocates for itself when nothing gave it one:
 //! `ArchiveCounters.allocateErrorCounter` is reached only on the `null ==
-//! errorCounter` branch (`Archive.java:1354-1362`), which is the *standalone*
+//! errorCounter` branch (`Archive.java:1420-1428`), which is the *standalone*
 //! launcher. The aggregate launcher does the opposite — `ArchivingMediaDriver`
 //! takes the **driver's** `ERRORS` counter (`SystemCounterDescriptor.ERRORS.id()`,
 //! `ArchivingMediaDriver.java:87-89`) and hands it to the archive, and `Archive`
@@ -24,7 +24,7 @@
 //!
 //! # The label is the acceptance criterion
 //!
-//! `shouldSendClientInfoToArchive` (`client/aeron_archive_test.cpp:4131-4195`)
+//! `shouldSendClientInfoToArchive` (`client/aeron_archive_test.cpp:4198-4262`)
 //! finds the 113 counter by type id, reads its **key** back as two `int64`s, and
 //! looks for `name=… version=… commit=…` and `archiveId=…` inside its **label**.
 //! The `name=…` text is the client's own doing — it is the `clientInfo` the
@@ -35,7 +35,7 @@
 //!
 //! Composing it is the *conductor's*: `newControlSession` passes
 //! `Strings.isEmpty(clientInfo) ? imageInfo : clientInfo + " " + imageInfo`
-//! (`ArchiveConductor.java:492-498`), so `imageInfo` is always in the label and
+//! (`ArchiveConductor.java:491-497`), so `imageInfo` is always in the label and
 //! `clientInfo` is prepended to it when there is one. This module takes the
 //! finished string, as `ControlSessionCounter.allocate` does.
 //!
@@ -133,25 +133,25 @@ pub const ARCHIVE_REPLAY_SESSION_COUNT_TYPE_ID: i32 = 112;
 /// every archive counter's label ends with.
 const ARCHIVE_ID_LABEL_SUFFIX: &str = " - archiveId=";
 
-/// The name the 102 counter is allocated under (`Archive.java:1561`).
+/// The name the 102 counter is allocated under (`Archive.java:1629`).
 const CONTROL_SESSIONS_NAME: &str = "Archive Control Sessions";
 
-/// The name the 111 counter is allocated under (`Archive.java:1568`).
+/// The name the 111 counter is allocated under (`Archive.java:1636`).
 pub const RECORDING_SESSIONS_NAME: &str = "Archive Recording Sessions";
 
 /// The names the recorder's three counters are allocated under
-/// (`Archive.java:1601`, `:1612`, `:1623`).
+/// (`Archive.java:1669`, `:1612`, `:1623`).
 pub const RECORDER_MAX_WRITE_TIME_NAME: &str = "archive-recorder max write time in ns";
 /// See [`RECORDER_MAX_WRITE_TIME_NAME`].
 pub const RECORDER_TOTAL_WRITE_BYTES_NAME: &str = "archive-recorder total write bytes";
 /// See [`RECORDER_MAX_WRITE_TIME_NAME`].
 pub const RECORDER_TOTAL_WRITE_TIME_NAME: &str = "archive-recorder total write time in ns";
 
-/// The name the 112 counter is allocated under (`Archive.java:1581`).
+/// The name the 112 counter is allocated under (`Archive.java:1649`).
 pub const REPLAY_SESSIONS_NAME: &str = "Archive Replay Sessions";
 
 /// The names the replayer's three counters are allocated under
-/// (`Archive.java:1635`, `:1646`, `:1657`).
+/// (`Archive.java:1703`, `:1714`, `:1725`).
 pub const REPLAYER_MAX_READ_TIME_NAME: &str = "archive-replayer max read time in ns";
 /// See [`REPLAYER_MAX_READ_TIME_NAME`].
 pub const REPLAYER_TOTAL_READ_BYTES_NAME: &str = "archive-replayer total read bytes";
@@ -212,7 +212,7 @@ pub fn control_sessions_key(archive_id: i64) -> [u8; CONTROL_SESSIONS_KEY_LENGTH
 /// `ARCHIVE_ID_KEY_OFFSET + SIZE_OF_LONG` (`ControlSessionCounter.java:47`,
 /// `:52`), and both are written with `putLong` (`:70-71`) — the buffer's own
 /// order, which is the little-endian `memcpy` the C test reads them back with
-/// (`client/aeron_archive_test.cpp:4183-4186`).
+/// (`client/aeron_archive_test.cpp:4250-4253`).
 pub fn control_session_key(
     archive_id: i64,
     control_session_id: i64,
@@ -224,7 +224,7 @@ pub fn control_session_key(
 }
 
 /// `"Archive Control Sessions" + " - archiveId=" + archiveId`
-/// (`Archive.java:1561` and `ArchiveCounters.appendArchiveIdLabel`, `:102-109`).
+/// (`Archive.java:1629` and `ArchiveCounters.appendArchiveIdLabel`, `:102-109`).
 pub fn control_sessions_label(archive_id: i64) -> String {
     archive_id_label(CONTROL_SESSIONS_NAME, archive_id)
 }
@@ -241,7 +241,7 @@ pub fn control_session_label(client_info: &str, archive_id: i64) -> String {
 }
 
 /// What can go wrong asking for a counter, or finding one again.
-/// Which agent a duty cycle is measured for (`Archive.java:1402-1480`): the
+/// Which agent a duty cycle is measured for (`Archive.java:1470-1548`): the
 /// conductor's, the recorder's and the replayer's, each with a pair of counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DutyCycleActor {
@@ -258,7 +258,7 @@ impl DutyCycleActor {
     pub const ALL: [Self; 3] = [Self::Conductor, Self::Recorder, Self::Replayer];
 
     /// The prefix both of this actor's labels carry
-    /// (`Archive.java:1407`, `:1446`, `:1465`).
+    /// (`Archive.java:1475`, `:1514`, `:1533`).
     pub const fn label_name(self) -> &'static str {
         match self {
             Self::Conductor => "archive-conductor",
@@ -349,12 +349,12 @@ impl DutyCycleRequests {
     }
 }
 
-/// **The three agents' counters, allocated together** (`Archive.java:1402-1480`).
+/// **The three agents' counters, allocated together** (`Archive.java:1470-1548`).
 ///
 /// Six counters, and in `SHARED` — the only mode this build runs — **one of the
 /// three pairs is ever measured**: the reference measures the conductor's on
 /// every turn (`ArchiveConductor.doWork:374`) and the recorder's and replayer's
-/// only from `DedicatedModeArchiveConductor` (`:191`, `:346`), which has no
+/// only from `DedicatedModeArchiveConductor` (`:197`, `:352`), which has no
 /// `SHARED` counterpart. So the other four are allocated, labelled and left at
 /// zero, exactly as they are there.
 pub struct DutyCycles {
@@ -476,8 +476,8 @@ impl DutyCycleCounters {
     }
 
     /// Set the baseline the next cycle is measured from, without measuring —
-    /// the reference's `onStart` (`DedicatedModeArchiveConductor.java:176`,
-    /// `:333`). A worker's first turn has to do this: the pair it found was not
+    /// the reference's `onStart` (`DedicatedModeArchiveConductor.java:186`,
+    /// `:343`). A worker's first turn has to do this: the pair it found was not
     /// the one the conductor claimed at its own clock, and measuring from that
     /// would make the first cycle the whole uptime of the archive.
     pub(crate) fn update(&mut self, now_ns: i64) {
@@ -548,11 +548,11 @@ impl DutyCycleCounters {
 }
 
 /// The mode a dedicated worker's pair is labelled with
-/// (`Archive.java:1407`, where `MODE` is `DEDICATED` for the two agents on
+/// (`Archive.java:1475`, where `MODE` is `DEDICATED` for the two agents on
 /// threads of their own).
 pub const DEDICATED_MODE: &str = "DEDICATED";
 
-/// `"archive-{actor} max cycle time in ns: {MODE}"` (`Archive.java:1407`).
+/// `"archive-{actor} max cycle time in ns: {MODE}"` (`Archive.java:1475`).
 fn max_cycle_time_label(actor: DutyCycleActor, mode: &str, archive_id: i64) -> String {
     archive_id_label(
         &format!("{} max cycle time in ns: {mode}", actor.label_name()),
@@ -561,7 +561,7 @@ fn max_cycle_time_label(actor: DutyCycleActor, mode: &str, archive_id: i64) -> S
 }
 
 /// `"archive-{actor} work cycle time exceeded count: threshold={duration} {MODE}"`
-/// (`Archive.java:1412-1415`, where the duration is
+/// (`Archive.java:1480-1483`, where the duration is
 /// `SystemUtil.formatDuration`'s spelling of the threshold).
 fn threshold_exceeded_label(
     actor: DutyCycleActor,
@@ -647,7 +647,7 @@ pub trait Counters {
     /// driver and answers with the slot it allocated.
     ///
     /// The reference blocks here too, and only at archive construction
-    /// (`Archive.java:1560`), where there is no session to stall behind.
+    /// (`Archive.java:1628`), where there is no session to stall behind.
     fn add_counter(
         &mut self,
         type_id: i32,
@@ -726,9 +726,9 @@ impl Counters for Client {
 
 /// The 102 counter: how many control sessions are open.
 ///
-/// Allocated once, at archive construction (`Archive.java:1558-1563`), and then
+/// Allocated once, at archive construction (`Archive.java:1626-1631`), and then
 /// only ever moved by one: up when a session is added
-/// (`ArchiveConductor.java:520`), down when one is removed
+/// (`ArchiveConductor.java:519`), down when one is removed
 /// (`ControlSessionAdapter.java:1158-1161`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlSessionsCounter {
@@ -738,7 +738,7 @@ pub struct ControlSessionsCounter {
 impl ControlSessionsCounter {
     /// Allocate the archive's session count and check what came back.
     ///
-    /// The check is `validateCounterTypeId` (`Archive.java:1563`): the
+    /// The check is `validateCounterTypeId` (`Archive.java:1631`): the
     /// reference throws rather than start an archive whose session count no
     /// tool can find, and so does this.
     ///
@@ -768,7 +768,7 @@ impl ControlSessionsCounter {
         self.counter_id
     }
 
-    /// One more open session (`ArchiveConductor.java:520`).
+    /// One more open session (`ArchiveConductor.java:519`).
     ///
     /// `incrementRelease` is a read and a release write rather than an atomic
     /// add — that is what the reference's is too
@@ -840,7 +840,7 @@ pub fn request_control_sessions_counter<C: Counters>(
 ///
 /// `Ok(None)` means "not yet" rather than "no", exactly as
 /// [`ControlSessionCounter::claim`] does, and the type check is
-/// `validateCounterTypeId` (`Archive.java:1563`) — the reference throws rather
+/// `validateCounterTypeId` (`Archive.java:1631`) — the reference throws rather
 /// than start an archive whose session count no tool can find.
 ///
 /// # Errors
@@ -884,9 +884,9 @@ pub fn claim_control_sessions_counter<C: Counters, Access>(
 /// (`ArchiveCounters.java:52-69`).
 ///
 /// The four differ in what moves them and in nothing else: 111 goes up and down
-/// with the recording sessions (`ArchiveConductor.java:2056`, `:1362`), and the
+/// with the recording sessions (`ArchiveConductor.java:2078`, `:1364`), and the
 /// recorder's three are set outright once per turn that wrote something
-/// (`:2732-2743`). So they share one handle rather than four — the type id and
+/// (`:2767-2778`). So they share one handle rather than four — the type id and
 /// the name are the caller's, and the key and the label suffix are this
 /// module's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -898,8 +898,8 @@ impl ArchiveIdCounter {
     /// Allocate one and check what came back, for a caller with a driver
     /// running on its own threads.
     ///
-    /// The check is `validateCounterTypeId` (`Archive.java:1564`, `:1604`,
-    /// `:1615`, `:1626`), which each of the four does after allocating.
+    /// The check is `validateCounterTypeId` (`Archive.java:1632`, `:1672`,
+    /// `:1615`, `:1694`), which each of the four does after allocating.
     ///
     /// # Errors
     ///
@@ -941,23 +941,23 @@ impl ArchiveIdCounter {
 
     /// What the counter reads now, which is what `AeronStat` shows and what the
     /// C harness reads a recording's position out of
-    /// (`aeron_archive_test.cpp:267-273`).
+    /// (`aeron_archive_test.cpp:272-278`).
     pub fn value<Access>(&self, counters: &CountersReader<'_, Access>) -> Option<i64> {
         counters.value(self.counter_id)
     }
 
     /// Set it outright — the recorder's three, once per turn that wrote
-    /// (`ArchiveConductor.java:2737-2739`).
+    /// (`ArchiveConductor.java:2772-2774`).
     pub fn set(&self, counters: &CountersReader<'_, ReadWrite>, value: i64) -> Option<()> {
         counters.set_value(self.counter_id, value)
     }
 
-    /// One more recording session (`ArchiveConductor.java:2056`).
+    /// One more recording session (`ArchiveConductor.java:2078`).
     pub fn increment(&self, counters: &CountersReader<'_, ReadWrite>) -> Option<i64> {
         self.bump(counters, 1)
     }
 
-    /// One fewer (`:1362`), with the same `None` as
+    /// One fewer (`:1364`), with the same `None` as
     /// [`ControlSessionsCounter::increment`].
     pub fn decrement(&self, counters: &CountersReader<'_, ReadWrite>) -> Option<i64> {
         self.bump(counters, -1)
@@ -979,7 +979,7 @@ impl ArchiveIdCounter {
 ///
 /// One caller so far, and it is the reason the function exists: the 105 is
 /// allocated only if no other archive has one for this archive id, and the
-/// archive refuses to start if one does (`Archive.java:1586-1595`). The
+/// archive refuses to start if one does (`Archive.java:1654-1663`). The
 /// reference checks that one and not the other three.
 pub fn find_archive_id_counter<Access>(
     counters: &CountersReader<'_, Access>,
@@ -1066,7 +1066,7 @@ pub fn claim_archive_id_counter<C: Counters, Access>(
 /// [`ArchiveIdCounter::allocate`] needs, and the list they are allocated in.
 ///
 /// The reference allocates a block of these in `Archive.Context.conclude`
-/// (`Archive.java:1575-1660`) — 112 and the replayer's three, then the
+/// (`Archive.java:1643-1728`) — 112 and the replayer's three, then the
 /// recorder's three — and this trait is what makes one loop out of a block
 /// instead of one loop per owner.
 pub trait CounterKind: Copy + PartialEq + 'static {
@@ -1176,8 +1176,8 @@ impl<K: CounterKind> CounterAllocator<K> {
 }
 
 /// `validateCounterTypeId` (`AeronCounters.java:1540-1547`), which the four
-/// archive-id-keyed counters do at `Archive.java:1574`, `:1604`, `:1615` and
-/// `:1626`.
+/// archive-id-keyed counters do at `Archive.java:1642`, `:1672`, `:1683` and
+/// `:1694`.
 pub(super) fn check_type_id<Access>(
     counters: &CountersReader<'_, Access>,
     counter_id: i32,
@@ -1195,7 +1195,7 @@ pub(super) fn check_type_id<Access>(
 
 /// The 113 counter: one control session.
 ///
-/// Made when a session is (`ArchiveConductor.java:493-498`), bound when its
+/// Made when a session is (`ArchiveConductor.java:492-497`), bound when its
 /// response publication arrives (`ControlSession.java:890-908`), and given back
 /// when the session goes (`:176-183`).
 ///
@@ -1213,7 +1213,7 @@ pub struct ControlSessionCounter {
 }
 
 impl ControlSessionCounter {
-    /// Ask for the session's counter (`ArchiveConductor.java:493-498`).
+    /// Ask for the session's counter (`ArchiveConductor.java:492-497`).
     ///
     /// Asynchronous, unlike the 102: this happens on the turn a connect request
     /// arrives, and a conductor that waited for the driver there would be
@@ -1339,7 +1339,7 @@ impl ControlSessionCounter {
 /// In the aggregate launcher that is the **driver's** `ERRORS`
 /// (`ArchivingMediaDriver.java:87-89`), which is why this holds an id and no
 /// way to make one. What it is for is the reference's `CountedErrorHandler`
-/// (`Archive.java:1379`): every error the archive observes moves it up by one.
+/// (`Archive.java:1445`): every error the archive observes moves it up by one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ErrorCounter {
     counter_id: i32,
@@ -1356,12 +1356,12 @@ impl ErrorCounter {
         self.counter_id
     }
 
-    /// One more error observed (`Archive.java:1379`).
+    /// One more error observed (`Archive.java:1445`).
     ///
     /// `increment`, not `incrementRelease`: an `AtomicCounter` over the
     /// driver's values buffer has nothing to release *to*, and the reference's
     /// own spelling of this one is a plain `increment`
-    /// (`DedicatedModeArchiveConductor.java:222-224`). `None` when the id is
+    /// (`DedicatedModeArchiveConductor.java:232-234`). `None` when the id is
     /// not a slot in this region at all, the same guard as
     /// [`ControlSessionsCounter::increment`].
     pub fn increment(&self, counters: &CountersReader<'_, ReadWrite>) -> Option<i64> {
@@ -1528,7 +1528,7 @@ mod tests {
         assert_eq!(0, counter.counter_id());
     }
 
-    /// ★ **The six labels, byte for byte** (`Archive.java:1407-1476`).
+    /// ★ **The six labels, byte for byte** (`Archive.java:1475-1544`).
     ///
     /// This is what `AeronStat` reads, and it is a contract with Java rather
     /// than a description: the threading mode is `ThreadingMode.name()` and the
@@ -1706,7 +1706,7 @@ mod tests {
     }
 
     /// The reference throws here rather than start an archive whose session
-    /// count no tool can find (`Archive.java:1563`).
+    /// count no tool can find (`Archive.java:1631`).
     #[test]
     fn a_102_that_is_not_a_102_stops_the_archive() {
         let mut client = FakeCounters::default();
@@ -2024,7 +2024,7 @@ mod tests {
 
     /// The recorder's three names are what an operator reads in `AeronStat`,
     /// and two of them differ by one word — so they are checked to the byte
-    /// (`Archive.java:1601`, `:1612`, `:1623`).
+    /// (`Archive.java:1669`, `:1680`, `:1691`).
     #[test]
     fn the_recorder_counters_are_named_the_references_way() {
         let mut client = FakeCounters::default();
@@ -2060,8 +2060,8 @@ mod tests {
     }
 
     /// 111 goes up and down with the recording sessions
-    /// (`ArchiveConductor.java:2056`, `:1362`), while the recorder's three are
-    /// set outright once per turn that wrote (`:2737-2739`).
+    /// (`ArchiveConductor.java:2078`, `:1364`), while the recorder's three are
+    /// set outright once per turn that wrote (`:2772-2774`).
     #[test]
     fn an_archive_id_counter_is_moved_or_set_outright() {
         let mut meta = metadata(0, ARCHIVE_RECORDING_SESSION_COUNT_TYPE_ID);
@@ -2080,7 +2080,7 @@ mod tests {
 
     /// The one caller of [`find_archive_id_counter`]: the 105 is not allocated
     /// for an archive id that already has one, and the archive refuses to start
-    /// rather than make a second (`Archive.java:1586-1595`).
+    /// rather than make a second (`Archive.java:1654-1663`).
     #[test]
     fn a_counter_is_found_by_its_type_and_the_archive_id_in_its_key() {
         let mut meta = metadata_with_key(

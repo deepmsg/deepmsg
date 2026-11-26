@@ -39,7 +39,7 @@
 //! all**: `aeronmd`'s stderr writes are all failure branches
 //! (`aeron-driver/src/main/c/aeronmd.c:78,98,107,117,124,131,141,148,155,175,181`),
 //! and its one happy-path print — the configuration dump — goes to stdout
-//! (`aeron_driver.c:504-506`, gated on `AERON_PRINT_CONFIGURATION`, which the
+//! (`aeron_driver.c:521-523`, gated on `AERON_PRINT_CONFIGURATION`, which the
 //! test harness sets unconditionally at `CTestMediaDriver.java:268`).
 //!
 //! So the split below is by *kind*, not by severity: an operator-facing
@@ -129,9 +129,9 @@ fn main() -> ExitCode {
             // Deliberately stderr, against the rule above: this is the one
             // diagnostic the reference itself writes there. It warns *before*
             // it deletes, so a delete-on-start deployment warns too
-            // (`aeron-driver/src/main/c/aeron_driver.c:139-149`), and the
+            // (`aeron-driver/src/main/c/aeron_driver.c:156-166`), and the
             // reference's own warning goes to stderr
-            // (`aeron_log_func_stderr`, `:145`).
+            // (`aeron_log_func_stderr`, `:162`).
             //
             // It is unreachable from the reference's system tests, which is why
             // it is safe to keep faithful: the harness never sets
@@ -141,7 +141,7 @@ fn main() -> ExitCode {
             // `getAdditionalEnvVarsMap` — so `warn_if_dirs_exist` keeps its
             // `false` default and no notice is ever pushed.
             dir::Notice::DirectoryExists { path } => {
-                // The reference's own words (`aeron_driver.c:143-149`), without
+                // The reference's own words (`aeron_driver.c:160-166`), without
                 // this build's prefix: a test that parses stderr should see
                 // what it sees from `aeronmd`.
                 eprintln!("WARNING: {} exists", path.display());
@@ -393,7 +393,7 @@ fn close_the_media(claimed: Option<Claim>) {
 /// Stop the driver the way the reference does, and report how it stopped.
 fn shutdown(driver: &mut Driver, prepared: dir::PreparedDir) -> ExitCode {
     // The close stops every runner the mode started, waits for it, and closes
-    // the conductor (`aeron_driver_close`, `aeron_driver.c:1274-1296`). The
+    // the conductor (`aeron_driver_close`, `aeron_driver.c:1429-1451`). The
     // order inside it is the one that matters: every log buffer it hands back
     // goes back *through* the agent, and a free sent to an agent that has
     // already stopped is a file nobody removes.

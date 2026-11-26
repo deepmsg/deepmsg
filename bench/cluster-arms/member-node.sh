@@ -206,7 +206,7 @@ _archive_common_defines() {
 }
 
 # The leader is a property both consensus modules honour: the reference's
-# `aeron.cluster.appointed.leader.id` (`ConsensusModule.java:451`) and ours
+# `aeron.cluster.appointed.leader.id` (`ConsensusModule.java:458`) and ours
 # (`crates/cluster/consensus/src/config.rs:181`). `-1` is the default and means
 # "elect", so an empty or absent value changes nothing. Anything else pins the
 # leader, which is what a batch needs when its arms are separate cells: without

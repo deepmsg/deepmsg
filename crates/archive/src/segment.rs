@@ -2,7 +2,7 @@
 //!
 //! A recording is a set of files, one per segment of the stream, named
 //! `<recordingId>-<segmentBasePosition>.rec` (`Archive.segmentFileName`,
-//! `Archive.java:3903-3906`). Inside one is **Aeron's own frame format** — the
+//! `Archive.java:4091-4094`). Inside one is **Aeron's own frame format** — the
 //! same 32-byte data header and 32-byte alignment as an IPC or UDP term — so
 //! this module is about the file, not about the frames: where a segment begins,
 //! how long it is before the next one, and the three things a recording does to
@@ -79,7 +79,7 @@ use deepmsg_log::{Component as LogComponent, Event as LogEvent, Level as LogLeve
 
 use crate::checksum::Checksum;
 
-/// `Archive.Configuration.RECORDING_SEGMENT_SUFFIX` (`Archive.java:289`).
+/// `Archive.Configuration.RECORDING_SEGMENT_SUFFIX` (`Archive.java:295`).
 pub const SUFFIX: &str = ".rec";
 
 /// The name of one segment file
@@ -90,7 +90,7 @@ pub fn segment_file_name(recording_id: i64, segment_base_position: i64) -> Strin
 }
 
 /// Where a segment file's first term begins — the offset of the first frame in
-/// it that has a length (`ArchiveConductor.findTermOffsetForStart`, `:1782-1855`).
+/// it that has a length (`ArchiveConductor.findTermOffsetForStart`, `:1789-1862`).
 ///
 /// # What it is for
 ///
@@ -102,17 +102,17 @@ pub fn segment_file_name(recording_id: i64, segment_base_position: i64) -> Strin
 /// was. So the walk asks this for an offset, and acts on the two answers
 /// differently — `0` means the segment starts clean and the walk goes on, and
 /// anything else means the recording's start moves to *that* byte and the walk
-/// stops (`:1600-1612`).
+/// stops (`:1668-1680`).
 ///
 /// `Ok(Some(offset))` is the answer, and `Ok(None)` is "this file is not one
 /// this recording can start on" — the reference has already answered the client
-/// with its reason and returns its `NULL_VALUE` (`:1816`, `:1827`, `:1837`).
+/// with its reason and returns its `NULL_VALUE` (`:1884`, `:1895`, `:1905`).
 ///
 /// # The divergence
 ///
 /// A header that cannot be read is `Err` here. The reference sends the error
 /// and then returns `termOffset`, which is **zero** at that point
-/// (`:1797-1802`) — so its caller carries on as if the segment were clean and
+/// (`:1865-1870`) — so its caller carries on as if the segment were clean and
 /// counts it. That is a slip rather than a behaviour: nothing can reach it (the
 /// file has just been found to exist and its length checked), and carrying on
 /// after saying no is not what any of the other three refusals in this method
@@ -225,7 +225,7 @@ const SCAN_BUFFER_LENGTH: usize = 1024 * 1024;
 /// **Two callers, and they are the reference's two**: a replay checks that a
 /// late-join position points at a frame before it starts reading there
 /// (`:328-336`), and a truncate checks that the position it is about to cut at
-/// is one before it cuts anything (`ArchiveConductor.java:2550-2554`). Same
+/// is one before it cuts anything (`ArchiveConductor.java:2585-2589`). Same
 /// question, so the same read.
 ///
 /// `Ok(false)` is "not the frame this position implies". The reference's name is
@@ -254,15 +254,15 @@ pub fn header_matches_position(
 }
 
 /// Cut a segment file at `segment_offset` and leave the rest of it as zeros
-/// (`ArchiveConductor.eraseRemainingSegment`, `:2535-2575`).
+/// (`ArchiveConductor.eraseRemainingSegment`, `:2570-2610`).
 ///
 /// **The file keeps its full length.** The reference truncates it to the cut and
-/// then writes a single zero byte at `segment_length - 1` (`:2560-2568`), which
+/// then writes a single zero byte at `segment_length - 1` (`:2595-2603`), which
 /// on a file system extends it back out with zeros in between: the tail reads as
 /// empty — no frames, which is what "erased" has to mean to a reader — while the
 /// segment is still the size everything else expects. Truncating and stopping
 /// there would leave a short file, and `attachSegments` refuses one whose length
-/// is not exactly `segmentLength` (`:1591-1596`).
+/// is not exactly `segmentLength` (`:1598-1603`).
 ///
 /// # Errors
 ///
@@ -727,7 +727,7 @@ impl SegmentWriter {
     ///
     /// An existing file of the right length is opened where it is, which is what
     /// a recording being **extended** does: its bytes go into the segments the
-    /// first session already made (`ArchiveConductor.java:2109`). A file of some
+    /// first session already made (`ArchiveConductor.java:2144`). A file of some
     /// other length is set to this one, which is the reference's `setLength` and
     /// is where it would lose bytes rather than refuse.
     fn open_segment(path: &Path, segment_length: usize) -> Result<File, SegmentError> {

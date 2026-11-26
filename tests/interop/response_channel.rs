@@ -3,7 +3,7 @@
 //!
 //! `control-mode=response` names the channel a responder sends its response
 //! setup to, and its subscription deliberately reads nothing until that setup
-//! arrives (`aeron_driver_conductor.c:5072-5092`). The reference calls
+//! arrives (`aeron_driver_conductor.c:5169-5189`). The reference calls
 //! `incref_to_response_stream` where every other mode calls
 //! `add_network_subscription_to_receiver`, so no interest is registered for its
 //! stream and no image can form on one however much traffic reaches its socket.
@@ -26,7 +26,7 @@
 //! endpoint exists — one status message carrying `SEND_SETUP` with the stream,
 //! the session and every position left at zero
 //! (`aeron_receive_channel_endpoint_add_pending_setup_destination`,
-//! `media/aeron_receive_channel_endpoint.c:1127-1152`). The far end's socket is
+//! `media/aeron_receive_channel_endpoint.c:1132-1157`). The far end's socket is
 //! therefore bound **before** its subscription, and the ask is drained before
 //! the `SETUP` goes out: an ask sent to a port nobody has bound yet is lost,
 //! and a test that only *sometimes* loses it measures the race rather than the
@@ -175,14 +175,14 @@ impl FarEnd {
     /// The ask a receive endpoint makes when it knows a stream and a session
     /// but has no image for them: a status message that is nothing but
     /// `SEND_SETUP` (`aeron_receive_channel_endpoint_elicit_setup`,
-    /// `media/aeron_receive_channel_endpoint.c:259-289` — stream, session, and
+    /// `media/aeron_receive_channel_endpoint.c:264-294` — stream, session, and
     /// three zeroes, which is why the window here is zero and not the 64K a
     /// position report would carry).
     ///
     /// It is the **session** that makes this one work, and it is why a
     /// requester has to wait for the far end's `RSP_SETUP` before it can ask:
     /// the far end finds its publication by `(stream_id << 32) | session_id`
-    /// (`aeron_send_channel_endpoint.c:614-616`), so an ask that names no
+    /// (`aeron_send_channel_endpoint.c:607-609`), so an ask that names no
     /// session reaches no publication at all.
     ///
     /// It goes to the channel's `control=` address, where the far end's send
@@ -307,7 +307,7 @@ fn watch_for(
 /// the session and every position left at zero, because there is no stream yet
 /// — the ask is for a `SETUP` describing whatever the far end publishes
 /// (`aeron_receive_channel_endpoint_add_pending_setup_destination`,
-/// `media/aeron_receive_channel_endpoint.c:1127-1152`).
+/// `media/aeron_receive_channel_endpoint.c:1132-1157`).
 fn is_ask_for_setup(bytes: &[u8]) -> bool {
     StatusMessageFrame::read(bytes).is_some_and(|sm| {
         sm.stream_id == 0 && sm.session_id == 0 && bytes[5] & header_flags::SM_SEND_SETUP != 0
@@ -346,7 +346,7 @@ fn hear_one(far_end: &mut FarEnd, within: Duration) -> Option<Vec<u8>> {
 /// far end heard *after* the `SETUP` went out. The window is long enough to
 /// hold a periodic re-ask, which is the whole point: this build used to send
 /// one every second for a stream nobody had registered, and the reference sends
-/// **one, ever** (`aeron_driver_receiver.c:227`'s gate).
+/// **one, ever** (`aeron_driver_receiver.c:196`'s gate).
 ///
 /// `ports` seeds the two ports it needs, two apart. Two callers in one process
 /// must not share one.
@@ -465,7 +465,7 @@ fn a_response_subscription_is_not_a_reader() {
 /// `should_elicit_setup_message` over an empty dispatcher — a `control-mode=response`
 /// subscription puts its stream in the endpoint's *response* refcount instead
 /// (`aeron_receive_channel_endpoint_incref_to_response_stream`,
-/// `media/aeron_receive_channel_endpoint.c:746-756`), so nothing is registered
+/// `media/aeron_receive_channel_endpoint.c:751-761`), so nothing is registered
 /// and nothing is ever re-asked.
 #[test]
 fn the_reference_asks_a_response_subscription_once_too() {
@@ -614,7 +614,7 @@ fn a_response_setup_is_what_makes_a_session_readable() {
 /// ⑨: a `RSP_SETUP` whose session contradicts the one the subscription named
 /// leaves it unreadable rather than quietly re-pointing it.
 ///
-/// `aeron_driver_conductor.c:7084-7098`: a subscription that named
+/// `aeron_driver_conductor.c:7180-7194`: a subscription that named
 /// `session-id=` has said which stream it will read, and a response publication
 /// that says otherwise is a setup failure, not a correction. The reference
 /// drops the named session, poisons the link so later setups for the same
@@ -710,7 +710,7 @@ fn a_session_the_subscription_did_not_name_poisons_the_link() {
 
     assert!(
         !named.image,
-        "and the one it did name is dropped rather than read (`:7094-7096`): {named:?}"
+        "and the one it did name is dropped rather than read (`:7190-7192`): {named:?}"
     );
 
     drop(client);
@@ -720,7 +720,7 @@ fn a_session_the_subscription_did_not_name_poisons_the_link() {
 /// ⑩: a publication that claims to answer a subscription this driver does not
 /// hold is refused, rather than created to answer nothing.
 ///
-/// `aeron_driver_conductor.c:631-656`. The correlation id is a **registration
+/// `aeron_driver_conductor.c:672-697`. The correlation id is a **registration
 /// id**, which never crosses the wire, so a driver that accepted one it does
 /// not hold would create a publication whose response half can never be found —
 /// and the client would wait for an answer to a question nobody was asked.
@@ -754,7 +754,7 @@ fn a_publication_that_names_no_ones_subscription_is_refused() {
             assert_eq!(
                 deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
                 code,
-                "an EINVAL reaches a client as the generic code (`:2326-2341`)"
+                "an EINVAL reaches a client as the generic code (`:2389-2404`)"
             );
             assert_eq!(
                 "unable to find response subscription for response-correlation-id=424242",
@@ -851,7 +851,7 @@ fn the_publication_that_asks_for_a_response_says_so_in_its_setup() {
     // `control=` and **no** `endpoint=` (`samples_configuration.h:34`). That
     // is not decoration. It is what makes the two ends meet — the requester's
     // receive endpoint elicits *to* the control address, and the publication's
-    // send endpoint is bound there (`aeron_send_channel_endpoint.c:112-116`),
+    // send endpoint is bound there (`aeron_send_channel_endpoint.c:104-108`),
     // so the ask arrives; while the publication itself has nowhere to send
     // until the ask tells it where (`aeron_network_publication.c:355-378`).
     let response_control = free_udp_port(103);
@@ -868,7 +868,7 @@ fn the_publication_that_asks_for_a_response_says_so_in_its_setup() {
 
     // The one fact a requester cannot guess is which session the publication
     // speaks on, and the image is where it is told
-    // (`aeron_publication_image.c:899-923`).
+    // (`aeron_publication_image.c:904-928`).
     let said = requester
         .take_rsp_setups(Duration::from_secs(5))
         .pop()
@@ -947,7 +947,7 @@ fn refusal(result: Result<i64, CommandError>) -> (i32, String) {
 /// ⑩: the image a response publication names is found by registration id — and
 /// the id alone is not enough.
 ///
-/// `find_response_publication_image` (`aeron_driver_conductor.c:1787-1833`)
+/// `find_response_publication_image` (`aeron_driver_conductor.c:1828-1874`)
 /// walks the images for the id in `response-correlation-id` and then asks the
 /// one it found whether its sender wanted a response channel. That is the flags
 /// byte of the `SETUP` that made the image, which is the header's to say and is
@@ -961,7 +961,7 @@ fn refusal(result: Result<i64, CommandError>) -> (i32, String) {
 ///
 /// The four refusals are the reference's, and the last two are on a channel
 /// that already has a publication — which is the *other* call site
-/// (`:4350-4370`, where the image is looked for after the agreement with the
+/// (`:4447-4467`, where the image is looked for after the agreement with the
 /// publication being shared, not before it).
 #[test]
 fn a_response_publication_finds_only_the_image_that_asked_for_one() {
@@ -1096,14 +1096,14 @@ fn a_response_publication_finds_only_the_image_that_asked_for_one() {
 /// responses will arrive on — that is the *image's* session, on the far side of
 /// the handshake — and a `RSP_SETUP` is the only frame that says it
 /// (`aeron_receive_channel_endpoint_send_response_setup`,
-/// `media/aeron_receive_channel_endpoint.c:432-466`). It goes out on the
+/// `media/aeron_receive_channel_endpoint.c:437-471`). It goes out on the
 /// status-message timer, because an image has no other timer, and it goes out
 /// through the connection the request arrived on
-/// (`aeron_publication_image_send_pending_status_message`, `:899-923`).
+/// (`aeron_publication_image_send_pending_status_message`, `:904-928`).
 ///
 /// It stops when the publication reports a live receiver, which is the end of
 /// the handshake: the conductor clears what it set
-/// (`aeron_driver_conductor.c:4227-4232` sets it, `:7117-7131` clears it).
+/// (`aeron_driver_conductor.c:4324-4329` sets it, `:7213-7227` clears it).
 ///
 /// Both halves are asserted, and the second is what makes the first mean
 /// something: an image that said it once and an image that says it forever both

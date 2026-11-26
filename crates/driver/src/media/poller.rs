@@ -58,7 +58,7 @@ pub struct TransportPoller {
     /// when a pass falls back to that many or fewer. A driver with a handful of
     /// channels never makes one, and never has a socket in a set nobody waits
     /// on either. The reference is the other way round: it makes its instance
-    /// once, in `_init` (`:45`), and fills it on every add (`:96`) whether or
+    /// once, in `_init` (`:46`), and fills it on every add (`:96`) whether or
     /// not the branch it is on will ever wait on it.
     poller: Option<Poller>,
     /// The descriptors the poller was last told about, to avoid a syscall per

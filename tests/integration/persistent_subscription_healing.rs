@@ -3,12 +3,12 @@
 //! # What is judged here
 //!
 //! The reference's `shouldRecoverFromArchiveRestartDuringReplay` and
-//! `shouldReconnectToTheArchiveAfterArchiveRestart` (`…_resilience_test.cpp:835`,
-//! `:1235`), in the shape this build can drive deterministically: a subscription
+//! `shouldReconnectToTheArchiveAfterArchiveRestart` (`…_resilience_test.cpp:837`,
+//! `:1238`), in the shape this build can drive deterministically: a subscription
 //! **in the middle of a replay**, whose archive is killed and started again over
 //! the same recordings.
 //!
-//! What it must do (`on_archive_disconnected`, `:804-829`): keep the position it
+//! What it must do (`on_archive_disconnected`, `:806-831`): keep the position it
 //! had read to, let go of everything that belonged to the connection it lost,
 //! and wait for another one — **without failing**. Nothing about that is
 //! observable through messages here (the recording does not grow while the
@@ -17,7 +17,7 @@
 //!
 //! # What is *not* judged here, and why it needs a different rig
 //!
-//! `shouldContinueConsumingFromLiveWhileArchiveIsUnavailable` (`:942`) — the
+//! `shouldContinueConsumingFromLiveWhileArchiveIsUnavailable` (`:944`) — the
 //! live stream keeps being delivered while the archive is away — **cannot** be
 //! driven with this build's archiving media driver, in which the archive and the
 //! driver are one process: killing it kills the live subscription too. The

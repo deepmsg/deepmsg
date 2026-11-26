@@ -328,7 +328,7 @@ fn an_appointed_leader_is_the_one_that_serves() {
 
 /// **A consensus partition heals, the cluster elects again, and the
 /// reference's client offers on the far side of it**
-/// (`ClusterTest.shouldFormClusterAfterFullPartition`, `ClusterTest.java:3502-3559`).
+/// (`ClusterTest.shouldFormClusterAfterFullPartition`, `ClusterTest.java:3504-3561`).
 ///
 /// Every member stops hearing every other member's **consensus** traffic for a
 /// window (`debug.receive.data.loss.*` on stream 108, heartbeats included,
@@ -342,11 +342,11 @@ fn an_appointed_leader_is_the_one_that_serves() {
 ///
 /// That is the reference's own shape: its case enables a
 /// `StreamIdLossGenerator` on `consensusStreamId` and nothing else
-/// (`ClusterTest.java:3526-3530`). The log is what makes the difference. A
+/// (`ClusterTest.java:3528-3532`). The log is what makes the difference. A
 /// blackout that also stops the log leaves the leader's log ahead of its
 /// commit position — uncommitted entries it appended while it could not reach
 /// a quorum — and the container's log reader is bounded by the commit position
-/// (`BoundedLogAdapter.poll(limit)`, `BoundedLogAdapter.java:130-133`).
+/// (`BoundedLogAdapter.poll(limit)`, `BoundedLogAdapter.java:145-148`).
 /// Its old image therefore never drains, is never announced unavailable, and
 /// the new term's `JoinLog` is never taken: the consensus module waits in
 /// `awaitServicesReady` for an ack that cannot come. That is what the case

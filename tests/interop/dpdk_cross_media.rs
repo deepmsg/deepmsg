@@ -107,7 +107,7 @@ fn variable(name: &str, default: &str) -> String {
 /// Our driver, configured for the media, on the port this file names.
 ///
 /// The media selection has **no `-D` spelling** — the reference reads it from
-/// the environment alone (`aeronmd.h:731`) — which is why this takes the
+/// the environment alone (`aeronmd.h:748`) — which is why this takes the
 /// environment door rather than a property.
 fn own_driver_on_the_media(test_name: &str) -> Option<OwnDriver> {
     let port = variable(OWN_PCI, OWN_PCI_DEFAULT);

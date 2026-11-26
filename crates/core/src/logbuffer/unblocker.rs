@@ -1,7 +1,7 @@
 //! Unblocking a log at a **position**: which term it falls in, and the rotation
 //! that may have to follow.
 //!
-//! Mirrors `aeron-driver/src/main/c/concurrent/aeron_logbuffer_unblocker.c:19-66`
+//! Mirrors `aeron-driver/src/main/c/concurrent/aeron_logbuffer_unblocker.c:24-71`
 //! and Java's `io.aeron.logbuffer.LogBufferUnblocker`
 //! (`aeron-client/src/main/java/io/aeron/logbuffer/LogBufferUnblocker.java:40-78`),
 //! which are the same thirty lines under two different module roofs — C files it
@@ -30,7 +30,7 @@ use super::repair::{UnblockStatus, Unblocker};
 /// Returns whether anything was done. A publication calls this when it has been
 /// blocked past its unblock timeout, and again on every time event while it
 /// drains — see `aeron_logbuffer_unblocker.c`'s two callers in
-/// `aeron_network_publication.c:1019` and `aeron_ipc_publication.c:579`.
+/// `aeron_network_publication.c:1019` and `aeron_ipc_publication.c:605`.
 ///
 /// `blocked_position` is a **position** in the stream, not an offset in a term:
 /// which term it falls in, and therefore which partition's block of memory is
@@ -57,7 +57,7 @@ pub fn unblock(log: &LogFile, blocked_position: i64, term_length: i32) -> bool {
     // the blocked position is the first byte of the term before it. That term
     // is full and the rotation it is owed never happened, so the rotation is
     // the whole of the unblocking — there is nothing to examine
-    // (`aeron_logbuffer_unblocker.c:38-49`, `LogBufferUnblocker.java:51-56`).
+    // (`aeron_logbuffer_unblocker.c:43-54`, `LogBufferUnblocker.java:51-56`).
     //
     // The rotation's own answer is deliberately discarded, as the reference
     // discards it: losing the compare-exchange means somebody else rotated,
@@ -104,7 +104,7 @@ pub fn unblock(log: &LogFile, blocked_position: i64, term_length: i32) -> bool {
 }
 
 /// The raw tail of the partition that `term_count` falls in, read **acquire**
-/// (`aeron_logbuffer_descriptor.h:94-102`: the count is what says which counter
+/// (`aeron_logbuffer_descriptor.h:95-103`: the count is what says which counter
 /// is current, so it is read first and this follows from it).
 fn raw_tail(metadata: &AtomicBuffer<'_, ReadWrite>, term_count: i32) -> Option<RawTail> {
     let index = position::index_by_term_count(term_count);
@@ -165,7 +165,7 @@ mod tests {
 
         // And the default-header template, which is what a padding frame is
         // built from. A real log buffer always has one — the driver writes it at
-        // publication creation (`aeron_ipc_publication.c:107-142`) — so the
+        // publication creation (`aeron_ipc_publication.c:112-147`) — so the
         // fixture has one too, as every other test in this crate does. (The
         // reference's C test leaves the block zeroed and gets away with it,
         // because a zero template length is a `memcpy` of zero bytes there; that

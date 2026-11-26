@@ -216,7 +216,7 @@ fn launch(driver: &OwnArchivingMediaDriver, cluster_dir: &TempDir) -> ConsensusM
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
             .expect("the configuration parses");
     // This build has no class loader; the flag is the programmatic
-    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2193`).
     config.consensus_module_extension = true;
     ConsensusModuleAgent::launch(config).expect("the module launches")
 }
@@ -391,7 +391,7 @@ fn shutdown_snapshots_and_then_ends_the_duty_cycle() {
         i64::from(ModuleState::Closed.code()),
         counter_value(&agent, MODULE_STATE_TYPE_ID)
     );
-    // An orderly shutdown is a snapshot first (`:2585-2607`).
+    // An orderly shutdown is a snapshot first (`:2620-2642`).
     assert_eq!(1, agent.recovery_plan().snapshots.len());
     assert_eq!(1, counter_value(&agent, SNAPSHOT_COUNTER_TYPE_ID));
     // A shutdown is not an operator action the module resets: the reference
@@ -552,7 +552,7 @@ fn an_admin_snapshot_request_switches_the_control_toggle() {
     driver.await_ready(DEADLINE).expect("the driver is ready");
 
     // The reference's own admin test runs with `AuthorisationService.ALLOW_ALL`
-    // (`ClusterTest.java:2093-2096`): the default service denies an
+    // (`ClusterTest.java:2097-2100`): the default service denies an
     // `AdminRequest`, so an injection-configuring test has to say otherwise.
     let mut config =
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))

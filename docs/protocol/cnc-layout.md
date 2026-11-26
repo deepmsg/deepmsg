@@ -48,7 +48,7 @@ The reference applies two rules, and they come from different implementations:
 | Rule | Source | Fatal? |
 |---|---|---|
 | major must match | `aeron-client/src/main/c/aeron_cnc_file_descriptor.c:103` | yes |
-| the file's minor must be ≥ ours | `aeron-client/src/main/java/io/aeron/CommonContext.java:1432`, `aeron-client/src/main/c/aeron_context.c:617` | yes |
+| the file's minor must be ≥ ours | `aeron-client/src/main/java/io/aeron/CommonContext.java:1493`, `aeron-client/src/main/c/aeron_context.c:617` | yes |
 
 **The C reference is inconsistent with itself here.** Its *read* path checks
 only the major; its *command* path (`aeron_context.c:617-624`, in
@@ -74,10 +74,10 @@ exercise one branch of this table. The rules are unit-tested in
 `cnc_version != 0`, read **with an acquire**, is the single readiness gate.
 
 The driver fills every other field first
-(`aeron-driver/src/main/c/aeron_driver.c:252-260`) and only then stores the
+(`aeron-driver/src/main/c/aeron_driver.c:269-277`) and only then stores the
 version with a release
-(`aeron-driver/src/main/c/aeron_driver_context.h:456`, called at
-`aeron_driver.c:972`), before any agent thread starts. An acquire that observes
+(`aeron-driver/src/main/c/aeron_driver_context.h:464`, called at
+`aeron_driver.c:1012`), before any agent thread starts. An acquire that observes
 a non-zero version therefore orders every other field in the block, which is
 why the reader can copy the whole 128 bytes afterwards and decode them as plain
 little-endian.
@@ -89,27 +89,27 @@ more (`aeron_cnc_file_descriptor.c:70,88`).
 
 Only a media driver creates a CnC file. The reference has no client-side
 creation path: `aeron_cnc_length` is a function of the *driver's* context
-(`aeron-driver/src/main/c/aeron_driver_context.c:1690`), and a client only
+(`aeron-driver/src/main/c/aeron_driver_context.c:1734`), and a client only
 ever maps a file that is already there (`aeron-client/src/main/c/aeron_context.c:220`
 unmaps the one it was handed). A client that finds an aeron directory with no
 `cnc.dat` in it is looking at a dead driver, not at a job to do.
 
 Creation is exclusive — `open(O_RDWR|O_CREAT|O_EXCL, 0666)`
-(`aeron-client/src/main/c/util/aeron_fileutil.c:967`) — so a driver pointed at
+(`aeron-client/src/main/c/util/aeron_fileutil.c:966`) — so a driver pointed at
 a directory another driver holds fails rather than sharing the file. What to
 do about that directory is decided *before* the create, by the driver's
-directory discipline (`aeron-driver/src/main/c/aeron_driver.c:136-235`): a
+directory discipline (`aeron-driver/src/main/c/aeron_driver.c:153-252`): a
 heartbeat inside the driver timeout means `EBUSY`, and anything else means the
 directory is deleted and rebuilt.
 
 The length is allocated rather than merely declared: the CnC file is mapped
 with `fill_with_zeroes = true` (`aeron-driver.c:313`), which selects a
-non-sparse file (`aeron_fileutil.c:1135`) and then touches every page
-(`:1123-1132`). The fields are written plainly and the version is stored last
-with a release (`aeron-driver.c:972`), then the whole file is flushed (`:973`).
+non-sparse file (`aeron_fileutil.c:1134`) and then touches every page
+(`:1122-1131`). The fields are written plainly and the version is stored last
+with a release (`aeron-driver.c:972`), then the whole file is flushed (`:1013`).
 deepmsg splits that into `CncFile::create` and `CncFile::publish`, because
 there is work that belongs between them: the driver writes its first heartbeat
-one line before the version (`:971`), and a client that passes the version
+one line before the version (`:970`), and a client that passes the version
 gate must not then find a heartbeat of zero. `publish` **enforces** that order
 rather than documenting it: a file whose to-driver heartbeat is still zero is
 refused, because the alternative is a file that every client reads as a driver
@@ -169,10 +169,10 @@ then five `volatile int64` fields each padded out to a two-line block
 
 `consumer_heartbeat` is the liveness signal: the driver is considered alive
 while `now_ms - heartbeat <= driver_timeout_ms`
-(`aeron-driver/src/main/c/aeron_driver_context.c:1625-1643`). There is no lock
+(`aeron-driver/src/main/c/aeron_driver_context.c:1669-1687`). There is no lock
 file anywhere in the aeron-directory discipline. A driver shutting down
 deliberately writes `AERON_NULL_VALUE` (`-1`) there
-(`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`), which is a different
+(`aeron-driver/src/main/c/aeron_driver_conductor.c:3590`), which is a different
 signal from a stale timestamp.
 
 **to-clients broadcast** — 128 bytes, three `volatile int64` with **no**
@@ -209,7 +209,7 @@ a padding record; `length <= 0` ends a scan.
 ## Writing a command
 
 A client sends a command by claiming a record in the to-driver ring and filling
-it in place (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:143-202`). The claim
+it in place (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:145-204`). The claim
 reserves `align_up(payload + 8, 8)` bytes of index space; the record is then:
 
 | # | Store | Ordering |
@@ -254,7 +254,7 @@ They are ceremony the wire format requires — there is no reply to correlate.
 ## Counters
 
 Metadata records are **512 bytes**, value records **128**, indexed identically
-by counter id (`aeron-client/src/main/c/aeronc.h:849-870`).
+by counter id (`aeron-client/src/main/c/aeronc.h:852-873`).
 
 | Metadata offset | Field |
 |---|---|
@@ -328,7 +328,7 @@ All three carry the same **112-byte key**
 
 Every field is written, including the channel's tail past the 92nd byte — the
 reference builds the key as a designated initialiser
-(`aeron-driver/src/main/c/aeron_position.c:41-42`), so what it does not name is
+(`aeron-driver/src/main/c/aeron_position.c:46-47`), so what it does not name is
 zero rather than whatever was on the stack. The label is the other way round:
 it carries the channel **whole**, up to 380 bytes (`:35-39`), and its length
 field is the label's own. A 200-byte URI therefore produces a label that shows
@@ -339,14 +339,14 @@ Which side writes which is the whole of the backpressure contract: the producer
 writes `pub-pos` through the log's tail (and the driver writes it again from the
 same place every duty cycle), the driver is the only writer of `pub-lmt`, and a
 subscriber writes `sub-pos` — whereupon the driver recomputes `pub-lmt` from the
-smallest of them (`aeron-driver/src/main/c/aeron_ipc_publication.c:278-328`).
+smallest of them (`aeron-driver/src/main/c/aeron_ipc_publication.c:283-333`).
 A reader that reads without reporting eventually stops the producer, which is
 the property `tests/interop/c_driver_pubsub.rs` asserts from the other side.
 
 ### The system counters
 
 A driver allocates forty-six of them at conductor init
-(`aeron-driver/src/main/c/aeron_system_counters.c:24-71`), all with type id `0`,
+(`aeron-driver/src/main/c/aeron_system_counters.c:29-76`), all with type id `0`,
 a four-byte little-endian **index** as the key, the index as their
 `registration_id` and `NULL_VALUE` as their owner. The reference fails init if
 the manager hands back any id other than the table index (`:99-107`), so they
@@ -361,7 +361,7 @@ claim to have been written by a build that does not exist — and it is why a
 golden comparison of the two catalogues masks those two labels.
 
 The reference also appends runtime context to eight labels
-(`aeron_driver_conductor.c:848-951`): the resolver's name, the driver's
+(`aeron_driver_conductor.c:889-992`): the resolver's name, the driver's
 threading mode and the duty-cycle thresholds. deepmsg appends to three of them;
 the sender, receiver and name-resolver counters keep their base labels, because
 those agents are not built yet and a suffix naming the duty cycle of something
@@ -403,7 +403,7 @@ still being written by another process.
 A reader must not:
 
 - advance `head_position` or zero the MPSC ring — that is the driver's job as
-  the ring's single consumer (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:242-246`);
+  the ring's single consumer (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:245-249`);
 - write any broadcast counter;
 - assume a region's length is page-aligned, or that the metadata struct is as
   long as the metadata region.
@@ -462,12 +462,12 @@ rather than on arrival order is what makes that harmless.
 sight of a `client_id` — there is no registration command in this protocol —
 and allocates a heartbeat counter for it: type id `11`, registration id equal
 to the client id
-(`aeron-driver/src/main/c/aeron_driver_conductor.c:994-998`).
+(`aeron-driver/src/main/c/aeron_driver_conductor.c:1035-1039`).
 
 The driver reaps that client once the counter's age exceeds
 `aeron.client.liveness.timeout`, **10 s by default**, and reaping destroys every
 subscription, publication and counter the client owned
-(`aeron_driver_conductor.c:1038-1055`, `:1233-1283`). It announces the fact as
+(`aeron_driver_conductor.c:1079-1096`, `:1274-1324`). It announces the fact as
 `ON_CLIENT_TIMEOUT` (`0x0F0A`).
 
 A client writes that counter directly on every duty cycle — the reference does
@@ -482,7 +482,7 @@ treated as an error.
 ### A leak in the reference, recorded rather than copied
 
 When a command's deadline expires, the reference marks it timed out and sends
-nothing (`aeron_client_conductor.c:1451-1481`). The driver keeps whatever it
+nothing (`aeron_client_conductor.c:1498-1528`). The driver keeps whatever it
 created, so a subscription can exist that the client believes failed — and its
 registration id, which is the correlation id, is the only handle on it. That is
 why the timeout error here carries the correlation id.

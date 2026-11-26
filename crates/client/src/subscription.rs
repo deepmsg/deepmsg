@@ -7,7 +7,7 @@
 //! client asked for, the image is what it got
 //! (`aeron-client/src/main/c/aeron_subscription.h:24-40`).
 //!
-//! Mirrors `aeron-client/src/main/c/aeron_client_conductor.c:1040-1080`.
+//! Mirrors `aeron-client/src/main/c/aeron_client_conductor.c:1078-1118`.
 
 use deepmsg_cnc::command::CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED;
 use deepmsg_cnc::counters::{
@@ -206,9 +206,9 @@ impl Subscription {
             // And **only a read that moved the position** is published, which is
             // the reference's own gate: `Image.poll` writes the counter only
             // `if (newPosition > initialPosition)` (`Image.java:374-378`;
-            // `aeron_image.c:314-322`). Publishing one that did not move
+            // `aeron_image.c:318-326`). Publishing one that did not move
             // re-sends the value the counter already holds — which the driver's
-            // window computation (`aeron_ipc_publication.c:296-313`) cannot tell
+            // window computation (`aeron_ipc_publication.c:301-318`) cannot tell
             // from not writing at all — on the **empty** poll that is most of a
             // waiting reader's turns. It is also what makes the caller's own
             // gate real: an empty poll hands it nothing to publish, so it never
@@ -371,7 +371,7 @@ impl Subscription {
     ///
     /// The archive's replay merge is what asks: until a subscription is
     /// connected there is no image to look for, so the state that waits for the
-    /// replay's image does not look (`ReplayMerge.java:429-436`).
+    /// replay's image does not look (`ReplayMerge.java:434-441`).
     pub fn is_connected(&self) -> bool {
         self.images.iter().any(|image| !image.is_closed())
     }

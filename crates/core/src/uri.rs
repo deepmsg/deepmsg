@@ -24,17 +24,17 @@
 //!
 //! [`ChannelUriStringBuilder`] is the write half — the reference's
 //! `ChannelUriStringBuilder`, field for field and in its parameter order
-//! (`ChannelUriStringBuilder.java:45-86`, `:2451-2512`). It is here because the
+//! (`ChannelUriStringBuilder.java:45-86`, `:2505-2566`). It is here because the
 //! archive derives the channel it answers a client on by rebuilding the
-//! client's own URI (`ArchiveConductor.java:458-481`), and that means writing
+//! client's own URI (`ArchiveConductor.java:457-480`), and that means writing
 //! one.
 //!
 //! # One thing the reference's builder does and this does not
 //!
 //! `ChannelUriStringBuilder` **validates its arguments** and throws:
 //! `build` refuses a URI with no media, or a `udp` one with neither `endpoint`
-//! nor `control` (`:216-242`); `mtu` must be 32-65504 and frame-aligned
-//! (`:610-615`), `ttl` 0-255 (`:550`), a term offset inside its term (`:838-843`).
+//! nor `control` (`:215-241`); `mtu` must be 32-65504 and frame-aligned
+//! (`:609-614`), `ttl` 0-255 (`:550`), a term offset inside its term (`:837-842`).
 //! This writes what it is given.
 //!
 //! The checks are not here because every value this build sets comes from a URI
@@ -75,7 +75,7 @@ pub const TAG_PREFIX: &str = "tag:";
 /// (`aeron-client/src/main/c/uri/aeron_uri.h:45`).
 pub const ENDPOINT_PARAM_NAME: &str = "endpoint";
 
-/// `CommonContext.INTERFACE_PARAM_NAME` (`CommonContext.java:257`), which
+/// `CommonContext.INTERFACE_PARAM_NAME` (`CommonContext.java:259`), which
 /// `ChannelUri.createDestinationUri` carries over (`ChannelUri.java:593-598`).
 pub const INTERFACE_PARAM_NAME: &str = "interface";
 
@@ -83,7 +83,7 @@ pub const INTERFACE_PARAM_NAME: &str = "interface";
 /// (`aeron_uri.h:59`).
 pub const LINGER_PARAM_NAME: &str = "linger";
 
-/// `CommonContext.EOS_PARAM_NAME` (`:356`), `AERON_URI_EOS_KEY`
+/// `CommonContext.EOS_PARAM_NAME` (`:358`), `AERON_URI_EOS_KEY`
 /// (`aeron_uri.h:62`).
 pub const EOS_PARAM_NAME: &str = "eos";
 
@@ -240,7 +240,7 @@ impl ChannelUri {
     /// Set a parameter, in the place the URI already carries it.
     ///
     /// This is the writer for a URI that was *read* rather than built, which
-    /// `ArchiveConductor.java:231-232` needs: the archive forces its own
+    /// `ArchiveConductor.java:230-231` needs: the archive forces its own
     /// `sparse` into the configured control channel before subscribing to it.
     ///
     /// **In place, because a channel's identity is its text** — see the type's
@@ -415,7 +415,7 @@ impl ChannelUri {
 ///
 /// Every setter is one field of the same name in
 /// `ChannelUriStringBuilder.java:45-86`, and [`ChannelUriStringBuilder::build`]
-/// writes them in the order `:2451-2512` writes them — which is the whole of
+/// writes them in the order `:2505-2566` writes them — which is the whole of
 /// what makes two builders produce the same string.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChannelUriStringBuilder {
@@ -507,7 +507,7 @@ impl ChannelUriStringBuilder {
     /// The `aeron-spy` (or other) prefix, written before `aeron:`.
     ///
     /// It is not a parameter: it goes in front of the scheme and carries its
-    /// own colon (`ChannelUriStringBuilder.java:2455-2458`).
+    /// own colon (`ChannelUriStringBuilder.java:2509-2512`).
     pub fn prefix(&mut self, value: impl Into<String>) -> &mut Self {
         self.prefix = Some(value.into());
         self
@@ -630,10 +630,10 @@ impl ChannelUriStringBuilder {
         self
     }
 
-    /// The URI, in the reference's parameter order (`:2451-2512`).
+    /// The URI, in the reference's parameter order (`:2505-2566`).
     ///
     /// The trailing separator is dropped, which is why a URI with no
-    /// parameters is `aeron:ipc` and not `aeron:ipc?` (`:2507-2511`).
+    /// parameters is `aeron:ipc` and not `aeron:ipc?` (`:2562-2566`).
     pub fn build(&self) -> String {
         let mut out = String::with_capacity(128);
 
@@ -1236,7 +1236,7 @@ mod tests {
     }
 
     /// Setting a parameter that is already there leaves it where it was, which
-    /// is the whole point: `ArchiveConductor.java:231-232` forces `sparse` into
+    /// is the whole point: `ArchiveConductor.java:230-231` forces `sparse` into
     /// a configured control channel, and a rewrite that moved it to the end
     /// would be a different channel.
     #[test]

@@ -52,7 +52,7 @@ shows nothing, which is the cheapest check that the generator is deterministic.
 **Every recording is finished** — a real stop position and stop timestamp rather
 than `NULL_POSITION`. A record that is `VALID` with a null stop position is one
 the reference tries to *repair* on open, by reading the recording's **segment
-files** (`refreshAndFixDescriptor`, `Catalog.java:1066`), and this fixture has no
+files** (`refreshAndFixDescriptor`, `Catalog.java:1069`), and this fixture has no
 segments: it would fail for a reason that has nothing to do with the catalog's
 layout. What a catalog of *live* recordings looks like is the archive's question,
 not a format fixture's.
@@ -64,4 +64,4 @@ would land somewhere that is not a record. The frame lengths are 256, 192 and
 
 `GenerateCatalog.java` is in `package io.aeron.archive` for the same reason
 `GenerateMarkFile.java` is: the constructor that creates a catalog is
-package-private (`Catalog.java:152`), as is `addNewRecording` (`:407`).
+package-private (`Catalog.java:155`), as is `addNewRecording` (`:410`).

@@ -256,8 +256,8 @@ impl LogAdapter {
     /// (`boundedControlledPoll`, `:96-104`).
     ///
     /// A live follower bounds this at `min(commitPosition, limit)` and a replay
-    /// at the replay's stop position (`ConsensusModuleAgent.java:2523`,
-    /// `:1853`) — the same number, the reference's single `LogAdapter` serves
+    /// at the replay's stop position (`ConsensusModuleAgent.java:2549`,
+    /// `:1869`) — the same number, the reference's single `LogAdapter` serves
     /// both.
     ///
     /// # Errors

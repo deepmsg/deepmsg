@@ -4,7 +4,7 @@
 //! evidence, but it cannot run in CI — so the matching loop and the deadline
 //! are exercised here against replies the test fabricates byte for byte. That
 //! is the same technique the reference's own client test uses
-//! (`aeron-client/src/test/c/aeron_client_conductor_test.cpp:338-355`).
+//! (`aeron-client/src/test/c/aeron_client_conductor_test.cpp:336-353`).
 //!
 //! What is *not* here: the encoding and decoding of a message. Those are pure
 //! functions with their own tests in `deepmsg-cnc`; what needs a client is the
@@ -156,7 +156,7 @@ fn matches_a_ready_response_by_correlation_id() {
 /// its map and only then awaits the response (`ClientConductor.java:749-750`),
 /// writing the counter id on it when the response arrives (`:396`), and C
 /// creates the subscription inside the ready handler itself
-/// (`aeron_client_conductor.c:625-652`). It is what closes the gap in which an
+/// (`aeron_client_conductor.c:659-686`). It is what closes the gap in which an
 /// image for this subscription could arrive before the subscription existed.
 #[test]
 fn a_subscription_is_registered_before_its_channel_status_counter_is_known() {
@@ -251,7 +251,7 @@ fn closing_a_client_tells_the_driver_once() {
 ///
 /// The three states the reference's poll can be in
 /// (`aeron_client_conductor_async_resource_poll`,
-/// `aeron_client_conductor.c:3675-3775`): awaiting, registered, and — since
+/// `aeron_client_conductor.c:3762-3862`): awaiting, registered, and — since
 /// polling consumes the answer — nothing left to say.
 #[test]
 fn an_async_add_is_awaiting_then_ready_then_nothing() {
@@ -408,7 +408,7 @@ fn a_client_that_goes_out_of_scope_says_goodbye_too() {
 /// That ordering is the reference's, in both implementations: Java notifies
 /// before `driverProxy.clientClose` (`ClientConductor.java:184` against `:203`),
 /// and C notifies at the top of `aeron_client_conductor_on_close` and claims the
-/// command at the bottom (`aeron_client_conductor.c:2749-2751` against `:2779`).
+/// command at the bottom (`aeron_client_conductor.c:2797-2799` against `:2827`).
 /// It is worth a test rather than a doc comment because it is the one thing a
 /// handler can be used for that a queue could not do — and because getting it
 /// backwards would be invisible until something needed it.
@@ -705,9 +705,9 @@ fn commands_written(dir: &Path) -> Vec<(i32, Vec<u8>)> {
 ///
 /// There is no separate allocation for a destination in the reference: its
 /// client completes a registering resource when the reply's correlation id
-/// matches the one it is waiting on (`aeron_client_conductor.c:975-991`), and
+/// matches the one it is waiting on (`aeron_client_conductor.c:1013-1029`), and
 /// `aeron_async_destination_get_registration_id` is documented as returning
-/// "correlation_id sent to driver" (`aeronc.h:2697-2705`). So the id a caller
+/// "correlation_id sent to driver" (`aeronc.h:2721-2729`). So the id a caller
 /// removes a destination by is the id of the command that created it, and that
 /// is what this pins.
 #[test]
@@ -811,11 +811,11 @@ fn every_destination_operation_completes_on_the_same_reply() {
 /// the reference answers nothing to, and the client has to survive that the way
 /// the reference's own clients do: by timing out.
 ///
-/// `aeron_driver_conductor.c:3188-3200` calls the handler without taking its
-/// result, so the `-1` it returns for a publication it cannot find (`:5562-5578`)
-/// never reaches the `result < 0` at `:3222-3225` that would send an `ON_ERROR`.
-/// Every other destination command assigns it (`:3020`, `:3035`, `:3055-3062`,
-/// `:3083-3090`). This build reproduces that rather than improving on it —
+/// `aeron_driver_conductor.c:3285-3297` calls the handler without taking its
+/// result, so the `-1` it returns for a publication it cannot find (`:5659-5675`)
+/// never reaches the `result < 0` at `:3319-3322` that would send an `ON_ERROR`.
+/// Every other destination command assigns it (`:3083`, `:3098`, `:3118-3125`,
+/// `:3146-3153`). This build reproduces that rather than improving on it —
 /// `docs/compat.md` carries the line — so a caller that names an unknown
 /// publication waits. This pins that the wait ends on the caller's own deadline,
 /// against the id it used, rather than hanging or blaming a connection.

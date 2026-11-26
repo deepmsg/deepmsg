@@ -105,7 +105,7 @@ def main():
             "A class here produced no result at all. The timeout is the reference's own\n"
             "problem to have: at least one of its tests waits on something this driver does\n"
             "not do in a loop with no timeout, and `Thread.yield()` swallows the interrupt\n"
-            "its own `InterruptingTestCallback` sends. See `CounterTest.java:640`.\n"
+            "its own `InterruptingTestCallback` sends. See `CounterTest.java:642`.\n"
         )
         for name, verdict in stopped:
             print(f"- `{name}` — {verdict}")

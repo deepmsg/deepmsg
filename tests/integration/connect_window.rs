@@ -87,7 +87,7 @@ fn connecting_gives_up_when_no_driver_ever_arrives() {
 /// Two shapes of "gone", because the reference's fourth step has two ways to
 /// arrive there (`aeronc.c:149-167`): an orderly shutdown writes
 /// `NULL_VALUE` into the heartbeat on its way out
-/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`), and a driver that
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:3590`), and a driver that
 /// was killed leaves a timestamp that simply ages out of the window.
 #[test]
 fn connecting_does_not_take_a_file_a_dead_driver_left_behind() {

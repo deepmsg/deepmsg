@@ -86,7 +86,7 @@ pub enum RecordingSignal {
 
 /// An archive-to-archive replication of a log (reference
 /// `RecordingReplication.java`). Created by `ElectionHost::new_log_replication`
-/// (`ConsensusModuleAgent.java:2951`), advanced by
+/// (`ConsensusModuleAgent.java:2974`), advanced by
 /// [`Election::on_recording_signal`](crate::election::Election::on_recording_signal).
 ///
 /// **The state machine is here; the work is not.** The reference's `poll`

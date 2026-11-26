@@ -367,7 +367,7 @@ pub fn service_counter(
 /// (`ClusterCounters.java:175-204`).
 ///
 /// A service counter whose label is also versioned; the container allocates
-/// exactly this shape for its error counter (`ClusteredServiceContainer.java:955`).
+/// exactly this shape for its error counter (`ClusteredServiceContainer.java:989`).
 ///
 /// # Errors
 ///
@@ -395,7 +395,7 @@ pub fn service_error_counter(
 ///
 /// Key: `clusterId` (4 bytes) then the session id (8 bytes), both
 /// little-endian. Label: `cluster-session: <sessionInfo> - clusterId=<clusterId>`.
-/// The reader that pins this shape is `ClusterTest.java:3247-3255`, which reads
+/// The reader that pins this shape is `ClusterTest.java:3251-3259`, which reads
 /// the cluster id at 0 and the session id at 4.
 ///
 /// # Errors

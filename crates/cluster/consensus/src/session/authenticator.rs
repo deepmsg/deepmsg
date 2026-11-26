@@ -2,7 +2,7 @@
 //!
 //! Counterpart of `io.aeron.security.{Authenticator, SessionProxy,
 //! AuthorisationService}` plus the cluster's two supplier lookups
-//! (`ConsensusModule.java:1307-1370`). The interfaces live in `aeron-client` in
+//! (`ConsensusModule.java:1321-1384`). The interfaces live in `aeron-client` in
 //! the reference, not in the cluster, because the archive uses the same two
 //! questions.
 //!
@@ -224,7 +224,7 @@ impl std::fmt::Display for AuthConfigError {
 
 impl std::error::Error for AuthConfigError {}
 
-/// Build the authenticator a name asks for (`ConsensusModule.java:1312-1332`).
+/// Build the authenticator a name asks for (`ConsensusModule.java:1326-1346`).
 ///
 /// # Errors
 ///
@@ -241,7 +241,7 @@ pub fn authenticator_for(name: &str) -> Result<Box<dyn Authenticator>, AuthConfi
 }
 
 /// Build the authorisation service a name asks for
-/// (`ConsensusModule.java:1341-1370`): the two tokens the reference
+/// (`ConsensusModule.java:1355-1384`): the two tokens the reference
 /// special-cases, and the default for an unset name.
 ///
 /// # Errors

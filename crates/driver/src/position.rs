@@ -1,6 +1,6 @@
 //! The position counters a driver publishes, and the key they all carry.
 //!
-//! Mirrors `aeron-driver/src/main/c/aeron_position.c:23-111`. Three counters
+//! Mirrors `aeron-driver/src/main/c/aeron_position.c:28-116`. Three counters
 //! come from one allocator there — `pub-pos`, `pub-lmt` and `sub-pos` differ
 //! only in their type id, their name and a suffix — because they are one shape:
 //! a position belonging to a `(registration, session, stream, channel)` tuple,
@@ -10,10 +10,10 @@
 //! # The channel appears twice, and differently
 //!
 //! In the **label** it is written whole, up to 380 bytes
-//! (`aeron_position.c:35-39`), because the label is for a human reading
+//! (`aeron_position.c:40-44`), because the label is for a human reading
 //! `AeronStat`. In the **key** it is truncated to the 92 bytes the struct leaves
 //! for it, and the key's length field records *that* length
-//! (`:44-47`) — so a 200-byte URI produces a label that shows all of it and a
+//! (`:49-52`) — so a 200-byte URI produces a label that shows all of it and a
 //! key that shows the first 92 and says so. Copying one length into the other is
 //! a bug that no test of either alone would catch.
 
@@ -60,10 +60,10 @@ pub mod type_id {
     /// `AERON_COUNTER_NAME_RESOLVER_NEIGHBORS_COUNTER_TYPE_ID` (`:111`), the
     /// counter a **driver's own resolver** keeps the size of its neighbor list
     /// in, labelled `Resolver neighbors: bound <address>`
-    /// (`aeron_driver_name_resolver.c:234-243`, `:476-489`).
+    /// (`aeron_driver_name_resolver.c:234-243`, `:477-490`).
     pub const NAME_RESOLVER_NEIGHBORS: i32 = 15;
     /// `AERON_COUNTER_NAME_RESOLVER_CACHE_ENTRIES_COUNTER_TYPE_ID` (`:113`),
-    /// labelled `Resolver cache entries: name=<name>` (`:490-506`).
+    /// labelled `Resolver cache entries: name=<name>` (`:491-507`).
     pub const NAME_RESOLVER_CACHE_ENTRIES: i32 = 16;
     /// `AERON_COUNTER_NAME_RESOLVER_BOOTSTRAP_NEIGHBOR_COUNTER_TYPE_ID`
     /// (`:126`), one for each bootstrap neighbor the resolver was configured
@@ -81,7 +81,7 @@ pub mod type_id {
 pub use deepmsg_cnc::position_key::StreamPositionKey;
 
 /// The label every one of these counters carries, formatted as the reference
-/// formats it (`aeron_position.c:35-39`): `name: <registration> <session>
+/// formats it (`aeron_position.c:40-44`): `name: <registration> <session>
 /// <stream> <channel><suffix>`.
 pub fn stream_counter_label(
     name: &str,
@@ -99,7 +99,7 @@ pub fn stream_counter_label(
 }
 
 /// Allocate a counter of the shape every stream position uses
-/// (`aeron_position.c:23-62`).
+/// (`aeron_position.c:28-67`).
 ///
 /// Returns the id, or `None` if the manager is full — and leaves nothing behind
 /// when it fails, because the manager's own allocation is the only step that can
@@ -216,7 +216,7 @@ pub fn allocate_publisher_limit(
 /// (`AERON_COUNTER_SUBSCRIPTION_POSITION_TYPE_ID`, `aeron_counters.h:80-81`).
 ///
 /// One per (subscription, publication) pair, and the join position is in the
-/// **label** (`aeron_position.c:86-105`) because it is what a reader needs to
+/// **label** (`aeron_position.c:91-110`) because it is what a reader needs to
 /// interpret the value: a subscriber that reads 0 is caught up if it joined at
 /// 0 and an eternity behind if it joined at a million.
 #[allow(clippy::too_many_arguments)] // one per field of the key and the label
@@ -289,7 +289,7 @@ pub mod channel_status {
 /// the channel's length and the channel.
 ///
 /// The reference builds this with a `memcpy` into an uninitialized struct
-/// (`aeron_position.c:220-222`), so everything past the copied bytes is
+/// (`aeron_position.c:225-227`), so everything past the copied bytes is
 /// whatever was on its stack. Here it is zero — the same bytes for the same
 /// channel every time, which is the point of a key.
 pub struct ChannelStatusKey<'a> {
@@ -383,7 +383,7 @@ impl LocalSockaddrKey<'_> {
 
 /// Allocate the counter that says where an endpoint or destination is actually
 /// bound (`aeron_counter_local_sockaddr_indicator_allocate`,
-/// `aeron-driver/src/main/c/aeron_position.c:276-309`).
+/// `aeron-driver/src/main/c/aeron_position.c:281-314`).
 ///
 /// Its **value** is the endpoint's state rather than a position — the caller
 /// writes `ACTIVE` once the socket is up — and its label names both the channel
@@ -415,7 +415,7 @@ pub fn allocate_local_sockaddr_counter(
     .encode();
 
     // `"%s: %d %s"` — the name, the channel status, and the address
-    // (`aeron_position.c:295-297`).
+    // (`aeron_position.c:300-302`).
     let label = format!("{name}: {channel_status_counter_id} {local_sockaddr}");
 
     let counter_id = manager.allocate(
@@ -432,7 +432,7 @@ pub fn allocate_local_sockaddr_counter(
 }
 
 /// Allocate a channel-status counter for an endpoint
-/// (`aeron_channel_endpoint_status_allocate`, `aeron_position.c:204-229`).
+/// (`aeron_channel_endpoint_status_allocate`, `aeron_position.c:209-234`).
 ///
 /// Its **value** is the endpoint's state rather than a position, and its
 /// registration id is the endpoint's own — which is what a client reads to
@@ -539,7 +539,7 @@ mod tests {
     }
 
     /// The counter itself: type 14, the address in its label beside the channel
-    /// status it belongs to (`aeron_position.c:295-297`), and the client that
+    /// status it belongs to (`aeron_position.c:300-302`), and the client that
     /// asked as its registration id.
     #[test]
     fn a_local_address_counter_names_the_channel_status_and_the_address() {

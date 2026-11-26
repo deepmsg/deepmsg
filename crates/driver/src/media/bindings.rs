@@ -4,7 +4,7 @@
 //! (`aeron_udp_channel_transport_bindings_t`,
 //! `media/aeron_udp_channel_transport_bindings.h:113-134`) that the context
 //! loads by name from `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA`
-//! (`aeron_driver_context.c:1258-1263`). Of its twelve slots, [`Transport`]
+//! (`aeron_driver_context.c:1288-1293`). Of its twelve slots, [`Transport`]
 //! already carries the ones a transport answers for itself; what is here are
 //! the two that **make** things — `init_func`, which opens a transport
 //! (`:43-50`), and `poller_init_func`, which makes a thread's poller
@@ -22,7 +22,7 @@
 //! **The conductor's transports do not come through here.** The reference
 //! gives the conductor a bindings of its own
 //! (`AERON_CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA`,
-//! `aeron_driver_context.c:1266-1270`) and the name resolver is its only user
+//! `aeron_driver_context.c:1296-1300`) and the name resolver is its only user
 //! (`aeron_driver_name_resolver.c:399`); this build serves `default` there
 //! and nothing else, so the resolver opens its socket directly
 //! (`crate::name_resolver::driver`).
@@ -179,7 +179,7 @@ fn keeps_the_cpu(setting: &IdleStrategySetting) -> bool {
 ///
 /// The reference passes it to `init_func` and `poller_init_func`, and its
 /// default bindings read it only to name it in a bind failure
-/// (`media/aeron_udp_channel_transport.c:151,209,271`, which is where the
+/// (`media/aeron_udp_channel_transport.c:165,209,271`, which is where the
 /// `affinity=0` and `affinity=1` in the endpoints' bind reports come from):
 /// it is there for bindings that give each thread a queue of its own, which
 /// have to know at open time whose queue a transport belongs to. The
@@ -188,17 +188,17 @@ fn keeps_the_cpu(setting: &IdleStrategySetting) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Affinity {
     /// `AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_SENDER`: a send endpoint's
-    /// transport (`media/aeron_send_channel_endpoint.c:140`), and the sender's
-    /// poller (`aeron_driver_sender.c:43-44`).
+    /// transport (`media/aeron_send_channel_endpoint.c:133`), and the sender's
+    /// poller (`aeron_driver_sender.c:36-37`).
     Sender = 0,
     /// `AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_RECEIVER`: a receive
-    /// destination's transport (`media/aeron_receive_destination.c:76`), and
-    /// the receiver's poller (`aeron_driver_receiver.c:41-42`).
+    /// destination's transport (`media/aeron_receive_destination.c:82`), and
+    /// the receiver's poller (`aeron_driver_receiver.c:33-34`).
     Receiver = 1,
 }
 
 impl TransportBindings {
-    /// Open a transport (`init_func`, `:43-50`), for the thread `affinity`
+    /// Open a transport (`init_func`, `:36-43`), for the thread `affinity`
     /// names.
     ///
     /// **Which media it is opened on is decided here, per channel**, from the
@@ -496,7 +496,7 @@ impl TransportBindings {
     ///
     ///   The reference resolves the other way — it builds no transport at all
     ///   for a manual subscription and creates one per destination as each is
-    ///   added (`aeron_driver_conductor.c:2099`, then `:5903`) — and its own
+    ///   added (`aeron_driver_conductor.c:2150`, then `:6000`) — and its own
     ///   manual channels talk to `localhost`
     ///   (`aeron-system-tests/src/test/java/io/aeron/MultipathTest.java:41-43`),
     ///   which is the kernel's either way. Following it there would move
@@ -778,7 +778,7 @@ mod tests {
     /// `control=`, no tag, and its destinations arrive later through
     /// `addDestination` — so there is nothing at the open for this rule to read.
     /// The reference answers it at each destination instead
-    /// (`aeron_driver_conductor.c:2099`, `:5903`); this build answers it here and
+    /// (`aeron_driver_conductor.c:2150`, `:6000`); this build answers it here and
     /// takes the consequence, which the second half of this test writes down: a
     /// manual channel's destinations are reached over the kernel, so the ones
     /// the reference's own tests add (`localhost`) work and the ones on a port

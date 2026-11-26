@@ -100,7 +100,7 @@ impl Options {
 ///
 /// `AERON_DIR` first, because that is what the driver itself honours; then the
 /// reference's own default, `/dev/shm/aeron-<user>`
-/// (`aeron-client/src/main/c/util/aeron_fileutil.c:1474`). Falling back to the
+/// (`aeron-client/src/main/c/util/aeron_fileutil.c:1502`). Falling back to the
 /// username *we* are running as is not exactly what the driver does — it uses
 /// the user that started *it* — but the two agree whenever a tool is run by
 /// the same person who started the driver, which is the case worth defaulting

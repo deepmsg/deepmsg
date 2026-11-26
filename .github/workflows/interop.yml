@@ -175,7 +175,7 @@ jobs:
       # does not have in a loop with no timeout at all —
       #
       #     while (null == (counter = client.getCounter(correlationId))) Thread.yield();
-      #     (CounterTest.java:640, waiting for a static counter)
+      #     (CounterTest.java:642, waiting for a static counter)
       #
       # — and `Thread.yield()` swallows the interrupt, so the reference's own
       # `InterruptingTestCallback` cannot break it either. In a single run one

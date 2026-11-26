@@ -20,7 +20,7 @@ use deepmsg_tests::archive;
 use deepmsg_tests::archiving_driver::{self, OwnArchivingMediaDriver};
 use deepmsg_tests::temp::TempDir;
 
-/// `shouldResolveArchiveId`'s id (`aeron_archive_test.cpp:3395`), and the whole
+/// `shouldResolveArchiveId`'s id (`aeron_archive_test.cpp:3412`), and the whole
 /// reason that case exists: it is **wider than 32 bits**, so an `as i32`
 /// anywhere on the path truncates it and the client answers with a different
 /// archive than the one it is talking to.

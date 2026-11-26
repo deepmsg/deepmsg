@@ -14,7 +14,7 @@ Reference: `aeron-client/src/main/c/concurrent/aeron_distinct_error_log.{c,h}`
 
 What a recording site passes is a message; what the log holds is the two-line
 composition `AERON_SET_ERR` left in the thread's error buffer (`aeron_err_set`,
-`aeron_error.c:351-375`, the entry formatting at `:326-334`):
+`aeron_error.c:371-395`, the entry formatting at `:346-354`):
 
 ```text
 (<code>) <the code's description>
@@ -25,8 +25,8 @@ composition `AERON_SET_ERR` left in the thread's error buffer (`aeron_err_set`,
   codes (`-AERON_ERROR_CODE_*`), so an entry a driver wrote begins `(-6)` and
   not `(6)`.
 - The description is chosen by the **sign** of the code (`aeron_err_set`,
-  `aeron_error.c:361-373`). At or below zero it is the row in
-  `aeron_error_code_str` (`aeron_error.c:195-230`) — `unknown command type id`
+  `aeron_error.c:381-393`). At or below zero it is the row in
+  `aeron_error_code_str` (`aeron_error.c:200-235`) — `unknown command type id`
   for 6, `insufficient storage space` for 12 — and a code with no row is
   `unknown error code`. Above zero it is the OS's own `strerror` text, because
   a positive code is an errno rather than one of the protocol's: a receiver
@@ -35,33 +35,33 @@ composition `AERON_SET_ERR` left in the thread's error buffer (`aeron_err_set`,
   the one place a reader looks.
 - `<line>` is the line bearing the `AERON_SET_ERR` itself — the macro name's
   line, not a closing paren. Pinned empirically against a live 1.53.2 driver:
-  unknown commands report `aeron_driver_conductor.c:3219`, malformed ones
-  `:3232`, and the storage warning `aeron_driver_context.c:1370`.
+  unknown commands report `aeron_driver_conductor.c:3316`, malformed ones
+  `:3308`, and the storage warning `aeron_driver_context.c:1414`.
 - The composition ends in `\n`, and a long one is cut at byte 8186:
   `AERON_ERROR_MAX_TOTAL_LENGTH` is 8192 (`aeron_error.h:26`) and the
   `"...\n"` trailer is `strcpy`d six bytes from the end (`aeron_error.c:33`,
-  `:348`).
+  `:368`).
 
 The one driver-side recording that does **not** carry the composition is a
 broadcast transmit failure. The reference appends it with `AERON_APPEND_ERR`
-(`aeron_driver_conductor.c:2240`), which is the other half of
+(`aeron_driver_conductor.c:2303`), which is the other half of
 `aeron_err_update_entry`: no code's own line, no reset of the code, just the
 site line and the message — so the entry reads
-`[aeron_driver_conductor_client_transmit, aeron_driver_conductor.c:2240]
+`[aeron_driver_conductor_client_transmit, aeron_driver_conductor.c:2303]
 failed to transmit message`. That divergence is recorded in `docs/compat.md`.
 
 - A recording site may append further lines after the composition — that is
-  the other half of `AERON_APPEND_ERR` (`aeron_error.c:337-349`). The
+  the other half of `AERON_APPEND_ERR` (`aeron_error.c:357-369`). The
   sender-MTU refusal is one: `aeron_receiver_channel_endpoint_validate_sender_mtu_length`
   raises it and the conductor's call site appends a second site line naming the
-  stream and the session (`aeron_driver_conductor.c:6509`).
+  stream and the session (`aeron_driver_conductor.c:6604`).
 - How many appended lines there are is a property of **how many layers** the
   failure crossed, because each one appends as it unwinds. A subscription whose
   port cannot be bound is the longest this driver records: five —
   `aeron_bind` sets it (`aeron_socket.c:93`), then the transport
-  (`aeron_udp_channel_transport.c:151`), the destination
-  (`aeron_receive_destination.c:78`) and two frames of the conductor
-  (`aeron_driver_conductor.c:2110`, `:5043`) add theirs. The last of them has an
+  (`aeron_udp_channel_transport.c:165`), the destination
+  (`aeron_receive_destination.c:84`) and two frames of the conductor
+  (`aeron_driver_conductor.c:2161`, `:5140`) add theirs. The last of them has an
   **empty message**: the site line alone says where it was.
 
 Rust: `deepmsg_cnc::error_log::compose_description`, with the OS's text coming
@@ -111,7 +111,7 @@ fetch-add on the count and a store of the last-seen time (`:199-202`).
 An entry that would not fit — `(offset + length) > capacity` (`:127`) — is
 refused whole: no truncated description, no half entry. The caller prints to
 stderr instead (`:185-191`), and the errors system counter is bumped all the
-same (`aeron_driver_conductor.c:1203-1215`).
+same (`aeron_driver_conductor.c:1244-1256`).
 
 Rust: `DistinctErrorLog::record` and `RecordError::Unrecordable`.
 

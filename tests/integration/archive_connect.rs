@@ -31,7 +31,7 @@
 //! request channel as `response-correlation-id`.
 //!
 //! From there the chain is three registration ids
-//! (`aeron_driver_conductor.c:1711-1760`, implemented in this build at
+//! (`aeron_driver_conductor.c:1752-1801`, implemented in this build at
 //! `crates/driver/src/ipc_subscriptions.rs`):
 //!
 //! ```text

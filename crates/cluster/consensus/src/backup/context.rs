@@ -43,7 +43,7 @@ use crate::config::{
 use crate::error::ClusterError;
 use crate::persist::recording_log::CONSENSUS_MODULE_SERVICE_ID;
 
-/// `aeron.thread.naming` (`CommonContext.java:534`) — the same name the
+/// `aeron.thread.naming` (`CommonContext.java:541`) — the same name the
 /// consensus module reads (`config.rs:THREAD_NAMING_PROP_NAME`).
 pub const THREAD_NAMING_PROP_NAME: &str = "aeron.thread.naming";
 
@@ -92,43 +92,43 @@ pub const INITIAL_REPLAY_START_DEFAULT: &str = "BEGINNING";
 pub const AERON_DIR_PROP_NAME: &str = "aeron.dir";
 /// `aeron.cluster.id`.
 pub const CLUSTER_ID_PROP_NAME: &str = "aeron.cluster.id";
-/// `aeron.cluster.dir` — the cluster directory (`ClusteredServiceContainer.java:343`).
+/// `aeron.cluster.dir` — the cluster directory (`ClusteredServiceContainer.java:359`).
 pub const CLUSTER_DIR_PROP_NAME: &str = "aeron.cluster.dir";
-/// `CLUSTER_DIR_DEFAULT` (`ClusteredServiceContainer.java:349`).
+/// `CLUSTER_DIR_DEFAULT` (`ClusteredServiceContainer.java:365`).
 pub const CLUSTER_DIR_DEFAULT: &str = "aeron-cluster";
-/// `aeron.cluster.mark.file.dir` (`ClusteredServiceContainer.java:362`).
+/// `aeron.cluster.mark.file.dir` (`ClusteredServiceContainer.java:378`).
 pub const MARK_FILE_DIR_PROP_NAME: &str = "aeron.cluster.mark.file.dir";
-/// `aeron.cluster.error.buffer.length` (`ConsensusModule.java:828`).
+/// `aeron.cluster.error.buffer.length` (`ConsensusModule.java:835`).
 pub const ERROR_BUFFER_LENGTH_PROP_NAME: &str = "aeron.cluster.error.buffer.length";
-/// `aeron.cluster.consensus.channel` (`ConsensusModule.java:595`).
+/// `aeron.cluster.consensus.channel` (`ConsensusModule.java:602`).
 pub const CONSENSUS_CHANNEL_PROP_NAME: &str = "aeron.cluster.consensus.channel";
-/// `CONSENSUS_CHANNEL_DEFAULT` (`ConsensusModule.java:602`).
+/// `CONSENSUS_CHANNEL_DEFAULT` (`ConsensusModule.java:609`).
 pub const CONSENSUS_CHANNEL_DEFAULT: &str = "aeron:udp";
-/// `aeron.cluster.consensus.stream.id` (`ConsensusModule.java:608`).
+/// `aeron.cluster.consensus.stream.id` (`ConsensusModule.java:615`).
 pub const CONSENSUS_STREAM_ID_PROP_NAME: &str = "aeron.cluster.consensus.stream.id";
-/// `CONSENSUS_STREAM_ID_DEFAULT` (`ConsensusModule.java:614`).
+/// `CONSENSUS_STREAM_ID_DEFAULT` (`ConsensusModule.java:621`).
 pub const CONSENSUS_STREAM_ID_DEFAULT: i32 = 108;
-/// `aeron.cluster.log.stream.id` (`ConsensusModule.java:557`).
+/// `aeron.cluster.log.stream.id` (`ConsensusModule.java:564`).
 pub const LOG_STREAM_ID_PROP_NAME: &str = "aeron.cluster.log.stream.id";
-/// `LOG_STREAM_ID_DEFAULT` (`ConsensusModule.java:563`).
+/// `LOG_STREAM_ID_DEFAULT` (`ConsensusModule.java:570`).
 pub const LOG_STREAM_ID_DEFAULT: i32 = 100;
 /// `aeron.cluster.snapshot.stream.id` — the CM snapshot replay stream
-/// (`ConsensusModule.java:573`).
+/// (`ConsensusModule.java:580`).
 pub const CONSENSUS_MODULE_SNAPSHOT_STREAM_ID_PROP_NAME: &str = "aeron.cluster.snapshot.stream.id";
-/// `SNAPSHOT_STREAM_ID_DEFAULT` for the CM (`ConsensusModule.java:573`).
+/// `SNAPSHOT_STREAM_ID_DEFAULT` for the CM (`ConsensusModule.java:580`).
 pub const CONSENSUS_MODULE_SNAPSHOT_STREAM_ID_DEFAULT: i32 = 107;
-/// The container's snapshot stream id (`ClusteredServiceContainer.java:331`).
+/// The container's snapshot stream id (`ClusteredServiceContainer.java:347`).
 pub const SERVICE_SNAPSHOT_STREAM_ID_PROP_NAME: &str = "aeron.cluster.snapshot.stream.id";
-/// The container's default (`ClusteredServiceContainer.java:331`).
+/// The container's default (`ClusteredServiceContainer.java:347`).
 pub const SERVICE_SNAPSHOT_STREAM_ID_DEFAULT: i32 = 107;
-/// `aeron.cluster.consensus.endpoints` (`ConsensusModule.java:514`).
+/// `aeron.cluster.consensus.endpoints` (`ConsensusModule.java:521`).
 pub const CONSENSUS_ENDPOINTS_PROP_NAME: &str = "aeron.cluster.consensus.endpoints";
-/// `aeron.cluster.replication.progress.timeout` (`ConsensusModule.java:969`).
+/// `aeron.cluster.replication.progress.timeout` (`ConsensusModule.java:983`).
 pub const REPLICATION_PROGRESS_TIMEOUT_PROP_NAME: &str =
     "aeron.cluster.replication.progress.timeout";
-/// `REPLICATION_PROGRESS_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:976-977`).
+/// `REPLICATION_PROGRESS_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:990-991`).
 pub const REPLICATION_PROGRESS_TIMEOUT_DEFAULT_NS: i64 = 10_000_000_000;
-/// `aeron.cluster.replication.progress.interval` (`ConsensusModule.java:986`),
+/// `aeron.cluster.replication.progress.interval` (`ConsensusModule.java:1000`),
 /// whose default is `Aeron.NULL_VALUE` — "derive it as timeout / 10".
 pub const REPLICATION_PROGRESS_INTERVAL_PROP_NAME: &str =
     "aeron.cluster.replication.progress.interval";
@@ -294,7 +294,7 @@ impl ClusterBackupConfig {
         })
     }
 
-    /// `aeron.cluster.backup.source.type` as the enum (`:530-535`, validated in
+    /// `aeron.cluster.backup.source.type` as the enum (`:537-542`, validated in
     /// `conclude` at `:905-914`).
     ///
     /// # Errors
@@ -304,7 +304,7 @@ impl ClusterBackupConfig {
         SourceType::parse(&self.source_type)
     }
 
-    /// `cluster.backup.initial.replay.start` as the enum (`:569-578`).
+    /// `cluster.backup.initial.replay.start` as the enum (`:576-585`).
     ///
     /// # Errors
     ///
@@ -382,7 +382,7 @@ impl ClusterBackupConfig {
     }
 
     /// The replication's progress timeout, defaulted (`:647`, default at
-    /// `ConsensusModule.java:976-977`).
+    /// `ConsensusModule.java:990-991`).
     #[must_use]
     pub fn replication_progress_timeout_ns(&self) -> i64 {
         self.replication_progress_timeout_ns

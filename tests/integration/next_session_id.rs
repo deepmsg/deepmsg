@@ -40,7 +40,7 @@ fn the_driver_never_answers_with_a_session_id_a_publication_already_holds() {
 
     // A publication sitting exactly where the cursor now is. Naming a session
     // is not an allocation — the driver advances only on the ids it speculates
-    // (`aeron_driver_conductor.c:1071-1075`) — so this does not move the cursor
+    // (`aeron_driver_conductor.c:1112-1116`) — so this does not move the cursor
     // off the id it just claimed.
     client
         .add_publication(
@@ -67,7 +67,7 @@ fn the_driver_never_answers_with_a_session_id_a_publication_already_holds() {
 
     // A second ask does not repeat itself: the cursor moved past what it handed
     // out. The reference's handler advances *before* it checks for a clash
-    // (`aeron_driver_conductor.c:6425-6426`), so two clients asking in a row
+    // (`aeron_driver_conductor.c:6522-6523`), so two clients asking in a row
     // never get the same id.
     let third = client
         .next_session_id(STREAM_ID, DEFAULT_TIMEOUT)

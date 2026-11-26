@@ -6,7 +6,7 @@
 //! answers it receives, and the answers it is asked for — and this is the store
 //! both sides touch: an entry arrives with the age the sender put on it, so an
 //! answer that has travelled is not mistaken for a fresh one
-//! (`aeron_driver_name_resolver.c:689`), and it is believed until a timeout
+//! (`aeron_driver_name_resolver.c:690`), and it is believed until a timeout
 //! measured from **that** moment, not from its arrival (`:114`).
 //!
 //! The identity of an entry is the name **and the wire type**: the same name
@@ -49,7 +49,7 @@ pub struct CacheAddress {
 
 impl CacheAddress {
     /// The address an entry carries (`aeron_driver_name_resolver_receive`,
-    /// `aeron_driver_name_resolver.c:763-792`).
+    /// `aeron_driver_name_resolver.c:764-793`).
     pub fn from_entry(entry: &ResolutionDatagram<'_>) -> Self {
         Self {
             res_type: entry.res_type,
@@ -59,13 +59,13 @@ impl CacheAddress {
     }
 
     /// The same address as a socket address, which is what a caller resolves a
-    /// name *to* (`aeron_driver_name_resolver_to_sockaddr`, `:538-565`).
+    /// name *to* (`aeron_driver_name_resolver_to_sockaddr`, `:539-566`).
     pub const fn to_socket_addr(self) -> SocketAddr {
         SocketAddr::new(self.address, self.port)
     }
 
     /// The address a datagram came from, as a cache address
-    /// (`aeron_driver_name_resolver_from_sockaddr`, `:567-594`, which reads the
+    /// (`aeron_driver_name_resolver_from_sockaddr`, `:568-595`, which reads the
     /// family to pick the type and the port out of the socket address).
     pub const fn from_socket_addr(address: SocketAddr) -> Self {
         Self {
@@ -81,7 +81,7 @@ impl CacheAddress {
 
     /// Whether the address is the wildcard for its family — `0.0.0.0`, or the
     /// first four bytes of the sixteen being zero
-    /// (`aeron_driver_name_resolver_is_wildcard`, `:710-716`).
+    /// (`aeron_driver_name_resolver_is_wildcard`, `:711-717`).
     ///
     /// The reference writes that test as two comparisons and the second one
     /// subsumes the first: it memcmp's the **first four bytes** of whatever
@@ -91,7 +91,7 @@ impl CacheAddress {
     /// which `::1` does. It is only ever asked about a resolver's **own**
     /// address in a self-resolution, where the caller means "I booted on the
     /// wildcard and do not know my address" and replaces it with the source
-    /// address the datagram came from (`:803-812`).
+    /// address the datagram came from (`:804-813`).
     pub fn is_wildcard(self) -> bool {
         match self.address {
             IpAddr::V4(address) => [0u8; 4] == address.octets(),
@@ -110,7 +110,7 @@ pub struct CacheEntry {
     pub deadline_ms: i64,
     /// The moment the answer was last **about** — which is the datagram's own
     /// `now - age_in_ms` and not its arrival
-    /// (`aeron_driver_name_resolver.c:689`).
+    /// (`aeron_driver_name_resolver.c:690`).
     pub time_of_last_activity_ms: i64,
     /// The name: the whole channel name being resolved, not the host alone.
     pub name: String,
@@ -472,7 +472,7 @@ mod tests {
 
     /// The address a datagram came from, which is what replaces a resolver's
     /// own wildcard address in a self-resolution
-    /// (`aeron_driver_name_resolver.c:803-812`).
+    /// (`aeron_driver_name_resolver.c:804-813`).
     #[test]
     fn a_wildcard_is_a_wildcard_the_way_the_reference_tests_for_one() {
         assert!(address(RES_TYPE_NAME_TO_IP4, 1, [0, 0, 0, 0]).is_wildcard());

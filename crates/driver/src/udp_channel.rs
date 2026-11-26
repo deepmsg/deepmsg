@@ -14,10 +14,10 @@
 //! ones:
 //!
 //! * a **send** endpoint binds `local_control` and connects to `remote_data`
-//!   (`aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:112-140`);
+//!   (`aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:104-132`);
 //! * a **receive** endpoint binds `remote_data` — the endpoint parameter is
 //!   where a *subscriber* listens
-//!   (`aeron-driver/src/main/c/media/aeron_receive_destination.c:47-76`).
+//!   (`aeron-driver/src/main/c/media/aeron_receive_destination.c:52-81`).
 //!
 //! So for the common `aeron:udp?endpoint=host:port`, `local_data` and
 //! `local_control` are the wildcard (the kernel picks the sending port) and
@@ -40,7 +40,7 @@
 //! # A multicast endpoint is a different shape
 //!
 //! When `endpoint=` names a group the four addresses stop meaning what they
-//! mean for unicast (`aeron_udp_channel.c:421-441`):
+//! mean for unicast (`aeron_udp_channel.c:442-462`):
 //!
 //! * `remote_data` is the group, and `remote_control` is the group with its
 //!   **last byte incremented** (`aeron_multicast_control_address`, `:76-136`) —
@@ -55,9 +55,9 @@
 //!
 //! `control-mode=response` is a channel like the others here: the reference
 //! resolves its addresses down the same path as every other mode
-//! (`aeron_udp_channel.c:346-381`), the only difference being that a response
+//! (`aeron_udp_channel.c:347-382`), the only difference being that a response
 //! channel with nothing else to distinguish it is allowed through
-//! (`:336-344`) and that it is *not* a multi-destination mode
+//! (`:337-345`) and that it is *not* a multi-destination mode
 //! ([`ControlMode::is_multi_destination`]). What is special about a response
 //! channel lives above this layer, in the conductor.
 
@@ -78,7 +78,7 @@ pub const INVALID_TAG: i64 = -1;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlMode {
     /// Nothing named: the receiver answers to the source address of the data
-    /// it receives (`aeron_publication_image.c:584-587`).
+    /// it receives (`aeron_publication_image.c:589-592`).
     None,
     /// A control address resolved on its own and re-resolved on a timer.
     Dynamic,
@@ -91,7 +91,7 @@ pub enum ControlMode {
 impl ControlMode {
     /// Whether a channel in this mode is a **multi-destination** channel
     /// (`aeron_udp_channel_is_multi_destination`,
-    /// `media/aeron_udp_channel.h:147-151`).
+    /// `media/aeron_udp_channel.h:153-157`).
     ///
     /// That is not "has had a destination added": it is a property of the
     /// control mode, and it is what makes a channel a member of the
@@ -150,13 +150,13 @@ pub struct UdpChannel {
     pub tag_id: i64,
     /// The `gtag=` group tag, or [`None`] when the channel named none — which
     /// is not the same as naming `-1` (`aeron_uri_get_int64`'s two answers,
-    /// `aeron-client/src/main/c/uri/aeron_uri.c:384-407`).
+    /// `aeron-client/src/main/c/uri/aeron_uri.c:388-411`).
     ///
     /// It is what a receiver puts in the eight optional bytes of every status
     /// message it sends, and what it sets the flag for on an error frame
-    /// (`media/aeron_receive_channel_endpoint.c:302-325`, `:483-489`); a
+    /// (`media/aeron_receive_channel_endpoint.c:307-330`, `:483-489`); a
     /// channel that names none falls back to the driver's own
-    /// `AERON_RECEIVER_GROUP_TAG` (`:39-46`).
+    /// `AERON_RECEIVER_GROUP_TAG` (`:44-51`).
     pub group_tag: Option<i64>,
     /// The kernel's index for the interface, which the multicast options use
     /// and a unicast socket does not.
@@ -164,7 +164,7 @@ pub struct UdpChannel {
     /// The multicast hop limit, from `ttl=`; zero for a unicast channel and
     /// for a multicast one that named none — which the endpoint then reads as
     /// "use the driver's own default", because zero and "not set" are one
-    /// value here (`aeron_send_channel_endpoint.c:129`). The reference clamps
+    /// value here (`aeron_send_channel_endpoint.c:122`). The reference clamps
     /// what it reads to 255 rather than refusing it.
     pub multicast_ttl: u8,
     /// Whether the URI named an endpoint at all — the difference between a
@@ -175,7 +175,7 @@ pub struct UdpChannel {
     /// What `control-mode=` said.
     pub control_mode: ControlMode,
     /// Whether the endpoint is a multicast group
-    /// (`aeron_is_addr_multicast(&endpoint_addr)`, `aeron_udp_channel.c:421`).
+    /// (`aeron_is_addr_multicast(&endpoint_addr)`, `aeron_udp_channel.c:442`).
     ///
     /// It is read off the *endpoint*, not off the local side, and it is what
     /// decides the shape of the addresses above: the group for `remote_data`,
@@ -193,12 +193,12 @@ pub struct UdpChannel {
     pub receiver_window_length: usize,
     /// The `endpoint=` text as it was written, which is what a **re-resolution**
     /// asks about (`endpoint->conductor_fields.udp_channel->uri.params.udp.endpoint`,
-    /// `media/aeron_send_channel_endpoint.c:768`): a name that has to be
+    /// `media/aeron_send_channel_endpoint.c:761`): a name that has to be
     /// resolved again is the name the client wrote, not the address it once
     /// resolved to.
     pub endpoint_name: Option<String>,
     /// The `control=` text as it was written, which the receiver side
-    /// re-resolves (`media/aeron_receive_channel_endpoint.c:1057`).
+    /// re-resolves (`media/aeron_receive_channel_endpoint.c:1062`).
     pub control_name: Option<String>,
 }
 
@@ -208,7 +208,7 @@ pub enum UdpChannelError {
     /// The URI itself — scheme, parameters, their values as text.
     Uri(UriError),
     /// A channel the reference refuses with an invalid-channel error
-    /// (`aeron_udp_channel.c:303-344`, `:383-393`): its parameters contradict
+    /// (`aeron_udp_channel.c:304-345`, `:388-398`): its parameters contradict
     /// each other or leave it nothing to connect to.
     InvalidChannel(String),
     /// A host, a service or an interface that did not resolve. The reference's
@@ -232,7 +232,7 @@ pub enum UdpChannelError {
 impl UdpChannelError {
     /// The `ON_ERROR` code the reference answers with, by
     /// `aeron_driver_conductor_on_error`'s rule
-    /// (`aeron-driver/src/main/c/aeron_driver_conductor.c:2326-2358`): an error
+    /// (`aeron-driver/src/main/c/aeron_driver_conductor.c:2389-2421`): an error
     /// the reference *named* arrives negated and is sent as its absolute value;
     /// an errno arrives positive and reaches the client as a generic error.
     pub const fn error_code(&self) -> i32 {
@@ -250,7 +250,7 @@ impl UdpChannelError {
             // one: the reference sets `-AERON_ERROR_CODE_UNKNOWN_HOST` at the
             // resolver's own site (`util/aeron_netutil.c:76`), and its
             // conductor turns the negated code back into this positive one for
-            // the client (`aeron_driver_conductor.c:2333-2338`). The code is
+            // the client (`aeron_driver_conductor.c:2396-2401`). The code is
             // not cosmetic — it is the first line of the entry the driver
             // records, and the reference's own tests filter on that text.
             Self::UnknownHost(_) => deepmsg_cnc::command::ERROR_CODE_UNKNOWN_HOST,
@@ -299,13 +299,13 @@ impl UdpChannel {
             .find(|address| !address.ip().is_unspecified())
     }
     /// Whether this is a multi-destination channel
-    /// (`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:147-151`).
+    /// (`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:153-157`).
     pub const fn is_multi_destination(&self) -> bool {
         self.control_mode.is_multi_destination()
     }
 
     /// Whether this channel has group semantics
-    /// (`aeron_udp_channel_has_group_semantics`, `media/aeron_udp_channel.h:153-156`):
+    /// (`aeron_udp_channel_has_group_semantics`, `media/aeron_udp_channel.h:159-162`):
     /// multicast, or multi-destination.
     ///
     /// The two are one predicate in the reference because both name a channel
@@ -316,8 +316,8 @@ impl UdpChannel {
     }
 
     /// Where a control frame about data that arrived from `source` goes
-    /// (`aeron_receive_destination.c:120-129`, and the same three arms in
-    /// `aeron_data_packet_dispatcher.c:636-637`).
+    /// (`aeron_receive_destination.c:126-135`, and the same three arms in
+    /// `aeron_data_packet_dispatcher.c:641-642`).
     ///
     /// The multicast arm is the one that is easy to miss and impossible to
     /// work without: a group's control frames go to the group's **control
@@ -355,7 +355,7 @@ impl UdpChannel {
     /// [`UdpChannel::resolve`] with the resolver the driver built, which is
     /// what a driver that was configured with one parses its channels through
     /// (`aeron_driver_native_resource_agent_on_parse_udp_channel`,
-    /// `aeron_driver_native_resource_agent.c:385-397`).
+    /// `aeron_driver_native_resource_agent.c:390-402`).
     ///
     /// # Errors
     ///
@@ -378,7 +378,7 @@ impl UdpChannel {
         let control_mode = read_control_mode(uri)?;
         let channel_tag = channel_tag(uri);
         // The receiver's group tag: what it puts in the eight optional bytes
-        // of every status message it sends (`media/aeron_receive_channel_endpoint.c:302-325`),
+        // of every status message it sends (`media/aeron_receive_channel_endpoint.c:307-330`),
         // read the way the endpoint reads it (`:32-53`, through
         // `aeron_uri_get_int64`). A channel that names none is not a channel
         // that named `-1`: the endpoint falls back to the driver's own tag for
@@ -387,7 +387,7 @@ impl UdpChannel {
 
         refuse_unsupported(uri)?;
 
-        // `:331-344`: a UDP channel has to name something that distinguishes it
+        // `:332-345`: a UDP channel has to name something that distinguishes it
         // from every other channel — an endpoint, a control address, a tag, or
         // a control mode that supplies one.
         let has_no_distinguishing_characteristic =
@@ -403,7 +403,7 @@ impl UdpChannel {
             ));
         }
 
-        // `:346-374`: the control address resolves first, because it decides
+        // `:347-375`: the control address resolves first, because it decides
         // the family of the endpoint when no endpoint was named.
         let explicit_control_addr = match control {
             Some(text) => Some(resolve_name(names, unresolved, CONTROL_PARAM, text)?),
@@ -429,7 +429,7 @@ impl UdpChannel {
 
         let interface = read_interface(uri.value("interface"))?;
 
-        // `:421-441`: a multicast endpoint is a group, so the two remote
+        // `:442-462`: a multicast endpoint is a group, so the two remote
         // addresses are the group and its control twin, and both local sides
         // are the *interface* — a socket that has to join and to send on a
         // chosen interface cannot leave either to the kernel. Note what the
@@ -465,7 +465,7 @@ impl UdpChannel {
             });
         }
 
-        // `:376-381`: a channel nothing *identifies* gets a unique suffix in
+        // `:377-382`: a channel nothing *identifies* gets a unique suffix in
         // its canonical form, so it is an endpoint of its own rather than one
         // shared with every other unaddressed channel.
         let requires_additional_suffix = (endpoint.is_none() && control.is_none())
@@ -476,7 +476,7 @@ impl UdpChannel {
 
         let (local_data, local_control, has_explicit_control, canonical_form) =
             match (control, explicit_control_addr) {
-                // `:442-464`: with an explicit control address the local socket
+                // `:463-485`: with an explicit control address the local socket
                 // binds *there* — both the data and control sockets are the same
                 // one — while the remote side stays the endpoint.
                 (Some(text), Some(explicit)) => (
@@ -492,7 +492,7 @@ impl UdpChannel {
                         tag_id,
                     ),
                 ),
-                // `:465-487`: otherwise the local side is the interface, and the
+                // `:486-508`: otherwise the local side is the interface, and the
                 // control addresses travel with the data ones.
                 _ => (
                     local,
@@ -535,13 +535,13 @@ impl UdpChannel {
 }
 
 /// `control-mode=`, with the reference's silence about unknown values
-/// (`aeron_udp_channel.c:309-323`): a string that is none of the three is not
+/// (`aeron_udp_channel.c:310-324`): a string that is none of the three is not
 /// an error, it is simply no mode at all.
 ///
 /// # Errors
 ///
 /// [`UdpChannelError::InvalidChannel`] when `dynamic` is asked for without a
-/// control address to resolve (`:325-329`).
+/// control address to resolve (`:330-334`).
 fn read_control_mode(uri: &ChannelUri<'_>) -> Result<ControlMode, UdpChannelError> {
     let mode = match uri.value("control-mode") {
         Some("manual") => ControlMode::Manual,
@@ -565,12 +565,12 @@ pub const SPY_PREFIX: &str = "aeron-spy:";
 
 /// The prefix an IPC channel carries (`AERON_IPC_CHANNEL`,
 /// `aeron-client/src/main/c/uri/aeron_uri.h:35`), which the destination triage
-/// matches on its length alone (`aeron_driver_conductor.c:3051`).
+/// matches on its length alone (`aeron_driver_conductor.c:3114`).
 pub const IPC_PREFIX: &str = "aeron:ipc";
 
 /// The keys a destination URI may not carry
 /// (`AERON_DRIVER_CONDUCTOR_INVALID_DESTINATION_KEYS`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:52-60`).
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:51-59`).
 ///
 /// Each of them describes the *channel a publication or subscription owns* —
 /// its MTU, its window, its socket buffers, its response correlation — and a
@@ -625,7 +625,7 @@ pub fn validate_destination_uri_params(
 /// This is the send half only. A **receive** destination that names a spy is
 /// served — it is the third way a spy link is made, beside the two a
 /// subscription makes (`aeron_driver_conductor_execute_add_receive_spy_destination`,
-/// `:5704-5806`) — and the triage between the two is the caller's
+/// `:5801-5903`) — and the triage between the two is the caller's
 /// ([`crate::conductor`]).
 ///
 /// # Errors
@@ -650,8 +650,8 @@ pub fn is_spy_channel(channel: &[u8]) -> bool {
 
 /// Resolve the channel a spy names, with the `aeron-spy:` prefix taken off
 /// (`aeron_driver_conductor_on_add_spy_subscription`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:4939-4942`, and its
-/// destination twin at `:5821-5824`).
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:5036-5039`, and its
+/// destination twin at `:5918-5921`).
 ///
 /// A spy is not a channel of its own: what follows the prefix is the UDP
 /// channel the publication it reads sends on, parsed exactly as that
@@ -685,7 +685,7 @@ pub fn resolve_spy_channel(channel: &[u8]) -> Result<UdpChannel, UdpChannelError
 }
 
 /// A destination URI a send endpoint can be given, resolved to where it points
-/// (`aeron_driver_conductor_validate_send_destination_uri`, `:5369-5410`, and
+/// (`aeron_driver_conductor_validate_send_destination_uri`, `:5466-5507`, and
 /// `aeron_driver_conductor_validate_destination_uri_params`, `:411-460`).
 ///
 /// The resolution is **synchronous**, which is where this build's
@@ -728,7 +728,7 @@ pub fn validate_send_destination_uri(
 
     // Port zero is refused rather than resolved: a destination that names no
     // port is one the driver cannot send to, and the reference refuses it by
-    // name before it resolves anything (`:5394-5404`).
+    // name before it resolves anything (`:5491-5501`).
     if let Some((_, port)) = endpoint.rsplit_once(':') {
         if "0" == port {
             return Err(UdpChannelError::InvalidChannel(format!(
@@ -741,7 +741,7 @@ pub fn validate_send_destination_uri(
 }
 
 /// The channel tag: `tags=` up to the first comma
-/// (`aeron_udp_uri_params_func`, `aeron-client/src/main/c/uri/aeron_uri.c:166-177`).
+/// (`aeron_udp_uri_params_func`, `aeron-client/src/main/c/uri/aeron_uri.c:172-183`).
 ///
 /// The reference splits the value in place at the comma — the first field is
 /// the channel tag, the rest the entity tag — so a value that starts with a
@@ -755,7 +755,7 @@ fn channel_tag<'a>(uri: &ChannelUri<'a>) -> Option<&'a str> {
 
 /// `strtoul(tag, &end, 10)` with the digits requirement but **no** trailing
 /// check, which is what makes `tags=12x` tag twelve
-/// (`aeron_uri_parse_tag`, `aeron-client/src/main/c/uri/aeron_uri.c:517-529`).
+/// (`aeron_uri_parse_tag`, `aeron-client/src/main/c/uri/aeron_uri.c:521-533`).
 ///
 /// # One value the reference's parser cannot produce
 ///
@@ -766,12 +766,12 @@ fn channel_tag<'a>(uri: &ChannelUri<'a>) -> Option<&'a str> {
 /// live merge — a live destination and no tags is the only way to reach that
 /// branch without one — asks for `tags=-1,-1`.
 ///
-/// The C driver refuses that channel (`aeron_udp_channel.c:385-390`): its
+/// The C driver refuses that channel (`aeron_udp_channel.c:386-391`): its
 /// parse-failure sentinel and its "no tag" sentinel are the same value
 /// (`#define AERON_URI_INVALID_TAG (-1)`,
-/// `aeron-client/src/main/c/uri/aeron_uri.h:89`), and `strtoul("-1", …)`
+/// `aeron-client/src/main/c/uri/aeron_uri.h:90`), and `strtoul("-1", …)`
 /// consumes the string and lands on it. The Java driver accepts it and reads it
-/// as a **real** tag of `-1` (`UdpChannel.java:216-218`, and `matchesTag`
+/// as a **real** tag of `-1` (`UdpChannel.java:243-245`, and `matchesTag`
 /// matches on equal tags, `:786`), which is not what the archive meant either.
 ///
 /// This driver takes the third reading, which is the only one that is both
@@ -819,7 +819,7 @@ fn read_size(uri: &ChannelUri<'_>, key: &str) -> Result<usize, UdpChannelError> 
     }
 }
 
-/// `so-tos=` (`aeron_udp_channel.c:410-427`): `0..=255`, or `-1` for a channel
+/// `so-tos=` (`aeron_udp_channel.c:431-448`): `0..=255`, or `-1` for a channel
 /// that names none. The reference's out-of-range answer is `EINVAL`, which
 /// reaches a client as the generic error — hence [`UdpChannelError::Resolution`]
 /// rather than the invalid-channel code.
@@ -896,7 +896,7 @@ fn is_multicast(address: IpAddr) -> bool {
 ///
 /// [`UdpChannelError::Resolution`] when the last byte is even. The reference
 /// answers `EINVAL` here and not an `AERON_ERROR_CODE_*`, so what a client
-/// sees is a generic error (`aeron_driver_conductor.c:2326-2358`).
+/// sees is a generic error (`aeron_driver_conductor.c:2389-2421`).
 fn multicast_control_address(address: SocketAddr) -> Result<SocketAddr, UdpChannelError> {
     let even =
         || UdpChannelError::Resolution(format!("Multicast data address must be odd: {address}"));
@@ -931,7 +931,7 @@ fn multicast_control_address(address: SocketAddr) -> Result<SocketAddr, UdpChann
 }
 
 /// `ttl=` as the multicast hop limit
-/// (`aeron_uri_multicast_ttl`, `aeron-client/src/main/c/uri/aeron_uri.c:323-334`).
+/// (`aeron_uri_multicast_ttl`, `aeron-client/src/main/c/uri/aeron_uri.c:329-340`).
 ///
 /// Three things the reference's `strtoull(value, NULL, 0)` brings with it, all
 /// of them kept: the radix is the value's own (so `0x10` and `010` are hop
@@ -1403,7 +1403,7 @@ pub fn resolve_host_and_port_with(
 
     // The resolver being asked is what a driver measures
     // (`aeron_time_tracking_name_resolver_resolve`,
-    // `aeron_driver_native_resource_agent.c:29-60`): system counter 32 takes
+    // `aeron_driver_native_resource_agent.c:34-65`): system counter 32 takes
     // the longest call so far, and 33 counts the ones past the threshold. A
     // literal never reaches here, so a channel that names an address is not
     // measured — which is the reference's shape too, because its wrapper
@@ -1441,7 +1441,7 @@ pub fn resolve_host_and_port_with(
 /// `aeron-driver/src/main/c/aeron_udp_channel.c:346-381`).
 ///
 /// This is the body of the native resource agent's `PARSE_CHANNEL` command
-/// (`aeron_driver_native_resource_agent_on_parse_udp_channel`, `:381-392`) and
+/// (`aeron_driver_native_resource_agent_on_parse_udp_channel`, `:386-397`) and
 /// it exists as a function of its own so that the conductor and the agent
 /// cannot drift: the conductor decides *when* a channel is parsed, the agent
 /// does it, and both go through here.
@@ -1482,7 +1482,7 @@ pub fn parse_channel_with(
 /// validates the endpoint and resolves it before the channel is built).
 ///
 /// Two calls and not one for the reason the conductor made two: the address is
-/// what a **removal** matches a destination by (`:311-350`), and it is `None`
+/// what a **removal** matches a destination by (`:312-351`), and it is `None`
 /// for a name that did not answer — the reference's `AF_UNSPEC`, kept on
 /// purpose so that a name which answers later answers *this* destination
 /// (`:5337-5343`).
@@ -1549,7 +1549,7 @@ pub fn parse_send_destination_with(
 ///
 /// The first line is `aeron_err_set`'s preamble — `"(%d) %s\n"` with the
 /// negated code and `aeron_error_code_str`'s text for it
-/// (`util/aeron_error.c:351-374`) — the middle line is the resolver's own
+/// (`util/aeron_error.c:371-394`) — the middle line is the resolver's own
 /// (`util/aeron_netutil.c:75-76`, also the CSV table's `(forced)` refusal at
 /// `aeron_csv_table_name_resolver.c:73`), and the last is this wrapper's
 /// `AERON_APPEND_ERR("Unresolved - %s=%s, name-and-port=%s", …)`.
@@ -1562,7 +1562,7 @@ pub fn parse_send_destination_with(
 /// channel named is what goes there.
 ///
 /// The lines the parse and the agent append after this one
-/// (`[aeron_udp_channel_finish_parse, aeron_udp_channel.c:360] URI: …`,
+/// (`[aeron_udp_channel_finish_parse, aeron_udp_channel.c:361] URI: …`,
 /// `failed to parse channel`, the conductor's own command-state line) are not
 /// here: those sites are the resolution-on-the-agent slice's, and they arrive
 /// with it.
@@ -2000,7 +2000,7 @@ mod tests {
     #[test]
     fn a_channel_the_kernel_places_gets_a_unique_canonical_form() {
         // Nothing distinguishes this channel from the next one like it, so the
-        // reference appends a counting suffix (`aeron_udp_channel.c:376-381`).
+        // reference appends a counting suffix (`aeron_udp_channel.c:377-382`).
         let one = resolve("aeron:udp?control-mode=manual");
         let two = resolve("aeron:udp?control-mode=manual");
 
@@ -2076,7 +2076,7 @@ mod tests {
 
     /// And a channel that is *only* a null tag is still a channel with a
     /// distinguishing characteristic — the reference's own test for that
-    /// (`aeron_udp_channel.c:331-344`) asks whether the parameter is **there**,
+    /// (`aeron_udp_channel.c:332-345`) asks whether the parameter is **there**,
     /// which `channel_tag` answers for `-1` as it does for `7`.
     #[test]
     fn a_null_tag_still_identifies_the_channel() {
@@ -2089,7 +2089,7 @@ mod tests {
 
     #[test]
     fn a_channel_with_nothing_to_identify_it_is_refused() {
-        // `aeron_udp_channel.c:331-344`.
+        // `aeron_udp_channel.c:332-345`.
         assert_eq!(
             UdpChannelError::InvalidChannel(
                 "URIs for UDP must specify endpoint, control, tags, or \
@@ -2100,7 +2100,7 @@ mod tests {
         );
 
         // Unless a control mode says where it is — the two modes the reference
-        // exempts (`:336-344`).
+        // exempts (`:337-345`).
         assert_eq!(
             ControlMode::Manual,
             resolve("aeron:udp?control-mode=manual").control_mode
@@ -2113,7 +2113,7 @@ mod tests {
 
     #[test]
     fn dynamic_control_mode_needs_a_control_address_to_resolve() {
-        // `aeron_udp_channel.c:325-329`.
+        // `aeron_udp_channel.c:326-330`.
         assert_eq!(
             UdpChannelError::InvalidChannel(
                 "explicit control expected with dynamic control mode".to_owned()
@@ -2142,7 +2142,7 @@ mod tests {
 
     /// A spy names the channel it reads, with the prefix taken off — and the
     /// two channels it can then be compared with are the publisher's
-    /// (`:4939-4942`, `:92-108`).
+    /// (`:5036-5039`, `:92-108`).
     #[test]
     fn a_spy_names_the_channel_after_its_prefix() {
         let spy = resolve_spy_channel(b"aeron-spy:aeron:udp?endpoint=127.0.0.1:10123")
@@ -2339,7 +2339,7 @@ mod tests {
 
     /// A multi-destination channel is one whose **control mode** says so, not
     /// one that has had a destination added
-    /// (`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:147-151`).
+    /// (`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:153-157`).
     ///
     /// Three things hang off it: whether a send endpoint keeps a destination
     /// tracker, whether the channel has group semantics, and which flow-control
@@ -2361,11 +2361,11 @@ mod tests {
         assert!(
             !resolve("aeron:udp?endpoint=127.0.0.1:10123|control-mode=nonsense")
                 .is_multi_destination(),
-            "an unknown control mode is no mode at all (`:309-323`)"
+            "an unknown control mode is no mode at all (`:310-324`)"
         );
 
         // `response` is a control mode that is not a multi-destination one
-        // (`media/aeron_udp_channel.h:147-151`), even though its channel now
+        // (`media/aeron_udp_channel.h:153-157`), even though its channel now
         // resolves like any other.
         assert!(
             !resolve("aeron:udp?endpoint=127.0.0.1:10123|control-mode=response")
@@ -2389,7 +2389,7 @@ mod tests {
 
     #[test]
     fn an_unknown_control_mode_is_no_mode_at_all() {
-        // `:309-323` matches the three known strings and leaves the rest
+        // `:310-324` matches the three known strings and leaves the rest
         // behind, which is what makes `control-mode=` plus an endpoint a
         // channel like any other.
         assert_eq!(
@@ -2432,7 +2432,7 @@ mod tests {
         // `-AERON_ERROR_CODE_INVALID_CHANNEL` is sent as its absolute value; a
         // failure that is not a *name* is an errno — `EINVAL` for a multicast
         // group that will not do, say — and reaches the client as a generic
-        // error (`aeron_driver_conductor.c:2326-2358`). A name, on the other
+        // error (`aeron_driver_conductor.c:2389-2421`). A name, on the other
         // hand, arrives negated from the resolver and is sent as
         // `ERROR_CODE_UNKNOWN_HOST`; this path cannot reach that one, because
         // `Names::System` is the shortcut without a resolver in it — the
@@ -2461,7 +2461,7 @@ mod tests {
         // `gtag=` is read into the channel, on a unicast one as much as on a
         // multicast one: the reference resolves it in
         // `aeron_receive_channel_endpoint_set_group_tag`, which asks the
-        // channel nothing about its kind (`:32-53`).
+        // channel nothing about its kind (`:37-58`).
         let named = resolve("aeron:udp?endpoint=127.0.0.1:10123|gtag=17");
         assert_eq!(Some(17), named.group_tag);
 
@@ -2478,7 +2478,7 @@ mod tests {
         );
 
         // The reference's reader is `strtoll(.., 0)` and requires the whole
-        // value (`aeron_uri_get_int64`, `aeron-client/src/main/c/uri/aeron_uri.c:393-402`).
+        // value (`aeron_uri_get_int64`, `aeron-client/src/main/c/uri/aeron_uri.c:397-406`).
         assert_eq!(
             Some(16),
             resolve("aeron:udp?endpoint=127.0.0.1:10123|gtag=0x10").group_tag
@@ -2491,7 +2491,7 @@ mod tests {
         // `group=` is a *subscription* parameter and never reached this layer
         // in the first place: it is read where a subscription is created, into
         // the parameters an image is built from
-        // (`aeron_driver_uri.c:494-495`), so a channel that carries it resolves
+        // (`aeron_driver_uri.c:499-500`), so a channel that carries it resolves
         // like any other.
         let named = resolve("aeron:udp?endpoint=127.0.0.1:10123|group=true");
         assert!(!named.is_multicast);
@@ -2849,7 +2849,7 @@ mod tests {
 
         // And the call was **measured**, which is what the reference's
         // time-tracking wrapper does around its delegate
-        // (`aeron_driver_native_resource_agent.c:29-60`). The threshold here is
+        // (`aeron_driver_native_resource_agent.c:34-65`). The threshold here is
         // zero, so the count beside the maximum is the count of calls.
         let reader = regions.reader();
         assert_eq!(
@@ -2869,7 +2869,7 @@ mod tests {
 
     #[test]
     fn an_explicit_control_address_binds_the_local_side_to_it() {
-        // `aeron_udp_channel.c:442-464`.
+        // `aeron_udp_channel.c:463-485`.
         let channel = resolve("aeron:udp?endpoint=127.0.0.1:10123|control=127.0.0.1:10124");
 
         assert_eq!(ipv4("127.0.0.1:10124"), channel.local_data);
@@ -3018,7 +3018,7 @@ mod tests {
     #[test]
     fn a_response_channel_resolves_its_addresses_like_any_other() {
         // The reference sends every control mode down the same resolution
-        // (`aeron_udp_channel.c:346-381`), and a response channel names its
+        // (`aeron_udp_channel.c:347-382`), and a response channel names its
         // control address the way a manual one does.
         let response = resolve(
             "aeron:udp?endpoint=127.0.0.1:10123|control=127.0.0.1:10124|control-mode=response",
@@ -3038,7 +3038,7 @@ mod tests {
         assert!(!response.is_multi_destination());
         assert!(manual.is_multi_destination());
 
-        // And it is allowed to name nothing else at all (`:336-344`).
+        // And it is allowed to name nothing else at all (`:337-345`).
         assert_eq!(
             ControlMode::Response,
             resolve("aeron:udp?control-mode=response").control_mode

@@ -210,7 +210,7 @@ fn a_named_supplier_decides_for_every_image() {
 /// A `cc=` this driver cannot serve is a **subscription that exists and an
 /// image that is never built** — the reference's answer
 /// (`aeron_congestion_control.c:165-205` fails its supplier, and
-/// `aeron_driver_conductor.c:6633-6640` fails the create with a line naming the
+/// `aeron_driver_conductor.c:6726-6733` fails the create with a line naming the
 /// stream and the session).
 ///
 /// This build used to refuse the name on `ADD_SUBSCRIPTION`, which is early and

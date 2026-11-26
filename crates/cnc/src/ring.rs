@@ -13,7 +13,7 @@
 //! to hand out the other side's fields to be useful; two cannot.
 //!
 //! Mirrors `aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:43-202` for the
-//! producer and `:203-241` for the consumer. The protocol is subtle in two
+//! producer and `:206-244` for the consumer. The protocol is subtle in two
 //! places, and both are reproduced exactly rather than paraphrased:
 //!
 //! - **A record is published by a positive length.** While it is being filled
@@ -414,13 +414,13 @@ impl<'a> ToDriverRing<'a> {
 ///
 /// Stateless in the way that matters: the cursor is the trailer's
 /// `head_position`, which the reference reads at the top of every read
-/// (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:207`). A driver that
+/// (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:210`). A driver that
 /// restarts resumes exactly where the file says it stopped, and there is no
 /// cursor to hand across a process boundary. What this type does own is the
 /// discipline, which is the part that is easy to get wrong:
 ///
 /// - **It zeroes what it consumed, and only then publishes `head_position`.**
-///   That is the reference's order (`:244-245`) and the reason the producer may
+///   That is the reference's order (`:247-248`) and the reason the producer may
 ///   assume claimed space starts zeroed.
 /// - **It stops at the first record whose length is not positive**, which is
 ///   what makes a claim still in flight invisible, and it never compares
@@ -524,7 +524,7 @@ impl ToDriverRingConsumer {
     /// Not the consumer's own field, but a consumer needs it to tell "nothing
     /// to read" from "something to read that cannot be read" — the difference
     /// [`ToDriverRingConsumer::unblock`] exists for
-    /// (`aeron_mpsc_rb_producer_position`, `concurrent/aeron_mpsc_rb.c:186-190`).
+    /// (`aeron_mpsc_rb_producer_position`, `concurrent/aeron_mpsc_rb.c:189-193`).
     pub fn producer_position<A>(&self, region: &AtomicBuffer<'_, A>) -> Option<i64> {
         region.load_i64_acquire(self.trailer + layout::MPSC_TAIL_POSITION_OFFSET)
     }
@@ -532,11 +532,11 @@ impl ToDriverRingConsumer {
     /// Read at most `limit` records, handing each to `handler`.
     ///
     /// Returns how many messages were delivered, matching the reference's
-    /// `messages_read` (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:248`).
+    /// `messages_read` (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:251`).
     /// Padding records do not count: they are skipped, and their bytes are
     /// consumed like any other.
     ///
-    /// The reference's `controlled_read` (`:243`) also lets a handler ask for
+    /// The reference's `controlled_read` (`:246`) also lets a handler ask for
     /// the read to stop or to resume later, which is how it parks a command
     /// waiting on an asynchronous resource. Nothing here is asynchronous yet, so
     /// the plain read is what this models; the actions arrive with the first
@@ -641,8 +641,8 @@ impl ToDriverRingConsumer {
     /// heartbeat keeps being refreshed by the very loop that cannot read).
     /// Nothing about that is self-healing, which is why the reference has
     /// `aeron_mpsc_rb_unblock` and calls it from its own duty cycle
-    /// (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:373-431`,
-    /// called at `aeron_driver_conductor.c:3253`).
+    /// (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:376-434`,
+    /// called at `aeron_driver_conductor.c:3350`).
     ///
     /// Two shapes, and the first is the one that happens:
     ///
@@ -754,7 +754,7 @@ impl ToDriverRingConsumer {
     /// Whether every record header from `from` back to `limit` reads zero.
     ///
     /// The counterpart of the reference's `scan_back_to_confirm_still_zeroed`
-    /// (`concurrent/aeron_mpsc_rb.c:351-367`), and the reason the gap case is
+    /// (`concurrent/aeron_mpsc_rb.c:354-370`), and the reason the gap case is
     /// safe to write at all: the producer may have claimed the gap between the
     /// scan and the store, and this is what says it did not.
     ///
@@ -785,9 +785,9 @@ impl ToDriverRingConsumer {
     /// Publish the consumer's liveness, in epoch milliseconds.
     ///
     /// This is the field a client reads to decide whether the driver is there
-    /// (`aeron-driver/src/main/c/aeron_driver_context.c:1625-1643`). A driver
+    /// (`aeron-driver/src/main/c/aeron_driver_context.c:1669-1687`). A driver
     /// that stops on purpose writes [`layout::NULL_VALUE`] here instead
-    /// (`aeron_driver_conductor.c:3493`), which is a different answer from a
+    /// (`aeron_driver_conductor.c:3590`), which is a different answer from a
     /// stale timestamp and the only external evidence that a termination did
     /// anything at all.
     pub fn write_consumer_heartbeat(

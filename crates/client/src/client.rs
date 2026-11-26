@@ -18,7 +18,7 @@
 //! everything the client created. There is no separate keepalive command to
 //! send: the reference writes the counter directly, in
 //! `aeron_client_conductor_check_liveness`
-//! (`aeron-client/src/main/c/aeron_client_conductor.c:1305-1375`), and that is
+//! (`aeron-client/src/main/c/aeron_client_conductor.c:1355-1425`), and that is
 //! what this does.
 //!
 //! # One response per poll
@@ -292,13 +292,13 @@ impl std::error::Error for CommandError {}
 ///
 /// The reference reports these through an error handler and then force-closes
 /// everything the client holds (`aeron_client_conductor_check_liveness`,
-/// `aeron-client/src/main/c/aeron_client_conductor.c:1305-1394`). A `Client`
+/// `aeron-client/src/main/c/aeron_client_conductor.c:1355-1444`). A `Client`
 /// that has one of these has no driver behind it any more, and every call that
 /// would wait for one says so instead of waiting for a deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientError {
     /// The driver stopped on purpose: it wrote the null sentinel into the ring
-    /// as it shut down (`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`).
+    /// as it shut down (`aeron-driver/src/main/c/aeron_driver_conductor.c:3590`).
     DriverShutdown,
     /// The driver has not refreshed the ring's heartbeat for longer than the
     /// driver timeout, so it is gone rather than slow — killed, or a machine
@@ -334,7 +334,7 @@ impl std::error::Error for ClientError {}
 
 /// How stale the driver's heartbeat may be before this client treats it as
 /// gone: `AERON_DRIVER_TIMEOUT_MS_DEFAULT (10 * 1000)`
-/// (`aeron-driver/src/main/c/aeron_driver_context.c:217`), which is what the
+/// (`aeron-driver/src/main/c/aeron_driver_context.c:219`), which is what the
 /// reference's client context uses too (`aeron.driver.timeout`).
 pub const DRIVER_TIMEOUT_MS: i64 = 10 * 1000;
 
@@ -389,7 +389,7 @@ enum Ready {
 /// reference keeps the same distinction as a type on its registering resource
 /// and matches on it when a cancellation arrives
 /// (`aeron_client_conductor_resource_type_match`,
-/// `aeron-client/src/main/c/aeron_client_conductor.c:3061-3070`).
+/// `aeron-client/src/main/c/aeron_client_conductor.c:3123-3132`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AsyncResource {
     /// Given back with `REMOVE_SUBSCRIPTION`.
@@ -553,7 +553,7 @@ pub enum AsyncNextSessionIdPoll {
 /// The reference's `aeron_async_destination_t`, which is what
 /// `Subscription.asyncAddDestination` hands back and what the archive's replay
 /// merge keeps across turns so the driver may answer in its own time
-/// (`aeron_archive_replay_merge.c:490`, `:717-731` — the merge polls its one
+/// (`aeron_archive_replay_merge.c:512`, `:739-753` — the merge polls its one
 /// outstanding handle at the top of every turn).
 ///
 /// It carries the correlation id and nothing else, like
@@ -570,7 +570,7 @@ impl AsyncDestination {
     /// The handle a caller that kept the **id** across turns puts back
     /// together — [`AsyncAdd::publication`]'s counterpart, and for the same
     /// caller: the archive's replay merge carries the correlation id of the
-    /// destination it started (`aeron_archive_replay_merge.c:717-731`) while
+    /// destination it started (`aeron_archive_replay_merge.c:739-753`) while
     /// the object it would otherwise hold cannot cross the turn.
     pub const fn from_correlation_id(correlation_id: i64) -> Self {
         Self { correlation_id }
@@ -844,7 +844,7 @@ pub struct Client {
     /// lifecycle and the driver has no part in it: Java's `addCloseHandler`
     /// takes a `Runnable` and its conductor runs it from its own close path
     /// (`ClientConductor.java:184` → `:2063-2077`), and C's runs them from
-    /// `aeron_client_conductor_on_close` (`aeron_client_conductor.c:2749-2751`).
+    /// `aeron_client_conductor_on_close` (`aeron_client_conductor.c:2797-2799`).
     /// A queue would be exactly wrong here, because when a client closes there
     /// is nobody left to poll it.
     ///
@@ -937,7 +937,7 @@ impl Client {
             // starting from a **file** a driver left behind. A heartbeat older
             // than the window means the driver behind this file is gone — an
             // orderly shutdown leaves `NULL_VALUE` in it
-            // (`aeron_driver_conductor.c:3493`), and a killed driver leaves a
+            // (`aeron_driver_conductor.c:3590`), and a killed driver leaves a
             // timestamp that ages out — and the reference's answer is
             // deliberately *not* to fail: it **unmaps the file and looks again**,
             // because what replaces a dead driver is a new file at the same path,
@@ -1033,7 +1033,7 @@ impl Client {
     /// Once this is set, every command that waits for a reply fails with it
     /// rather than waiting out its deadline, and nothing is written to the
     /// driver any more — the reference's client does the same, and calls it
-    /// being terminating (`aeron_client_conductor.c:1305-1336`).
+    /// being terminating (`aeron_client_conductor.c:1355-1386`).
     pub const fn error(&self) -> Option<ClientError> {
         self.terminated
     }
@@ -1067,7 +1067,7 @@ impl Client {
     /// A `CLIENT_CLOSE` is the whole of the message. The driver marks the
     /// client closed and zeroes its heartbeat counter
     /// (`aeron_driver_conductor_on_client_close`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:6321-6331`), which is
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:6418-6428`), which is
     /// what stops it being waited on — so a client that says goodbye is
     /// collected, rather than held for the driver's liveness timeout with its
     /// counters, publications and images still allocated. For an IPC-only
@@ -1078,7 +1078,7 @@ impl Client {
     /// (`Aeron.java:276`, guarded by a compare-and-set so a second call does
     /// nothing, `:278`), and C from `aeron_close` (`aeron_client.c:180`) via
     /// `aeron_client_conductor_on_cmd_client_close`
-    /// (`aeron_client_conductor.c:1888-1891`).
+    /// (`aeron_client_conductor.c:1938-1941`).
     ///
     /// There is no reply, so nothing here waits for one. Idempotent, and called
     /// by [`Drop`] — a caller that wants the driver told before the client goes
@@ -1092,7 +1092,7 @@ impl Client {
     /// `notifyCloseHandlers()` and sends `clientClose` afterwards
     /// (`ClientConductor.java:184` against `:203`), and C notifies at the top
     /// of `aeron_client_conductor_on_close` and claims the command at the
-    /// bottom of it (`aeron_client_conductor.c:2749-2751` against `:2779`).
+    /// bottom of it (`aeron_client_conductor.c:2797-2799` against `:2827`).
     pub fn close(&mut self) {
         if self.closed {
             return;
@@ -1480,7 +1480,7 @@ impl Client {
     /// The subscription is registered **before** the response is awaited, which
     /// is the reference's order on both sides: Java puts it into its map and
     /// only then awaits (`ClientConductor.java:749-750`), and C creates it
-    /// inside the ready handler itself (`aeron_client_conductor.c:625-652`).
+    /// inside the ready handler itself (`aeron_client_conductor.c:659-686`).
     ///
     /// Registering after the wait instead would leave a gap one message wide: a
     /// driver that emits `ON_AVAILABLE_IMAGE` for a subscription before its
@@ -1518,7 +1518,7 @@ impl Client {
             client_id: self.client_id,
             correlation_id,
             // A field the driver never reads; the reference sends -1
-            // (`aeron_client_conductor.c:2000-2004` writes the other four
+            // (`aeron_client_conductor.c:2050-2054` writes the other four
             // fields and leaves these eight as whatever the ring held).
             registration_correlation_id: -1,
             stream_id,
@@ -1546,7 +1546,7 @@ impl Client {
     ///
     /// Returns the publication's registration id — the correlation id the
     /// request used, and the id the driver names the log file after
-    /// (`aeron_fileutil.c:1208-1214`). The log buffer is mapped before this
+    /// (`aeron_fileutil.c:1207-1213`). The log buffer is mapped before this
     /// returns, so [`Client::offer`] is usable immediately.
     ///
     /// # Errors
@@ -1704,9 +1704,9 @@ impl Client {
     /// it is not known until [`Client::async_add_poll`] says so.
     ///
     /// The reference's asynchronous adds are these three
-    /// (`aeron_async_add_subscription`, `aeron-client/src/main/c/aeronc.h:605`;
-    /// `aeron_async_add_publication`, `:492`;
-    /// `aeron_async_add_exclusive_publication`, `:546`), each with a poll and a
+    /// (`aeron_async_add_subscription`, `aeron-client/src/main/c/aeronc.h:608`;
+    /// `aeron_async_add_publication`, `:495`;
+    /// `aeron_async_add_exclusive_publication`, `:549`), each with a poll and a
     /// cancel beside it. Java's return the registration id instead and leave
     /// the resource to be found by it (`Aeron.asyncAddSubscription`,
     /// `Aeron.java:451`), which cannot report a *failed* add at all. This is the
@@ -1771,7 +1771,7 @@ impl Client {
     /// a second poll of the same handle answers [`AsyncAddPoll::Unknown`]. The
     /// reference marks its handle `POLL_COMPLETED` and answers `-1` to a second
     /// poll (`aeron_client_conductor_async_resource_poll`,
-    /// `aeron_client_conductor.c:3675-3775`); the difference is that it keeps the
+    /// `aeron_client_conductor.c:3762-3862`); the difference is that it keeps the
     /// handle and this keeps the state.
     ///
     /// A publication is mapped **here** rather than when the response was read,
@@ -1839,7 +1839,7 @@ impl Client {
     /// the handle's [`AsyncResource`] is for. The reference's own cancel for one
     /// says what a caller can expect — "if a counter gets created by the time
     /// cancellation happens, it will get removed"
-    /// (`aeron_async_add_counter_cancel`, `aeronc.h:698-714`) — and sending the
+    /// (`aeron_async_add_counter_cancel`, `aeronc.h:701-717`) — and sending the
     /// removal at once is how that works out here too, since the command was
     /// already in the ring and the driver processes its ring in order.
     ///
@@ -2055,7 +2055,7 @@ impl Client {
     /// under the registration id the handle drew.
     ///
     /// The reference has the same split twice over. C's `aeron_async_add_counter`
-    /// (`aeronc.h:679-687`) takes a handle to poll (`:695`), and Java's
+    /// (`aeronc.h:682-690`) takes a handle to poll (`:698`), and Java's
     /// `Aeron.asyncAddCounter` (`Aeron.java:678-693`) returns the registration id
     /// and leaves the counter itself to `getCounter` — which is this shape, and
     /// the reason the handle is the one [`AsyncAdd`] the other adds return.
@@ -2116,7 +2116,7 @@ impl Client {
     /// handle or about which list holds it. One command, one registration: the
     /// id the driver allocated under is the correlation id the request used,
     /// which is what `ON_COUNTER_READY` echoed
-    /// (`aeron_client_conductor.c:850-895`).
+    /// (`aeron_client_conductor.c:888-933`).
     fn adopt_counter(&mut self, correlation_id: i64, counter_id: i32) -> Counter {
         let counter = Counter::new(correlation_id, correlation_id, counter_id);
         self.counters.push(counter);
@@ -2129,7 +2129,7 @@ impl Client {
     /// The acknowledgement is the whole reply — `ON_UNAVAILABLE_COUNTER`
     /// follows it on the broadcast as an event for whoever was watching, and
     /// is not part of this command's answer
-    /// (`aeron_driver_conductor.c:6221-6235`).
+    /// (`aeron_driver_conductor.c:6318-6332`).
     ///
     /// # Errors
     ///
@@ -2175,14 +2175,14 @@ impl Client {
     /// correlation id this request used. There is no separate allocation for a
     /// destination in the reference either: its client completes a registering
     /// resource when the reply's correlation id matches the id it is waiting on
-    /// (`aeron_client_conductor.c:975-991`), and
+    /// (`aeron_client_conductor.c:1013-1029`), and
     /// `aeron_async_destination_get_registration_id` documents its return value
-    /// as "correlation_id sent to driver" (`aeronc.h:2697-2705`).
+    /// as "correlation_id sent to driver" (`aeronc.h:2721-2729`).
     ///
     /// The URI is **not** parsed here. The reference's client only null-checks
     /// it (`aeron_client.c:635-652`); what a destination URI may be is the
     /// driver's question (`aeron_driver_conductor_validate_send_destination_uri`,
-    /// `aeron_driver_conductor.c:5369-5410`). A bad URI therefore comes back as
+    /// `aeron_driver_conductor.c:5466-5507`). A bad URI therefore comes back as
     /// the driver's own `ON_ERROR`, in the driver's words, rather than as a
     /// second refusal worded here that no other client would recognise.
     ///
@@ -2226,10 +2226,10 @@ impl Client {
     /// This is the one command in the family whose failures the reference
     /// answers **nothing** to: `REMOVE_DESTINATION_BY_ID` calls its handler
     /// without taking the result
-    /// (`aeron_driver_conductor.c:3188-3200`), so the error the handler returns
-    /// for a publication it cannot find (`:5562-5578`) never reaches the
+    /// (`aeron_driver_conductor.c:3285-3297`), so the error the handler returns
+    /// for a publication it cannot find (`:5659-5675`) never reaches the
     /// `result < 0` that would send an `ON_ERROR`. Every other destination
-    /// command assigns it (`:3020`, `:3035`, `:3055-3062`, `:3083-3090`). A
+    /// command assigns it (`:3083`, `:3098`, `:3118-3125`, `:3146-3153`). A
     /// caller that passes an unknown publication waits for an answer that is
     /// not coming, and the reference's own clients do the same — so a timeout
     /// here is the reference's behaviour, not a broken connection.
@@ -2923,7 +2923,7 @@ impl Client {
     /// The counter belongs to the **driver**, not to this client: it is
     /// allocated with an owner id of `NULL_VALUE` and is not added to the list
     /// this client's counters are in, so it survives this client and is never
-    /// announced as unavailable (`aeron_driver_conductor.c:6300-6312`). That is
+    /// announced as unavailable (`aeron_driver_conductor.c:6397-6409`). That is
     /// what makes it useful — a value two processes want to watch without
     /// either of them owning it — and it is why the handle that comes back is a
     /// [`StaticCounter`] rather than a [`Counter`]: there is no removal to make.
@@ -3118,7 +3118,7 @@ impl Client {
     /// waited for**.
     ///
     /// `aeron_client_conductor_reject_image`
-    /// (`aeron-client/src/main/c/aeron_client_conductor.c:3627-3651`): the
+    /// (`aeron-client/src/main/c/aeron_client_conductor.c:3712-3736`): the
     /// command goes into the ring, the ring is committed, and the client is
     /// done. Nothing in that function waits, and the answer the driver does
     /// send — `ON_OPERATION_SUCCEEDED` on the command's correlation id —
@@ -3306,13 +3306,13 @@ impl Client {
     /// handler has returned, never before — and, when the read moved it, that
     /// publication is not optional. The driver computes the publisher's window
     /// limit from the minimum of these counters
-    /// (`aeron_ipc_publication.c:296-313`), so an image that is read but not
+    /// (`aeron_ipc_publication.c:301-318`), so an image that is read but not
     /// reported eventually blocks the publisher.
     ///
     /// Only a read that **moved** the position is published, which is the
     /// reference's own gate: `Image.poll` writes the subscriber position counter
     /// only `if (newPosition > initialPosition)` (`Image.java:374-378`;
-    /// `aeron_image.c:314-322`). A poll that read nothing would re-send the value
+    /// `aeron_image.c:318-326`). A poll that read nothing would re-send the value
     /// the counter already holds — the driver's window computation cannot see a
     /// difference between that and not writing at all — and it was building a
     /// `CountersReader` to do it.
@@ -3341,7 +3341,7 @@ impl Client {
     ///
     /// A cluster follower polls its log image this way up to what the leader
     /// has committed, so it never applies an entry ahead of the commit
-    /// position (`ConsensusModuleAgent.java:2523`).
+    /// position (`ConsensusModuleAgent.java:2549`).
     pub fn poll_image_bounded<F>(
         &mut self,
         subscription_id: i64,
@@ -3386,7 +3386,7 @@ impl Client {
     /// [`Client::poll_image_bounded`], letting each fragment decide what
     /// happens to it — the controlled face's bounded form
     /// (`Image.boundedControlledPoll`, `Image.java:565-665`;
-    /// `aeron_image_bounded_controlled_poll`, `aeron_image.c:528`).
+    /// `aeron_image_bounded_controlled_poll`, `aeron_image.c:532`).
     ///
     /// It exists because the reference's log reader is this call
     /// (`LogAdapter.java:103`): a cluster follower reads its log image up to
@@ -3545,7 +3545,7 @@ impl Client {
         // the CnC file — in order to write nothing. What the write is for is the
         // driver's publisher-window computation: an image that is read but never
         // reported eventually blocks the publisher
-        // (`aeron_ipc_publication.c:296-313`).
+        // (`aeron_ipc_publication.c:301-318`).
         let mut publish = |counter_id: i32, position: i64| {
             if let Some(counters) = cnc.counters_writable() {
                 counters.set_value(counter_id, position);
@@ -3830,7 +3830,7 @@ impl Client {
 
         // The reference's two failure branches, in its order, and the order is
         // what makes them distinguishable: a driver that *stopped* leaves the
-        // null sentinel behind (`aeron_driver_conductor.c:3493` writes it), and
+        // null sentinel behind (`aeron_driver_conductor.c:3590` writes it), and
         // a driver that was killed leaves its last heartbeat — so the first
         // test is exact and the second is a timeout
         // (`aeron_client_conductor.c:1308-1334`).
@@ -3865,7 +3865,7 @@ impl Client {
             // this scan is what saves a client that never saw the
             // announcement — a lap, or polls that stopped — and is also the
             // reference's only mechanism, run every liveness check until it
-            // hits (`aeron_client_conductor.c:1338-1341`).
+            // hits (`aeron_client_conductor.c:1384-1387`).
             self.heartbeat_counter =
                 counters.find_by_type_and_registration(CLIENT_HEARTBEAT_TYPE_ID, self.client_id);
 
@@ -3878,10 +3878,10 @@ impl Client {
         // counter by now — after the driver went away and another took the
         // directory, or after this client was reaped. Writing `now` into it
         // would keep a stranger alive and keep this client looking healthy
-        // while it is not (`aeron_client_conductor.c:1338-1390`).
+        // while it is not (`aeron_client_conductor.c:1384-1436`).
         //
         // Read **by id**, in constant time, as the reference does
-        // (`aeron_counter_heartbeat_timestamp_is_active`, `:1234-1249`). Asking
+        // (`aeron_counter_heartbeat_timestamp_is_active`, `:1264-1279`). Asking
         // the same question by scanning the catalogue costs the whole catalogue
         // — every counter in the file, each one built into a descriptor with
         // its label — and this is on the poll path, which is the loop every
@@ -3901,7 +3901,7 @@ impl Client {
     ///
     /// The reference force-closes every resource it holds, which unmaps every
     /// image it had mapped (`aeron_client_conductor_force_close_resources`,
-    /// `:1290-1303`). Dropping them here does the same, and a caller that
+    /// `:1320-1333`). Dropping them here does the same, and a caller that
     /// reaches for one afterwards finds nothing rather than a mapping of a log
     /// buffer whose driver is gone.
     fn terminate(&mut self, error: ClientError) {
@@ -4145,7 +4145,7 @@ impl Client {
             // by the echoed correlation id — the same match the reference's
             // `on_counter_ready` makes against its awaiting resources before
             // it fires the watchers' handlers unconditionally, for every
-            // client's counters (`aeron_client_conductor.c:850-895`). The
+            // client's counters (`aeron_client_conductor.c:888-933`). The
             // messages that match nothing pending are broadcasts — another
             // client's counter, or this client's own heartbeat — and are not
             // a reply to any command, so they are neither completed nor
@@ -4165,7 +4165,7 @@ impl Client {
                 // drawn at connect, so the value is spent and will not be
                 // handed out as a correlation. The reference instead finds its
                 // heartbeat by scanning the file on the liveness path
-                // (`aeron_client_conductor.c:1338-1341`); adopting it here
+                // (`aeron_client_conductor.c:1384-1387`); adopting it here
                 // saves that scan in the normal case, and the scan remains
                 // below for a client that never saw the announcement.
                 if self.heartbeat_counter.is_none() && correlation_id == self.client_id {
@@ -4182,7 +4182,7 @@ impl Client {
             }
             // A counter went away. The reference's handler for this fires the
             // unavailable callbacks and does nothing else — no lookup, no
-            // close (`aeron_client_conductor.c:898-906`) — because a handle
+            // close (`aeron_client_conductor.c:936-944`) — because a handle
             // is only a name and a reclaimed slot already answers every
             // question about itself with "gone". So does this: the event is
             // the whole of the client's side.
@@ -4221,7 +4221,7 @@ impl Client {
     ) {
         // Where to start reading. The driver writes the join position into the
         // counter as part of linking the subscription
-        // (`aeron_driver_conductor.c:3547-3575`), and it does so *before*
+        // (`aeron_driver_conductor.c:3644-3672`), and it does so *before*
         // sending this message — so the counter, not the message, is the
         // authority on where this subscriber starts.
         let join_position = self

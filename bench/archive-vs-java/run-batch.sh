@@ -292,7 +292,7 @@ _archive_defines() {
     printf -- '-Daeron.archive.control.channel=%s\n' "aeron:udp?endpoint=$_batch_ip:$control_port"
     printf -- '-Daeron.archive.control.response.channel=%s\n' "aeron:udp?endpoint=$_batch_ip:0"
     # A UDP control channel obliges a replication channel — the reference refuses
-    # to start without one (`Archive.java:1237`) once the control channel is not
+    # to start without one (`Archive.java:1303`) once the control channel is not
     # IPC, and its own two-machine script passes `endpoint=${DESTINATION_IP}:0`.
     printf -- '-Daeron.archive.replication.channel=%s\n' "aeron:udp?endpoint=$_batch_ip:0"
 }

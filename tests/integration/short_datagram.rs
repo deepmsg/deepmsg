@@ -7,7 +7,7 @@
 //!   with the header's length — `packet_length >= AERON_FRAME_HEADER_LENGTH`
 //!   (`aeron-client/src/main/c/protocol/aeron_udp_protocol.h:229-231`) — so a
 //!   short datagram is invalid by that first clause, and its dispatch counts it
-//!   (`media/aeron_receive_channel_endpoint.c:524-535`). In this build the
+//!   (`media/aeron_receive_channel_endpoint.c:529-540`). In this build the
 //!   header *read* failed before the check was reached and the datagram went
 //!   nowhere: no counter, no log, nothing to see from outside.
 //! * **Long enough and invalid anyway.** This one was counted all along; it is

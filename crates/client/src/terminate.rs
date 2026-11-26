@@ -21,7 +21,7 @@
 //!
 //! The only way to see the outcome is to watch the file: a driver that closes
 //! cleanly release-stores `-1` into the to-driver ring's `consumer_heartbeat`
-//! (`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`), so
+//! (`aeron-driver/src/main/c/aeron_driver_conductor.c:3590`), so
 //! `cnc.consumer_heartbeat_ms()` becoming [`deepmsg_cnc::layout::NULL_VALUE`]
 //! is the evidence. `cnc-dump` prints it.
 

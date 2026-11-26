@@ -10,7 +10,7 @@
 //! What the reference relies on is that a business exception in `onTakeSnapshot`
 //! propagates out of the agent (`ClusteredServiceAgent.java:988-1019` catches
 //! only `ArchiveException`), after the action has been acked with a null
-//! recording id (`:1057-1092`). That is the behaviour asserted here: the failing
+//! recording id (`:1064-1099`). That is the behaviour asserted here: the failing
 //! container **ends**, the module's snapshot count stays put, its neighbour
 //! keeps applying the log, and the restarted container replays what it missed.
 //!

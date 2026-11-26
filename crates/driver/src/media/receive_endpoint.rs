@@ -6,7 +6,7 @@
 //! between them is the whole reason both exist: a *send* endpoint binds the
 //! interface and connects to the endpoint parameter, while a **receive**
 //! endpoint binds the endpoint parameter itself
-//! (`aeron_receive_destination.c:47-76`) — the address a subscription names is
+//! (`aeron_receive_destination.c:52-81`) — the address a subscription names is
 //! where it listens.
 //!
 //! # What it answers with
@@ -16,8 +16,8 @@
 //! * a **status message** says how far this endpoint has read and how much room
 //!   it has, which is the publisher's whole flow control. One is sent to elicit
 //!   a `SETUP` when data arrives for a session with no image
-//!   (`elicit_setup_from_source`, `aeron_data_packet_dispatcher.c:616-659`),
-//!   and one periodically for each image (`aeron_publication_image.c:862-990`);
+//!   (`elicit_setup_from_source`, `aeron_data_packet_dispatcher.c:621-664`),
+//!   and one periodically for each image (`aeron_publication_image.c:867-995`);
 //! * a **NAK** says which bytes were missed;
 //! * an **RTTM** answers a measurement.
 //!
@@ -25,13 +25,13 @@
 //! the implicit-unicast control address, and it is why a subscriber can answer
 //! a publisher it was never told the address of. A channel that named an
 //! explicit `control=` overrides it, and multicast uses the group's control
-//! address (`:120-129`).
+//! address (`:125-134`).
 //!
 //! # Reference counts
 //!
 //! The endpoint lives while anything reads through it: one count per stream and
 //! one per (stream, session) subscription, both kept here
-//! (`stream_id_to_refcnt_map`, `stream_and_session_id_to_refcnt_map`, `:104-122`)
+//! (`stream_id_to_refcnt_map`, `stream_and_session_id_to_refcnt_map`, `:109-127`)
 //! because the endpoint is what a subscription is *linked* to. The image count
 //! is separate and lives on the conductor, where images are created.
 
@@ -83,7 +83,7 @@ pub enum ReceiveEndpointError {
     /// is why it travels as a value rather than being finished here.
     Bind(deepmsg_cnc::error_log::ErrorReport),
     /// The wildcard port manager had no port to give
-    /// (`aeron_wildcard_port_manager_get_managed_port`, `aeron_port_manager.c:93-104`).
+    /// (`aeron_wildcard_port_manager_get_managed_port`, `aeron_port_manager.c:98-109`).
     ///
     /// The words are the manager's own, because they are what a client reads in
     /// its `RegistrationException` when the driver has run out of ports
@@ -106,8 +106,8 @@ impl std::error::Error for ReceiveEndpointError {}
 
 /// The first three lines of what the reference records when a receive
 /// destination cannot bind: `aeron_bind` set it, and two layers appended to it
-/// on the way up (`aeron_socket.c:93`, `aeron_udp_channel_transport.c:151`,
-/// `aeron_receive_destination.c:78`).
+/// on the way up (`aeron_socket.c:93`, `aeron_udp_channel_transport.c:165`,
+/// `aeron_receive_destination.c:84`).
 ///
 /// `affinity=1` is `AERON_UDP_CHANNEL_TRANSPORT_AFFINITY_RECEIVER`
 /// (`media/aeron_udp_channel_transport_bindings.h:26-30` — the sender's is 0),
@@ -152,7 +152,7 @@ impl ReceiveDestination {
 
     /// A destination with a socket of its own
     /// (`aeron_receive_destination_create`,
-    /// `media/aeron_receive_destination.c:30-139`).
+    /// `media/aeron_receive_destination.c:35-144`).
     ///
     /// # Errors
     ///
@@ -173,7 +173,7 @@ impl ReceiveDestination {
         now_ns: i64,
         interceptors: &[super::interceptor::Interceptor],
     ) -> Result<Self, ReceiveEndpointError> {
-        // `aeron_receive_destination.c:47-56`: the manager is asked for the
+        // `aeron_receive_destination.c:52-61`: the manager is asked for the
         // port **before** the socket is opened, on the address the channel
         // wrote as `endpoint=` — `remote_data`, the group for a group.
         //
@@ -185,7 +185,7 @@ impl ReceiveDestination {
             .map_err(ReceiveEndpointError::Port)?;
         let managed_port = bind.port();
 
-        // `:69-75`: the bind address is that one, the interface is the
+        // `:75-81`: the bind address is that one, the interface is the
         // channel's `local_data`, and a destination **never** connects, which
         // is why a subscriber's transport has one descriptor.
         let transport = match bindings.open(
@@ -200,7 +200,7 @@ impl ReceiveDestination {
                 // The port goes back with the socket that could not have it:
                 // the reference's create calls its own delete on every failure
                 // path, and the managed port is freed there
-                // (`:54`, `:79`, `:152-156`).
+                // (`:59`, `:85`, `:158-162`).
                 port_manager.free_managed_port(managed_port);
                 return Err(ReceiveEndpointError::Bind(bind_report(&channel, &failure)));
             }
@@ -264,7 +264,7 @@ impl ReceiveDestination {
 
         let has_explicit_control = channel.has_explicit_control;
 
-        // `:120-129`: a group's control address is its twin, an explicit
+        // `:126-135`: a group's control address is its twin, an explicit
         // control is the one the channel named, and a destination that named
         // neither has none — which is the same flag that says it never asks
         // (`has_explicit_control`).
@@ -308,7 +308,7 @@ impl ReceiveDestination {
     }
 
     /// Data, a `SETUP` or an `RTTM` arrived for this destination, which is what
-    /// "it is still there" means (`aeron_receive_channel_endpoint.c:589`).
+    /// "it is still there" means (`aeron_receive_channel_endpoint.c:594`).
     pub const fn on_activity(&mut self, now_ns: i64) {
         self.time_of_last_activity_ns = now_ns;
     }
@@ -368,7 +368,7 @@ impl ReceiveDestination {
 
     /// Where the ask goes: the channel's own control address
     /// (`udp_channel->local_control`,
-    /// `media/aeron_receive_channel_endpoint.c:1138-1139`).
+    /// `media/aeron_receive_channel_endpoint.c:1143-1144`).
     ///
     /// [`None`] for a destination that has nothing to ask.
     pub fn setup_address(&self) -> Option<SocketAddr> {
@@ -377,14 +377,14 @@ impl ReceiveDestination {
 
     /// The channel this destination is for, which is what identifies it: the
     /// reference compares two by `aeron_udp_channel_equals` when one is removed
-    /// (`media/aeron_receive_channel_endpoint.c:877-905`).
+    /// (`media/aeron_receive_channel_endpoint.c:882-910`).
     pub const fn channel(&self) -> &UdpChannel {
         &self.channel
     }
 }
 
 /// Allocate the counter that says where a destination is **actually** bound
-/// (`aeron_receive_destination.c:88-105`).
+/// (`aeron_receive_destination.c:94-111`).
 ///
 /// The address comes from the kernel, not from the channel: a destination is
 /// allowed to name port zero — a multi-destination one does — and then this
@@ -441,10 +441,10 @@ fn destination_local_sockaddr_counter(
 /// `aeron_receive_destination_t *` lives in the endpoint's `destinations`
 /// array, and everyone who has to answer *through* one carries that pointer —
 /// each connection an image has (`aeron_publication_image.h:41`) and each
-/// pending setup (`aeron_driver_receiver.h:41`). Sending then takes the
+/// pending setup (`aeron_driver_receiver.h:50`). Sending then takes the
 /// destination as an argument rather than choosing one
 /// (`aeron_receive_channel_endpoint_send`,
-/// `media/aeron_receive_channel_endpoint.c:225-257`).
+/// `media/aeron_receive_channel_endpoint.c:230-262`).
 ///
 /// A Rust endpoint cannot hand out pointers into its own `Vec` — it has to keep
 /// writing to it — so the handle is a number. The one property it has to have
@@ -481,7 +481,7 @@ impl DestinationId {
 /// `:34`) and its own channel, and a receive endpoint holds a list of them. A
 /// unicast channel has exactly one — the endpoint it named — and a
 /// multi-destination channel starts with none and gains them as clients add
-/// them (`aeron_driver_conductor.c:2099-2114`).
+/// them (`aeron_driver_conductor.c:2150-2165`).
 ///
 /// The reference's entry also carries the control address it answers through,
 /// whether the channel named one, and when something was last heard from it.
@@ -521,26 +521,26 @@ pub struct ReceiveDestination {
     /// The port the wildcard port manager is holding for this destination, and
     /// zero when it holds none
     /// (`aeron_receive_destination.port_manager` + the bind address it was
-    /// given, `media/aeron_receive_destination.c:47-58`).
+    /// given, `media/aeron_receive_destination.c:52-63`).
     ///
     /// Non-zero only when the driver named a range and the channel named port
     /// zero. It travels back to the conductor with the counter when the
     /// destination is gone, because giving the port back is the conductor's —
     /// the manager is on its thread — and because the reference gives it back
-    /// where the destination is deleted (`:152-156`), which is here.
+    /// where the destination is deleted (`:158-162`), which is here.
     managed_port: u16,
     /// Whether the destination's channel named a `control=`
     /// (`has_explicit_control`).
     ///
     /// This is what decides whether the receiver **opens the conversation**:
     /// a destination with an explicit control address is one the sender does
-    /// not know about, so the receiver has to ask (`aeron_driver_receiver.c:475-486`,
+    /// not know about, so the receiver has to ask (`aeron_driver_receiver.c:485-496`,
     /// which adds a periodic pending setup for exactly these and no others).
     /// A destination the sender already knows — an implicit-unicast one — is
     /// asked for nothing.
     has_explicit_control: bool,
     /// Where this destination's control frames go **now** (`current_control_addr`,
-    /// `aeron_receive_destination.c:120-129`): the channel's own control address
+    /// `aeron_receive_destination.c:126-135`): the channel's own control address
     /// until a re-resolution moves it.
     ///
     /// It is stored rather than read off the channel because the channel is
@@ -549,9 +549,9 @@ pub struct ReceiveDestination {
     /// knows.
     control_addr: SocketAddr,
     /// When this destination was last heard from
-    /// (`time_of_last_activity_ns`, `:118` at creation): data, a `SETUP` or an
-    /// `RTTM` (`aeron_receive_channel_endpoint.c:589`, `:631`, `:659`), and the
-    /// check itself (`:1059`).
+    /// (`time_of_last_activity_ns`, `:124` at creation): data, a `SETUP` or an
+    /// `RTTM` (`aeron_receive_channel_endpoint.c:594`, `:636`, `:664`), and the
+    /// check itself (`:1064`).
     ///
     /// Five seconds of silence from a destination that **named** a control
     /// address is a name to resolve again
@@ -569,7 +569,7 @@ pub struct ReceiveChannelEndpoint {
     ///
     /// A unicast channel has one — the endpoint it named — and a
     /// multi-destination channel starts with none and gains them as clients add
-    /// them (`aeron_driver_conductor.c:2099-2114`), which is why the callers
+    /// them (`aeron_driver_conductor.c:2150-2165`), which is why the callers
     /// handle the empty case rather than assuming a destination.
     ///
     /// The pair is the point: a position in this `Vec` is a **cursor** — good
@@ -599,7 +599,7 @@ pub struct ReceiveChannelEndpoint {
     pub socket_sndbuf: usize,
     /// The group tag this endpoint stamps into what it sends (`group_tag`):
     /// the channel's own `gtag=` when it named one, the driver's setting
-    /// otherwise (`aeron_receive_channel_endpoint_set_group_tag`, `:32-53`).
+    /// otherwise (`aeron_receive_channel_endpoint_set_group_tag`, `:37-58`).
     ///
     /// [`None`] is the difference the reference keeps between "no tag" and a
     /// tag of `-1`: the first sends a 36-byte status message and leaves the
@@ -622,7 +622,7 @@ pub struct ReceiveChannelEndpoint {
 }
 
 /// Write the address the endpoint is bound to into its channel-status label
-/// (`aeron_driver_conductor.c:2157-2165`, asking
+/// (`aeron_driver_conductor.c:2208-2216`, asking
 /// `aeron_receive_channel_endpoint_bind_addr_and_port`, `:316-329`).
 ///
 /// The address is the **first destination's**, because the endpoint's socket is
@@ -660,7 +660,7 @@ fn publish_bound_address(
     };
 
     // `"%s: %.*s %.*s"` — the name, the channel, the address
-    // (`aeron_position.c:229-244`), replacing the label the counter was
+    // (`aeron_position.c:234-249`), replacing the label the counter was
     // allocated with. The channel is bytes rather than text, as it is there: it
     // is whatever the client sent, and this end never decodes it.
     let mut label = format!("{}: ", counter_position::RECEIVE_CHANNEL_STATUS_NAME).into_bytes();
@@ -698,8 +698,8 @@ fn release_counters(
 impl ReceiveChannelEndpoint {
     /// Create the endpoint: allocate its channel-status counter and open the
     /// socket bound to the channel's endpoint parameter
-    /// (`aeron_receive_channel_endpoint_create`, `:58-170`, with the bind in
-    /// `aeron_receive_destination.c:30-139`).
+    /// (`aeron_receive_channel_endpoint_create`, `:63-175`, with the bind in
+    /// `aeron_receive_destination.c:35-144`).
     ///
     /// # Errors
     ///
@@ -736,11 +736,11 @@ impl ReceiveChannelEndpoint {
         // The endpoint's first destination opens the socket, because the
         // socket *is* a destination's: the receive side binds the endpoint —
         // where a subscription listens — and is never connected, because it
-        // answers whoever writes to it (`aeron_receive_destination.c:30-139`).
+        // answers whoever writes to it (`aeron_receive_destination.c:35-144`).
         //
         // **Except on a manual channel, which starts with none at all.** The
         // reference creates this one only `if (AERON_UDP_CHANNEL_CONTROL_MODE_MANUAL
-        // != channel->control_mode)` (`aeron_driver_conductor.c:2099-2114`): a
+        // != channel->control_mode)` (`aeron_driver_conductor.c:2150-2165`): a
         // manual channel's sources are the ones a client names with
         // `ADD_RCV_DESTINATION`, and until one is named there is nowhere to
         // listen. Every other channel is told where to listen by its own
@@ -1030,7 +1030,7 @@ impl ReceiveChannelEndpoint {
         // The dispatcher hears it only when the endpoint's **last** holder of
         // the stream lets go
         // (`aeron_receive_channel_endpoint_decref_to_stream`,
-        // `media/aeron_receive_channel_endpoint.c:720-748`): two subscriptions
+        // `media/aeron_receive_channel_endpoint.c:725-753`): two subscriptions
         // on one stream share one dispatcher entry, and the first to leave
         // must not stop the packets the other is still reading.
         if self.decrement(&stream_id, None).0 {
@@ -1044,7 +1044,7 @@ impl ReceiveChannelEndpoint {
     pub fn remove_subscription_by_session(&mut self, stream_id: i32, session_id: i32) -> bool {
         // The same rule per session
         // (`aeron_receive_channel_endpoint_decref_to_stream_and_session`,
-        // `:807-837`): the dispatcher's per-session entry goes when the last
+        // `:812-842`): the dispatcher's per-session entry goes when the last
         // subscription that named that session does. A backup depends on it —
         // it resolves its wildcard catchup port with a session-named
         // subscription and then closes it, while the archive's own recording
@@ -1062,7 +1062,7 @@ impl ReceiveChannelEndpoint {
     ///
     /// Answers whether the stream's count reached zero, and whether the
     /// session's did — the two the dispatcher is told about, each on its own
-    /// count (`aeron_receive_channel_endpoint.c:720-837`).
+    /// count (`aeron_receive_channel_endpoint.c:725-842`).
     fn decrement(&mut self, stream_id: &i32, session_id: Option<i32>) -> (bool, bool) {
         let mut stream_was_last = false;
         let mut session_was_last = false;
@@ -1093,7 +1093,7 @@ impl ReceiveChannelEndpoint {
                 }
                 // A session this endpoint has no count for is one it has
                 // already let go: the reference returns from the decref
-                // without telling the receiver anything (`:814-817`).
+                // without telling the receiver anything (`:819-822`).
                 None => session_was_last = false,
             }
         }
@@ -1130,7 +1130,7 @@ impl ReceiveChannelEndpoint {
     /// notices.
     /// Whether the **endpoint's own** generator withholds this `DATA` frame
     /// (`aeron_receive_channel_endpoint_on_data`,
-    /// `media/aeron_receive_channel_endpoint.c:576-585`).
+    /// `media/aeron_receive_channel_endpoint.c:581-590`).
     ///
     /// The frame's fields are passed in rather than read out of `datagram`
     /// again, because the caller has already parsed them and a second read is a
@@ -1158,7 +1158,7 @@ impl ReceiveChannelEndpoint {
     }
 
     /// Whether it withholds this `SETUP` or `RTTM`
-    /// (`media/aeron_receive_channel_endpoint.c:618-620`, `:646-648`).
+    /// (`media/aeron_receive_channel_endpoint.c:623-625`, `:651-653`).
     ///
     /// Neither frame carries a term offset a rule could name, which is why the
     /// reference asks its generators about them through a different entry point
@@ -1195,7 +1195,7 @@ impl ReceiveChannelEndpoint {
     ///
     /// The destination arrives **built** — its socket open, the counter holding
     /// its address allocated — because the conductor is what has a counter
-    /// manager (`aeron_driver_conductor.c:5903-5919`: it creates the destination
+    /// manager (`aeron_driver_conductor.c:6000-6016`: it creates the destination
     /// and hands it to the receiver, exactly as it hands over an endpoint).
     /// This is the receiver's half: the endpoint holds it, and the next pass
     /// reads from it.
@@ -1218,12 +1218,12 @@ impl ReceiveChannelEndpoint {
     /// one.
     ///
     /// A destination is identified by its channel, which is how the reference
-    /// compares two (`media/aeron_receive_channel_endpoint.c:877-905`). The
+    /// compares two (`media/aeron_receive_channel_endpoint.c:882-910`). The
     /// counters it holds are the caller's to give back, because the caller
     /// allocated them — and the handle comes back too, because it is what tells
     /// the images on this endpoint which connection to let go
     /// (`aeron_publication_image_remove_destination`,
-    /// `aeron_driver_receiver.c:527`).
+    /// `aeron_driver_receiver.c:537`).
     ///
     /// The handle is retired here and never handed out again, so a caller that
     /// forgets to tell everyone is left with a connection that sends nothing
@@ -1247,7 +1247,7 @@ impl ReceiveChannelEndpoint {
     /// Ask a destination's source for a `SETUP`, and give back the periodic
     /// entry that keeps asking until it answers
     /// (`aeron_receive_channel_endpoint_add_pending_setup_destination`,
-    /// `media/aeron_receive_channel_endpoint.c:1127-1152`).
+    /// `media/aeron_receive_channel_endpoint.c:1132-1157`).
     ///
     /// Two halves in one call, and both matter: the entry makes the ask
     /// **periodic**, and the status message sent beside it is the *first* ask —
@@ -1258,7 +1258,7 @@ impl ReceiveChannelEndpoint {
     ///
     /// [`None`] for a destination whose channel named no `control=`: the sender
     /// already knows about it, and there is nothing to ask
-    /// (`:1136`, the same condition).
+    /// (`:1141`, the same condition).
     pub(crate) fn ask_for_setup(
         &mut self,
         endpoint_id: u64,
@@ -1278,7 +1278,7 @@ impl ReceiveChannelEndpoint {
 
         // The channel that is not multicast and did name a control sends to
         // `local_control`, which is where the entry above will send too
-        // (`media/aeron_receive_destination.c:117-124`).
+        // (`media/aeron_receive_destination.c:123-130`).
         let _ = self.send_sm(destination, address, 0, 0, 0, 0, 0, Self::send_setup_flag());
 
         Some(setup)
@@ -1288,7 +1288,7 @@ impl ReceiveChannelEndpoint {
     ///
     /// A unicast channel has one; a multi-destination channel has as many as
     /// clients have added. The receiver polls every one of them
-    /// (`aeron_driver_receiver_do_work`, `:130-260`, which polls the transport
+    /// (`aeron_driver_receiver_do_work`, `:136-266`, which polls the transport
     /// poller — every transport in it).
     pub fn destination_count(&self) -> usize {
         self.destinations.len()
@@ -1334,7 +1334,7 @@ impl ReceiveChannelEndpoint {
 
     /// The destinations that named a control address and have gone quiet long
     /// enough for it to be resolved again
-    /// (`aeron_receive_channel_endpoint_check_for_re_resolution`, `:1046-1062`).
+    /// (`aeron_receive_channel_endpoint_check_for_re_resolution`, `:1051-1067`).
     ///
     /// Each is `(id, name, address-it-has-now)`, and asking **stamps** it
     /// (`:1059`), so one destination is asked about once per timeout rather
@@ -1363,7 +1363,7 @@ impl ReceiveChannelEndpoint {
     }
 
     /// A frame arrived for a destination, which is what keeps it from being
-    /// asked about (`aeron_receive_channel_endpoint.c:589`, `:631`, `:659`).
+    /// asked about (`aeron_receive_channel_endpoint.c:594`, `:636`, `:664`).
     pub fn on_activity(&mut self, id: DestinationId, now_ns: i64) {
         if let Some((_, destination)) = self.destinations.iter_mut().find(|(key, _)| *key == id) {
             destination.on_activity(now_ns);
@@ -1371,7 +1371,7 @@ impl ReceiveChannelEndpoint {
     }
 
     /// Take the answer to a re-resolution
-    /// (`aeron_receive_channel_endpoint_update_control_address`, `:1064-1073`).
+    /// (`aeron_receive_channel_endpoint_update_control_address`, `:1069-1078`).
     ///
     /// The id may be gone — a client can remove a destination while its name is
     /// being resolved — and that is not an error.
@@ -1382,7 +1382,7 @@ impl ReceiveChannelEndpoint {
     }
 
     /// The address a status message about `source` should go
-    /// (`aeron_receive_destination.c:120-129`): a group's control twin, the
+    /// (`aeron_receive_destination.c:126-135`): a group's control twin, the
     /// control address a channel named, or else the source of the data being
     /// answered.
     ///
@@ -1395,7 +1395,7 @@ impl ReceiveChannelEndpoint {
             // A destination that named a control address answers there — and
             // that address is the one a re-resolution moves, so it is read off
             // the destination rather than off its channel
-            // (`current_control_addr`, `aeron_receive_destination.c:120-129`).
+            // (`current_control_addr`, `aeron_receive_destination.c:126-135`).
             if destination.has_explicit_control {
                 destination.current_control_address()
             } else {
@@ -1405,7 +1405,7 @@ impl ReceiveChannelEndpoint {
     }
 
     /// Send a status message through the destination it is about
-    /// (`aeron_receive_channel_endpoint_send_sm`, `:291-338`).
+    /// (`aeron_receive_channel_endpoint_send_sm`, `:296-343`).
     ///
     /// The destination is the caller's to name, and that is the reference's
     /// shape too: it passes the `aeron_receive_destination_t` the answer
@@ -1469,7 +1469,7 @@ impl ReceiveChannelEndpoint {
     }
 
     /// Send a `RSP_SETUP`
-    /// (`aeron_receive_channel_endpoint_send_response_setup`, `:432-466`).
+    /// (`aeron_receive_channel_endpoint_send_response_setup`, `:437-471`).
     ///
     /// This is the answer an image owes a publication whose `SETUP` carried
     /// [`header_flags::SETUP_SEND_RESPONSE`](crate::protocol::header_flags::SETUP_SEND_RESPONSE):
@@ -1740,17 +1740,17 @@ impl ReceiveChannelEndpoint {
 
     /// Ask **every** destination for the stream
     /// (`aeron_receive_channel_endpoint_elicit_setup`,
-    /// `media/aeron_receive_channel_endpoint.c:259-289`).
+    /// `media/aeron_receive_channel_endpoint.c:264-294`).
     ///
     /// Unconditional, and that is the reference's shape: the endpoint-level ask
     /// is not a decision, it is the whole act, and it goes to every destination
     /// the endpoint has. What decides *whether* to ask is the caller's, and the
     /// guard there is the channel's — a channel that named no control address
-    /// has nowhere to send it (`aeron_driver_receiver.c:418-426`).
+    /// has nowhere to send it (`aeron_driver_receiver.c:428-436`).
     ///
     /// It is a separate method from [`Self::elicit_setup`] because that one
     /// answers a different question: it is the *data*-driven path
-    /// (`aeron_data_packet_dispatcher_elicit_setup_from_source`, `:616-659`),
+    /// (`aeron_data_packet_dispatcher_elicit_setup_from_source`, `:621-664`),
     /// which is asked once per session and decides whether an ask is owed at
     /// all. This one is the ask.
     ///
@@ -2005,7 +2005,7 @@ mod tests {
     ///
     /// The answer moves where its control frames go — the ask and the answer
     /// both read it off the destination now
-    /// (`current_control_addr`, `aeron_receive_destination.c:120-129`).
+    /// (`current_control_addr`, `aeron_receive_destination.c:126-135`).
     #[test]
     fn only_a_quiet_destination_with_a_control_name_is_resolved_again() {
         let mut fixture = Fixture::new();
@@ -2054,7 +2054,7 @@ mod tests {
             "a destination that named no control address has no name to ask about"
         );
 
-        // A frame resets the clock (`aeron_receive_channel_endpoint.c:589`).
+        // A frame resets the clock (`aeron_receive_channel_endpoint.c:594`).
         with_control.on_activity(past);
         assert!(!with_control.re_resolution_required(past + RECEIVE_DESTINATION_TIMEOUT_NS));
 
@@ -2079,7 +2079,7 @@ mod tests {
     }
 
     /// Only a destination whose channel named a `control=` has anything to ask
-    /// (`aeron_driver_receiver.c:475-486`).
+    /// (`aeron_driver_receiver.c:485-496`).
     ///
     /// This is the condition the receiver pushes a periodic pending setup on: a
     /// sender that does not know the receiver exists will never describe its
@@ -2199,8 +2199,8 @@ mod tests {
     /// The dispatcher hears that a subscription went away only when the
     /// endpoint's **last** holder of that stream and session lets go
     /// (`aeron_receive_channel_endpoint_decref_to_stream_and_session`,
-    /// `media/aeron_receive_channel_endpoint.c:807-837`; the stream's own
-    /// count is `:720-748`).
+    /// `media/aeron_receive_channel_endpoint.c:812-842`; the stream's own
+    /// count is `:725-753`).
     ///
     /// The case that needs it: a backup resolves its wildcard catchup port
     /// with a session-named subscription and then closes it, and the archive's
@@ -2542,8 +2542,8 @@ mod tests {
 
     /// A channel that named a `control=` is one the sender does not know
     /// about, so the endpoint asks — once now, and then once a second until it
-    /// is answered (`aeron_driver_receiver.c:305-320`, which asks when the
-    /// endpoint arrives, and `media/aeron_receive_channel_endpoint.c:1127-1152`,
+    /// is answered (`aeron_driver_receiver.c:315-330`, which asks when the
+    /// endpoint arrives, and `media/aeron_receive_channel_endpoint.c:1132-1157`,
     /// which is the two halves this is).
     ///
     /// It is the whole of who speaks on a dynamic channel: without it a
@@ -2708,7 +2708,7 @@ mod tests {
     }
 
     /// And the error frame says so with a **flag** instead
-    /// (`aeron_receive_channel_endpoint.c:483-489`), with the field written
+    /// (`aeron_receive_channel_endpoint.c:488-494`), with the field written
     /// whether or not the flag is set.
     #[test]
     fn an_error_frame_flags_its_group_tag_when_the_endpoint_has_one() {
@@ -2815,7 +2815,7 @@ mod tests {
     }
 
     /// The text is clipped to the frame's own bound, which is the one the
-    /// reference measures with (`aeron_receive_channel_endpoint.c:479`).
+    /// reference measures with (`aeron_receive_channel_endpoint.c:484`).
     #[test]
     fn an_over_long_reason_is_clipped_to_the_frames_own_bound() {
         let mut fixture = Fixture::new();

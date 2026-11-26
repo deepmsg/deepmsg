@@ -4,7 +4,7 @@
 //! # What is judged here
 //!
 //! `shouldTriggerListRecordingTimeoutViaTimeoutManipulation` — the reference's
-//! case (`…_persistent_subscription_resilience_test.cpp:4125`) — which asks a
+//! case (`…_persistent_subscription_resilience_test.cpp:4128`) — which asks a
 //! question none of this slice's other cases do: not "does the machine take the
 //! right step", but "what does it do when an answer **never comes**".
 //!
@@ -22,7 +22,7 @@
 //! anything, and both are the same fact seen twice.
 //!
 //! **`controlled_poll` reads the archive client before it runs the state**
-//! (`:2281`), so an answer that has already arrived is always taken before the
+//! (`:2284`), so an answer that has already arrived is always taken before the
 //! deadline is even looked at. A deadline of a nanosecond therefore fires only
 //! if a *turn* is shorter than the round trip to the archive — so this case polls
 //! in a tight loop and does not sleep, which is what the reference's own loop
@@ -71,7 +71,7 @@
 //! # What this build does not have
 //!
 //! The hook is `set_message_timeout_ns_for_testing`, which is the reference's own
-//! (`:2425`) and is on the client side, so nothing here needs the driver or the
+//! (`:2428`) and is on the client side, so nothing here needs the driver or the
 //! archive to cooperate. What is *not* here is the rest of the family: the same
 //! manipulation for `max_recorded_position` and for the replay token, and the
 //! cases that drop responses instead of shrinking deadlines. Those need either a
@@ -102,7 +102,7 @@ const LIVE_STREAM_ID: i32 = 4248;
 const REPLAY_CHANNEL: &str = "aeron:ipc?alias=ps-timeout-replay";
 const REPLAY_STREAM_ID: i32 = 4249;
 
-/// What the recording holds — the reference's ten (`:4139`).
+/// What the recording holds — the reference's ten (`:4142`).
 const MESSAGES: usize = 10;
 
 const ARCHIVE_CONTROL_UDP: &str = "aeron:udp?endpoint=127.0.0.1:18010";
@@ -114,11 +114,11 @@ fn free_port(offset: u16) -> u16 {
     deepmsg_tests::ports::port(offset)
 }
 
-/// A deadline that has always passed by the time it is looked at (`:4161`).
+/// A deadline that has always passed by the time it is looked at (`:4164`).
 const INSTANT: i64 = 1;
 
 /// The archive's own default, restored once the machine has been watched
-/// (`:4157`, `:4176`).
+/// (`:4160`, `:4179`).
 const TEN_SECONDS_NS: i64 = 10_000_000_000;
 
 /// How long the machine has to **decide** once the deadline is a deadline again.
@@ -433,7 +433,7 @@ fn a_list_recording_request_that_times_out_is_asked_again() {
 /// the blackout ends by itself.**
 ///
 /// The reference's `shouldTimeoutOnListRecordingAndReplayResponseWhenResponsesDropped`
-/// (`…_resilience_test.cpp:4284`): pass the archive's connect handshake, withhold
+/// (`…_resilience_test.cpp:4287`): pass the archive's connect handshake, withhold
 /// everything after it, so the list-recording response never arrives and its
 /// deadline fires. The reference then **turns the loss off** from its own thread
 /// and waits for the machine to recover.
@@ -490,7 +490,7 @@ fn a_withheld_control_response_does_not_fail_the_subscription() {
     )
     .expect("the subscription is created");
 
-    // The reference's own 200 ms (`:4318`): short enough that a three-second
+    // The reference's own 200 ms (`:4321`): short enough that a three-second
     // blackout is several deadlines long.
     subscription.set_message_timeout_ns_for_testing(200_000_000);
 

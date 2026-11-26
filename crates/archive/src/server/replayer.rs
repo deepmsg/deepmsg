@@ -1,11 +1,11 @@
 //! The replayer's counters: how many replays are open, and what the reads cost.
 //!
 //! Four of the archive's, and the reference allocates them together
-//! (`Archive.java:1578-1659`): **112** `Archive Replay Sessions`, which the
-//! conductor moves as sessions open and close (`:993`, `:1382`), and the
+//! (`Archive.java:1646-1727`): **112** `Archive Replay Sessions`, which the
+//! conductor moves as sessions open and close (`:1055`, `:1448`), and the
 //! replayer's three statistics — **108** the longest single read, **109** the
 //! bytes read, **110** the nanoseconds spent reading — which the `Replayer`
-//! worker publishes once per turn that did work (`:2745-2791`).
+//! worker publishes once per turn that did work (`:2929-2975`).
 //!
 //! # The two halves live in different places, on purpose
 //!
@@ -37,7 +37,7 @@ use crate::server::counters::{
 
 /// One of the replayer's four counters.
 ///
-/// The order is `Archive.Context.conclude`'s (`Archive.java:1578-1659`), which
+/// The order is `Archive.Context.conclude`'s (`Archive.java:1646-1727`), which
 /// allocates 112, then the recorder's three, then these — the recorder's own
 /// block is the other [`CounterAllocator`], and the two blocks are independent
 /// of each other.
@@ -61,7 +61,7 @@ impl CounterKind for ReplayerCounter {
         Self::TotalReadTime,
     ];
 
-    /// `AeronCounters`' own ids (`:792`, `:799`, `:806`, `:818`).
+    /// `AeronCounters`' own ids (`:854`, `:861`, `:868`, `:880`).
     fn type_id(self) -> i32 {
         match self {
             Self::ReplaySessions => ARCHIVE_REPLAY_SESSION_COUNT_TYPE_ID,
@@ -71,8 +71,8 @@ impl CounterKind for ReplayerCounter {
         }
     }
 
-    /// The names their labels are built from (`Archive.java:1581`, `:1635`,
-    /// `:1646`, `:1657`).
+    /// The names their labels are built from (`Archive.java:1649`, `:1703`,
+    /// `:1714`, `:1725`).
     fn name(self) -> &'static str {
         match self {
             Self::ReplaySessions => REPLAY_SESSIONS_NAME,
@@ -95,7 +95,7 @@ pub struct ReplayerCounters {
     pub(crate) total_read_time: ArchiveIdCounter,
 }
 
-/// What the reads have added up to (`ArchiveConductor.java:2747-2749`).
+/// What the reads have added up to (`ArchiveConductor.java:2782-2784`).
 ///
 /// `i64` and not `u64`, for the reason [`RecorderTotals`] gives: the
 /// reference's three are `long`s, and they are published into counters read as
@@ -110,11 +110,11 @@ pub struct ReadTotals {
 }
 
 impl ReadTotals {
-    /// `Replayer.bytesRead` and `Replayer.readTimeNs` (`:2764-2777`), which a
+    /// `Replayer.bytesRead` and `Replayer.readTimeNs` (`:2799-2812`), which a
     /// session calls once per read it did.
     ///
     /// The maximum is of a **single** read, so a short read after a long one
-    /// leaves it where it was (`:2769-2772`).
+    /// leaves it where it was (`:2804-2807`).
     pub fn read(&mut self, bytes: u64, time_ns: u64) {
         let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
         let time_ns = i64::try_from(time_ns).unwrap_or(i64::MAX);
@@ -127,7 +127,7 @@ impl ReadTotals {
         }
     }
 
-    /// The bytes, the nanoseconds, and the longest single read (`:2747-2749`).
+    /// The bytes, the nanoseconds, and the longest single read (`:2782-2784`).
     #[must_use]
     pub const fn totals(&self) -> (i64, i64, i64) {
         (
@@ -138,7 +138,7 @@ impl ReadTotals {
     }
 }
 
-/// `ArchiveConductor.Replayer` (`:2745-2791`), as far as its counters go: the
+/// `ArchiveConductor.Replayer` (`:2780-2826`), as far as its counters go: the
 /// four, the totals, and the rule for publishing them.
 #[derive(Debug)]
 pub struct Replayer {
@@ -166,7 +166,7 @@ impl Replayer {
     }
 
     /// Ask for the four, one at a time, and take each up when the driver
-    /// answers (`Archive.java:1578-1659`).
+    /// answers (`Archive.java:1646-1727`).
     pub fn allocate(
         &mut self,
         client: &mut Client,
@@ -199,7 +199,7 @@ impl Replayer {
     }
 
     /// Publish the three statistics — but only on a turn that did work
-    /// (`:2779-2790`).
+    /// (`:2963-2974`).
     ///
     /// `workCount > 0` is the whole of the condition, and it is a parameter here
     /// rather than a test of the totals because that is what the reference
@@ -334,7 +334,7 @@ pub enum ReplayNotice {
     ///
     /// It carries the position because that is the one thing a session has that
     /// the conductor cannot ask it for once the two are on different threads —
-    /// `isValidDetach` reads it (`ArchiveConductor.java:2322-2332`).
+    /// `isValidDetach` reads it (`ArchiveConductor.java:2357-2367`).
     Worked {
         /// Which replay.
         replay_session_id: i64,
@@ -373,7 +373,7 @@ pub enum ReplayNotice {
 /// Under `SHARED` the sessions are the conductor's own and are driven in its own
 /// turn (`SharedModeArchiveConductor.java:57-66`, which invokes the replayer's
 /// `AgentInvoker` twice a turn). Under `DEDICATED` they are an agent on a thread
-/// of their own (`DedicatedModeArchiveConductor.java:55`) and what the conductor
+/// of their own (`DedicatedModeArchiveConductor.java:65`) and what the conductor
 /// holds is a channel to it. The conductor asks the same questions either way.
 pub enum ReplayerHalf {
     /// `SHARED`: the conductor's turn drives every replay.
@@ -430,7 +430,7 @@ pub struct ReplayerWorker {
     /// This thread's own 103/104, once the conductor's claim has reached the
     /// region — see [`DutyCycleCounters::find`].
     duty: Option<DutyCycleCounters>,
-    /// The threshold its 104 counts against (`Archive.java:1460-1468`).
+    /// The threshold its 104 counts against (`Archive.java:1528-1536`).
     cycle_threshold_ns: i64,
     cnc: deepmsg_cnc::CncFile,
     idle: deepmsg_driver::idle::Strategy,
@@ -653,7 +653,7 @@ impl ReplayerWorker {
     pub fn run(mut self) {
         loop {
             // The cycle that just ended, before this turn does anything with it
-            // (`DedicatedModeArchiveConductor.java:346`).
+            // (`DedicatedModeArchiveConductor.java:356`).
             self.measure_cycle();
 
             let mut work = 0;
@@ -714,7 +714,7 @@ impl ReplayerWorker {
     }
 
     /// One turn of this thread's duty cycle, into the pair the conductor
-    /// allocated for the replayer (`Archive.java:1460-1468`).
+    /// allocated for the replayer (`Archive.java:1528-1536`).
     fn measure_cycle(&mut self) {
         let now_ns = deepmsg_core::clock::monotonic_nano_time();
 
@@ -782,7 +782,7 @@ fn drive_one(
 
     // **One notice per turn that did anything, and none at all for a quiet
     // one.** That is what the reference's `workCount` counts
-    // (`ArchiveConductor.java:2779-2790`: `!matches!(progress, Idle)`), so the
+    // (`ArchiveConductor.java:2814-2825`: `!matches!(progress, Idle)`), so the
     // conductor's own count of it is exact rather than derived.
     match progress {
         Progress::Started => notices.push(ReplayNotice::Started {
@@ -858,7 +858,7 @@ mod tests {
 
     /// The totals add up, and the one that is a maximum stays at the longest —
     /// a short read after a long one leaves it where it was
-    /// (`ArchiveConductor.java:2764-2777`).
+    /// (`ArchiveConductor.java:2799-2812`).
     #[test]
     fn the_reads_add_up_and_the_longest_read_is_kept() {
         let mut totals = ReadTotals::default();
@@ -874,7 +874,7 @@ mod tests {
     }
 
     /// The three are published on a turn that did work, and not otherwise
-    /// (`:2779-2790`).
+    /// (`:2814-2825`).
     #[test]
     fn the_statistics_are_published_only_on_a_turn_that_did_work() {
         let (mut replayer, mut meta, mut values) = replayer_with_counters();
@@ -917,7 +917,7 @@ mod tests {
     }
 
     /// The session count goes up and down with the sessions that are open
-    /// (`:993`, `:1382`).
+    /// (`:993`, `:1388`).
     #[test]
     fn the_session_count_follows_the_sessions() {
         let (replayer, mut meta, mut values) = replayer_with_counters();

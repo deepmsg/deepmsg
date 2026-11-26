@@ -1,6 +1,6 @@
 //! Mapping a log buffer file and reading the geometry it describes.
 //!
-//! Mirrors `aeron-client/src/main/c/util/aeron_fileutil.c:1309-1356` — the
+//! Mirrors `aeron-client/src/main/c/util/aeron_fileutil.c:1308-1355` — the
 //! `aeron_raw_log_map_existing` path, which is the only way a client ever gets
 //! a log buffer. **A client never creates one**: the driver's native resource
 //! agent does, with `O_CREAT | O_EXCL`, and a client that created it first
@@ -70,7 +70,7 @@ impl LogBuffer {
     /// [`io::ErrorKind::NotFound`] if the driver has not created the file yet —
     /// which for a publication is impossible after `ON_PUBLICATION_READY`,
     /// because the driver only sends it once the mapping succeeded
-    /// (`aeron_driver_conductor.c:4056-4068`). `InvalidData` if the metadata
+    /// (`aeron_driver_conductor.c:4153-4165`). `InvalidData` if the metadata
     /// does not describe a usable log.
     pub fn open(path: &Path, writable: bool) -> io::Result<Self> {
         let file = if writable {
@@ -158,7 +158,7 @@ impl LogBuffer {
     /// The count is read **before** anything derived from it, which is the
     /// reference's order for its own reason — after a rotation the count and a
     /// tail disagree for a moment, and the count is the one that is right
-    /// (`aeron_logbuffer_descriptor.h:94-102`).
+    /// (`aeron_logbuffer_descriptor.h:95-103`).
     pub fn active_term_partition(&self) -> Option<usize> {
         self.metadata()?
             .load_i32(descriptor::ACTIVE_TERM_COUNT_OFFSET)

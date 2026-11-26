@@ -1,7 +1,7 @@
 //! The counters the container owns, and how it reports an error.
 //!
 //! The reference's `Context.conclude` allocates five counters for a service
-//! (`ClusteredServiceContainer.java:948-1010`): the error count, a max-cycle and
+//! (`ClusteredServiceContainer.java:982-1044`): the error count, a max-cycle and
 //! a threshold-exceeded pair, and a snapshot-duration pair. P3-2a allocated the
 //! **first** one — it is the counter an error is counted in, and the mark
 //! file's error log is the other half of the same report. P3-2b adds the
@@ -47,7 +47,7 @@ pub struct ErrorReporter {
 /// `DutyCycleStallTracker` (`DutyCycleStallTracker.java:84-94`): counters
 /// 218/219, the container's own duty cycle. The reference's agent calls
 /// `update(nanoClock)` in `onStart` and `measureAndUpdate(now)` as the first
-/// thing in `doWork` (`ClusteredServiceAgent.java:205`, `:247-249`).
+/// thing in `doWork` (`ClusteredServiceAgent.java:206`, `:248-250`).
 pub struct DutyCycle {
     max_cycle_time: Counter,
     threshold_exceeded: Counter,
@@ -58,7 +58,7 @@ pub struct DutyCycle {
 
 impl DutyCycle {
     /// Allocate `Cluster container max cycle time in ns` (218) and its
-    /// threshold-exceeded count (219) (`ClusteredServiceContainer.java:969-984`).
+    /// threshold-exceeded count (219) (`ClusteredServiceContainer.java:1003-1018`).
     ///
     /// # Errors
     ///
@@ -141,7 +141,7 @@ pub struct SnapshotDuration {
 
 impl SnapshotDuration {
     /// Allocate `Clustered service max snapshot duration in ns` (236) and its
-    /// threshold-exceeded count (237) (`ClusteredServiceContainer.java:988-1008`).
+    /// threshold-exceeded count (237) (`ClusteredServiceContainer.java:1022-1042`).
     ///
     /// # Errors
     ///
@@ -231,7 +231,7 @@ fn format_duration_ns(duration_ns: i64) -> String {
 
 impl ErrorReporter {
     /// Allocate `Cluster Container Errors` for `(clusterId, serviceId)`
-    /// (`ClusteredServiceContainer.java:948-957`).
+    /// (`ClusteredServiceContainer.java:982-991`).
     ///
     /// # Errors
     ///
@@ -257,7 +257,7 @@ impl ErrorReporter {
     }
 
     /// Count the error and record it in the mark file's distinct error log
-    /// (`CountedErrorHandler.onError`, `:1160-1180`).
+    /// (`CountedErrorHandler.onError`, `:1168-1188`).
     ///
     /// A counter or log that cannot be written is reported on stderr: this is
     /// the path that exists because something else failed, and a second failure

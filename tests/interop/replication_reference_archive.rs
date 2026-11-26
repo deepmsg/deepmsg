@@ -52,7 +52,7 @@ const REPLICATION_CHANNEL: &str = "aeron:udp?endpoint=localhost:0";
 const CONTROL_STREAM_ID: i32 = 10;
 
 /// Where the **reference** archive listens for clients — UDP, and it has to be:
-/// a Java archive refuses anything else outright (`Archive.java:1225`).
+/// a Java archive refuses anything else outright (`Archive.java:1291`).
 fn source_control_channel() -> String {
     format!("aeron:udp?endpoint=localhost:{}", port(0))
 }
@@ -62,7 +62,7 @@ fn source_control_channel() -> String {
 /// A concrete port, and no `control-mode=response`: this client is the source's
 /// own, and a *network* publication that carries a response-correlation-id has
 /// to name a **network** response subscription
-/// (`aeron_driver_conductor_validate_response_subscription`, `:631-651`). Plain
+/// (`aeron_driver_conductor_validate_response_subscription`, `:660-680`). Plain
 /// is also what `java_archive_id.rs` uses against the same archive.
 fn source_response_channel() -> String {
     format!("aeron:udp?endpoint=localhost:{}", port(1))

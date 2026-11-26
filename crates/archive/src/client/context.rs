@@ -5,7 +5,7 @@
 //!
 //! A C archive client is configured by **environment variables** and nothing
 //! else, and the names are the reference's
-//! (`aeron_archive_context.h:23-41`): `AERON_ARCHIVE_CONTROL_CHANNEL` for the
+//! (`aeron_archive_context.h:24-42`): `AERON_ARCHIVE_CONTROL_CHANNEL` for the
 //! archive to talk to, `AERON_ARCHIVE_CONTROL_RESPONSE_CHANNEL` for the channel
 //! it wants to be answered on, and ten more with defaults that matter — 10 and
 //! 20 for the two stream ids, 30 for the events stream, 10 s for a request's
@@ -45,51 +45,51 @@ use deepmsg_core::uri::{ChannelUri, UriError};
 pub const AERON_DIR_ENV: &str = "AERON_DIR";
 
 /// The archive to talk to. **No default**: a client without one has nowhere to
-/// send anything (`aeron_archive_context.c:113-120`).
+/// send anything (`aeron_archive_context.c:112-119`).
 pub const CONTROL_CHANNEL_ENV: &str = "AERON_ARCHIVE_CONTROL_CHANNEL";
 
-/// The stream the requests go out on (`:122-127`), 10 by default — and 10 is
+/// The stream the requests go out on (`:121-126`), 10 by default — and 10 is
 /// the reference *server's* local control stream id too, which is not a
 /// coincidence: the number is the protocol's.
 pub const CONTROL_STREAM_ID_ENV: &str = "AERON_ARCHIVE_CONTROL_STREAM_ID";
 
-/// The channel the answers come back on. **No default** (`:129-136`).
+/// The channel the answers come back on. **No default** (`:128-135`).
 pub const CONTROL_RESPONSE_CHANNEL_ENV: &str = "AERON_ARCHIVE_CONTROL_RESPONSE_CHANNEL";
 
-/// The stream the answers come back on (`:138-143`), 20 by default.
+/// The stream the answers come back on (`:137-142`), 20 by default.
 pub const CONTROL_RESPONSE_STREAM_ID_ENV: &str = "AERON_ARCHIVE_CONTROL_RESPONSE_STREAM_ID";
 
-/// The stream recording lifecycle events are published on (`:145-152`), 30 by
+/// The stream recording lifecycle events are published on (`:144-151`), 30 by
 /// default. No default *channel*: an archive that publishes events publishes
 /// them where it was told to.
 pub const RECORDING_EVENTS_CHANNEL_ENV: &str = "AERON_ARCHIVE_RECORDING_EVENTS_CHANNEL";
 
-/// See [`RECORDING_EVENTS_CHANNEL_ENV`] (`:154-159`).
+/// See [`RECORDING_EVENTS_CHANNEL_ENV`] (`:153-158`).
 pub const RECORDING_EVENTS_STREAM_ID_ENV: &str = "AERON_ARCHIVE_RECORDING_EVENTS_STREAM_ID";
 
-/// How long a request may take, as a duration (`:161-166`): `10s`, `500ms`,
+/// How long a request may take, as a duration (`:160-165`): `10s`, `500ms`,
 /// `1001ns`. Ten seconds, and the same ten the reference *server* gives a
 /// connect (`aeron.archive.connect.timeout`) — the two sides time out together.
 pub const MESSAGE_TIMEOUT_ENV: &str = "AERON_ARCHIVE_MESSAGE_TIMEOUT";
 
-/// How many times an offer is retried (`:168-173`). Three.
+/// How many times an offer is retried (`:167-172`). Three.
 pub const MESSAGE_RETRY_ATTEMPTS_ENV: &str = "AERON_ARCHIVE_MESSAGE_RETRY_ATTEMPTS";
 
-/// The control channel's term length (`:175-180`), a size: `64k`.
+/// The control channel's term length (`:174-179`), a size: `64k`.
 pub const CONTROL_TERM_BUFFER_LENGTH_ENV: &str = "AERON_ARCHIVE_CONTROL_TERM_BUFFER_LENGTH";
 
 /// The client's name, which is a *counter's* name where it lands
-/// (`:108-111`). Empty by default.
+/// (`:107-110`). Empty by default.
 pub const CLIENT_NAME_ENV: &str = "AERON_ARCHIVE_CLIENT_NAME";
 
-/// Whether the control channel's term buffer is sparse (`:189-190`). **True**
+/// Whether the control channel's term buffer is sparse (`:188-189`). **True**
 /// by default, unlike a data channel's.
 pub const CONTROL_TERM_BUFFER_SPARSE_ENV: &str = "AERON_ARCHIVE_CONTROL_TERM_BUFFER_SPARSE";
 
-/// The control channel's MTU (`:182-187`), a size. It defaults to
+/// The control channel's MTU (`:181-186`), a size. It defaults to
 /// [`crate::client::context::MTU_LENGTH_DEFAULT`] — and *that* default is
 /// seeded from `AERON_MTU_LENGTH`, the driver-wide setting, before this one
-/// overrides it (`aeron_archive_context.c:92-97`).
+/// overrides it (`aeron_archive_context.c:91-96`).
 pub const CONTROL_MTU_LENGTH_ENV: &str = "AERON_ARCHIVE_CONTROL_MTU_LENGTH";
 
 /// The driver's own MTU, whose value seeds the control MTU's
@@ -98,11 +98,11 @@ pub const MTU_LENGTH_ENV: &str = "AERON_MTU_LENGTH";
 
 /// The name the **driver** knows this process by — the driver's variable, not
 /// the archive's, and the one whose width a counter's field bounds
-/// (`aeronc.h:885`). Read by `aeron_client_init` when a client owns its own
+/// (`aeronc.h:888`). Read by `aeron_client_init` when a client owns its own
 /// Aeron client; it defaults to the process's name.
 pub const AERON_CLIENT_NAME_ENV: &str = "AERON_CLIENT_NAME";
 
-/// `AERON_COUNTER_MAX_CLIENT_NAME_LENGTH` (`aeron-client/src/main/c/aeronc.h:885`):
+/// `AERON_COUNTER_MAX_CLIENT_NAME_LENGTH` (`aeron-client/src/main/c/aeronc.h:888`):
 /// the width of a counter's client-name field, and the reason a longer name is
 /// refused rather than truncated.
 pub const MAX_CLIENT_NAME_LENGTH: usize = 100;
@@ -124,7 +124,7 @@ const TERM_MAX_LENGTH: i32 = deepmsg_core::logbuffer::descriptor::TERM_MAX_LENGT
 const MESSAGE_TIMEOUT_NS_DEFAULT: i64 = 10 * 1_000_000_000;
 
 /// A control MTU's default when neither variable says otherwise
-/// (`AERON_ARCHIVE_CONTROL_MTU_LENGTH_DEFAULT`, `aeron_archive_context.h:92-97`).
+/// (`AERON_ARCHIVE_CONTROL_MTU_LENGTH_DEFAULT`, `aeron_archive_context.h:93-98`).
 const MTU_LENGTH_DEFAULT: i32 = 1408;
 
 /// The three parameters a concluded context writes into both channels
@@ -150,7 +150,7 @@ const CONTROL_MODE_RESPONSE: &str = "response";
 /// What a client is configured with.
 ///
 /// The fields are the reference's
-/// (`aeron_archive_context_stct`, `aeron_archive_context.h:43-83`), minus the
+/// (`aeron_archive_context_stct`, `aeron_archive_context.h:44-84`), minus the
 /// ones that do not exist until the layers above land: the credentials supplier,
 /// the recording-signal handler, the error handler, the idle strategy and the
 /// Aeron client this context may own.
@@ -234,7 +234,7 @@ impl ArchiveContext {
     /// A context with every default and nothing read yet.
     ///
     /// `aeron_archive_context_init`: what a client has before it has been told
-    /// anything (`aeron_archive_context.c:33-198`).
+    /// anything (`aeron_archive_context.c:32-197`).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -261,7 +261,7 @@ impl ArchiveContext {
     ///
     /// The pairs are the environment's, and the order is the reference's: the
     /// control MTU's *default* is read out of `AERON_MTU_LENGTH` first and the
-    /// archive's own variable overrides it after (`:92-97`), so a pair for the
+    /// archive's own variable overrides it after (`:91-96`), so a pair for the
     /// second has to be applied to a context that already read the first.
     #[must_use]
     pub fn resolve(environment: &[(String, String)]) -> Self {
@@ -357,7 +357,7 @@ impl ArchiveContext {
         );
 
         // Not a mistake: the reference reads the retry count with the *duration*
-        // reader (`:168-173`), so `3`, `3s` and `3000ms` all mean three. The two
+        // reader (`:167-172`), so `3`, `3s` and `3000ms` all mean three. The two
         // it lands between are the ones the field can hold.
         context.message_retry_attempts = u32::try_from(duration_ns(
             get(MESSAGE_RETRY_ATTEMPTS_ENV),
@@ -416,7 +416,7 @@ impl ArchiveContext {
 
     /// Whether this context is one a session can be opened with.
     ///
-    /// `aeron_archive_context_conclude` (`:312-452`), which is the first half of
+    /// `aeron_archive_context_conclude` (`:311-451`), which is the first half of
     /// it: the four refusals. What it does *after* the refusals — create the
     /// Aeron client, write the channel defaults and mint the session id — is
     /// P2-C1's next commit, and it needs a driver.

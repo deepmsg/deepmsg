@@ -2,7 +2,7 @@
 //! it gets.
 //!
 //! The reference's `ControlSession` is a `Session` — an `Agent` the conductor
-//! drives (`ArchiveConductor.java:395`, `SessionWorker.java:56-81`) — and it is
+//! drives (`ArchiveConductor.java:394`, `SessionWorker.java:56-81`) — and it is
 //! **always driven on the conductor's thread**, which it asserts
 //! (`ControlSession.java:834-841`). Everything here assumes the same caller.
 //!
@@ -35,11 +35,11 @@
 //! not move on until `null != controlPublication && null != sessionCounter`
 //! (`ControlSession.java:895`), and the counter is the session's own. It is
 //! allocated by the conductor, because that is where the archive asks the
-//! driver for things (`ArchiveConductor.java:493-498`), and handed over with
+//! driver for things (`ArchiveConductor.java:492-497`), and handed over with
 //! [`ControlSession::set_counter`]; from there the session owns all four of its
 //! steps — claim it once the driver has answered (`:890-893`), bind it when
 //! both are in hand (`:898-903`), and give it back when the session goes
-//! (`:176-183`).
+//! (`:175-182`).
 //!
 //! The values region travels with the call, as the client does, because the
 //! bind is a write the archive makes to its own mapping of the CnC file: a
@@ -226,12 +226,12 @@ pub enum Response {
         control_session_id: i64,
         /// The correlation id of the request that started this — the `START`
         /// carries the start request's, and the `STOP` the stop's
-        /// (`ArchiveConductor.java:2046-2051`, `:1342-1347`).
+        /// (`ArchiveConductor.java:2068-2073`, `:1342-1347`).
         correlation_id: i64,
         /// The recording the signal is about.
         recording_id: i64,
         /// The recording *subscription* it belongs to, which is the
-        /// registration id the start answered with (`:2049`).
+        /// registration id the start answered with (`:2071`).
         subscription_id: i64,
         /// Where the recording had got to.
         position: i64,
@@ -427,24 +427,24 @@ pub struct ControlSession<E: Egress> {
     /// The connect request's correlation id, which the connect answer echoes.
     connect_correlation_id: i64,
     /// The channel the response publication is made on. The conductor derives
-    /// it from the client's own channel (`ArchiveConductor.java:458-481`).
+    /// it from the client's own channel (`ArchiveConductor.java:457-480`).
     response_channel: String,
     /// ...and its stream id, from the client's request.
     response_stream_id: i32,
     /// Set when the client's protocol major is not this archive's
-    /// (`ArchiveConductor.java:483-488`): the connect answer is an ERROR
+    /// (`ArchiveConductor.java:482-487`): the connect answer is an ERROR
     /// instead, and the session never activates (`:933-942`, `:1070-1076`).
     invalid_version_message: Option<String>,
-    /// How long a pending response may sit (`Archive.java:502`).
+    /// How long a pending response may sit (`Archive.java:531`).
     connect_timeout_ms: i64,
-    /// How often an active session is pinged (`Archive.java:520`).
+    /// How often an active session is pinged (`Archive.java:549`).
     liveness_check_interval_ms: i64,
 
     state: State,
     egress: E,
 
     /// The session's own counter, once the conductor has allocated it
-    /// (`ArchiveConductor.java:493-498`). `None` for the turns between the
+    /// (`ArchiveConductor.java:492-497`). `None` for the turns between the
     /// session being made and the conductor reaching it, and in a conductor
     /// that keeps no counters at all — the session simply will not leave
     /// `INIT` without one, which is what the reference's `null !=
@@ -519,7 +519,7 @@ impl<E: Egress> ControlSession<E> {
     }
 
     /// Hand the session its counter, which the conductor allocated
-    /// (`ArchiveConductor.java:493-498`).
+    /// (`ArchiveConductor.java:492-497`).
     ///
     /// Called once, before the session is driven: the registration id exists
     /// from the moment the driver is asked, so a session that never gets one is
@@ -1089,8 +1089,8 @@ impl<E: Egress> ControlSession<E> {
     /// A recording signal (`ControlSession.java:779-800`), which is the third
     /// kind of thing a session sends and the only one that is not an answer:
     /// `START`, `STOP` and `EXTEND` tell the client that asked to record what
-    /// its recording went on to do (`ArchiveConductor.java:2046-2051`,
-    /// `:1342-1347`, `:2121-2122`).
+    /// its recording went on to do (`ArchiveConductor.java:2068-2073`,
+    /// `:1342-1347`, `:2156-2157`).
     ///
     /// It shares [`ControlSession::send_or_queue`] with the answers because the
     /// reference shares the code too: same queue, same deadline, same three
@@ -1778,7 +1778,7 @@ mod tests {
 
     #[test]
     fn an_invalid_client_version_is_an_error_instead_of_a_connection() {
-        // `ArchiveConductor.java:483-488` computes the message,
+        // `ArchiveConductor.java:482-487` computes the message,
         // `ControlSession.java:933-942` sends it, and `:1072` refuses to
         // activate afterwards.
         let mut egress = FakeEgress {

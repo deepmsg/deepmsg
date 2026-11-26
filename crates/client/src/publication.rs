@@ -12,7 +12,7 @@
 //!
 //! It does not create the log file, does not write `is_connected`, does not
 //! write `end_of_stream_position`, and does not write the `pub-pos` counter —
-//! all of those are the driver's (`aeron_ipc_publication.c:278-325`). The only
+//! all of those are the driver's (`aeron_ipc_publication.c:283-330`). The only
 //! things a producer owns are the current term's tail counter, by get-and-add,
 //! and the bytes of the frames it writes into.
 //!

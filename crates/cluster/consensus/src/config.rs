@@ -2,7 +2,7 @@
 //! with the reference's defaults.
 //!
 //! Counterpart of `ConsensusModule.Context` / `Configuration`
-//! (`aeron-cluster/src/main/java/io/aeron/cluster/ConsensusModule.java:363-1725`).
+//! (`aeron-cluster/src/main/java/io/aeron/cluster/ConsensusModule.java:370-1732`).
 //! Only the names `P3-4a` uses are read here; the rest stay `Pending` in
 //! [`deepmsg_cluster_common::config::names`] until the slice that honours them
 //! arrives. A name this build reads is marked `Honoured` there in the same
@@ -10,7 +10,7 @@
 //!
 //! # What `conclude` owns
 //!
-//! The reference's `Context.conclude()` (`:1725-2100`) does three jobs at once:
+//! The reference's `Context.conclude()` (`:1752-2127`) does three jobs at once:
 //! it validates and normalises the directories, it creates the mark file and the
 //! two on-disk state files, and it allocates the counters. This split keeps the
 //! first: [`ConsensusModuleConfig::conclude`] settles paths and validates, and
@@ -27,84 +27,84 @@ use deepmsg_codec_cluster::cluster_time_unit::ClusterTimeUnit;
 
 use crate::error::ClusterError;
 
-/// `aeron.cluster.dir` (`ClusteredServiceContainer.java:343`).
+/// `aeron.cluster.dir` (`ClusteredServiceContainer.java:359`).
 pub const CLUSTER_DIR_PROP_NAME: &str = "aeron.cluster.dir";
-/// `CLUSTER_DIR_DEFAULT` (`ClusteredServiceContainer.java:349`).
+/// `CLUSTER_DIR_DEFAULT` (`ClusteredServiceContainer.java:365`).
 pub const CLUSTER_DIR_DEFAULT: &str = "aeron-cluster";
-/// `aeron.cluster.mark.file.dir` (`ClusteredServiceContainer.java:362`).
+/// `aeron.cluster.mark.file.dir` (`ClusteredServiceContainer.java:378`).
 pub const MARK_FILE_DIR_PROP_NAME: &str = "aeron.cluster.mark.file.dir";
-/// `aeron.cluster.id` (`ClusteredServiceContainer.java:211`).
+/// `aeron.cluster.id` (`ClusteredServiceContainer.java:219`).
 pub const CLUSTER_ID_PROP_NAME: &str = "aeron.cluster.id";
-/// `CLUSTER_ID_DEFAULT` (`ClusteredServiceContainer.java:217`).
+/// `CLUSTER_ID_DEFAULT` (`ClusteredServiceContainer.java:225`).
 pub const CLUSTER_ID_DEFAULT: i32 = 0;
-/// `aeron.cluster.member.id` (`ConsensusModule.java:437`).
+/// `aeron.cluster.member.id` (`ConsensusModule.java:444`).
 pub const CLUSTER_MEMBER_ID_PROP_NAME: &str = "aeron.cluster.member.id";
-/// `CLUSTER_MEMBER_ID_DEFAULT` (`ConsensusModule.java:443`).
+/// `CLUSTER_MEMBER_ID_DEFAULT` (`ConsensusModule.java:450`).
 pub const CLUSTER_MEMBER_ID_DEFAULT: i32 = 0;
-/// `aeron.cluster.members` (`ConsensusModule.java:507`).
+/// `aeron.cluster.members` (`ConsensusModule.java:514`).
 pub const CLUSTER_MEMBERS_PROP_NAME: &str = "aeron.cluster.members";
 /// `aeron.cluster.ingress.channel` (`AeronCluster.java:1267`).
 pub const INGRESS_CHANNEL_PROP_NAME: &str = "aeron.cluster.ingress.channel";
-/// `aeron.cluster.consensus.channel` (`ConsensusModule.java:595`).
+/// `aeron.cluster.consensus.channel` (`ConsensusModule.java:602`).
 pub const CONSENSUS_CHANNEL_PROP_NAME: &str = "aeron.cluster.consensus.channel";
-/// `CONSENSUS_CHANNEL_DEFAULT` (`ConsensusModule.java:602`).
+/// `CONSENSUS_CHANNEL_DEFAULT` (`ConsensusModule.java:609`).
 pub const CONSENSUS_CHANNEL_DEFAULT: &str = "aeron:udp";
-/// `aeron.cluster.log.channel` (`ConsensusModule.java:527`).
+/// `aeron.cluster.log.channel` (`ConsensusModule.java:534`).
 pub const LOG_CHANNEL_PROP_NAME: &str = "aeron.cluster.log.channel";
-/// `LOG_CHANNEL_DEFAULT` (`ConsensusModule.java:533`).
+/// `LOG_CHANNEL_DEFAULT` (`ConsensusModule.java:540`).
 pub const LOG_CHANNEL_DEFAULT: &str = "aeron:udp?term-length=64m";
 /// `aeron.cluster.follower.catchup.channel`
-/// (`ConsensusModule.java:626`): the template the leader replays a log to a
+/// (`ConsensusModule.java:633`): the template the leader replays a log to a
 /// follower over, with the follower's catchup endpoint substituted.
 pub const FOLLOWER_CATCHUP_CHANNEL_PROP_NAME: &str = "aeron.cluster.follower.catchup.channel";
-/// `FOLLOWER_CATCHUP_CHANNEL_DEFAULT` (`ConsensusModule.java:633`): `UDP_CHANNEL`.
+/// `FOLLOWER_CATCHUP_CHANNEL_DEFAULT` (`ConsensusModule.java:640`): `UDP_CHANNEL`.
 pub const FOLLOWER_CATCHUP_CHANNEL_DEFAULT: &str = "aeron:udp";
 /// `aeron.cluster.leader.archive.control.channel`
-/// (`ConsensusModule.java:639`): the leader archive's control channel, which
+/// (`ConsensusModule.java:646`): the leader archive's control channel, which
 /// log replication also uses as its destination template.
 pub const LEADER_ARCHIVE_CONTROL_CHANNEL_PROP_NAME: &str =
     "aeron.cluster.leader.archive.control.channel";
-/// `LEADER_ARCHIVE_CONTROL_CHANNEL_DEFAULT` (`ConsensusModule.java:646`).
+/// `LEADER_ARCHIVE_CONTROL_CHANNEL_DEFAULT` (`ConsensusModule.java:653`).
 pub const LEADER_ARCHIVE_CONTROL_CHANNEL_DEFAULT: &str = "aeron:udp?term-length=64k";
-/// `aeron.cluster.log.control.enable` (`ConsensusModule.java:1026-1027`).
+/// `aeron.cluster.log.control.enable` (`ConsensusModule.java:1040-1041`).
 pub const LOG_CONTROL_ENABLE_PROP_NAME: &str = "aeron.cluster.log.control.enable";
-/// `CONSENSUS_MODULE_ENABLE_CONTROL_ON_LOG_CHANNEL_DEFAULT` (`ConsensusModule.java:1569`).
+/// `CONSENSUS_MODULE_ENABLE_CONTROL_ON_LOG_CHANNEL_DEFAULT` (`ConsensusModule.java:1594`).
 pub const LOG_CONTROL_ENABLE_DEFAULT: bool = true;
 /// `aeron.cluster.egress.channel` (`AeronCluster.java:1302`).
 pub const EGRESS_CHANNEL_PROP_NAME: &str = "aeron.cluster.egress.channel";
-/// `aeron.cluster.snapshot.channel` (`ClusteredServiceContainer.java:319`).
+/// `aeron.cluster.snapshot.channel` (`ClusteredServiceContainer.java:335`).
 pub const SNAPSHOT_CHANNEL_PROP_NAME: &str = "aeron.cluster.snapshot.channel";
-/// `SNAPSHOT_CHANNEL_DEFAULT` (`ConsensusModule.java:568`).
+/// `SNAPSHOT_CHANNEL_DEFAULT` (`ConsensusModule.java:575`).
 pub const SNAPSHOT_CHANNEL_DEFAULT: &str = "aeron:ipc?alias=snapshot";
-/// `aeron.cluster.snapshot.stream.id` (`ClusteredServiceContainer.java:331`).
+/// `aeron.cluster.snapshot.stream.id` (`ClusteredServiceContainer.java:347`).
 pub const SNAPSHOT_STREAM_ID_PROP_NAME: &str = "aeron.cluster.snapshot.stream.id";
-/// `SNAPSHOT_STREAM_ID_DEFAULT` (`ConsensusModule.java:573`).
+/// `SNAPSHOT_STREAM_ID_DEFAULT` (`ConsensusModule.java:580`).
 pub const SNAPSHOT_STREAM_ID_DEFAULT: i32 = 107;
-/// `aeron.cluster.replay.channel` (`ClusteredServiceContainer.java:259`).
+/// `aeron.cluster.replay.channel` (`ClusteredServiceContainer.java:275`).
 pub const REPLAY_CHANNEL_PROP_NAME: &str = "aeron.cluster.replay.channel";
-/// `REPLAY_CHANNEL_DEFAULT` (`ClusteredServiceContainer.java:265`): IPC.
+/// `REPLAY_CHANNEL_DEFAULT` (`ClusteredServiceContainer.java:281`): IPC.
 pub const REPLAY_CHANNEL_DEFAULT: &str = "aeron:ipc";
-/// `aeron.cluster.replay.stream.id` (`ClusteredServiceContainer.java:271`).
+/// `aeron.cluster.replay.stream.id` (`ClusteredServiceContainer.java:287`).
 pub const REPLAY_STREAM_ID_PROP_NAME: &str = "aeron.cluster.replay.stream.id";
-/// `REPLAY_STREAM_ID_DEFAULT` (`ClusteredServiceContainer.java:277`).
+/// `REPLAY_STREAM_ID_DEFAULT` (`ClusteredServiceContainer.java:293`).
 pub const REPLAY_STREAM_ID_DEFAULT: i32 = 103;
 /// `aeron.cluster.log.fragment.limit` (`ConsensusModule.java:...`), default 10.
 pub const LOG_FRAGMENT_LIMIT_PROP_NAME: &str = "aeron.cluster.log.fragment.limit";
 /// `LOG_FRAGMENT_LIMIT_DEFAULT` (`ConsensusModule.java:...`).
 pub const LOG_FRAGMENT_LIMIT_DEFAULT: i32 = 10;
-/// `aeron.cluster.replication.channel` (`ConsensusModule.java:620`); **required**.
+/// `aeron.cluster.replication.channel` (`ConsensusModule.java:627`); **required**.
 pub const REPLICATION_CHANNEL_PROP_NAME: &str = "aeron.cluster.replication.channel";
-/// `aeron.cluster.control.channel` (`ClusteredServiceContainer.java:283`).
+/// `aeron.cluster.control.channel` (`ClusteredServiceContainer.java:299`).
 pub const CONTROL_CHANNEL_PROP_NAME: &str = "aeron.cluster.control.channel";
-/// `CONTROL_CHANNEL_DEFAULT` (`ClusteredServiceContainer.java:289`).
+/// `CONTROL_CHANNEL_DEFAULT` (`ClusteredServiceContainer.java:305`).
 pub const CONTROL_CHANNEL_DEFAULT: &str = "aeron:ipc?term-length=128k";
-/// `aeron.cluster.consensus.stream.id` (`ConsensusModule.java:608`).
+/// `aeron.cluster.consensus.stream.id` (`ConsensusModule.java:615`).
 pub const CONSENSUS_STREAM_ID_PROP_NAME: &str = "aeron.cluster.consensus.stream.id";
-/// `CONSENSUS_STREAM_ID_DEFAULT` (`ConsensusModule.java:614`).
+/// `CONSENSUS_STREAM_ID_DEFAULT` (`ConsensusModule.java:621`).
 pub const CONSENSUS_STREAM_ID_DEFAULT: i32 = 108;
-/// `aeron.cluster.log.stream.id` (`ConsensusModule.java:557`).
+/// `aeron.cluster.log.stream.id` (`ConsensusModule.java:564`).
 pub const LOG_STREAM_ID_PROP_NAME: &str = "aeron.cluster.log.stream.id";
-/// `LOG_STREAM_ID_DEFAULT` (`ConsensusModule.java:563`).
+/// `LOG_STREAM_ID_DEFAULT` (`ConsensusModule.java:570`).
 pub const LOG_STREAM_ID_DEFAULT: i32 = 100;
 /// `aeron.cluster.ingress.stream.id` (`AeronCluster.java:1279`).
 pub const INGRESS_STREAM_ID_PROP_NAME: &str = "aeron.cluster.ingress.stream.id";
@@ -114,95 +114,95 @@ pub const INGRESS_STREAM_ID_DEFAULT: i32 = 101;
 pub const EGRESS_STREAM_ID_PROP_NAME: &str = "aeron.cluster.egress.stream.id";
 /// `EGRESS_STREAM_ID_DEFAULT` (`AeronCluster.java:1320`).
 pub const EGRESS_STREAM_ID_DEFAULT: i32 = 102;
-/// `aeron.cluster.service.stream.id` (`ClusteredServiceContainer.java:295`).
+/// `aeron.cluster.service.stream.id` (`ClusteredServiceContainer.java:311`).
 pub const SERVICE_STREAM_ID_PROP_NAME: &str = "aeron.cluster.service.stream.id";
-/// `SERVICE_STREAM_ID_DEFAULT` (`ClusteredServiceContainer.java:301`).
+/// `SERVICE_STREAM_ID_DEFAULT` (`ClusteredServiceContainer.java:317`).
 pub const SERVICE_STREAM_ID_DEFAULT: i32 = 104;
-/// `aeron.cluster.consensus.module.stream.id` (`ClusteredServiceContainer.java:307`).
+/// `aeron.cluster.consensus.module.stream.id` (`ClusteredServiceContainer.java:323`).
 pub const CONSENSUS_MODULE_STREAM_ID_PROP_NAME: &str = "aeron.cluster.consensus.module.stream.id";
-/// `CONSENSUS_MODULE_STREAM_ID_DEFAULT` (`ClusteredServiceContainer.java:313`).
+/// `CONSENSUS_MODULE_STREAM_ID_DEFAULT` (`ClusteredServiceContainer.java:329`).
 pub const CONSENSUS_MODULE_STREAM_ID_DEFAULT: i32 = 105;
-/// `aeron.cluster.service.count` (`ConsensusModule.java:709`).
+/// `aeron.cluster.service.count` (`ConsensusModule.java:716`).
 pub const SERVICE_COUNT_PROP_NAME: &str = "aeron.cluster.service.count";
-/// `SERVICE_COUNT_DEFAULT` (`ConsensusModule.java:715`).
+/// `SERVICE_COUNT_DEFAULT` (`ConsensusModule.java:722`).
 pub const SERVICE_COUNT_DEFAULT: i32 = 1;
-/// `MAX_SERVICE_COUNT` (`ClusteredServiceContainer.java:234`).
+/// `MAX_SERVICE_COUNT` (`ClusteredServiceContainer.java:242`).
 pub const MAX_SERVICE_COUNT: i32 = 10;
-/// `aeron.cluster.ingress.fragment.limit` (`ConsensusModule.java:427`).
+/// `aeron.cluster.ingress.fragment.limit` (`ConsensusModule.java:434`).
 pub const INGRESS_FRAGMENT_LIMIT_PROP_NAME: &str = "aeron.cluster.ingress.fragment.limit";
-/// `CLUSTER_INGRESS_FRAGMENT_LIMIT_DEFAULT` (`ConsensusModule.java:433`).
+/// `CLUSTER_INGRESS_FRAGMENT_LIMIT_DEFAULT` (`ConsensusModule.java:440`).
 pub const INGRESS_FRAGMENT_LIMIT_DEFAULT: i32 = 50;
-/// `aeron.cluster.ingress.ipc.allowed` (`ConsensusModule.java:439`).
+/// `aeron.cluster.ingress.ipc.allowed` (`ConsensusModule.java:446`).
 pub const INGRESS_IPC_ALLOWED_PROP_NAME: &str = "aeron.cluster.ingress.ipc.allowed";
-/// `CLUSTER_INGRESS_IPC_ALLOWED_DEFAULT` (`ConsensusModule.java:445`).
+/// `CLUSTER_INGRESS_IPC_ALLOWED_DEFAULT` (`ConsensusModule.java:452`).
 pub const INGRESS_IPC_ALLOWED_DEFAULT: bool = false;
-/// `aeron.cluster.max.sessions` (`ConsensusModule.java:721`).
+/// `aeron.cluster.max.sessions` (`ConsensusModule.java:728`).
 pub const MAX_SESSIONS_PROP_NAME: &str = "aeron.cluster.max.sessions";
-/// `MAX_CONCURRENT_SESSIONS_DEFAULT` (`ConsensusModule.java:727`).
+/// `MAX_CONCURRENT_SESSIONS_DEFAULT` (`ConsensusModule.java:734`).
 pub const MAX_CONCURRENT_SESSIONS_DEFAULT: i32 = 10;
-/// `aeron.cluster.authenticator.supplier` (`ConsensusModule.java:807`).
+/// `aeron.cluster.authenticator.supplier` (`ConsensusModule.java:814`).
 pub const AUTHENTICATOR_SUPPLIER_PROP_NAME: &str = "aeron.cluster.authenticator.supplier";
 /// The class the reference names when the property is unset
-/// (`ConsensusModule.java:804-807`); the mark file records it as well.
+/// (`ConsensusModule.java:811-814`); the mark file records it as well.
 pub const DEFAULT_AUTHENTICATOR_SUPPLIER: &str = "io.aeron.security.DefaultAuthenticatorSupplier";
-/// `aeron.cluster.authorisation.service.supplier` (`ConsensusModule.java:813`).
+/// `aeron.cluster.authorisation.service.supplier` (`ConsensusModule.java:820`).
 pub const AUTHORISATION_SERVICE_SUPPLIER_PROP_NAME: &str =
     "aeron.cluster.authorisation.service.supplier";
-/// `aeron.cluster.session.timeout` (`ConsensusModule.java:733`), 10 s.
+/// `aeron.cluster.session.timeout` (`ConsensusModule.java:740`), 10 s.
 pub const SESSION_TIMEOUT_PROP_NAME: &str = "aeron.cluster.session.timeout";
-/// `SESSION_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:739`).
+/// `SESSION_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:746`).
 pub const SESSION_TIMEOUT_DEFAULT_NS: i64 = 10_000_000_000;
-/// `aeron.cluster.leader.heartbeat.timeout` (`ConsensusModule.java:745`), 10 s.
+/// `aeron.cluster.leader.heartbeat.timeout` (`ConsensusModule.java:752`), 10 s.
 pub const LEADER_HEARTBEAT_TIMEOUT_PROP_NAME: &str = "aeron.cluster.leader.heartbeat.timeout";
-/// `LEADER_HEARTBEAT_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:751`).
+/// `LEADER_HEARTBEAT_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:758`).
 pub const LEADER_HEARTBEAT_TIMEOUT_DEFAULT_NS: i64 = 10_000_000_000;
-/// `aeron.cluster.leader.heartbeat.interval` (`ConsensusModule.java:757`), 200 ms.
+/// `aeron.cluster.leader.heartbeat.interval` (`ConsensusModule.java:764`), 200 ms.
 pub const LEADER_HEARTBEAT_INTERVAL_PROP_NAME: &str = "aeron.cluster.leader.heartbeat.interval";
-/// `LEADER_HEARTBEAT_INTERVAL_DEFAULT_NS` (`ConsensusModule.java:763`).
+/// `LEADER_HEARTBEAT_INTERVAL_DEFAULT_NS` (`ConsensusModule.java:770`).
 pub const LEADER_HEARTBEAT_INTERVAL_DEFAULT_NS: i64 = 200_000_000;
-/// `aeron.cluster.startup.canvass.timeout` (`ConsensusModule.java:770`), 60 s.
+/// `aeron.cluster.startup.canvass.timeout` (`ConsensusModule.java:777`), 60 s.
 pub const STARTUP_CANVASS_TIMEOUT_PROP_NAME: &str = "aeron.cluster.startup.canvass.timeout";
-/// `STARTUP_CANVASS_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:777`).
+/// `STARTUP_CANVASS_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:784`).
 pub const STARTUP_CANVASS_TIMEOUT_DEFAULT_NS: i64 = 60_000_000_000;
-/// `aeron.cluster.termination.timeout` (`ConsensusModule.java:840`), 10 s: how
+/// `aeron.cluster.termination.timeout` (`ConsensusModule.java:847`), 10 s: how
 /// long a terminating leader waits for followers that never answer.
 pub const TERMINATION_TIMEOUT_PROP_NAME: &str = "aeron.cluster.termination.timeout";
-/// `TERMINATION_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:886`).
+/// `TERMINATION_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:893`).
 pub const TERMINATION_TIMEOUT_DEFAULT_NS: i64 = 10_000_000_000;
-/// `aeron.cluster.election.timeout` (`ConsensusModule.java:783`), 1 s.
+/// `aeron.cluster.election.timeout` (`ConsensusModule.java:790`), 1 s.
 pub const ELECTION_TIMEOUT_PROP_NAME: &str = "aeron.cluster.election.timeout";
-/// `ELECTION_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:789`).
+/// `ELECTION_TIMEOUT_DEFAULT_NS` (`ConsensusModule.java:796`).
 pub const ELECTION_TIMEOUT_DEFAULT_NS: i64 = 1_000_000_000;
-/// `aeron.cluster.election.status.interval` (`ConsensusModule.java:795`), 100 ms.
+/// `aeron.cluster.election.status.interval` (`ConsensusModule.java:802`), 100 ms.
 pub const ELECTION_STATUS_INTERVAL_PROP_NAME: &str = "aeron.cluster.election.status.interval";
-/// `ELECTION_STATUS_INTERVAL_DEFAULT_NS` (`ConsensusModule.java:801`).
+/// `ELECTION_STATUS_INTERVAL_DEFAULT_NS` (`ConsensusModule.java:808`).
 pub const ELECTION_STATUS_INTERVAL_DEFAULT_NS: i64 = 100_000_000;
-/// `aeron.cluster.appointed.leader.id` (`ConsensusModule.java:451`).
+/// `aeron.cluster.appointed.leader.id` (`ConsensusModule.java:458`).
 pub const APPOINTED_LEADER_ID_PROP_NAME: &str = "aeron.cluster.appointed.leader.id";
-/// `aeron.cluster.file.sync.level` (`ConsensusModule.java:923`).
+/// `aeron.cluster.file.sync.level` (`ConsensusModule.java:930`).
 pub const FILE_SYNC_LEVEL_PROP_NAME: &str = "aeron.cluster.file.sync.level";
-/// `FILE_SYNC_LEVEL_DEFAULT` (`ConsensusModule.java:929`).
+/// `FILE_SYNC_LEVEL_DEFAULT` (`ConsensusModule.java:936`).
 pub const FILE_SYNC_LEVEL_DEFAULT: i32 = 0;
-/// `aeron.cluster.error.buffer.length` (`ConsensusModule.java:828`).
+/// `aeron.cluster.error.buffer.length` (`ConsensusModule.java:835`).
 pub const ERROR_BUFFER_LENGTH_PROP_NAME: &str = "aeron.cluster.error.buffer.length";
-/// `aeron.cluster.cycle.threshold` (`ConsensusModule.java:847`), 100 ms.
+/// `aeron.cluster.cycle.threshold` (`ConsensusModule.java:854`), 100 ms.
 pub const CYCLE_THRESHOLD_PROP_NAME: &str = "aeron.cluster.cycle.threshold";
-/// `CYCLE_THRESHOLD_DEFAULT_NS` (`ConsensusModule.java:853`).
+/// `CYCLE_THRESHOLD_DEFAULT_NS` (`ConsensusModule.java:860`).
 pub const CYCLE_THRESHOLD_DEFAULT_NS: i64 = 100_000_000;
-/// `aeron.cluster.total.snapshot.duration.threshold` (`ConsensusModule.java:859`), 10 s.
+/// `aeron.cluster.total.snapshot.duration.threshold` (`ConsensusModule.java:866`), 10 s.
 pub const TOTAL_SNAPSHOT_DURATION_THRESHOLD_PROP_NAME: &str =
     "aeron.cluster.total.snapshot.threshold";
-/// `TOTAL_SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS` (`ConsensusModule.java:866`).
+/// `TOTAL_SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS` (`ConsensusModule.java:873`).
 pub const TOTAL_SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS: i64 = 10_000_000_000;
-/// `aeron.cluster.clock` (`ConsensusModule.java:906`); only milliseconds is implemented.
+/// `aeron.cluster.clock` (`ConsensusModule.java:913`); only milliseconds is implemented.
 pub const CLUSTER_CLOCK_PROP_NAME: &str = "aeron.cluster.clock";
 /// `aeron.dir`, the driver's directory (`CommonContext.java`).
 pub const AERON_DIR_PROP_NAME: &str = "aeron.dir";
-/// `aeron.cluster.idle.strategy` (`ClusteredServiceContainer.java:575`).
+/// `aeron.cluster.idle.strategy` (`ClusteredServiceContainer.java:602`).
 pub const CLUSTER_IDLE_STRATEGY_PROP_NAME: &str = "aeron.cluster.idle.strategy";
-/// `DEFAULT_IDLE_STRATEGY` (`ClusteredServiceContainer.java:569`).
+/// `DEFAULT_IDLE_STRATEGY` (`ClusteredServiceContainer.java:596`).
 pub const CLUSTER_IDLE_STRATEGY_DEFAULT: &str = "org.agrona.concurrent.BackoffIdleStrategy";
-/// `Context.appVersion`'s default (`ConsensusModule.java:1610`).
+/// `Context.appVersion`'s default (`ConsensusModule.java:1635`).
 pub const APP_VERSION_DEFAULT: i32 = 1;
 
 /// The only clock this build has: the millisecond one
@@ -212,14 +212,14 @@ pub const CLUSTER_TIME_UNIT: ClusterTimeUnit = ClusterTimeUnit::MILLIS;
 /// `ClusterSession.MAX_ENCODED_PRINCIPAL_LENGTH` (`ClusterSession.java:49`).
 pub const MAX_ENCODED_PRINCIPAL_LENGTH: usize = 4 * 1024;
 
-/// `ConsensusModule.Configuration.SESSION_LIMIT_MSG` (`ConsensusModule.java:578`).
+/// `ConsensusModule.Configuration.SESSION_LIMIT_MSG` (`ConsensusModule.java:585`).
 pub const SESSION_LIMIT_MSG: &str = "concurrent session limit";
 
 /// `ConsensusModule.Configuration.SESSION_INVALID_VERSION_MSG`
-/// (`ConsensusModule.java:588`).
+/// (`ConsensusModule.java:595`).
 pub const SESSION_INVALID_VERSION_MSG: &str = "invalid client version";
 
-/// `ConsensusModule.Configuration.SESSION_REJECTED_MSG` (`ConsensusModule.java:583`).
+/// `ConsensusModule.Configuration.SESSION_REJECTED_MSG` (`ConsensusModule.java:590`).
 pub const SESSION_REJECTED_MSG: &str = "session failed authentication";
 
 /// `AeronCluster.Configuration.PROTOCOL_MAJOR_VERSION` (`AeronCluster.java:1209`).
@@ -246,19 +246,19 @@ pub const fn semantic_version_major(version: i32) -> i32 {
     (version >> 16) & 0xFFFF
 }
 
-/// `CLUSTER_SERVICES_DIR_PROP_NAME` (`ClusteredServiceContainer.java:356`):
+/// `CLUSTER_SERVICES_DIR_PROP_NAME` (`ClusteredServiceContainer.java:372`):
 /// where the containers' mark files are, when it is not the cluster dir.
 pub const SERVICES_DIR_PROP_NAME: &str = "aeron.cluster.services.dir";
 
-/// `THREAD_NAMING_PROP_NAME` (`CommonContext.java:534`).
+/// `THREAD_NAMING_PROP_NAME` (`CommonContext.java:541`).
 pub const THREAD_NAMING_PROP_NAME: &str = "aeron.thread.naming";
 
 /// `CLUSTER_CONSENSUS_MODULE_AGENT_ROLE_NAME_PROP_NAME`
-/// (`ConsensusModule.java:957-961`): the name of the agent's thread, empty for
+/// (`ConsensusModule.java:964-968`): the name of the agent's thread, empty for
 /// the computed one.
 pub const AGENT_ROLE_NAME_PROP_NAME: &str = "aeron.cluster.consensus.module.agent.role.name";
 
-/// `AERON_CLUSTER_CONSENSUS_THREAD_NAME` (`ConsensusModule.java:281`): the
+/// `AERON_CLUSTER_CONSENSUS_THREAD_NAME` (`ConsensusModule.java:284`): the
 /// `new` naming's role name.
 pub const AGENT_ROLE_NAME_NEW: &str = "aeron-cl-cm";
 
@@ -336,7 +336,7 @@ pub struct ConsensusModuleConfig {
     /// The leader archive's control channel
     /// (`aeron.cluster.leader.archive.control.channel`); log replication turns
     /// it into the archive's destination
-    /// (`ConsensusModuleAgent.java:2980`).
+    /// (`ConsensusModuleAgent.java:3003`).
     pub leader_archive_control_channel: String,
     /// Consensus stream id.
     pub consensus_stream_id: i32,
@@ -383,7 +383,7 @@ pub struct ConsensusModuleConfig {
     /// `aeron.cluster.startup.canvass.timeout`.
     pub startup_canvass_timeout_ns: i64,
     /// `aeron.cluster.termination.timeout`: how long a terminating leader
-    /// waits for followers to acknowledge (`ConsensusModule.java:1254`).
+    /// waits for followers to acknowledge (`ConsensusModule.java:1268`).
     pub termination_timeout_ns: i64,
     /// `aeron.cluster.election.timeout`.
     pub election_timeout_ns: i64,
@@ -404,12 +404,12 @@ pub struct ConsensusModuleConfig {
     /// Delete the cluster directory before starting (programmatic, not a property).
     pub delete_dir_on_start: bool,
     /// The application version stamped into `NewLeadershipTermEvent.appVersion`
-    /// (`ConsensusModule.java:1610`, default `SemanticVersion.compose(0, 0, 1)`).
+    /// (`ConsensusModule.java:1635`, default `SemanticVersion.compose(0, 0, 1)`).
     pub app_version: i32,
-    /// `aeron.cluster.idle.strategy` (`ClusteredServiceContainer.java:575`),
-    /// default `org.agrona.concurrent.BackoffIdleStrategy` (`:569`).
+    /// `aeron.cluster.idle.strategy` (`ClusteredServiceContainer.java:602`),
+    /// default `org.agrona.concurrent.BackoffIdleStrategy` (`:596`).
     pub idle_strategy: String,
-    /// `aeron.cluster.timer.service.supplier` (`ConsensusModule.java:935`).
+    /// `aeron.cluster.timer.service.supplier` (`ConsensusModule.java:942`).
     pub timer_service_supplier: String,
     /// Whether this configuration carries a consensus-module extension.
     ///
@@ -417,28 +417,28 @@ pub struct ConsensusModuleConfig {
     /// .extension`); this build has no class loader, so the property is refused
     /// by name and the flag is the **programmatic** seam a test (or an
     /// embedder) uses to say it supplied an extension. Zero services are only
-    /// allowed when it is set (`ConsensusModule.java:2158`).
+    /// allowed when it is set (`ConsensusModule.java:2193`).
     pub consensus_module_extension: bool,
     /// `aeron.cluster.services.dir`; empty when unset.
     pub services_dir_property: Option<String>,
     /// Where the service containers' mark files are: the property, canonical
-    /// (`ConsensusModule.java:1756-1762`), or the cluster directory.
+    /// (`ConsensusModule.java:1783-1789`), or the cluster directory.
     pub services_dir: PathBuf,
     /// `aeron.cluster.consensus.module.agent.role.name`; `None` when empty.
     pub agent_role_name: Option<String>,
     /// `aeron.thread.naming`: which spelling of the computed role name applies
-    /// (`ConsensusModule.java:1867-1871`).
+    /// (`ConsensusModule.java:1894-1898`).
     pub thread_naming: ThreadNaming,
     /// `aeron.cluster.wheel.tick.resolution`, in nanoseconds
-    /// (`ConsensusModule.java:892-898`, default 8 ms).
+    /// (`ConsensusModule.java:899-905`, default 8 ms).
     pub wheel_tick_resolution_ns: i64,
-    /// `aeron.cluster.ticks.per.wheel` (`ConsensusModule.java:905-912`).
+    /// `aeron.cluster.ticks.per.wheel` (`ConsensusModule.java:912-919`).
     pub ticks_per_wheel: i32,
 }
 
 impl ConsensusModuleConfig {
     /// The name of the thread the agent runs on: the property when it names
-    /// one, otherwise the computed role name (`ConsensusModule.java:1867-1871`).
+    /// one, otherwise the computed role name (`ConsensusModule.java:1894-1898`).
     #[must_use]
     pub fn agent_role_name(&self) -> String {
         if let Some(name) = &self.agent_role_name {
@@ -478,7 +478,7 @@ impl ConsensusModuleConfig {
         };
 
         // `Boolean.parseBoolean`: anything but "true" is false, and the default
-        // applies only when the name is absent (`ConsensusModule.java:439-445`).
+        // applies only when the name is absent (`ConsensusModule.java:446-452`).
         let boolean = |name: &'static str, default: bool| -> bool {
             match properties.get(name) {
                 None => default,
@@ -517,7 +517,7 @@ impl ConsensusModuleConfig {
             STARTUP_CANVASS_TIMEOUT_DEFAULT_NS,
         )?;
 
-        // `Conclude` (`:1786-1790`): the reference's own check.
+        // `Conclude` (`:1813-1817`): the reference's own check.
         if leader_heartbeat_timeout_ns == 0
             || startup_canvass_timeout_ns / leader_heartbeat_timeout_ns < 2
         {
@@ -529,7 +529,7 @@ impl ConsensusModuleConfig {
 
         let cluster_id = int(CLUSTER_ID_PROP_NAME, CLUSTER_ID_DEFAULT)?;
         let member_id = int(CLUSTER_MEMBER_ID_PROP_NAME, CLUSTER_MEMBER_ID_DEFAULT)?;
-        // `concludeArchiveContext` (`ConsensusModule.java:2077-2100`): the
+        // `concludeArchiveContext` (`ConsensusModule.java:2112-2135`): the
         // local archive's two channels carry an alias that names this member,
         // so two members sharing a driver do not share a control session.
         let request_uri = deepmsg_core::uri::ChannelUri::parse("aeron:ipc")
@@ -546,7 +546,7 @@ impl ConsensusModuleConfig {
         archive.aeron_dir = aeron_dir.to_string_lossy().into_owned();
         archive.control_request_channel = Some(request_uri.build());
         archive.control_response_channel = Some(response_uri.build());
-        // `Context.conclude` (`ConsensusModule.java:2077-2084`): the response
+        // `Context.conclude` (`ConsensusModule.java:2112-2119`): the response
         // stream is per-cluster so two clusters can share one archive.
         archive.control_response_stream_id += cluster_id * 100 + 100;
 
@@ -719,7 +719,7 @@ impl ConsensusModuleConfig {
                     .filter(|name| !name.is_empty())
                     .unwrap_or(crate::timer::TIMER_SERVICE_SUPPLIER_DEFAULT);
                 // The reference's own whitelist: two class names, everything
-                // else throws (`ConsensusModule.java:4589-4607`).
+                // else throws (`ConsensusModule.java:4653-4671`).
                 crate::timer::timer_service_kind(name)
                     .map_err(|error| ConfigProblem::Invalid(error.to_string()))?;
                 name.to_owned()
@@ -741,19 +741,19 @@ impl ConsensusModuleConfig {
     /// The mark file's directory defaults to the cluster directory **unless
     /// `aeron.cluster.mark.file.dir` named one** — the reference takes the
     /// container's property when the CM's own `markFileDir` is unset
-    /// (`ConsensusModule.java:1740-1744`).
+    /// (`ConsensusModule.java:1767-1771`).
     ///
     /// # Errors
     ///
     /// [`ConfigProblem::Directory`] when a path cannot be canonicalised or a
     /// directory cannot be created.
     pub fn conclude(&mut self) -> Result<(), ConfigProblem> {
-        // `validateLogChannel` (`ConsensusModule.java:4609-4624`): a log
+        // `validateLogChannel` (`ConsensusModule.java:4673-4688`): a log
         // channel that names a starting position would fight the recording
         // log, which owns it.
         let log_channel = deepmsg_core::uri::ChannelUri::parse(&self.log_channel)
             .map_err(|error| ConfigProblem::Invalid(format!("logChannel: {error}")))?;
-        // `Context.conclude` (`ConsensusModule.java:2156-2160`): zero services
+        // `Context.conclude` (`ConsensusModule.java:2191-2195`): zero services
         // need an extension.
         if self.service_count == 0 && !self.consensus_module_extension {
             return Err(ConfigProblem::Invalid(
@@ -792,7 +792,7 @@ impl ConsensusModuleConfig {
             }
         }
 
-        // `clusterServicesDirectoryName` (`ConsensusModule.java:1756-1762`):
+        // `clusterServicesDirectoryName` (`ConsensusModule.java:1783-1789`):
         // the property, canonical, or the cluster directory's own path. Rust's
         // `canonicalize` needs the path to exist, so it is made first.
         self.services_dir = match self.services_dir_property.as_deref() {

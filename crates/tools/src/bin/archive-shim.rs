@@ -763,7 +763,7 @@ impl Config {
     }
 }
 
-/// The standalone archive entry point (`archive/Archive.java:184`), which is
+/// The standalone archive entry point (`archive/Archive.java:190`), which is
 /// what the archive half of a `hybrid` pair runs: the reference's combined
 /// process is split into ours and theirs, and theirs is this.
 const ARCHIVE_STANDALONE: &str = "io.aeron.archive.Archive";
@@ -1028,7 +1028,7 @@ mod tests {
 
     /// The split that makes one reference process into two: same properties,
     /// same classpath, the archive's own entry point instead of the combined
-    /// one (`archive/Archive.java:184`).
+    /// one (`archive/Archive.java:190`).
     #[test]
     fn the_class_can_be_swapped_for_the_standalone_archive() {
         let invocation = Invocation::parse(&captured_argv());

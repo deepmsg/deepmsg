@@ -159,7 +159,7 @@ impl Credentials for NoCredentials {
 /// request named, offered as they are, and **no challenge answered at all**.
 ///
 /// The reference builds one on the context its session connects with, and only
-/// when the request carried something (`ArchiveConductor.java:1443-1446`: an
+/// when the request carried something (`ArchiveConductor.java:1450-1453`: an
 /// empty `encodedCredentials` leaves the context's own supplier alone). The
 /// second half is not an oversight on its part and is copied rather than
 /// improved: a replication's credentials are the caller's, and a session that
@@ -256,7 +256,7 @@ impl core::fmt::Display for ConnectError {
             Self::Add(reason) => write!(f, "{reason}"),
             Self::Request(error) => write!(f, "{error}"),
             Self::ResponseChannel(reason) => write!(f, "{reason}"),
-            // The reference's text (`:387`).
+            // The reference's text (`:386`).
             Self::UnexpectedCode(code) => write!(f, "unexpected response code: code={code}"),
             Self::Refused { message } => write!(f, "{message}"),
             Self::TimedOut => write!(f, "connect timeout"),
@@ -281,7 +281,7 @@ pub struct AsyncConnect {
     subscription: Option<i64>,
     proxy: Option<ArchiveProxy>,
     poller: Option<ControlResponsePoller>,
-    /// **Taken once**, in [`AsyncConnect::new`] (`:173`).
+    /// **Taken once**, in [`AsyncConnect::new`] (`:172`).
     deadline: Instant,
     /// The request the connect is waiting on.
     correlation_id: i64,
@@ -320,7 +320,7 @@ impl AsyncConnect {
         let timeout = Duration::from_nanos(u64::try_from(context.message_timeout_ns).unwrap_or(0));
 
         // The response channel's subscription is added **first**, because the
-        // request channel may have to name it (`:462-500`) — and because the id
+        // request channel may have to name it (`:461-499`) — and because the id
         // it draws is what the request carries.
         let subscription_add = client
             .async_add_subscription(
@@ -376,7 +376,7 @@ impl AsyncConnect {
         self.correlation_id
     }
 
-    /// Drive the machine a turn (`:168-455`).
+    /// Drive the machine a turn (`:167-454`).
     ///
     /// # Errors
     ///
@@ -391,7 +391,7 @@ impl AsyncConnect {
             return Err(ConnectError::Client(reason.clone()));
         }
 
-        // **The one deadline** (`:173-176`), before anything else: a connect
+        // **The one deadline** (`:172-175`), before anything else: a connect
         // that has run out of time does not get to take one more step.
         if Instant::now() > self.deadline {
             return Err(self.fail(ConnectError::TimedOut));
@@ -512,7 +512,7 @@ impl AsyncConnect {
                     // ever a hint.** A poll that read a message *and* filled
                     // the slot has the answer, whatever it cost to read — the
                     // reference asks `is_poll_complete && correlation_id ==`
-                    // and never looks at the count (`:361-365`). Testing the
+                    // and never looks at the count (`:360-364`). Testing the
                     // count first is a connect that discards its own answer and
                     // waits for a second one that will not come.
                     let _ = fragments;
@@ -724,7 +724,7 @@ fn has_an_image(client: &Client, subscription: Option<i64>) -> bool {
         .is_some_and(|subscription| !subscription.images().is_empty())
 }
 
-/// `aeron_archive_check_and_setup_response_channel` (`:462-500`).
+/// `aeron_archive_check_and_setup_response_channel` (`:450-488`).
 ///
 /// A response-mode response channel is the archive's own, so instead of a
 /// session id on the request the client writes the **id of the subscription it
@@ -755,7 +755,7 @@ const CONTROL_MODE_KEY: &str = "control-mode";
 /// See [`CONTROL_MODE_KEY`].
 const CONTROL_MODE_RESPONSE: &str = "response";
 /// `AERON_UDP_CHANNEL_CONTROL_MODE_MANUAL_VALUE`, which is the one control mode
-/// a wildcard port is *not* resolved for (`aeron_subscription.c:660-672`).
+/// a wildcard port is *not* resolved for (`aeron_subscription.c:648-660`).
 const CONTROL_MODE_MANUAL: &str = "manual";
 /// `AERON_URI_RESPONSE_CORRELATION_ID_KEY`.
 const RESPONSE_CORRELATION_ID_KEY: &str = "response-correlation-id";
@@ -763,7 +763,7 @@ const RESPONSE_CORRELATION_ID_KEY: &str = "response-correlation-id";
 const ENDPOINT_KEY: &str = "endpoint";
 
 /// `aeron_subscription_try_resolve_channel_endpoint_port`
-/// (`aeron_subscription.c:674-728`).
+/// (`aeron_subscription.c:662-716`).
 ///
 /// An answer of `""` means **not yet**: the channel is a UDP endpoint with a
 /// wildcard port, and the driver has not yet assigned it one. Everything else —
@@ -800,7 +800,7 @@ fn resolve_response_channel(
     Ok(uri.build())
 }
 
-/// `aeron_subscription_should_replace_wildcard_port` (`aeron_subscription.c:660-672`):
+/// `aeron_subscription_should_replace_wildcard_port` (`aeron_subscription.c:648-660`):
 /// a **UDP** channel whose endpoint names port **zero**, and which is not
 /// `control-mode=manual`.
 fn should_replace_wildcard_port(uri: &ChannelUri) -> bool {

@@ -14,7 +14,7 @@
 //! each:
 //!
 //! * **The position counter**, which is the one the reference's C harness waits
-//!   on (`aeron_archive_test.cpp:267-273` polls the counter's **slot**), found
+//!   on (`aeron_archive_test.cpp:272-278` polls the counter's **slot**), found
 //!   the way that harness finds it: by **session id** (`:275-286`), which is the
 //!   question a client with a publication can ask.
 //! * **`RecordingPositionRequest`** (12) answers with the live session's counter
@@ -25,7 +25,7 @@
 //!   of its own and the client took it.
 //! * And the counter **goes away** with the session that owned it, which is what
 //!   a reader that held the id across the stop must not be able to see a stale
-//!   version of (`RecordingPos.isActive`, `RecordingPos.java:292-298`).
+//!   version of (`RecordingPos.isActive`, `RecordingPos.java:264-270`).
 //!
 //! # The channel is the C suite's shape
 //!
@@ -89,7 +89,7 @@ const RECORDING_STREAM_ID: i32 = 33;
 /// once and a UDP endpoint is one process's at a time.
 ///
 /// `term-length=64k` is what makes the segment length small: the archive takes
-/// `max(configured, term length)` (`ArchiveConductor.java:2006`), so a 64 KiB
+/// `max(configured, term length)` (`ArchiveConductor.java:2028`), so a 64 KiB
 /// setting without a 64 KiB term would still be a 16 MiB segment.
 fn recording_channel_log() -> String {
     format!("aeron:udp?endpoint=localhost:{}|term-length=64k", port(2))
@@ -181,8 +181,8 @@ fn a_recording_round_trip_with_env(
 
     // `StartRecordingRequest2` (63), which the product sends. Its answer is the
     // **subscription's** registration id, and it comes before any image exists:
-    // the two are different moments (`ArchiveConductor.java:570` against
-    // `:2046-2051`).
+    // the two are different moments (`ArchiveConductor.java:569` against
+    // `:2068-2073`).
     //
     // The request used to be built here byte by byte and posted through
     // `Session::send`. It is now `Archive::start_recording` — the same request,
@@ -415,8 +415,8 @@ fn read_whatever_there_is(client: &mut Client, reader: i64) {
 /// Wait for the recording's position counter to reach `position`, answering with
 /// the recording id the counter names.
 ///
-/// The C harness's own wait (`aeron_archive_test.cpp:267-273`) with its own
-/// lookup (`:275-286`): the counter's **slot** is what a client polls, and the
+/// The C harness's own wait (`aeron_archive_test.cpp:272-278`) with its own
+/// lookup (`:274-285`): the counter's **slot** is what a client polls, and the
 /// session id is how it is found. A recording that never gets there hangs the
 /// reference's harness too, so the deadline here says what it was waiting for
 /// rather than that something timed out.
@@ -562,7 +562,7 @@ fn list_recording(session: &mut Session, client: &mut Client, recording_id: i64)
         .expect("the archive offered a descriptor")
 }
 
-/// ★ **P2-9b: the six duty-cycle counters** (`Archive.java:1402-1480`).
+/// ★ **P2-9b: the six duty-cycle counters** (`Archive.java:1470-1548`).
 ///
 /// Three pairs — the conductor's, the recorder's and the replayer's — with the
 /// labels `AeronStat` reads. The acceptance for this slice is that a reader sees
@@ -573,7 +573,7 @@ fn list_recording(session: &mut Session, client: &mut Client, recording_id: i64)
 /// maximum cycle time has moved by the time the archive has served, because the
 /// reference measures it on every turn (`ArchiveConductor.doWork:374`), while
 /// the other two stay at zero — the reference only measures those from
-/// `DedicatedModeArchiveConductor` (`:191`, `:346`), and a `SHARED` archive has
+/// `DedicatedModeArchiveConductor` (`:197`, `:352`), and a `SHARED` archive has
 /// no agent of its own for either.
 ///
 /// ★ Since P2-9a the mode is said out loud for the second reason as well as the
@@ -625,8 +625,8 @@ fn the_archive_allocates_the_duty_cycle_counters() {
 
     let counters = client.counters_reader().expect("a counters region");
 
-    // ★ **Six counters, and the labels are the reference's** (`Archive.java:1407`
-    // and `:1412-1415`): the mode this build runs, and the default threshold in
+    // ★ **Six counters, and the labels are the reference's** (`Archive.java:1475`
+    // and `:1480-1483`): the mode this build runs, and the default threshold in
     // `SystemUtil.formatDuration`'s spelling.
     for actor in ["conductor", "recorder", "replayer"] {
         let max = counters_of(&counters, 103, &format!("archive-{actor} max cycle time"));

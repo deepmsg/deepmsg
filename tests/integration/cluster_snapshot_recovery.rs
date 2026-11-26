@@ -6,9 +6,9 @@
 //! carries:
 //!
 //! * `ClusterTest.shouldStopLeaderAndFollowersThenRestartAllWithSnapshot`
-//!   (`ClusterTest.java:254`) — a `SNAPSHOT` toggle, a stop, a restart, and
+//!   (`ClusterTest.java:259`) — a `SNAPSHOT` toggle, a stop, a restart, and
 //!   every business handed its snapshot;
-//! * `ClusterTest.shouldShutdownClusterAndRestartWithSnapshots` (`:338`) — the
+//! * `ClusterTest.shouldShutdownClusterAndRestartWithSnapshots` (`:343`) — the
 //!   orderly `SHUTDOWN`, whose snapshot is the one the restart loads (the
 //!   restart half of
 //!   [`deepmsg_tests::cluster_harness`]'s `shutdown_snapshots_and_then_ends_the_duty_cycle`);
@@ -258,7 +258,7 @@ fn await_messages(node: &Node, faults: &Faults, count: usize) {
 
 /// **Every member restarts on the snapshot it took** —
 /// `ClusterTest.shouldStopLeaderAndFollowersThenRestartAllWithSnapshot`
-/// (`ClusterTest.java:254`).
+/// (`ClusterTest.java:259`).
 ///
 /// The reference takes a snapshot, stops all three, restarts all three on their
 /// own directories, and waits for `awaitSnapshotsLoaded`. The three messages
@@ -369,7 +369,7 @@ fn a_restart_without_a_snapshot_loads_nothing() {
 
 /// **An orderly shutdown snapshots every member, and the restart comes back on
 /// those snapshots** — `ClusterTest.shouldShutdownClusterAndRestartWithSnapshots`
-/// (`ClusterTest.java:338`).
+/// (`ClusterTest.java:343`).
 ///
 /// The first half (a `SHUTDOWN` snapshots and then ends the duty cycle) is
 /// `cluster_control::shutdown_snapshots_and_then_ends_the_duty_cycle` for one
@@ -400,7 +400,7 @@ fn a_graceful_shutdown_snapshots_every_member_and_the_cluster_comes_back() {
     drop(client);
 
     // `TestCluster.shutdownCluster` (`TestCluster.java:1514`): the orderly toggle, which
-    // snapshots first (`ConsensusModuleAgent.java:2585-2607`).
+    // snapshots first (`ConsensusModuleAgent.java:2611-2633`).
     cluster.leader_counters().set(
         CLUSTER_CONTROL_TOGGLE_TYPE_ID,
         i64::from(ToggleState::Shutdown.code()),
@@ -429,7 +429,7 @@ fn a_graceful_shutdown_snapshots_every_member_and_the_cluster_comes_back() {
 
     assert_eq!(2, cluster.followers(), "the two followers came back");
     // The reference compares the followers to the leader
-    // (`ClusterTest.java:358-364`), not to the term before the shutdown: a
+    // (`ClusterTest.java:363-369`), not to the term before the shutdown: a
     // whole-cluster restart is free to close a new term, and this one does
     // (0 -> 1).
     let new_leader = cluster.leader();
@@ -543,14 +543,14 @@ fn stop_while_keeping_alive(
 }
 
 /// **A follower comes back to a snapshot taken while it was down** —
-/// `ClusterTest.shouldReplaySnapshotTakenWhileDown` (`ClusterTest.java:691`).
+/// `ClusterTest.shouldReplaySnapshotTakenWhileDown` (`ClusterTest.java:696`).
 ///
 /// The snapshot is a `SNAPSHOT` **action appended to the cluster log**
-/// (`ConsensusModuleAgent.java:2569`, `appendAction`), and every member takes
+/// (`ConsensusModuleAgent.java:2595`, `appendAction`), and every member takes
 /// its own snapshot when it applies that position. A member that was away
 /// therefore does not "fetch" one from anybody: it replays the action on the
 /// way back and takes its own. That is what the snapshot counter is read for —
-/// only a local `takeSnapshot` increments it (`:3190`), so `count == 1` on the
+/// only a local `takeSnapshot` increments it (`:3211`), so `count == 1` on the
 /// returning member says the action was replayed, not that some other path
 /// filled the gap.
 ///
@@ -689,7 +689,7 @@ fn a_keep_alive_keeps_the_ingress_publication_connected() {
 /// **An empty follower catches up from the shutdown snapshot and takes its
 /// own** —
 /// `ClusterTest.shouldCatchupFromEmptyLogThenSnapshotAfterShutdownAndFollowerCleanStart`
-/// (`ClusterTest.java:1213`).
+/// (`ClusterTest.java:1217`).
 ///
 /// The two members that kept their directories lost nothing: they load the
 /// snapshot the shutdown wrote. The one that comes back on an empty directory
@@ -741,7 +741,7 @@ fn an_empty_follower_replays_the_shutdown_snapshot_and_takes_its_own() {
     }
     cluster.stop_all();
 
-    // The reference's `cleanStart` member is 2 (`ClusterTest.java:1242-1246`),
+    // The reference's `cleanStart` member is 2 (`ClusterTest.java:1246-1250`),
     // and it is the one that must **not** have been handed a snapshot.
     let clean = 2;
     cluster.restart_one(0);
@@ -781,7 +781,7 @@ fn an_empty_follower_replays_the_shutdown_snapshot_and_takes_its_own() {
 
 /// **Two snapshots are replayed into an empty follower log** —
 /// `ClusterTest.shouldReplayMultipleSnapshotsWithEmptyFollowerLog`
-/// (`ClusterTest.java:1295`).
+/// (`ClusterTest.java:1299`).
 ///
 /// Two snapshots, two messages before the first and one between them, and a
 /// member that comes back clean: it replays both actions, catches up to the
@@ -847,7 +847,7 @@ fn two_snapshots_are_replayed_into_an_empty_follower_log() {
     );
 
     // The reference reconnects a client after the restart and sends four more
-    // (`ClusterTest.java:1350-1356`); this build's client does not follow a
+    // (`ClusterTest.java:1354-1360`); this build's client does not follow a
     // redirect, so reconnecting is a second client (`cluster_restart_path`).
     let new_leader = cluster.leader();
     let Some(mut second_client) = ClientSide::start_at(ports.ports(), new_leader, 1) else {
@@ -881,7 +881,7 @@ fn client_on(
 
 /// **The last snapshot is marked invalid, so the one before it is what the
 /// cluster comes back on** — `ClusterTest.shouldRecoverWhenLastSnapshotIsMarkedInvalid`
-/// (`ClusterTest.java:1597`).
+/// (`ClusterTest.java:1601`).
 ///
 /// Two snapshots (three messages each), a leader that goes and comes back, three
 /// more messages, and then the **second** snapshot is invalidated with every
@@ -955,7 +955,7 @@ fn the_last_snapshot_is_marked_invalid_and_the_one_before_it_is_used() {
 /// **The snapshot before the invalidated one is what the cluster comes back
 /// on** — the same-term half of
 /// `ClusterTest.shouldRecoverWhenLastSnapshotIsMarkedInvalid`
-/// (`ClusterTest.java:1597`).
+/// (`ClusterTest.java:1601`).
 ///
 /// Two snapshots, the newest invalidated on every member with all of them
 /// stopped, and the restart must recover the six messages from the first
@@ -1003,7 +1003,7 @@ fn the_snapshot_before_the_invalidated_one_is_what_the_cluster_comes_back_on() {
 
 /// **The latest snapshot is invalidated between two elections** —
 /// `ClusterTest.shouldRecoverWhenLastSnapshotIsInvalidBetweenTwoElections`
-/// (`ClusterTest.java:1707`).
+/// (`ClusterTest.java:1711`).
 ///
 /// A snapshot in the first term, nothing in the second, and the first one
 /// invalidated with every member stopped: the cluster comes back on the log.
@@ -1076,7 +1076,7 @@ fn a_snapshot_invalidated_between_two_elections() {
 
 /// **The last two snapshots are invalidated after an election** —
 /// `ClusterTest.shouldRecoverWhenLastTwosSnapshotsAreInvalidAfterElection`
-/// (`ClusterTest.java:1753`).
+/// (`ClusterTest.java:1757`).
 ///
 /// Three snapshots across two terms; the newest two are invalidated with every
 /// member stopped, so the recovery is the first snapshot plus the log. The
@@ -1123,7 +1123,7 @@ fn the_last_two_snapshots_are_invalidated_after_an_election() {
     take_snapshot(cluster.leader_counters());
     for id in 0..MEMBER_COUNT {
         // The member that was away for the first snapshot replays its action
-        // and is one behind (`ClusterTest.java:1795-1798`).
+        // and is one behind (`ClusterTest.java:1799-1802`).
         let expected = if id == leader0 { 1 } else { 2 };
         await_snapshot_count(
             &cluster.counters[usize::try_from(id).unwrap()],

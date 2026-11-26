@@ -9,7 +9,7 @@
 //! 4. **the business's own records, after END** — `service.on_take_snapshot` is
 //!    called once `snapshot_state` has returned
 //!
-//! `typeId` is **2**, the container's (`ClusteredServiceContainer.java:195`),
+//! `typeId` is **2**, the container's (`ClusteredServiceContainer.java:203`),
 //! not 1, the consensus module's: the two share `SnapshotMarker(100)`, and the
 //! type id is all that tells their snapshots apart.
 //!
@@ -49,7 +49,7 @@ use crate::error::ContainerError;
 use crate::role::TimeUnit;
 use crate::session::ContainerClientSession;
 
-/// `ClusteredServiceContainer.Configuration.SNAPSHOT_TYPE_ID` (`:195`).
+/// `ClusteredServiceContainer.Configuration.SNAPSHOT_TYPE_ID` (`:203`).
 pub const SNAPSHOT_TYPE_ID: i64 = 2;
 
 /// `ServiceSnapshotLoader.FRAGMENT_LIMIT` (`:31`).

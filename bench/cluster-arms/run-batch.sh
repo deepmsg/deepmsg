@@ -133,7 +133,7 @@ path_port=${BENCH_PATH_PORT:-61411}
 # A diagnostic knob, not a measurement: the cluster's own session timeout, so
 # that a client which cannot get a message in for longer than the default 10 s
 # is told apart from one that is merely slow. Empty keeps every arm on its
-# default (the reference's is 10 s, `ConsensusModule.java:739`).
+# default (the reference's is 10 s, `ConsensusModule.java:746`).
 session_timeout=${BENCH_CLUSTER_SESSION_TIMEOUT:-}
 # ★ Which member leads, pinned. `-1` (the default) keeps the reference's
 # behaviour -- an election -- and then the leader lands wherever it lands. That
@@ -284,7 +284,7 @@ for ((_i = 0; _i < member_count; _i++)); do
     # ★ The log is the one channel whose shape depends on the membership. A
     # single member publishes to itself, so an endpoint is the whole channel. A
     # three-member cluster publishes to the other members, and the reference's
-    # rule (`ConsensusModule.java:2145`) is *udp with no endpoint* = multi-
+    # rule (`ConsensusModule.java:2180`) is *udp with no endpoint* = multi-
     # destination; the publication then gets `control-mode=manual` and a control
     # endpoint of its own. An endpoint here is a one-destination publication,
     # and followers time out with "failed to join live log".

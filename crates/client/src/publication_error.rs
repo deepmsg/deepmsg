@@ -5,8 +5,8 @@
 //! id, carries no correlation id, and is the way a publisher learns that a
 //! reader refused its stream. Both ways into it arrive here — a client that
 //! rejected an image, and a driver whose own publication heard the `ERR` frame
-//! (`aeron_driver_conductor.c:2263-2323`, reached from
-//! `aeron_ipc_publication.c:249` and `aeron_network_publication.c:873`).
+//! (`aeron_driver_conductor.c:2326-2386`, reached from
+//! `aeron_ipc_publication.c:254` and `aeron_network_publication.c:873`).
 //!
 //! The reference delivers it through a callback registered on the context
 //! (`Aeron.Context.publicationErrorFrameHandler`, and on the C side
@@ -39,7 +39,7 @@ pub struct PublicationErrorEvent {
     /// The destination the error came from, or `-1`. Always `-1` on the IPC
     /// path, and `-1` on the network path when the channel has no destination
     /// tracker to name one from
-    /// (`media/aeron_send_channel_endpoint.c:685-691`).
+    /// (`media/aeron_send_channel_endpoint.c:678-684`).
     pub destination_registration_id: i64,
     /// The stream's session id.
     pub session_id: i32,

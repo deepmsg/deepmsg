@@ -50,7 +50,7 @@ mod tests {
         );
         assert_eq!(
             (cluster::SBE_SCHEMA_ID, cluster::SBE_SCHEMA_VERSION),
-            (111, 17)
+            (111, 18)
         );
         assert_eq!(
             (

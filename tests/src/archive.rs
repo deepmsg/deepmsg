@@ -30,7 +30,7 @@
 //! request channel as `response-correlation-id`.
 //!
 //! From there the chain is three registration ids
-//! (`aeron_driver_conductor.c:1711-1760`, implemented in this build at
+//! (`aeron_driver_conductor.c:1752-1801`, implemented in this build at
 //! `crates/driver/src/ipc_subscriptions.rs`):
 //!
 //! ```text
@@ -207,7 +207,7 @@ impl Session {
     ///
     /// `correlation_id` **no longer names the connect**. `AsyncConnect` takes the
     /// connect's own correlation id from the driver's command ring, which is what
-    /// the reference does (`aeron_archive_client.c:408-411` for the counter, and
+    /// the reference does (`aeron_archive_client.c:488-491` for the counter, and
     /// no entry point lets a caller choose one), so the parameter survives only
     /// as the seed for [`Session::next_correlation_id`]. The callers' constants
     /// are unchanged and still name a request; they just no longer also name the
@@ -281,7 +281,7 @@ impl Session {
     /// payload this module built. The reference has the same gap and the same
     /// answer: its test reaches past the client to the proxy itself
     /// (`aeron_archive_proxy_get_start_position(archive->archive_proxy, …)`,
-    /// `aeron_archive_test.cpp:1117`), and the proxy is where a named request
+    /// `aeron_archive_test.cpp:1124`), and the proxy is where a named request
     /// gets its bytes.
     ///
     /// What is left is not "the requests the product has no method for yet" —
@@ -358,9 +358,9 @@ impl Session {
 /// The fourth is the budget, and **it is the one setting here that is not merely
 /// moved**. In the reference there is exactly one owner of a deadline —
 /// `ctx->message_timeout_ns`, which every wait in `aeron_archive_client.c` starts
-/// from (`:156` and its siblings) and which no entry point lets a caller
+/// from (`:227` and its siblings) and which no entry point lets a caller
 /// override; a test that wants another one sets it on the context
-/// (`aeron_archive_test.cpp:1114` sets 500 ms for exactly that reason). The
+/// (`aeron_archive_test.cpp:1121` sets 500 ms for exactly that reason). The
 /// fixture used to pass `DEADLINE` per call, on both the connect and every wait
 /// after it. So the caller's deadline is handed over here, once, as whatever is
 /// left of it — which for the callers that pass `Instant::now() + DEADLINE` is
@@ -606,7 +606,7 @@ pub struct Archive {
     /// The archive's own directory, and held rather than merely made: a
     /// `TempDir` removes its directory when it is dropped, and this is the one
     /// the archive asks `statvfs` about before every recording
-    /// (`isLowStorageSpace`, `ArchiveConductor.java:2597-2617`) as well as the
+    /// (`isLowStorageSpace`, `ArchiveConductor.java:2632-2652`) as well as the
     /// one its segment files are in. A dropped one is a start refused for want
     /// of room on a filesystem that is not there.
     archive_dir: TempDir,
@@ -1187,7 +1187,7 @@ fn publication_position(client: &Client, publication: i64) -> i64 {
 
 /// Wait for the recording's position counter to catch up with the publication,
 /// answering with the recording id it names
-/// (`aeron_archive_test.cpp:267-286`).
+/// (`aeron_archive_test.cpp:272-291`).
 fn wait_for_the_counter(
     client: &mut Client,
     publication: i64,

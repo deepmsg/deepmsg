@@ -14,7 +14,7 @@
 //!
 //! `aeron:ipc` over the reference driver, so the reject takes the IPC branch
 //! there: the reference synthesizes the publication error directly
-//! (`aeron_ipc_publication.c:216-277`) instead of sending an `ERR` frame, and
+//! (`aeron_ipc_publication.c:221-282`) instead of sending an `ERR` frame, and
 //! it is the same `ON_PUBLICATION_ERROR` either way.
 
 use std::time::{Duration, Instant};
@@ -110,7 +110,7 @@ fn the_reference_driver_reads_our_rejection_and_answers_with_an_error_frame() {
 
     // The command under test. Its bytes are this build's, and **nothing is
     // waited for** — that is the C client's shape
-    // (`aeron_client_conductor_reject_image`, `aeron_client_conductor.c:3627-3651`).
+    // (`aeron_client_conductor_reject_image`, `aeron_client_conductor.c:3712-3736`).
     // Whether the reference believed the record is what the *publication error*
     // below says: a record it called malformed is recorded and answered with
     // **silence**, so the publisher would never hear, and the wait after this

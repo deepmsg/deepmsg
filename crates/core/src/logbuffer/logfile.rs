@@ -5,7 +5,7 @@
 //! first would make the *driver's* creation fail. This is the other side — the
 //! driver (or rather its native resource agent) creates the file with
 //! `O_CREAT | O_EXCL`, lays out three terms and a metadata block, and hands the
-//! mapping to the publication (`aeron-client/src/main/c/util/aeron_fileutil.c:1260-1307`).
+//! mapping to the publication (`aeron-client/src/main/c/util/aeron_fileutil.c:1259-1306`).
 //!
 //! ```text
 //! offset 0                   : term 0                   (term_length bytes)
@@ -15,15 +15,15 @@
 //! ```
 //!
 //! so `length = ALIGN(3 * term_length + 4096, page_size)`
-//! (`concurrent/aeron_logbuffer_descriptor.h:107-110`).
+//! (`concurrent/aeron_logbuffer_descriptor.h:108-111`).
 //!
 //! # The metadata is written after the file exists, not before
 //!
 //! `create` leaves the metadata block zeroed and returns a handle to it; the
 //! caller fills it (`descriptor::initialise`) and then writes the term tails.
 //! That order is the reference's — `aeron_logbuffer_metadata_init` does not
-//! touch the tails (`:235-239`), and the publication writes them itself
-//! (`aeron_ipc_publication.c:75-103`) — and it is what lets a publication start
+//! touch the tails (`:236-240`), and the publication writes them itself
+//! (`aeron_ipc_publication.c:80-108`) — and it is what lets a publication start
 //! at a non-zero position without a second template.
 
 use std::io;
@@ -59,7 +59,7 @@ impl LogFile {
     /// allocates and touches its whole length up front, so a producer never
     /// pays a page fault on the hot path. The reference's `aeron_raw_log_map`
     /// makes the same choice from its `use_sparse_files` parameter
-    /// (`aeron-client/src/main/c/util/aeron_fileutil.c:1269-1292`).
+    /// (`aeron-client/src/main/c/util/aeron_fileutil.c:1268-1291`).
     ///
     /// # Errors
     ///
@@ -147,13 +147,13 @@ impl LogFile {
     /// The same arithmetic [`LogFile::create`] makes a file of, factored out
     /// for the caller that must know the length *before* it decides to create:
     /// the reference's storage check compares this against the usable space
-    /// first (`aeron_driver_context.c:1354-1375`, asking
+    /// first (`aeron_driver_context.c:1398-1419`, asking
     /// `aeron_logbuffer_compute_log_length` for the same number).
     ///
     /// The reference's own compute is a bare alignment
-    /// (`aeron_logbuffer_descriptor.h:107-110`) and trusts its caller for the
+    /// (`aeron_logbuffer_descriptor.h:108-111`) and trusts its caller for the
     /// page size, because the driver validates it once at start-up — a range
-    /// and a power of two (`aeron_driver.c:468-485`). This is the single
+    /// and a power of two (`aeron_driver.c:485-502`). This is the single
     /// validation point on this side, so the power-of-two test lives here: a
     /// non-power-of-two page size would not merely be unusual, the mask below
     /// would round to an arbitrary length.
@@ -254,7 +254,7 @@ impl LogFile {
     /// position. With `Some((term_id, term_offset))` it begins *there* — the
     /// other two partitions still hold the terms three and two rotations back,
     /// counted **forward from the active one**, which is what
-    /// `aeron_ipc_publication.c:75-103` writes and what `Appender::rotate`
+    /// `aeron_ipc_publication.c:80-108` writes and what `Appender::rotate`
     /// looks for when the log turns.
     ///
     /// Returns whether the block could be written.
@@ -273,8 +273,8 @@ impl LogFile {
             None => {
                 // Written here rather than through `Appender::initialise_tails`
                 // because the tails come *before* the metadata block in the
-                // reference's creation order (`aeron_ipc_publication.c:75-103`
-                // then `:107-142`), and an appender needs the metadata it has
+                // reference's creation order (`aeron_ipc_publication.c:80-108`
+                // then `:108-143`), and an appender needs the metadata it has
                 // not been given yet.
                 if !store(0, RawTail::new(initial_term_id, 0)) {
                     return false;
@@ -435,7 +435,7 @@ mod tests {
     fn a_page_size_that_is_not_a_power_of_two_is_refused() {
         // The mask the length is rounded with only means anything for a power
         // of two, and the reference's driver validates the same thing at
-        // start-up (`aeron_driver.c:468-485`). Refused here means the file is
+        // start-up (`aeron_driver.c:485-502`). Refused here means the file is
         // never made.
         let dir = TempDir::new();
         let odd = dir.path().join("odd.logbuffer");

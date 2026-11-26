@@ -510,7 +510,7 @@ fn grow(buffer: &mut Vec<u8>, length: usize) {
 /// Each method is the reference's `Aeron` or `Publication` call under the name
 /// this build gives it, and the one thing worth stating is what is *not* here:
 /// polling the client. The reference's conductor invokes the client's agent
-/// itself (`ArchiveConductor.java:377-380`), so a publication's answer is
+/// itself (`ArchiveConductor.java:376-379`), so a publication's answer is
 /// visible by the time a session looks for it; this build's conductor polls the
 /// client once a turn, and these methods only read what that poll brought in.
 impl Publications for Client {
@@ -795,7 +795,7 @@ mod tests {
     /// by the test, which is the whole point: the two halves have to fit without
     /// either of them knowing about the other
     /// (`Catalog.wrapDescriptor` / `ControlResponseProxy.sendDescriptor`,
-    /// `Catalog.java:464-493` and `ControlResponseProxy.java:54-89`).
+    /// `Catalog.java:467-496` and `ControlResponseProxy.java:54-89`).
     #[test]
     fn a_catalogs_descriptor_body_is_a_message() {
         use crate::catalog::{Catalog, DEFAULT_CAPACITY, Recording};

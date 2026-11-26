@@ -12,7 +12,7 @@
 //! Both call sites are exercised: the **leader** answers through
 //! `processAllPendingSessions`, which it already walks for client sessions, and
 //! a **follower** through its own `processPendingBackupSessions`
-//! (`SessionManager.java:569-580`, `ConsensusModuleAgent.java:2417,2440`).
+//! (`SessionManager.java:569-580`, `ConsensusModuleAgent.java:2434,2440`).
 //!
 //! # What the answer must say
 //!
@@ -42,7 +42,7 @@ use deepmsg_tests::cluster_harness::{
 };
 use deepmsg_tests::driver::OwnDriver;
 
-/// `aeron.cluster.consensus.stream.id`'s default (`ConsensusModule.java:614`).
+/// `aeron.cluster.consensus.stream.id`'s default (`ConsensusModule.java:621`).
 /// The backup both publishes its query on it and listens for the answer on it
 /// (`ClusterBackupAgent.java:170-172`: one stream id, `ctx.consensusStreamId()`).
 const CONSENSUS_STREAM_ID: i32 = 108;

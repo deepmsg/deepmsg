@@ -31,7 +31,7 @@ const VERSION_COUNTER_ID: i32 = 34;
 const SYSTEM_COUNTER_TYPE_ID: i32 = 0;
 
 /// What the driver stores in that counter: `aeron_semantic_version_compose` of
-/// its own major/minor/patch (`aeron-driver/src/main/c/aeron_driver.c:936-937`),
+/// its own major/minor/patch (`aeron-driver/src/main/c/aeron_driver.c:976-977`),
 /// i.e. `1.54.2` packed the same way the CnC version is.
 const VERSION_COUNTER_VALUE: i64 = ((1 << 16) | (54 << 8) | 2) as i64;
 
@@ -191,7 +191,7 @@ fn a_counter_the_driver_wrote_matches_a_number_computed_only_from_the_reference_
     );
 
     // The driver sets a system counter's registration id to its own slot
-    // (`aeron-driver/src/main/c/aeron_system_counters.c:106`), which is a
+    // (`aeron-driver/src/main/c/aeron_system_counters.c:111`), which is a
     // second field of the file we never told it.
     assert_eq!(i64::from(VERSION_COUNTER_ID), version.registration_id);
     assert_eq!(

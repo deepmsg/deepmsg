@@ -296,7 +296,7 @@ impl PortTable {
 
     /// Point a connected binding at a different peer, which is what a name
     /// that resolved somewhere else needs (`aeron_udp_channel_transport_reconnect`,
-    /// `aeron_udp_channel_transport.c:376-392`).
+    /// `aeron_udp_channel_transport.c:390-406`).
     ///
     /// A binding that has already been replaced is left alone: the generation
     /// says which binding of the slot this is, and only the current one may

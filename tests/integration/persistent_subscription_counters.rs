@@ -3,8 +3,8 @@
 //!
 //! # These are the reference's two cases
 //!
-//! `shouldAutoAllocateCounters` (`…_persistent_subscription_test.cpp:817`) and
-//! `shouldUseUserProvidedCounters` (`:875`). Both are `system` cases in the
+//! `shouldAutoAllocateCounters` (`…_persistent_subscription_test.cpp:819`) and
+//! `shouldUseUserProvidedCounters` (`:877`). Both are `system` cases in the
 //! ledger (`crates/archive/tests/reference-cases.tsv`), and both are about the
 //! **client** side of a persistent subscription rather than the archive's: the
 //! archive is started by the reference's tests and never asked anything here.
@@ -67,7 +67,7 @@ fn rig(test_name: &str) -> Option<(OwnDriver, Client)> {
     Some((media_driver, client))
 }
 
-/// **`shouldAutoAllocateCounters`** (`:817`): with nothing provided, the four
+/// **`shouldAutoAllocateCounters`** (`:819`): with nothing provided, the four
 /// exist under the client's own type ids, carrying the identity in their
 /// labels, and start at the values the reference's test asserts.
 #[test]
@@ -111,7 +111,7 @@ fn the_four_counters_are_allocated_under_the_clients_type_ids() {
     assert_eq!(Some(0), counters.live_left(&region));
 }
 
-/// **`shouldUseUserProvidedCounters`** (`:875`): counters the caller brought
+/// **`shouldUseUserProvidedCounters`** (`:877`): counters the caller brought
 /// are the ones used — no counter of 114–117 is allocated — their join
 /// difference is initialised, and **closing the subscription closes all four**,
 /// which is the part of the reference that surprises (`:117-140`).

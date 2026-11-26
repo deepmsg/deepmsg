@@ -43,7 +43,7 @@ pub const CNC_VERSION: i32 = semantic_version_compose(
 /// The Aeron version this build implements the contracts of, as text.
 ///
 /// It is the `version=` half of the two system counter labels that carry a
-/// build identity (`aeron-driver/src/main/c/aeron_system_counters.c:41,60`), and
+/// build identity (`aeron-driver/src/main/c/aeron_system_counters.c:46,60`), and
 /// it matches the packed value those counters hold — `1.53.2` as `79106`. The
 /// reference writes its own `AERON_VERSION_TXT` there; this is the honest
 /// equivalent: the version we are compatible with, which is a claim about the
@@ -68,7 +68,7 @@ pub const BUILD_IDENTITY: &str = concat!("deepmsg-", env!("CARGO_PKG_VERSION"));
 /// - **The major must match.** `aeron-client/src/main/c/aeron_cnc_file_descriptor.c:103`
 ///   — the C reader's check, and the authority wherever both languages have
 ///   one (ADR-0001).
-/// - **The file's minor must be at least ours.** `aeron-client/src/main/java/io/aeron/CommonContext.java:1432`,
+/// - **The file's minor must be at least ours.** `aeron-client/src/main/java/io/aeron/CommonContext.java:1493`,
 ///   and also `aeron-client/src/main/c/aeron_context.c:617-624` — the C
 ///   client's *command* path. Its *read* path
 ///   (`aeron_cnc_file_descriptor.c:103`) checks only the major, so the C

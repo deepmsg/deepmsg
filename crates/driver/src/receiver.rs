@@ -15,7 +15,7 @@
 //!    piece — the NAK its loss detector has found;
 //! 4. re-send the `SETUP`-eliciting status messages of the sessions that have
 //!    not answered yet, on a timeout
-//!    (`aeron_driver_receiver.c:211-252`).
+//!    (`aeron_driver_receiver.c:180-221`).
 //!
 //! # Why the receiver *sends*
 //!
@@ -54,7 +54,7 @@ use crate::udp_channel::UdpChannel;
 /// The configured value is this by default. In the **C** driver that value is
 /// also the `vlen` its poll reads with (`aeron_driver_receiver.c:127` reads
 /// `recv_buffers.vector_capacity`, set from `receiver_io_vector_capacity` at
-/// `:47`); in the **Java** driver it is read nowhere at all and the poll takes
+/// `:39`); in the **Java** driver it is read nowhere at all and the poll takes
 /// one datagram per transport (`media/DataTransportPoller.java:222-225`). This
 /// build keeps the pool the size the setting asks for and reads one, which is
 /// Java's cadence over C's allocation.
@@ -69,7 +69,7 @@ pub const RECEIVE_SLOTS_DEFAULT: usize = crate::config::RECEIVER_IO_VECTOR_CAPAC
 /// default would truncate every datagram past 1408 bytes, and the frame would
 /// be discarded without an error anywhere — the reference sizes the buffers
 /// from this constant for exactly that reason
-/// (`aeron_driver_receiver.c:48-62`, both the allocation and the `iov_len`).
+/// (`aeron_driver_receiver.c:40-54`, both the allocation and the `iov_len`).
 pub const RECEIVE_BUFFER_LENGTH: usize = 64 * 1024;
 
 /// How many datagrams one receive poll takes from one destination, which is
@@ -79,11 +79,11 @@ const DATAGRAMS_PER_POLL: usize = 1;
 
 /// How long a pending setup waits before the status message is sent again
 /// (`AERON_DRIVER_RECEIVER_PENDING_SETUP_TIMEOUT_NS`,
-/// `aeron-driver/src/main/c/aeron_driver_receiver.c:47` — 100 ms).
+/// `aeron-driver/src/main/c/aeron_driver_receiver.c:39` — 100 ms).
 pub const PENDING_SETUP_TIMEOUT_NS: i64 = 1_000_000_000;
 
 /// Whether a `SETUP` on this channel carries a TTL the channel was not
-/// configured for (`aeron_data_packet_dispatcher.c:507-510`).
+/// configured for (`aeron_data_packet_dispatcher.c:512-515`).
 ///
 /// Only a multicast channel has a TTL to compare, and only a **strictly
 /// larger** received TTL is the asymmetry the reference counts: equal values
@@ -107,7 +107,7 @@ pub struct ReleasedDestination {
     pub transport_counter_id: i32,
     /// The port the wildcard port manager held for it, or zero when the
     /// manager held none — a channel that named a port, or one the kernel
-    /// chose (`aeron_port_manager.c:165-174`, where a zero is not a port).
+    /// chose (`aeron_port_manager.c:170-179`, where a zero is not a port).
     pub managed_port: u16,
 }
 
@@ -122,7 +122,7 @@ pub enum ReceiverCommand {
     },
     /// The control name resolved somewhere else: answer there from now on
     /// (`aeron_driver_receiver_on_resolution_change`,
-    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:610-631`), which is
+    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:620-641`), which is
     /// also where `Resolution changes` is counted.
     ResolutionChange {
         /// Which endpoint.
@@ -149,7 +149,7 @@ pub enum ReceiverCommand {
         session_id: i32,
     },
     /// Ask the far end to describe a stream again
-    /// (`aeron_driver_receiver_on_request_setup`, `:412-427`).
+    /// (`aeron_driver_receiver_on_request_setup`, `:422-437`).
     ///
     /// The reference does this only when the channel named a control address —
     /// that is where the request goes, and a channel that named none has
@@ -186,8 +186,8 @@ pub enum ReceiverCommand {
     /// leaves behind — **without** releasing the image itself.
     ///
     /// `aeron_driver_receiver_proxy_on_remove_publication_image`
-    /// (`aeron_driver_receiver.c:585-610`) is the reference's own, called as the
-    /// image leaves `DRAINING` (`aeron_publication_image.c:1354`), and there the
+    /// (`aeron_driver_receiver.c:595-620`) is the reference's own, called as the
+    /// image leaves `DRAINING` (`aeron_publication_image.c:1380`), and there the
     /// object outlives the call: the reference's image state machine runs on the
     /// **conductor**. This build's runs here, over this command loop's own
     /// `images`, so an image removed from that list now would never reach
@@ -200,7 +200,7 @@ pub enum ReceiverCommand {
     /// Forget the cool-down an image left behind, so a `SETUP` or a frame from
     /// that session can ask for another one
     /// (`aeron_driver_receiver_proxy_on_remove_cool_down`,
-    /// `aeron-driver/src/main/c/aeron_driver_receiver_proxy.c:194-211`).
+    /// `aeron-driver/src/main/c/aeron_driver_receiver_proxy.c:199-216`).
     RemoveCoolDown {
         /// The endpoint the image was read through — the cool-down lives in
         /// *its* dispatcher.
@@ -212,7 +212,7 @@ pub enum ReceiverCommand {
     },
     /// Refuse an image: a client rejected it, and its publisher has to be told
     /// (`aeron_driver_receiver_on_invalidate_image`,
-    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:633-649`).
+    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:643-659`).
     ///
     /// The command reaches the conductor first, which is what knows whether an
     /// image answers that registration id at all; what arrives here is the
@@ -221,9 +221,9 @@ pub enum ReceiverCommand {
     ///
     /// **No position.** `REJECT_IMAGE` carries where the rejecting client had
     /// read to, and the reference drops it twice over: its receiver command has
-    /// the field and never reads it (`aeron_driver_receiver.c:636-648`), and
+    /// the field and never reads it (`aeron_driver_receiver.c:646-658`), and
     /// `aeron_publication_image_invalidate` does not take one
-    /// (`aeron_publication_image.c:1383-1387`). A field nothing reads is not a
+    /// (`aeron_publication_image.c:1409-1413`). A field nothing reads is not a
     /// fact about the wire, so it is not carried here.
     InvalidateImage {
         /// Which image.
@@ -266,7 +266,7 @@ pub enum ReceiverCommand {
     ///
     /// The destination arrives **built** — its socket open, the counter holding
     /// its address allocated — because the conductor is what has a counter
-    /// manager (`aeron_driver_conductor.c:5903-5919`). This is the same shape as
+    /// manager (`aeron_driver_conductor.c:6000-6016`). This is the same shape as
     /// [`ReceiverCommand::AddEndpoint`], and for the same reason.
     AddDestination {
         /// Which endpoint reads from it.
@@ -276,7 +276,7 @@ pub enum ReceiverCommand {
     },
     /// Let an endpoint go: it has no subscriptions and no images left
     /// (`aeron_driver_receiver_on_remove_endpoint`,
-    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:322-…`).
+    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:332-…`).
     ///
     /// The endpoint lives here, so this is the only place its socket can be
     /// closed — and closing it is what a port being free again means.
@@ -290,7 +290,7 @@ pub enum ReceiverCommand {
         endpoint_id: u64,
         /// Which destination, by the channel it was added with — the reference
         /// compares two by `aeron_udp_channel_equals`
-        /// (`media/aeron_receive_channel_endpoint.c:877-905`).
+        /// (`media/aeron_receive_channel_endpoint.c:882-910`).
         channel: Box<UdpChannel>,
     },
     /// Stop the thread.
@@ -310,8 +310,8 @@ pub enum ReceiverEvent {
         /// through this one and no other — the reference carries the
         /// `aeron_receive_destination_t` the `SETUP` came off all the way into
         /// the create command (`aeron_receive_channel_endpoint_on_setup`,
-        /// `media/aeron_receive_channel_endpoint.c:610-637`, then
-        /// `aeron_data_packet_dispatcher.c:457-470`, whose last argument is
+        /// `media/aeron_receive_channel_endpoint.c:615-642`, then
+        /// `aeron_data_packet_dispatcher.c:462-475`, whose last argument is
         /// that destination).
         destination: crate::media::receive_endpoint::DestinationId,
         /// The stream it names.
@@ -348,7 +348,7 @@ pub enum ReceiverEvent {
     },
     /// An image has left DRAINING for LINGER, which is when its readers are
     /// told it is gone (`aeron_driver_conductor_image_transition_to_linger`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1642-1675`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1683-1716`).
     ///
     /// Told **here** and not at the release, which is a linger window further
     /// on: an image that has stopped is not one a reader should keep polling.
@@ -367,7 +367,7 @@ pub enum ReceiverEvent {
     /// The endpoint is let go, and the counters it held go with it
     /// (`aeron_receive_channel_endpoint_has_receiver_released`, which is what
     /// the conductor waits for before it reclaims them —
-    /// `aeron_driver_conductor.c:1560`).
+    /// `aeron_driver_conductor.c:1601`).
     ///
     /// What the destination held travels with the news because the destinations
     /// lived here: the conductor owns the counter region *and* the wildcard
@@ -376,7 +376,7 @@ pub enum ReceiverEvent {
     /// conductor's, and it does it on this news — which is the reference's own
     /// moment, where the destination is deleted
     /// (`aeron_receive_destination_delete`,
-    /// `media/aeron_receive_destination.c:141-160`).
+    /// `media/aeron_receive_destination.c:147-166`).
     EndpointReleased {
         /// Which endpoint.
         id: u64,
@@ -386,7 +386,7 @@ pub enum ReceiverEvent {
     /// One destination is let go while its endpoint lives on — a client
     /// removed one from a multi-destination subscription
     /// (`aeron_receive_channel_endpoint_remove_destination`, called from
-    /// `aeron_driver_receiver.c:507`).
+    /// `aeron_driver_receiver.c:517`).
     ///
     /// The endpoint's own release says nothing about this one, so it has to be
     /// said here or the port is never given back: the conductor is told the
@@ -408,7 +408,7 @@ pub enum ReceiverEvent {
     /// A destination has named a control address and not been heard from for
     /// five seconds, so that name has to be resolved again
     /// (`aeron_driver_conductor_proxy_on_re_resolve_control`,
-    /// `aeron-driver/src/main/c/media/aeron_receive_channel_endpoint.c:1046-1062`).
+    /// `aeron-driver/src/main/c/media/aeron_receive_channel_endpoint.c:1051-1067`).
     ///
     /// The conductor resolves it — the resolver is its — and answers with
     /// [`ReceiverCommand::ResolutionChange`], or with nothing when the name
@@ -895,14 +895,14 @@ fn stopped() -> io::Error {
 
 /// A session whose `SETUP` was asked for and has not arrived
 /// (`aeron_driver_receiver_pending_setup_entry_t`,
-/// `aeron-driver/src/main/c/aeron_driver_receiver.h:60-70`).
+/// `aeron-driver/src/main/c/aeron_driver_receiver.h:70-80`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PendingSetup {
     pub(crate) endpoint_id: u64,
     /// Which of that endpoint's destinations the ask belongs to, and so which
     /// socket every repeat of it leaves through
     /// (`aeron_driver_receiver_pending_setup_entry_t.destination`,
-    /// `aeron_driver_receiver.h:35-45`).
+    /// `aeron_driver_receiver.h:44-54`).
     pub(crate) destination: crate::media::receive_endpoint::DestinationId,
     pub(crate) stream_id: i32,
     pub(crate) session_id: i32,
@@ -910,7 +910,7 @@ pub(crate) struct PendingSetup {
     /// wherever the packets came from.
     ///
     /// This is also what makes an entry **periodic**
-    /// (`aeron_driver_receiver_add_pending_setup`, `:653-687`: `is_periodic` is
+    /// (`aeron_driver_receiver_add_pending_setup`, `:663-697`: `is_periodic` is
     /// false, and set true only when a control address was given). A periodic
     /// entry is asked again every [`PENDING_SETUP_TIMEOUT_NS`]; one that is not
     /// periodic is **given up on** after that long, and the session's interest
@@ -938,7 +938,7 @@ pub(crate) struct ReceiverThread {
     images: Vec<PublicationImage>,
     /// The driver's loss report file, which this thread writes: the image's
     /// state machine runs here, and the record is written where the gap is
-    /// found (`aeron_publication_image.c:452-479`).
+    /// found (`aeron_publication_image.c:457-484`).
     loss_report: Arc<LossReportFile>,
     /// Where the next record goes. The file has no header and no index — the
     /// writer's cursor and the readers' zero-terminated walk are the whole
@@ -953,7 +953,7 @@ pub(crate) struct ReceiverThread {
         SocketAddr,
     )>,
     /// How often to look, and when to look next
-    /// (`aeron_driver_receiver.c:254-258`). Zero is a driver that does not look.
+    /// (`aeron_driver_receiver.c:223-227`). Zero is a driver that does not look.
     re_resolution_interval_ns: i64,
     re_resolution_deadline_ns: i64,
     /// When an image's own maintenance next runs. See [`Timer`].
@@ -1029,7 +1029,7 @@ impl ReceiverThread {
             pending_setups: Vec::new(),
             pending_resolutions: Vec::new(),
             // `receiver->recv_buffers.vector_capacity`
-            // (`aeron_driver_receiver.c:47`), which is also the `vlen` its poll
+            // (`aeron_driver_receiver.c:39`), which is also the `vlen` its poll
             // reads with (`:127`) — so this is the one setting that decides how
             // much of a burst one turn takes.
             buffers: (0..io_vector_capacity.max(RECEIVE_SLOTS_DEFAULT))
@@ -1079,7 +1079,7 @@ impl ReceiverThread {
                     ReceiverCommand::RemoveEndpoint { id } => {
                         // The pending setups first: an ask for an endpoint that
                         // is going away is a question nobody will answer
-                        // (`aeron_driver_receiver.c:334-348`, which drops them
+                        // (`aeron_driver_receiver.c:344-358`, which drops them
                         // before it lets the endpoint go).
                         self.pending_setups.retain(|setup| setup.endpoint_id != id);
 
@@ -1106,7 +1106,7 @@ impl ReceiverThread {
                         // An endpoint whose channel named a `control=` asks
                         // **first**, and asks as soon as it exists
                         // (`aeron_driver_receiver_on_add_endpoint`,
-                        // `aeron-driver/src/main/c/aeron_driver_receiver.c:305-320`,
+                        // `aeron-driver/src/main/c/aeron_driver_receiver.c:315-330`,
                         // whose `add_pending_setup` is the endpoint's half of
                         // what the destination path below does for a client's).
                         //
@@ -1137,7 +1137,7 @@ impl ReceiverThread {
                         // A destination whose channel named a `control=` is one
                         // the sender does not know about: the receiver has to
                         // ask, and has to keep asking until it is answered
-                        // (`aeron_driver_receiver.c:475-486`, which adds a
+                        // (`aeron_driver_receiver.c:485-496`, which adds a
                         // periodic pending setup for exactly these).
                         let now_ns = deepmsg_core::clock::monotonic_nano_time();
                         let setup_address = destination.setup_address();
@@ -1161,7 +1161,7 @@ impl ReceiverThread {
                         }
 
                         // And every image already running on that endpoint hears
-                        // from it too (`aeron_driver_receiver.c:489-495`): a
+                        // from it too (`aeron_driver_receiver.c:499-505`): a
                         // stream that is already up has to send its status
                         // messages and NAKs to the new source as well — through
                         // the new destination, which is what the handle it is
@@ -1210,7 +1210,7 @@ impl ReceiverThread {
 
                         // And the images stop answering it
                         // (`aeron_publication_image_remove_destination`, called
-                        // from `aeron_driver_receiver.c:527`): a connection
+                        // from `aeron_driver_receiver.c:537`): a connection
                         // whose socket has gone is one that would otherwise send
                         // to a handle nothing answers to, and — before the
                         // handle was a handle — through whichever socket moved
@@ -1248,10 +1248,10 @@ impl ReceiverThread {
                             // response subscription names no session until the
                             // far end's `RSP_SETUP` says which one it is, and
                             // *this* is where that session is finally asked
-                            // for by name (`aeron_driver_receiver.c:401-409`).
+                            // for by name (`aeron_driver_receiver.c:411-419`).
                             //
                             // Unlike the ask beside a destination
-                            // (`:475-486`), this one carries a real stream and
+                            // (`:485-496`), this one carries a real stream and
                             // session, and that is not a detail: the far end
                             // finds its publication by
                             // `(stream_id << 32) | session_id`, so an ask with
@@ -1260,7 +1260,7 @@ impl ReceiverThread {
                             //
                             // A channel with no control address has nowhere to
                             // send it, so the guard is the channel's
-                            // (`:418-426`).
+                            // (`:428-436`).
                             if endpoint.channel.has_explicit_control {
                                 endpoint.elicit_setup_to_destinations(stream_id, session_id);
                             }
@@ -1275,7 +1275,7 @@ impl ReceiverThread {
                             self.endpoints.iter_mut().find(|(id, _)| *id == endpoint_id)
                         {
                             // A channel that named no control address has
-                            // nowhere to send the request (`:418-426`), so the
+                            // nowhere to send the request (`:428-436`), so the
                             // guard is the channel's, not the caller's.
                             if endpoint.channel.has_explicit_control {
                                 endpoint.elicit_setup_to_destinations(stream_id, session_id);
@@ -1359,7 +1359,7 @@ impl ReceiverThread {
                     ReceiverCommand::DetachImage { registration_id } => {
                         // The dispatcher forgets the image and keeps
                         // `IMAGE_COOL_DOWN` for its session
-                        // (`aeron_data_packet_dispatcher.c:323-355`). The image
+                        // (`aeron_data_packet_dispatcher.c:328-360`). The image
                         // itself stays in this thread's list — it still has to
                         // reach `DONE` and send `ImageDone`, or the conductor
                         // never releases it.
@@ -1400,7 +1400,7 @@ impl ReceiverThread {
                         // removal takes it away. A command that cannot find
                         // its image is one that was removed between the two
                         // threads, which is a race the reference has too — its
-                        // loop simply finds nothing (`:640-648`).
+                        // loop simply finds nothing (`:650-658`).
                         if let Some(image) = self
                             .images
                             .iter_mut()
@@ -1473,7 +1473,7 @@ impl ReceiverThread {
         let system = System::new(&self.counters, &regions);
         let now_ns = deepmsg_core::clock::monotonic_nano_time();
 
-        // The reference's duty-cycle gate (`aeron_driver_receiver.c:263-268`):
+        // The reference's duty-cycle gate (`aeron_driver_receiver.c:273-278`):
         // data is polled every pass, the slow work (status messages, NAKs,
         // RTTMs, pending setups, re-resolution) every ratio passes or when
         // the status-message timeout says it has waited long enough.
@@ -1490,7 +1490,7 @@ impl ReceiverThread {
             &system,
         );
 
-        // And the question, on its own deadline (`aeron_driver_receiver.c:254-258`):
+        // And the question, on its own deadline (`aeron_driver_receiver.c:223-227`):
         // a zero interval is a driver that never asks.
         if slow_tick
             && self.re_resolution_interval_ns > 0
@@ -1586,7 +1586,7 @@ impl ReceiverThread {
 
     /// Ask about the control names of the destinations that have gone quiet
     /// (`aeron_udp_transport_poller_check_receive_endpoint_re_resolutions`,
-    /// `media/aeron_udp_transport_poller.c:312-328`, which the receiver calls on
+    /// `media/aeron_udp_transport_poller.c:349-365`, which the receiver calls on
     /// its own deadline).
     ///
     /// One event per destination, and asking stamps it — so a destination is
@@ -1623,12 +1623,12 @@ impl ReceiverThread {
 
     /// Apply the answers the conductor sent back
     /// (`aeron_driver_receiver_on_resolution_change`,
-    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:610-631`).
+    /// `aeron-driver/src/main/c/aeron_driver_receiver.c:620-641`).
     ///
     /// Two things move, and the reference moves them in this order: every
     /// **periodic pending setup** for that destination answers the new address
-    /// from now on (`:617-628`), and then the destination's own control address
-    /// follows (`:630`). `Resolution changes` is counted once per pending setup
+    /// from now on (`:627-638`), and then the destination's own control address
+    /// follows (`:640`). `Resolution changes` is counted once per pending setup
     /// it moved — which is the reference's own arithmetic, and is what the
     /// counter means to a reader: how many asks were redirected.
     fn apply_resolution_changes(
@@ -1669,7 +1669,7 @@ impl ReceiverThread {
     }
 
     /// Read every endpoint's socket and give each datagram to the thing that
-    /// wants it (`aeron_receive_channel_endpoint_dispatch`, `:535-553`).
+    /// wants it (`aeron_receive_channel_endpoint_dispatch`, `:545-563`).
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)] // one per thing the pass carries
     fn receive_datagrams(
@@ -1887,7 +1887,7 @@ impl ReceiverThread {
                 };
 
                 // **The endpoint's own generator, before anything else happens
-                // with the frame** (`media/aeron_receive_channel_endpoint.c:576-585`):
+                // with the frame** (`media/aeron_receive_channel_endpoint.c:581-590`):
                 // a dropped frame is not delivered, not counted against the
                 // image and does not mark the destination alive — which is what
                 // makes the loss real rather than reported.
@@ -1926,7 +1926,7 @@ impl ReceiverThread {
                     Interest::ElicitSetup => {
                         // The packet named a session nothing serves: ask the
                         // sender for a SETUP, and remember that we asked
-                        // (`elicit_setup_from_source`, `:616-659`).
+                        // (`elicit_setup_from_source`, `:621-664`).
                         if endpoint.elicit_setup(frame.stream_id, frame.session_id)
                             && endpoint
                                 .send_sm(
@@ -1946,7 +1946,7 @@ impl ReceiverThread {
 
                         // And remember that we asked — **without** a control
                         // address, which is what makes this entry non-periodic
-                        // (`aeron_driver_receiver_add_pending_setup`, `:653-687`:
+                        // (`aeron_driver_receiver_add_pending_setup`, `:663-697`:
                         // this path is given a `NULL` there).
                         //
                         // That is the whole point of recording it: a session
@@ -1970,7 +1970,7 @@ impl ReceiverThread {
             frame_type::SETUP => {
                 // A handshake is asked the **simple** question, and before it is
                 // parsed: neither it nor an `RTTM` carries a term offset a rule
-                // could name (`media/aeron_receive_channel_endpoint.c:618-620`).
+                // could name (`media/aeron_receive_channel_endpoint.c:623-625`).
                 if endpoint.drops_control(source, packet) {
                     return;
                 }
@@ -1985,7 +1985,7 @@ impl ReceiverThread {
                 // the reference compares its TTL with ours: a peer whose TTL is
                 // the **larger** of the two is one whose multicast path is not
                 // the one this channel was configured for, and the reference
-                // counts that (`aeron_data_packet_dispatcher.c:501-512`).
+                // counts that (`aeron_data_packet_dispatcher.c:506-517`).
                 //
                 // The state is read **before** `on_setup`, which is the
                 // reference's own order: that call moves a waiting session to
@@ -2019,7 +2019,7 @@ impl ReceiverThread {
                     // came in on: a session two publications share arrives on
                     // two destinations, and the second one is answered — or
                     // not — through the connection taken here
-                    // (`aeron_data_packet_dispatcher.c:499-502`). Without it
+                    // (`aeron_data_packet_dispatcher.c:504-507`). Without it
                     // the image keeps one socket and the second sender waits
                     // for a status message that goes to the first.
                     SetupInterest::Image { registration_id } => {
@@ -2060,7 +2060,7 @@ impl ReceiverThread {
             }
             frame_type::RTTM => {
                 // The other frame the simple question is asked about
-                // (`media/aeron_receive_channel_endpoint.c:646-648`).
+                // (`media/aeron_receive_channel_endpoint.c:651-653`).
                 if endpoint.drops_control(source, packet) {
                     return;
                 }
@@ -2071,8 +2071,8 @@ impl ReceiverThread {
 
                 // A measurement addressed to another receiver — or to none —
                 // is not this endpoint's to act on
-                // (`media/aeron_receive_channel_endpoint.c:657-660`), and the
-                // destination it came in on is alive either way (`:658`),
+                // (`media/aeron_receive_channel_endpoint.c:662-665`), and the
+                // destination it came in on is alive either way (`:663`),
                 // which is what keeps a channel with several destinations
                 // measuring each of them.
                 if frame.receiver_id != 0 && frame.receiver_id != endpoint.receiver_id() {
@@ -2080,7 +2080,7 @@ impl ReceiverThread {
                 }
 
                 // A measurement is traffic, and the reference marks the
-                // destination alive for it (`media/aeron_receive_channel_endpoint.c:658`,
+                // destination alive for it (`media/aeron_receive_channel_endpoint.c:663`,
                 // whose `aeron_receive_destination_update_last_activity_ns`
                 // this build has no per-destination clock for — a destination
                 // here is a socket and a channel, and what reads liveness is
@@ -2089,7 +2089,7 @@ impl ReceiverThread {
                     // A request: it is answered here, echoing the requester's
                     // own timestamp and reporting no time spent, so the reply
                     // carries **no** flag and is not answered in turn
-                    // (`aeron_data_packet_dispatcher.c:562-575`).
+                    // (`aeron_data_packet_dispatcher.c:567-580`).
                     let control_address = endpoint.control_address(destination, source);
                     let _ = endpoint.send_rttm(
                         destination,
@@ -2105,7 +2105,7 @@ impl ReceiverThread {
                 }
 
                 // An answer, so it is a round trip this image measured
-                // (`aeron_publication_image_on_rttm`, `:849-857`).
+                // (`aeron_publication_image_on_rttm`, `:854-862`).
                 if let Some(image) = images.iter_mut().find(|image| {
                     image.stream_id == frame.stream_id && image.session_id == frame.session_id
                 }) {
@@ -2176,14 +2176,14 @@ impl ReceiverThread {
 
             // What a reader may read, which is what the next status message
             // will say — and the hole, if one is in the way and has waited long
-            // enough to be asked for (`send_pending_loss`, `:995-1075`).
+            // enough to be asked for (`send_pending_loss`, `:1000-1080`).
             let gap = image.track_rebuild(counters, regions, now_ns);
 
             if let Some(gap) = gap {
                 // The report comes first and is the same on both paths: what
                 // happens next (a NAK, or a gap fill) is about *repairing* the
                 // hole, and the reference reports the hole itself before either
-                // (`aeron_publication_image_on_gap_detected`, `:452-479`).
+                // (`aeron_publication_image_on_gap_detected`, `:457-484`).
                 work += image.report_loss(
                     loss_report,
                     loss_report_cursor,
@@ -2217,7 +2217,7 @@ impl ReceiverThread {
                             // …and the same count under the image that asked for
                             // it: the system counter says the driver is
                             // retransmitting, this one says for which stream
-                            // (`aeron_publication_image.c:1052`).
+                            // (`aeron_publication_image.c:1057`).
                             let _ = system_counters::increment(
                                 counters,
                                 regions,
@@ -2231,7 +2231,7 @@ impl ReceiverThread {
                     // reads on, so whatever was in it is gone for good — which
                     // is what the channel asked for
                     // (`aeron_publication_image_send_pending_loss`,
-                    // `:1053-1066`). Nothing goes on the network, and the
+                    // `:1058-1071`). Nothing goes on the network, and the
                     // counter is the only trace of it.
                     //
                     // `work` moves whether or not the fill was made, as the
@@ -2264,7 +2264,7 @@ impl ReceiverThread {
     }
 
     /// Ask again for the `SETUP` of a session that has not answered
-    /// (`aeron_driver_receiver.c:211-252`).
+    /// (`aeron_driver_receiver.c:180-221`).
     fn send_pending_setups(
         pending_setups: &mut Vec<PendingSetup>,
         endpoints: &mut [(u64, Box<ReceiveChannelEndpoint>)],
@@ -2294,7 +2294,7 @@ impl ReceiverThread {
 
             let Some(control_address) = pending.control_address else {
                 // Not periodic: a session that has not answered in a second is
-                // given up on (`:215-227`), and dropping the interest is what
+                // given up on (`:184-196`), and dropping the interest is what
                 // lets the next frame from it ask again.
                 endpoint.remove_pending_setup(pending.stream_id, pending.session_id);
                 pending_setups.swap_remove(index);
@@ -2303,7 +2303,7 @@ impl ReceiverThread {
             };
 
             // The gate the reference puts on the periodic half alone
-            // (`:227`: `else if (aeron_receive_channel_endpoint_should_elicit_setup_message(entry->endpoint))`).
+            // (`:196`: `else if (aeron_receive_channel_endpoint_should_elicit_setup_message(entry->endpoint))`).
             // An endpoint no subscription registered interest on has nobody to
             // ask for, and the reference leaves the entry exactly where it is —
             // **without** moving its timestamp, so the next pass asks the same
@@ -2379,13 +2379,13 @@ impl ReceiverThread {
 
     /// The cycle-time counters, which are 30 and 31 — the receiver's
     /// duty-cycle stall tracker in the reference, whose two counter addresses
-    /// the conductor binds once at startup (`aeron_driver_conductor.c:839-842`)
+    /// the conductor binds once at startup (`aeron_driver_conductor.c:880-883`)
     /// and which `aeron_duty_cycle_tracker.h:50-61` reads and writes.
     ///
     /// `now_ns` is the pass's own reading, taken once at the top of
     /// `do_receive`, rather than a second one taken here. The reference reads
     /// the clock once (`aeron_driver_receiver.c:145`) and hands that same
-    /// instant to its tracker (`:150`), so the counters and the work they
+    /// instant to its tracker (`:151`), so the counters and the work they
     /// describe are stamped from one reading — which is also what the sender
     /// and the conductor do with theirs.
     fn track_cycle(

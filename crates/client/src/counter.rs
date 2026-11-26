@@ -6,7 +6,7 @@
 //! client, the driver itself — opens the same slot on its own mapping (M20).
 //! The reference's handle is `aeron_counter_t`
 //! (`aeron-client/src/main/c/aeron_counter.h:30-46`) plus the constants
-//! snapshot it also exposes (`aeron_counter_constants_t`, `aeronc.h:2478-2496`).
+//! snapshot it also exposes (`aeron_counter_constants_t`, `aeronc.h:2502-2520`).
 //!
 //! The value address the reference resolves once at create, this handle
 //! re-derives from the regions per call, which is the same trick the rest of
@@ -30,7 +30,7 @@ use deepmsg_core::buffer::ReadWrite;
 /// The reference delivers these through callback pairs an application
 /// registers (`aeron_add_available_counter_handler` /
 /// `aeron_add_unavailable_counter_handler`, fired from
-/// `aeron_client_conductor.c:850-895` and `:898-906`); this crate's shape is
+/// `aeron_client_conductor.c:888-933` and `:936-944`); this crate's shape is
 /// a queue the caller drains ([`crate::client::Client::counter_events`]),
 /// because a poll-driven client has no thread to run a callback on.
 ///
@@ -38,7 +38,7 @@ use deepmsg_core::buffer::ReadWrite;
 /// a name, and a slot that has been reclaimed already answers every question
 /// about itself with "gone" — which is exactly how the reference behaves too:
 /// its `on_unavailable_counter` fires the handlers and does not close or even
-/// look up the counter it names (`aeron_client_conductor.c:898-906`).
+/// look up the counter it names (`aeron_client_conductor.c:936-944`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CounterEvent {
     /// A counter was allocated, by any client.
@@ -68,8 +68,8 @@ pub enum CounterEvent {
 /// something the client does not own. The reference marks it with a resource
 /// *type* and matches on that type when a removal arrives
 /// (`aeron_client_conductor_resource_type_match`,
-/// `aeron-client/src/main/c/aeron_client_conductor.c:3061-3070`), and its
-/// `close` for one is a no-op (`:1283-1287`). Here the type is the match:
+/// `aeron-client/src/main/c/aeron_client_conductor.c:3123-3132`), and its
+/// `close` for one is a no-op (`:1313-1317`). Here the type is the match:
 /// [`Client::remove_counter`](crate::client::Client::remove_counter) takes a
 /// [`Counter`], so there is no way to hand it one of these.
 ///

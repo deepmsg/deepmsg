@@ -6,7 +6,7 @@
 //! reads: counter values, the CnC metadata's start time, the ring's consumer
 //! heartbeat. The reference keeps both, and re-derives the second from the
 //! first at most once per millisecond
-//! (`aeron-driver/src/main/c/aeron_driver_conductor.c:3276-3280`, against
+//! (`aeron-driver/src/main/c/aeron_driver_conductor.c:3373-3377`, against
 //! `AERON_DRIVER_CONDUCTOR_CLOCK_UPDATE_INTERNAL_NS` = 1 ms, declared at
 //! `aeron_driver_conductor.h:38`), because dividing on every iteration to get
 //! a value that changes a thousand times less often is work for nothing.
@@ -43,10 +43,10 @@ pub fn epoch_nano_time() -> i64 {
 /// The driver's own timing — liveness timeouts, NAK delays and linger, the
 /// status-message and heartbeat cadences, retransmit delays — wants a clock
 /// that cannot go backwards. That is what the reference's `nano_clock` is:
-/// `aeron_nano_clock` (`aeron-client/src/main/c/util/aeron_clock.c:113-122`)
+/// `aeron_nano_clock` (`aeron-client/src/main/c/util/aeron_clock.c:116-125`)
 /// calls `aeron_clock_gettime_monotonic`, and it is the default
 /// `context->nano_clock` the sender and receiver read
-/// (`aeron_driver_sender.c:136`, `aeron_driver_receiver.c:128`).
+/// (`aeron_driver_sender.c:175`, `aeron_driver_receiver.c:128`).
 ///
 /// The value is nanoseconds since the first call in this process, so it is a
 /// duration and not a date: it is meaningless to anything outside this process,

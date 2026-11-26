@@ -20,7 +20,7 @@
 //! # What lives here, and why it has to be together
 //!
 //! `update_pub_pos_and_lmt` (`aeron_network_publication.c:947-1010`) is the
-//! conductor's in the reference (`aeron_driver_conductor.c:3395-3399`), and this
+//! conductor's in the reference (`aeron_driver_conductor.c:3492-3496`), and this
 //! is everything it reaches: the log buffer it cleans
 //! ([`LogFile::open`]'s second mapping — same pages, no copy), the readers whose
 //! slowest one sets the limit, the position it has cleaned up to, and the
@@ -72,13 +72,13 @@ use crate::subscribable::{
 /// * `working_spies` — the count `has_subscribers` actually wants
 ///   (`aeron_driver_subscribable_has_working_positions`, `:762`). It is **not**
 ///   the same reading as `has_spies`: the removal hook sets that flag from the
-///   count *before* the removal (`:1364-1378`), so a set whose only working
+///   count *before* the removal (`:1405-1419`), so a set whose only working
 ///   reader is joined by a resting one and then loses the resting one reads
 ///   `has_spies == false` with a working reader still in it. The build has
 ///   always had both readings and they can disagree; keeping both keeps the
 ///   behaviour.
 /// * `max_spy_position` (`:75`) — the conductor's, read by the sender's idle
-///   branch (`:620-623`).
+///   branch (`:661-664`).
 ///
 /// Every write is a release store and every read an acquire load, which is what
 /// the reference's `AERON_SET_RELEASE`/`AERON_GET_ACQUIRE` are. The ones the
@@ -106,7 +106,7 @@ impl PublicationSightlines {
     }
 
     /// Whether a receiver has been heard from **and** the flow control is
-    /// satisfied that it has the ones it requires (`:758-760`).
+    /// satisfied that it has the ones it requires (`:799-801`).
     pub fn receivers_satisfy_flow_control(&self) -> bool {
         self.receivers_satisfy_flow_control.load(Ordering::Acquire)
     }
@@ -152,8 +152,8 @@ impl Default for PublicationSightlines {
 }
 
 /// What a publication does when one of its readers comes or goes
-/// (`aeron_network_publication_add_subscriber_hook`, `:1353-1362`, and its
-/// removal twin, `:1364-1378`).
+/// (`aeron_network_publication_add_subscriber_hook`, `:1374-1383`, and its
+/// removal twin, `:1405-1419`).
 ///
 /// The reference's hook is also where `is_connected` is rewritten when `ssc`
 /// asked for it; here that is the caller's job, because the write needs the log
@@ -198,7 +198,7 @@ pub struct PublicationMaintenance {
     initial_term_id: i32,
     /// `ssc`: whether a spy counts as a connection here.
     spies_simulate_connection: bool,
-    /// The three deadlines of the tether cycle (`:1138-1140`).
+    /// The three deadlines of the tether cycle (`:1179-1181`).
     untethered_window_limit_timeout_ns: i64,
     untethered_linger_timeout_ns: i64,
     untethered_resting_timeout_ns: i64,
@@ -260,7 +260,7 @@ impl PublicationMaintenance {
     }
 
     /// Give this publication a local reader
-    /// (`aeron_driver_subscribable_add_position`, `aeron_driver_conductor.c:3497-3523`).
+    /// (`aeron_driver_subscribable_add_position`, `aeron_driver_conductor.c:3594-3620`).
     ///
     /// The hook runs before the position counts, which is why the reference's
     /// add hook writes `true` for the connected status rather than asking: at
@@ -280,7 +280,7 @@ impl PublicationMaintenance {
         self.spies_simulate_connection
     }
 
-    /// Take a local reader away (`aeron_driver_conductor.c:3525-3545`).
+    /// Take a local reader away (`aeron_driver_conductor.c:3622-3642`).
     ///
     /// The reference's remove hook asks `has_subscribers` for the status to
     /// write, and that expression is **true by construction** where it runs:
@@ -484,7 +484,7 @@ impl PublicationMaintenance {
     ///   has not got past `snd-pos - term_window + term_window/4` (`:1123-1125`).
     ///   An IPC publication measures from its *fastest* reader instead, because
     ///   there is no sender to say how far the stream has got;
-    /// * a woken reader is seeded at **`snd-pos`** (`:1206`), which is the same
+    /// * a woken reader is seeded at **`snd-pos`** (`:1208`), which is the same
     ///   number its image can read from — an IPC reader is seeded at the
     ///   publication's join position.
     ///

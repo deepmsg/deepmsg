@@ -342,8 +342,8 @@ mod tests {
 
     /// The sibling list of each of the sixteen CPUs of the reference's fixture,
     /// which is its own vector entry for entry
-    /// (`TopologyTest::setupSiblings`, `aeron_topology_test.cpp:89-101` and the
-    /// sixteen pairs at `:139-142`): every CPU names the core it is on, so
+    /// (`TopologyTest::setupSiblings`, `aeron_topology_test.cpp:90-102` and the
+    /// sixteen pairs at `:136-139`): every CPU names the core it is on, so
     /// `cpu4` and `cpu5` both say `4-5`.
     fn write_siblings(dir: &TempDir) {
         for cpu in 0..16 {
@@ -355,7 +355,7 @@ mod tests {
         }
     }
 
-    /// `shouldCheckAlignment` (`:124-159`): the cpuset runs from CPU 5 to 10 and
+    /// `shouldCheckAlignment` (`:127-162`): the cpuset runs from CPU 5 to 10 and
     /// the machine's cores are pairs, so the core holding 5 is split (4 is
     /// outside) and the one holding 10 is too (11 is outside).
     #[test]
@@ -399,7 +399,7 @@ mod tests {
         assert!(warnings[0].contains("cpuset spans multiple L3 cache domains"));
     }
 
-    /// `shouldCheckClusterLocality` (`:196-227`): the CPUs are on two dies, and
+    /// `shouldCheckClusterLocality` (`:194-225`): the CPUs are on two dies, and
     /// the message carries the ids.
     #[test]
     fn a_cpuset_that_spans_two_dies_is_reported_once() {

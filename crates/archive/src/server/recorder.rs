@@ -2,7 +2,7 @@
 //! up to.
 //!
 //! `ArchiveConductor.Recorder` is a `SessionWorker` of its own
-//! (`ArchiveConductor.java:2699-2744`), driven on its own turn by the
+//! (`ArchiveConductor.java:2734-2779`), driven on its own turn by the
 //! conductor that owns it (`SharedModeArchiveConductor.java:57-66` — the
 //! recorder runs *after* the conductor's own sessions). What it holds is the
 //! recording sessions and three running totals; what it does not hold is
@@ -50,7 +50,7 @@ use crate::server::counters::{
 use crate::server::recording_session::RecordingSession;
 
 /// What every recording this archive has made adds up to
-/// (`ArchiveConductor.java:2701-2703`).
+/// (`ArchiveConductor.java:2736-2738`).
 ///
 /// `i64` and not `u64`, because the reference's three are `long`s and are
 /// published into counters that are read as `long`s — the writer hands over a
@@ -73,7 +73,7 @@ impl WriteStats for RecorderTotals {
 
         self.total_write_time_ns += nanos;
 
-        // `if (nanos > maxWriteTimeNs)` (`:2726-2729`): the largest single
+        // `if (nanos > maxWriteTimeNs)` (`:2761-2764`): the largest single
         // write, not the total.
         if nanos > self.max_write_time_ns {
             self.max_write_time_ns = nanos;
@@ -83,7 +83,7 @@ impl WriteStats for RecorderTotals {
 
 impl RecorderTotals {
     /// The bytes written, the nanoseconds spent, and the longest single write
-    /// (`:2701-2703`).
+    /// (`:2736-2738`).
     #[must_use]
     pub const fn totals(&self) -> (i64, i64, i64) {
         (
@@ -101,7 +101,7 @@ impl RecorderTotals {
 #[derive(Debug)]
 pub struct RecorderCounters {
     /// 105: the longest single write, whose allocation the reference refuses if
-    /// one for this archive id is already there (`Archive.java:1589-1595`).
+    /// one for this archive id is already there (`Archive.java:1657-1663`).
     pub max_write_time: ArchiveIdCounter,
     /// 106.
     pub total_write_bytes: ArchiveIdCounter,
@@ -110,11 +110,11 @@ pub struct RecorderCounters {
 }
 
 /// The three write counters, in the order the reference allocates them
-/// (`Archive.java:1587-1626`).
+/// (`Archive.java:1655-1694`).
 ///
 /// The order is not decoration: the reference asks for the max-write-time one
 /// first and **refuses to start** if a 105 for this archive id is already there
-/// (`:1589-1595`), and this build does that check where its archive starts.
+/// (`:1657-1663`), and this build does that check where its archive starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecorderCounter {
     /// 105: the longest single write, whose duplicate is refused.
@@ -133,8 +133,8 @@ impl CounterKind for RecorderCounter {
         Self::TotalWriteTime,
     ];
 
-    /// The type id `ArchiveCounters.allocate` is called with (`:1598`, `:1610`,
-    /// `:1622` over `AeronCounters`).
+    /// The type id `ArchiveCounters.allocate` is called with (`:1666`, `:1678`,
+    /// `:1690` over `AeronCounters`).
     fn type_id(self) -> i32 {
         match self {
             Self::MaxWriteTime => ARCHIVE_RECORDER_MAX_WRITE_TIME_TYPE_ID,
@@ -143,7 +143,7 @@ impl CounterKind for RecorderCounter {
         }
     }
 
-    /// The name its label is built from (`:1600`, `:1612`, `:1624`).
+    /// The name its label is built from (`:1668`, `:1680`, `:1692`).
     fn name(self) -> &'static str {
         match self {
             Self::MaxWriteTime => RECORDER_MAX_WRITE_TIME_NAME,
@@ -177,7 +177,7 @@ pub struct Recorder {
     ///
     /// Held **here** rather than by each session, which is the reference's
     /// arrangement too: its `ArchiveConductor` builds one
-    /// (`ArchiveConductor.java:224-225`) and hands the same object to every
+    /// (`ArchiveConductor.java:223-224`) and hands the same object to every
     /// session. It cannot be held by a session because a session does not own
     /// the thread it runs on and this build's client will not let two threads
     /// write one publication — so it lives with whatever runs the sessions, and
@@ -186,7 +186,7 @@ pub struct Recorder {
 }
 
 /// The three counters between the ask and the hand-over
-/// (`Archive.java:1587-1626`).
+/// (`Archive.java:1655-1694`).
 ///
 /// It is its own type, and not simply a field of [`Recorder`], because of *where*
 /// the ask can be made: naming the strategy and reading the answer is a client
@@ -195,7 +195,7 @@ pub struct Recorder {
 /// conductor's. So the ask stays with whoever holds the client
 /// ([`RecorderHalf::allocate`]) and only the result crosses, which is the
 /// reference's own split: its `Recorder` is constructed inside
-/// `Archive.Context.conclude` (`:1587-1626`), on the thread that owns the
+/// `Archive.Context.conclude` (`:1655-1694`), on the thread that owns the
 /// `Aeron`, and handed to a runner afterwards.
 #[derive(Debug)]
 pub struct RecorderCountersRequest {
@@ -244,7 +244,7 @@ impl RecorderCountersRequest {
 /// Under `SHARED` the conductor drives every session inside its own turn
 /// (`SharedModeArchiveConductor.java:57-66`) and so holds the [`Recorder`]
 /// itself. Under `DEDICATED` the recorder is an agent on a thread of its own
-/// (`DedicatedModeArchiveConductor.java:54-55`) and what the conductor holds is
+/// (`DedicatedModeArchiveConductor.java:64-65`) and what the conductor holds is
 /// a **channel** to it. The conductor asks the same six questions either way —
 /// the four a request asks of the recorder, the turn, and the sessions that
 /// finished — so it asks them of this.
@@ -265,7 +265,7 @@ impl RecorderCountersRequest {
 /// allocation stays where the client is — the conductor — and what crosses to a
 /// worker is the three counters it ends up with ([`Recorder::set_counters`]).
 /// That is the reference's own split too: its recorder is constructed inside
-/// `Archive.Context.conclude` (`:1587-1626`), on the thread that owns the
+/// `Archive.Context.conclude` (`:1655-1694`), on the thread that owns the
 /// `Aeron`, and only afterwards handed to a runner.
 pub enum RecorderHalf {
     /// `SHARED`: the conductor's turn drives every session.
@@ -289,7 +289,7 @@ impl RecorderHalf {
         Self::Threaded(thread)
     }
 
-    /// `recorder.addSession` (`ArchiveConductor.java:2055`).
+    /// `recorder.addSession` (`ArchiveConductor.java:2077`).
     pub fn add_session(&mut self, session: RecordingSession) {
         match self {
             Self::Inline(recorder) => recorder.add_session(session),
@@ -298,7 +298,7 @@ impl RecorderHalf {
     }
 
     /// Abort every session reading this subscription
-    /// (`ArchiveConductor.abortRecordingSessionAndCloseSubscription`, `:1766-1772`).
+    /// (`ArchiveConductor.abortRecordingSessionAndCloseSubscription`, `:1773-1779`).
     pub fn abort_sessions_for(&mut self, subscription_id: i64, reason: &str) {
         match self {
             Self::Inline(recorder) => recorder.abort_sessions_for(subscription_id, reason),
@@ -322,7 +322,7 @@ impl RecorderHalf {
     }
 
     /// Ask for the three counters and take each up when the driver answers
-    /// (`Archive.java:1587-1626`).
+    /// (`Archive.java:1655-1694`).
     ///
     /// The ask is made **here** whichever arm this is: it is a client operation,
     /// and the client is the conductor's. The threaded arm sends what the three
@@ -366,7 +366,7 @@ impl RecorderHalf {
     }
 
     /// Hand the recording events publication over
-    /// (`ArchiveConductor.java:224-225`).
+    /// (`ArchiveConductor.java:223-224`).
     ///
     /// The inline arm keeps it, because its recorder is this object; the
     /// threaded arm sends it, for the reason [`RecorderCommand::SetCounters`]
@@ -396,7 +396,7 @@ impl RecorderHalf {
 /// it, on another thread, an unspecified time later.
 #[derive(Debug)]
 pub enum RecorderCommand {
-    /// `recorder.addSession` (`ArchiveConductor.java:2055`).
+    /// `recorder.addSession` (`ArchiveConductor.java:2077`).
     ///
     /// Boxed because a session is by far the largest thing on this channel —
     /// every other arm is two machine words and a `String` — and the conductor's
@@ -409,7 +409,7 @@ pub enum RecorderCommand {
         /// Why, in the reference's words.
         reason: String,
     },
-    /// `recorder.abortSessionsFor` (`:1766-1772`), by the subscription read.
+    /// `recorder.abortSessionsFor` (`:1773-1779`), by the subscription read.
     AbortSessionsFor {
         /// The subscription whose sessions are to stop.
         subscription_id: i64,
@@ -431,7 +431,7 @@ pub enum RecorderCommand {
 /// Two channels, which is the reference's shape: its `DedicatedModeArchiveConductor`
 /// holds a `ManyToOneConcurrentLinkedQueue<Session> closeQueue` for what the
 /// workers hand back (`:35`) and each worker reads its own commands off the same
-/// queue its sessions arrived on (`ArchiveConductor.java:371-378`). What is
+/// queue its sessions arrived on (`ArchiveConductor.java:370-377`). What is
 /// here instead is [`std::sync::mpsc`] in both directions, which ADR-0003 leaves
 /// open: it forbids an async runtime, not a channel with a lock in it, and the
 /// reference's own queue is lock-free for a throughput this loop does not have —
@@ -449,7 +449,7 @@ pub struct RecorderThread {
     failed: Option<EventsError>,
     request: RecorderCountersRequest,
     /// Whether the three have been handed over, so that a later turn does not
-    /// ask again — the reference allocates them once (`Archive.java:1587-1626`).
+    /// ask again — the reference allocates them once (`Archive.java:1655-1694`).
     allocated: bool,
 }
 
@@ -551,7 +551,7 @@ impl RecorderThread {
 /// session's own image, writer and position counter (P2-9a's ③-1). It does
 /// **not** own the client, and must not: the reference's rule is that one
 /// `Aeron` has one thread driving it (`ArchiveConductor.doWork` calls
-/// `invokeAeronInvoker`, `:380`, and a worker's `doWork` does not). What it
+/// `invokeAeronInvoker`, `:379`, and a worker's `doWork` does not). What it
 /// needs from the region instead it opens for itself — a second mapping of the
 /// same files, which is what the reference's `CountersReader` makes from
 /// `aeronDir` in each agent's constructor.
@@ -564,7 +564,7 @@ pub struct RecorderWorker {
     /// This thread's own 103/104, once the conductor's claim has reached the
     /// region — see [`DutyCycleCounters::find`].
     duty: Option<DutyCycleCounters>,
-    /// The threshold its 104 counts against (`Archive.java:1441-1450`).
+    /// The threshold its 104 counts against (`Archive.java:1509-1518`).
     cycle_threshold_ns: i64,
     cnc: deepmsg_cnc::CncFile,
     idle: deepmsg_driver::idle::Strategy,
@@ -612,7 +612,7 @@ impl RecorderWorker {
     }
 
     /// One turn of this thread's duty cycle, into the pair the conductor
-    /// allocated for the recorder (`Archive.java:1441-1450`).
+    /// allocated for the recorder (`Archive.java:1509-1518`).
     fn measure_cycle(&mut self) {
         let now_ns = deepmsg_core::clock::monotonic_nano_time();
 
@@ -773,7 +773,7 @@ impl Recorder {
     }
 
     /// Ask for the three counters, one at a time, and take each up when the
-    /// driver answers (`Archive.java:1587-1626`).
+    /// driver answers (`Archive.java:1655-1694`).
     ///
     /// The reference does all three in `Archive.Context.conclude` — at startup,
     /// synchronously, because its archive drives the driver. This build cannot:
@@ -798,7 +798,7 @@ impl Recorder {
         self.counters = self.request.drive(client, counters, timeout);
     }
 
-    /// `recorder.addSession` (`ArchiveConductor.java:2055`).
+    /// `recorder.addSession` (`ArchiveConductor.java:2077`).
     pub fn add_session(&mut self, session: RecordingSession) {
         self.sessions.push(session);
     }
@@ -829,7 +829,7 @@ impl Recorder {
 
     /// Abort every session reading this subscription
     /// (`ArchiveConductor.abortRecordingSessionAndCloseSubscription`,
-    /// `:1766-1772`).
+    /// `:1773-1779`).
     ///
     /// The reference walks **the map of sessions**, not the subscription's own
     /// list, and aborts the ones that are reading it. A session that has
@@ -922,7 +922,7 @@ impl Recorder {
     }
 
     /// Publish the three totals — but only on a turn that did work
-    /// (`ArchiveConductor.java:2732-2743`).
+    /// (`ArchiveConductor.java:2767-2778`).
     ///
     /// `workCount > 0` is the whole of the condition, and it is a parameter here
     /// rather than a test of the totals because that is what the reference
@@ -990,7 +990,7 @@ mod tests {
 
     /// The three totals, and the one of them that is a maximum: a shorter write
     /// after a longer one leaves the longest where it was
-    /// (`ArchiveConductor.java:2717-2730`).
+    /// (`ArchiveConductor.java:2752-2765`).
     #[test]
     fn the_totals_add_up_and_the_longest_write_is_kept() {
         let mut totals = RecorderTotals::default();
@@ -1012,7 +1012,7 @@ mod tests {
     }
 
     /// The three counters are published on a turn that did work and **not** on
-    /// one that did not (`ArchiveConductor.java:2732-2743`).
+    /// one that did not (`ArchiveConductor.java:2767-2778`).
     ///
     /// What the condition is about is when a reader sees the numbers, so the
     /// quiet turn is asserted *after* a busy one and against the numbers that
@@ -1059,7 +1059,7 @@ mod tests {
     /// (`ArchiveConductor.stopRecordingByIdentity`, `:1306-1310`).
     ///
     /// `abort_sessions_for` is the subscription's question
-    /// (`abortRecordingSessionAndCloseSubscription`, `:1766-1774`); this is the
+    /// (`abortRecordingSessionAndCloseSubscription`, `:1773-1781`); this is the
     /// recording's, and a subscription can carry more than one image over its
     /// life, so the two sets are not the same.
     #[test]
@@ -1123,7 +1123,7 @@ mod tests {
 
     /// A recorder with no counters still records: the numbers are accumulated
     /// and simply never published, which is what an archive that never
-    /// allocated them does (`Archive.java:1586-1626` allocates on demand).
+    /// allocated them does (`Archive.java:1654-1694` allocates on demand).
     #[test]
     fn a_recorder_with_no_counters_publishes_nothing() {
         let counters = values_region();
@@ -1141,7 +1141,7 @@ mod tests {
 
     /// The three counters are the reference's three, by **type id and label**:
     /// what `AeronStat` reads to tell a 105 from a 106, and what a comparison
-    /// against the reference's own reader turns on (`Archive.java:1587-1626`).
+    /// against the reference's own reader turns on (`Archive.java:1655-1694`).
     #[test]
     fn the_three_counters_are_the_references_three() {
         assert_eq!(

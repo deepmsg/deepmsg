@@ -133,7 +133,7 @@ impl DeleteSegmentsSession {
     ///
     /// `Long.MIN_VALUE` for an empty list, which the reference would give a
     /// `NullPointerException`-free `Math.max` over nothing — and an empty list
-    /// never reaches a session anyway (`ArchiveConductor.java:1749-1752`).
+    /// never reaches a session anyway (`ArchiveConductor.java:1756-1759`).
     #[must_use]
     pub const fn max_delete_position(&self) -> i64 {
         self.max_delete_position
@@ -332,7 +332,7 @@ fn segment_position_of(path: &Path) -> Option<i64> {
 /// one.
 ///
 /// `deleteDetachedSegments` reads it off the directory before it works out what
-/// is detached (`ArchiveConductor.java:1515-1527`): the walk downwards has to
+/// is detached (`ArchiveConductor.java:1522-1534`): the walk downwards has to
 /// stop somewhere, and where it stops is the oldest file this recording still
 /// has.
 #[must_use]

@@ -4,8 +4,8 @@
 //! An operator process maps the driver's CnC file, finds the counter whose
 //! type is [`CONTROL_TOGGLE_TYPE_ID`] and whose key names the cluster, and
 //! switches it out of `NEUTRAL`. The leader reads it in `slowTickWork`
-//! (`ConsensusModuleAgent.java:2411`) and resets it when the action it names is
-//! complete (`:2580`, `:2654`, `:3143`).
+//! (`ConsensusModuleAgent.java:2428`) and resets it when the action it names is
+//! complete (`:2606`, `:2672`, `:3166`).
 //!
 //! Two rules are the whole of the protocol:
 //!
@@ -13,7 +13,7 @@
 //!   exception is `SUSPEND -> RESUME`, which the module cannot perform for the
 //!   operator because it is the module that is suspended;
 //! * `activate` and `deactivate` (`:143-156`) are unconditional writes, made
-//!   when this node becomes the leader (`ConsensusModuleAgent.java:1913`) and
+//!   when this node becomes the leader (`ConsensusModuleAgent.java:1929`) and
 //!   when it stops being one (`:1382`).
 
 use deepmsg_client::client::Client;

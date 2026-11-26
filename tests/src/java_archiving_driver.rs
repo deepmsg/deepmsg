@@ -83,7 +83,7 @@ impl JavaArchivingMediaDriver {
         args.push("-Daeron.perform.storage.checks=false".to_string());
         args.push("-Daeron.print.configuration=false".to_string());
         // **Required, not optional**: the reference's `Archive$Context.conclude`
-        // refuses to start without it (`Archive.java:1237`), which is why
+        // refuses to start without it (`Archive.java:1303`), which is why
         // `TestArchive` always passes one. A replication channel nobody uses is
         // still a channel it insists on having.
         args.push("-Daeron.archive.replication.channel=aeron:udp?endpoint=localhost:0".to_string());

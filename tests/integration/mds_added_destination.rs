@@ -391,8 +391,8 @@ fn await_destination(client: &mut Client, destination: AsyncDestination) -> Asyn
 ///
 /// | | |
 /// |---|---|
-/// | the reference C driver | refuses it, `could not parse channel tag string: -1` (`aeron_udp_channel.c:385-390`) |
-/// | the reference Java driver | serves it, as a **real** tag of `-1` (`UdpChannel.java:216-218`) |
+/// | the reference C driver | refuses it, `could not parse channel tag string: -1` (`aeron_udp_channel.c:386-391`) |
+/// | the reference Java driver | serves it, as a **real** tag of `-1` (`UdpChannel.java:243-245`) |
 /// | **this driver** | serves it, as **no tag** — which is what the value means |
 ///
 /// The channel is served at all so that the reference's own archive can start a

@@ -24,7 +24,7 @@
 //!
 //! Unicast's delays are a microsecond and then a hundred
 //! (`AERON_NAK_UNICAST_DELAY_NS_MIN` and the retry ratio,
-//! `aeron-driver/src/main/c/aeron_driver_context.c:222-224`) — loopback-speed
+//! `aeron-driver/src/main/c/aeron_driver_context.c:224-226`) — loopback-speed
 //! numbers, because a unicast receiver has one peer and asking again is cheap.
 
 use deepmsg_core::buffer::{AtomicBuffer, ReadOnly};
@@ -33,12 +33,12 @@ use deepmsg_core::logbuffer::{descriptor, position};
 use crate::protocol::{DataFrame, FrameHeader};
 
 /// The first NAK's delay for a unicast channel
-/// (`AERON_NAK_UNICAST_DELAY_NS_MIN`, `aeron_driver_context.c:222`).
+/// (`AERON_NAK_UNICAST_DELAY_NS_MIN`, `aeron_driver_context.c:224`).
 pub const NAK_UNICAST_DELAY_NS: i64 = 1_000;
 
 /// How many times the first delay a retry waits
 /// (`AERON_NAK_UNICAST_RETRY_DELAY_RATIO_DEFAULT`,
-/// `aeron_driver_context.c:224`: a hundred).
+/// `aeron_driver_context.c:226`: a hundred).
 pub const NAK_UNICAST_RETRY_RATIO: i64 = 100;
 
 /// The log-normal a **multicast** image's NAK delays are drawn from
@@ -61,7 +61,7 @@ pub const NAK_UNICAST_RETRY_RATIO: i64 = 100;
 pub struct MulticastBackoff {
     /// `max_backoff_T`, kept because the state it is built into holds it:
     /// `static_delay.delay_ns` and `static_delay.retry_ns` are both set to it
-    /// (`aeron_driver.c:960-966`).
+    /// (`aeron_driver.c:1000-1006`).
     max_backoff_ns: i64,
     rand_max: f64,
     base_x: f64,
@@ -71,8 +71,8 @@ pub struct MulticastBackoff {
 
 impl MulticastBackoff {
     /// Build one for a group of `group_size` and a maximum backoff
-    /// (`aeron_feedback_delay_state_init`, `:91-119`, which the driver calls
-    /// once with the settings it was configured with — `aeron_driver.c:960-966`).
+    /// (`aeron_feedback_delay_state_init`, `:90-118`, which the driver calls
+    /// once with the settings it was configured with — `aeron_driver.c:1000-1006`).
     ///
     /// `lambda = log(group_size) + 1` is the reference's shape parameter, and
     /// it is why the group size is the one input that changes the *spread*
@@ -99,7 +99,7 @@ impl MulticastBackoff {
     }
 
     /// One delay, from one uniform draw in `[0, 1)`
-    /// (`aeron_loss_detector_nak_multicast_delay_generator`, `:120-125`).
+    /// (`aeron_loss_detector_nak_multicast_delay_generator`, `:121-126`).
     ///
     /// It ignores the retry flag, which is a fact about this generator rather
     /// than an oversight: a repeated ask draws a **fresh** delay where the
@@ -244,7 +244,7 @@ impl LossDetector {
     /// are asked for, and what it buys is exactly this: a **static** delay in
     /// place of the adaptive one. The retry is the delay times the driver's
     /// ratio (`aeron_publication_image_create_static_delay_generator_state`,
-    /// `aeron_publication_image.c:112-117`, which multiplies by
+    /// `aeron_publication_image.c:117-122`, which multiplies by
     /// `context->nak_unicast_retry_delay_ratio`), and the multiplication
     /// saturates rather than wrapping — a delay near `i64::MAX` is a nonsense a
     /// client typed, not one that should become a *retry before the first
@@ -915,7 +915,7 @@ mod tests {
         // What `reliable=false` buys, in the one place a delay is visible: the
         // hole is fillable the moment it is seen. The reference returns the
         // zero generator *before* it reads `nak-delay=`
-        // (`aeron_publication_image.c:92-95`), so a channel that names both
+        // (`aeron_publication_image.c:97-100`), so a channel that names both
         // gets zero — the parameter it typed is not read at all.
         let unreliable = LossDetector::for_channel(
             7,

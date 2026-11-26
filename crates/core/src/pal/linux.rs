@@ -95,7 +95,7 @@ pub fn monotonic_nanos() -> i64 {
 /// returned mapping must be unmapped exactly once with the same `length`.
 unsafe fn mmap_impl(fd: i32, length: usize, writable: bool) -> io::Result<*const u8> {
     // The protection follows the mode the caller asked for. The reference
-    // chooses between the same two at `aeron_fileutil.c:839`, and its write
+    // chooses between the same two at `aeron_fileutil.c:838`, and its write
     // path (`aeron_context_request_driver_termination`) takes the writable one.
     let protection = if writable {
         libc::PROT_READ | libc::PROT_WRITE
@@ -109,7 +109,7 @@ unsafe fn mmap_impl(fd: i32, length: usize, writable: bool) -> io::Result<*const
     // than `MAP_PRIVATE` is load-bearing either way: the CnC file is written by
     // another process while we use it, and `MAP_PRIVATE` would hand us a
     // copy-on-write snapshot that never sees those writes — the reference makes
-    // the same choice at `aeron_fileutil.c:828`. Failure is reported only as
+    // the same choice at `aeron_fileutil.c:827`. Failure is reported only as
     // `MAP_FAILED`.
     let addr = unsafe {
         libc::mmap(
@@ -232,13 +232,13 @@ pub fn error_string(code: i32) -> String {
 /// — or **zero**, when the filesystem cannot be asked.
 ///
 /// This is the reference's `aeron_usable_fs_space`
-/// (`aeron-client/src/main/c/util/aeron_fileutil.c:952-961`): `statvfs`'s
+/// (`aeron-client/src/main/c/util/aeron_fileutil.c:951-960`): `statvfs`'s
 /// `f_frsize * f_bavail`, and nothing when the call fails.
 ///
 /// Zero is the reference's own answer to a failure, and it is the safe side to
 /// fail on for the one caller this has: the archive compares the answer against
 /// a threshold and refuses to start a recording below it
-/// (`ArchiveConductor.java:2597-2617`), so "cannot ask" reads as "no space"
+/// (`ArchiveConductor.java:2632-2652`), so "cannot ask" reads as "no space"
 /// rather than as "plenty". Its other caller in this workspace — the driver's
 /// log-buffer sizing (`crates/driver/src/sys.rs`) — reads it the same way.
 ///
@@ -332,17 +332,17 @@ impl MappedFile {
     ///
     /// Exclusive by construction: an existing file is an error rather than
     /// something to overwrite, which is what the reference asks the kernel for
-    /// (`aeron-client/src/main/c/util/aeron_fileutil.c:967` opens
+    /// (`aeron-client/src/main/c/util/aeron_fileutil.c:966` opens
     /// `O_RDWR|O_CREAT|O_EXCL`). A caller that has to cope with a leftover file
     /// — a media driver finding a stale aeron directory — deletes it
     /// deliberately, in the open, rather than by accident here.
     ///
     /// The length is *allocated*, not merely declared, and that is deliberate:
     /// the reference fills with zeroes for the CnC file
-    /// (`aeron-driver/src/main/c/aeron_driver.c:313` passes `true`), which
-    /// selects a non-sparse file (`aeron_fileutil.c:1135`, where the flag is
-    /// inverted) and then touches every page (`aeron_fileutil.c:1123-1132`).
-    /// `posix_fallocate` standing in for `fallocate` (`:985`) is the same
+    /// (`aeron-driver/src/main/c/aeron_driver.c:330` passes `true`), which
+    /// selects a non-sparse file (`aeron_fileutil.c:1134`, where the flag is
+    /// inverted) and then touches every page (`aeron_fileutil.c:1122-1131`).
+    /// `posix_fallocate` standing in for `fallocate` (`:984`) is the same
     /// bargain: space that reads as zero, and no page-fault storm when a client
     /// first writes forty megabytes into the counters region.
     ///
@@ -363,7 +363,7 @@ impl MappedFile {
     /// This is the reference's sparse log buffer: its `aeron_raw_log_map`
     /// creates the file with the sparse flag and neither prefaults nor
     /// touches when `use_sparse_files` is set
-    /// (`aeron-client/src/main/c/util/aeron_fileutil.c:1269-1292`), which is
+    /// (`aeron-client/src/main/c/util/aeron_fileutil.c:1268-1291`), which is
     /// the default a driver runs with (`term.buffer.sparse.file`). The bytes
     /// are indistinguishable from a dense file's to a reader; the difference
     /// is disk usage, and the pages of a sparse file's holes are the
@@ -394,8 +394,8 @@ impl MappedFile {
 
         // The two halves of "the file is there and it is really there": space,
         // then size. On Linux the first usually implies the second; the
-        // reference separates them the same way (`aeron_fileutil.c:985` then
-        // `:1015`), and a mapping taken over a short file would be a fault
+        // reference separates them the same way (`aeron_fileutil.c:984` then
+        // `:1014`), and a mapping taken over a short file would be a fault
         // waiting for the first reader. A sparse file skips the first half on
         // purpose — its length is a declaration, not a reservation.
         let prepared = if allocated {
@@ -471,7 +471,7 @@ impl MappedFile {
     /// A mapping cannot be resized, so this is what the reference does in two
     /// steps — close and unmap, then map the new capacity
     /// (`Catalog.growCatalog`'s `unmapAndCloseChannel` and the `map` after it,
-    /// `:866-880`) — with one difference in the order: the new mapping is taken
+    /// `:865-879`) — with one difference in the order: the new mapping is taken
     /// **before** the old one is unmapped. That way a failure at either step
     /// leaves this value exactly as it was rather than half-grown, which is a
     /// state a caller would have to remember not to use.
@@ -584,7 +584,7 @@ impl MappedFile {
     /// `MAP_SHARED` already makes writes visible to every other process without
     /// this call. What it adds is durability, and the reference makes the same
     /// distinction: it writes the ready version and then calls `aeron_msync`
-    /// over the whole CnC file (`aeron-driver/src/main/c/aeron_driver.c:973`),
+    /// over the whole CnC file (`aeron-driver/src/main/c/aeron_driver.c:1013`),
     /// so a reader that attaches *because* the version appeared cannot find a
     /// `cnc.dat` that is ready in memory and absent after a crash.
     ///

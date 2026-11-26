@@ -44,8 +44,8 @@
 //! 1. **A major-version mismatch refuses to start**; `VERSION_FAILED` (-1) is
 //!    only a warning (`ClusterMarkFile.java:154-171`).
 //! 2. **Only BACKUP -> CONSENSUS_MODULE is a tolerated type change**
-//!    (`:186-193`). Everything else refuses.
-//! 3. **An existing error log is rescued before being cleared** (`:197-201`), so
+//!    (`:188-195`). Everything else refuses.
+//! 3. **An existing error log is rescued before being cleared** (`:199-203`), so
 //!    the reason a previous process died survives the restart that follows it.
 
 use std::fmt;
@@ -306,7 +306,7 @@ impl ClusterMarkFile {
                 .ok_or_else(|| io::Error::other("mark file too short to hold a header"))?;
 
             // Old-format files carry no SBE header; the reference reads them and
-            // rewrites a new one (`:667`). It never writes the old format.
+            // rewrites a new one (`:682`). It never writes the old format.
             let is_new_format =
                 load_u16(&buffer, 2) == Some(200) && load_u16(&buffer, 4) == Some(110);
             if !is_new_format {
@@ -471,7 +471,7 @@ impl ClusterMarkFile {
 
     /// The cluster id.
     /// The four stream ids the header names (`ClusterMarkFile.encoder()`,
-    /// `ConsensusModule.java:4577-4580`). One call because the reference writes
+    /// `ConsensusModule.java:4641-4644`). One call because the reference writes
     /// them together, and a half-written header is a header a `ClusterTool`
     /// reports as wrong.
     pub fn set_stream_ids(
@@ -703,7 +703,7 @@ pub fn service_filename(service_id: i32) -> String {
 
 /// `driverFilePageSize`: the page size the driver aligned its CnC file to,
 /// which is what a component sizes **its own** mark file against
-/// (`ConsensusModule.java:1847-1853`, `ClusteredServiceContainer.java:887-889`).
+/// (`ConsensusModule.java:1874-1880`, `ClusteredServiceContainer.java:916-918`).
 ///
 /// The driver may not have published one (a pre-1.48 writer leaves zero); the
 /// build's default is used then, which is also what a driver that cannot be

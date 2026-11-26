@@ -4,9 +4,9 @@
 //! what they are called (`ArchiveThreadingMode.java:28-38`):
 //!
 //! * `DEDICATED` — the conductor, the recorder and the replayer, each an agent
-//!   on a thread of its own (`DedicatedModeArchiveConductor.java:54-55`);
+//!   on a thread of its own (`DedicatedModeArchiveConductor.java:64-65`);
 //! * `SHARED` — one agent, driven in one turn (`SharedModeArchiveConductor.java:57-66`);
-//! * `INVOKER` — that same agent, driven by the caller (`Archive.java:253-256`
+//! * `INVOKER` — that same agent, driven by the caller (`Archive.java:259-262`
 //!   starts an `AgentInvoker` and no runner at all).
 //!
 //! The reference's own acceptance for the *names* is `ArchiveThreadNamingTest`,
@@ -34,7 +34,7 @@
 //! # `SHARED`'s thread set, and `INVOKER`'s answer
 //!
 //! ★ **`SHARED` starts no thread of its own.** The reference starts the shared
-//! agent on a thread of its own (`AgentRunner.startOnThread`, `Archive.java:262`
+//! agent on a thread of its own (`AgentRunner.startOnThread`, `Archive.java:268`
 //! — the same call `DEDICATED` uses for its conductor), so its `SHARED` archive
 //! has one thread named `archive-conductor` under the classic naming. This
 //! build's `SHARED` runs the shared agent on the **caller's** thread, which is
@@ -64,12 +64,12 @@ use deepmsg_tests::temp::TempDir;
 ///
 /// The archive signals its mark file ready before its runner starts its
 /// workers — the reference's `signalReady` is at the end of `conclude`
-/// (`Archive.java:1665`) and the runners start in `onStart`, afterwards — so a
+/// (`Archive.java:1733`) and the runners start in `onStart`, afterwards — so a
 /// reading taken the instant `await_ready` returns can legitimately be missing
 /// one.
 const THREAD_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// `aeron.thread.naming=new` (`CommonContext.java:534-566`), which is the
+/// `aeron.thread.naming=new` (`CommonContext.java:541-573`), which is the
 /// archive's as much as the driver's.
 const NEW_NAMING: &str = "-Daeron.thread.naming=new";
 

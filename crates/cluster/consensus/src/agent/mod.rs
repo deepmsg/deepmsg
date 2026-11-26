@@ -124,7 +124,7 @@ use publisher::ConsensusPublisher;
 pub const SLOW_TICK_INTERVAL_NS: i64 = 10_000_000;
 
 /// `MARK_FILE_UPDATE_INTERVAL_NS` = 1 s
-/// (`ClusteredServiceContainer.java:200`).
+/// (`ClusteredServiceContainer.java:208`).
 pub const MARK_FILE_UPDATE_INTERVAL_NS: i64 = 1_000_000_000;
 
 /// How long a synchronous startup call waits for the driver.
@@ -145,10 +145,10 @@ const NULL_POSITION: i64 = -1;
 /// `Aeron.NULL_VALUE`, and the `-1` a recording id takes when there is none.
 const NULL_VALUE: i64 = -1;
 
-/// `ConsensusModule.CLUSTER_ACTION_FLAGS_DEFAULT` (`:132`).
+/// `ConsensusModule.CLUSTER_ACTION_FLAGS_DEFAULT` (`:135`).
 const CLUSTER_ACTION_FLAGS_DEFAULT: i32 = 0;
 
-/// The counters a consensus module allocates (`ConsensusModule.java:1892-2046`).
+/// The counters a consensus module allocates (`ConsensusModule.java:1919-2073`).
 ///
 /// They are `Copy` handles: the value lives in the CnC file, and every read and
 /// write goes through a [`deepmsg_cnc::CountersReader`] built from the client.
@@ -187,7 +187,7 @@ struct AppendPosition {
 /// A cluster's duty-cycle tracker (`DutyCycleStallTracker`).
 ///
 /// Two counters: the maximum cycle time seen, and how many cycles exceeded the
-/// configured threshold (`:2020-2034`). The reference's tracker also keeps the
+/// configured threshold (`:2047-2061`). The reference's tracker also keeps the
 /// threshold; so does this.
 struct DutyCycle {
     max_cycle_time: Counter,
@@ -298,7 +298,7 @@ pub struct ConsensusModuleAgent {
     log_subscription_channel: String,
     /// The steady-state reader of the live log (`logAdapter`,
     /// `LogAdapter.java:44`). A follower applies the leader's log through it
-    /// (`ConsensusModuleAgent.java:2523-2532`); the recovery replay has its own
+    /// (`ConsensusModuleAgent.java:2549-2558`); the recovery replay has its own
     /// (`AgentLogReplay`), as the reference's single adapter would otherwise be
     /// polled from both paths.
     log_adapter: crate::log::LogAdapter,
@@ -324,7 +324,7 @@ pub struct ConsensusModuleAgent {
     time_of_last_append_position_send_ns: i64,
     /// `timeOfLastAppendPositionUpdateNs` (`:151`): when the append position
     /// last moved, which is what tells a catchup that has stalled
-    /// (`:1999-2010`).
+    /// (`:2026-2037`).
     time_of_last_append_position_update_ns: i64,
     last_quorum_backtrack_commit_position: i64,
     time_of_last_log_update_ns: i64,
@@ -332,7 +332,7 @@ pub struct ConsensusModuleAgent {
     notified_commit_position: i64,
     slow_tick_deadline_ns: i64,
     mark_file_update_deadline_ns: i64,
-    /// `ClusterMember.ingressEndpoints(activeMembers)` (`:2380`): the
+    /// `ClusterMember.ingressEndpoints(activeMembers)` (`:2397`): the
     /// `id=endpoint,...` string a redirect, an admin response and a new session
     /// all carry. The members are fixed for the node's life, so it is made
     /// once — a steady-state duty cycle must not allocate (performance spec R1).
@@ -382,8 +382,8 @@ pub struct ConsensusModuleAgent {
     termination_leadership_term_id: i64,
     /// `uncommittedPreviousState` (`:182`): the state before each
     /// `SUSPEND`/`RESUME`/`SNAPSHOT` action, written by
-    /// `offerPositionAndPreviousState` (`:2664-2668`) and rolled back by
-    /// `restoreUncommittedEntries` (`:3020-3057`) when the action turns out not
+    /// `offerPositionAndPreviousState` (`:2682-2686`) and rolled back by
+    /// `restoreUncommittedEntries` (`:3043-3080`) when the action turns out not
     /// to be committed.
     uncommitted_previous_state: std::collections::VecDeque<(i64, i64)>,
     /// `totalSnapshotDurationTracker` (`:191`), counters 234 and 235.
@@ -392,12 +392,12 @@ pub struct ConsensusModuleAgent {
 
 /// What a deployment does with a counted error, once the counter has moved —
 /// the tail of `ConsensusModule.Context.countedErrorHandler`
-/// (`ConsensusModule.java:1857`).
+/// (`ConsensusModule.java:1884`).
 pub type CountedErrorHandler = Box<dyn Fn(&ClusterError) + Send + Sync>;
 
 /// The two objects a deployment names by class and a test supplies in process
 /// (`ConsensusModule.Context.authenticatorSupplier` and
-/// `authorisationServiceSupplier`, `ConsensusModule.java:1683-1690`).
+/// `authorisationServiceSupplier`, `ConsensusModule.java:1708-1715`).
 #[derive(Default)]
 pub struct LaunchComponents {
     /// `None` means the name in `aeron.cluster.authenticator.supplier`.
@@ -406,9 +406,9 @@ pub struct LaunchComponents {
     pub authorisation_service: Option<Box<dyn AuthorisationService>>,
     /// What a deployment does with a counted error after the counter has moved
     /// — the tail of `ConsensusModule.Context.countedErrorHandler`
-    /// (`ConsensusModule.java:1857`).
+    /// (`ConsensusModule.java:1884`).
     ///
-    /// `TestCluster` passes `ClusterTests.errorHandler` (`ClusterTest.java:565`),
+    /// `TestCluster` passes `ClusterTests.errorHandler` (`ClusterTest.java:570`),
     /// whose point is the split this build's [`ClusterError::is_warning`]
     /// mirrors: a **WARN** is printed, an **ERROR** fails the test
     /// (`ClusterTests.java:77-98`). `None` is this build's own reporting, which
@@ -431,7 +431,7 @@ impl ConsensusModuleAgent {
 
     /// The same, with the two security objects supplied in process — the
     /// equivalent of the reference's `Context.authenticatorSupplier` /
-    /// `authorisationServiceSupplier` fields (`ConsensusModule.java:1683-1690`).
+    /// `authorisationServiceSupplier` fields (`ConsensusModule.java:1708-1715`).
     ///
     /// # Errors
     ///
@@ -444,7 +444,7 @@ impl ConsensusModuleAgent {
         config.conclude()?;
 
         // `AgentRunner.startOnThread` names the thread before the first duty
-        // cycle (`ConsensusModule.java:343`); the kernel keeps 15 bytes of it.
+        // cycle (`ConsensusModule.java:350`); the kernel keeps 15 bytes of it.
         deepmsg_driver::sys::set_current_thread_name(&config.agent_role_name()).map_err(
             |error| ClusterError::Cluster(format!("could not name the agent's thread: {error}")),
         )?;
@@ -1129,7 +1129,7 @@ impl ConsensusModuleAgent {
 
     // -- operator toggles and termination (P3-4e) --------------------------
 
-    /// `checkClusterControlToggle` (`:2546-2662`).
+    /// `checkClusterControlToggle` (`:2572-2688`).
     ///
     /// Only a leader calls this, and only in a slow tick. The three states the
     /// module can be in each answer one question: `ACTIVE` may start an action,
@@ -1800,7 +1800,7 @@ impl ConsensusModuleAgent {
         // every `AtomicCounter` it owns (`ClientConductor.java:184`), which is
         // what a known directory needs — a restart must not find the previous
         // process's module-state counter and refuse itself
-        // (`ConsensusModule.java:1941-1945`). Closing the client alone only
+        // (`ConsensusModule.java:1968-1972`). Closing the client alone only
         // tells the driver the client is gone; the reaper frees what it owned
         // later, and a restart in the same directory cannot wait for that.
         let mut remove_error = None;
@@ -1860,7 +1860,7 @@ impl ConsensusModuleAgent {
     /// recording, and a value read from it then is that recording's — `0`, for
     /// a recording that has not written yet. The reference asks
     /// `RecordingPos.isActive(counters, counterId, registrationId)` before it
-    /// believes a position (`:292-298`), and so does this.
+    /// believes a position (`:295-301`), and so does this.
     ///
     /// A stale counter falls back to the highest append position this member
     /// last published — the last thing it knew to be true — rather than to a
@@ -1915,7 +1915,7 @@ impl ConsensusModuleAgent {
 
     // -- the log -----------------------------------------------------------
 
-    /// `addLogPublication` (`:1639-1686`). The publication is taken out of the
+    /// `addLogPublication` (`:1655-1702`). The publication is taken out of the
     /// client and given to [`LogPublisher`].
     fn add_log_publication(&mut self, append_position: i64) -> Result<usize, ClusterError> {
         let log_publication_tag = self.client.next_correlation_id().map_err(cluster)?;
@@ -1932,7 +1932,7 @@ impl ConsensusModuleAgent {
         );
 
         if channel.media() == "udp" {
-            // `addLogPublication` (`:1650-1656`): under a manual MDC log the
+            // `addLogPublication` (`:1675-1681`): under a manual MDC log the
             // publication says so itself, and — unless the configuration turns
             // it off — binds the control endpoint at this member's own log
             // address with a wildcard port. The reference puts these on the
@@ -1962,7 +1962,7 @@ impl ConsensusModuleAgent {
             );
             channel.put("mtu", log.mtu_length.to_string());
         } else {
-            // `ensureConsistentInitialTermId` (`:3395-3400`).
+            // `ensureConsistentInitialTermId` (`:3430-3435`).
             channel.put("init-term-id", "0");
             channel.put("term-id", "0");
             channel.put("term-offset", "0");
@@ -1983,7 +1983,7 @@ impl ConsensusModuleAgent {
         self.log_publisher
             .set_publication(&mut self.client, publication);
 
-        // `addLogPublication` (`:1674-1683`): under MDC the leader is the only
+        // `addLogPublication` (`:1699-1708`): under MDC the leader is the only
         // writer, so every follower is a destination of its log publication.
         if channel_uri_media_is_udp(&self.config.log_channel) && self.log_is_mdc() {
             for index in 0..self.members.len() {
@@ -2006,7 +2006,7 @@ impl ConsensusModuleAgent {
         Ok(1)
     }
 
-    /// `startLogRecording` (`:2360-2371`).
+    /// `startLogRecording` (`:2377-2388`).
     fn start_log_recording(
         &mut self,
         channel: &str,
@@ -2035,7 +2035,7 @@ impl ConsensusModuleAgent {
         Ok(())
     }
 
-    /// `tryCreateAppendPosition` (`:2726-2751`): the archive's recording
+    /// `tryCreateAppendPosition` (`:2749-2774`): the archive's recording
     /// position counter for this session, or `false` while it does not exist.
     fn try_create_append_position(&mut self, log_session_id: i32) -> Result<bool, ClusterError> {
         let Some(counters) = self.client.counters_reader() else {
@@ -2073,12 +2073,12 @@ impl ConsensusModuleAgent {
         Ok(true)
     }
 
-    /// `tryStopLogRecording` (`:3346-3378`), keeping the id like the reference
+    /// `tryStopLogRecording` (`:3378-3410`), keeping the id like the reference
     /// does (the recovery plan still needs it).
     ///
     /// **What the archive says about a stop that finds nothing is a warning,
     /// not a failure.** The reference catches every exception there and reports
-    /// a `ClusterEvent` (`:3369-3372`): the subscription the agent named is
+    /// a `ClusterEvent` (`:3404-3407`): the subscription the agent named is
     /// already gone, which is the state the caller wanted. Returning it instead
     /// is what put a rejoining member into a loop — a new term's
     /// `prepareForNewLeadership` stops the recording on its way in, and an error
@@ -2106,7 +2106,7 @@ impl ConsensusModuleAgent {
 
     // -- waiting -----------------------------------------------------------
 
-    /// The reference's `idle()` (`:529-557`): drive this agent's own client,
+    /// The reference's `idle()` (`:536-564`): drive this agent's own client,
     /// idle, and poll archive events. Nothing else — plan §4.4 rule 1.
     fn idle(&mut self) -> Result<(), ClusterError> {
         self.idle_strategy.idle(0);
@@ -2644,7 +2644,7 @@ impl ConsensusModuleAgent {
     /// Three gates, all the reference's: **no election in progress**, a state
     /// that can answer (`ACTIVE`, `SUSPENDED`, `SNAPSHOT`), and the response
     /// channel refined over the egress template (`refineResponseChannel`,
-    /// `:3459-3475`). A backup query that arrives mid-election is dropped —
+    /// `:3491-3507`). A backup query that arrives mid-election is dropped —
     /// the backup retries on its own interval.
     #[allow(clippy::too_many_arguments)] // one per field the query carries
     fn on_backup_query(
@@ -2680,7 +2680,7 @@ impl ConsensusModuleAgent {
         );
     }
 
-    /// `refineResponseChannel` (`:3459-3475`): an egress channel template, when
+    /// `refineResponseChannel` (`:3491-3507`): an egress channel template, when
     /// the deployment set one (`aeron.cluster.egress.channel`).
     ///
     /// Two shapes carry over from the reference: an `aeron:ipc` response
@@ -2966,7 +2966,7 @@ impl ConsensusModuleAgent {
         Ok(0)
     }
 
-    /// `updateFollowerPosition` (`:2753-2785`): the follower's append position
+    /// `updateFollowerPosition` (`:2776-2808`): the follower's append position
     /// is also its heartbeat — there is no separate ping.
     fn update_follower_position_internal(&mut self, now_ns: i64) -> Result<usize, ClusterError> {
         let recorded_position = match self.append_position {
@@ -2976,7 +2976,7 @@ impl ConsensusModuleAgent {
         self.update_follower_position(now_ns, recorded_position, APPEND_POSITION_FLAG_NONE)
     }
 
-    /// The five-argument form (`:2763-2785`): catchup sends the same heartbeat
+    /// The five-argument form (`:2786-2808`): catchup sends the same heartbeat
     /// with `APPEND_POSITION_FLAG_CATCHUP`, which is what tells the leader the
     /// position came from a replay.
     fn update_follower_position(
@@ -3016,7 +3016,7 @@ impl ConsensusModuleAgent {
         Ok(0)
     }
 
-    /// `enterElection` (`:3059-3094`): the four triggers all land here.
+    /// `enterElection` (`:3082-3117`): the four triggers all land here.
     fn enter_election(
         &mut self,
         is_log_end_of_stream: bool,
@@ -3075,7 +3075,7 @@ impl ConsensusModuleAgent {
 }
 
 impl ConsensusModuleAgent {
-    /// `ConsensusModuleAgent.pollArchiveEvents` (`:2074-2098`): a completed
+    /// `ConsensusModuleAgent.pollArchiveEvents` (`:2090-2114`): a completed
     /// poll that is a **control response with `code == ERROR`** while a
     /// replication is running.
     ///
@@ -3683,7 +3683,7 @@ impl ElectionHost for ConsensusModuleAgent {
         // subscription — is told its image is over. Leaving it alive is what
         // makes the next term unjoinable: the service keeps the old image and
         // never takes the `JoinLog` that would move it on
-        // (`BoundedLogAdapter.isDone`, `BoundedLogAdapter.java:115-118`).
+        // (`BoundedLogAdapter.isDone`, `BoundedLogAdapter.java:130-133`).
         self.log_publisher.disconnect(&mut self.client);
 
         self.last_quorum_backtrack_commit_position = NULL_POSITION;
@@ -3692,7 +3692,7 @@ impl ElectionHost for ConsensusModuleAgent {
         // honoured by a leader, so losing leadership disarms it.
         ClusterControlToggle::deactivate(&self.client, self.counters.control_toggle);
 
-        // `getLastAppendedPosition` (`:3372-3384`) asks the **archive** for the
+        // `getLastAppendedPosition` (`:3404-3416`) asks the **archive** for the
         // log's last appended position, not the driver's recording-position
         // counter: a counter whose recording is stopping is freed and its slot
         // can be handed to another recording, and a read of it then answers
@@ -3794,7 +3794,7 @@ impl ElectionHost for ConsensusModuleAgent {
     }
 
     fn catchup_initiated(&mut self, now_ns: i64) -> Result<(), ClusterError> {
-        // `:1964-1968`: a catchup that has just been asked for starts its
+        // `:1991-1995`: a catchup that has just been asked for starts its
         // progress clock now, so the first heartbeat is not already late.
         self.time_of_last_append_position_update_ns = now_ns;
         self.time_of_last_append_position_send_ns = now_ns;
@@ -3810,7 +3810,7 @@ impl ElectionHost for ConsensusModuleAgent {
 
         if self.state == ModuleState::Active || self.state == ModuleState::Suspended {
             if self.append_position.is_none() {
-                // `:1974-1977`: the recording stopped under the catchup, which
+                // `:2001-2004`: the recording stopped under the catchup, which
                 // is a `ClusterEvent` rather than a quiet zero.
                 return Err(ClusterError::ClusterEvent(format!(
                     "unexpected recording stop during catchup: position={}",
@@ -3824,7 +3824,7 @@ impl ElectionHost for ConsensusModuleAgent {
             let outcome = self.poll_log_adapter(bound)?;
             work += outcome.count;
 
-            // `:1980-1987`: the replay's image closing mid-catchup is a
+            // `:2007-2014`: the replay's image closing mid-catchup is a
             // `ClusterEvent`; the leader's archive has gone.
             if outcome.count == 0 && self.log_adapter.is_image_closed() {
                 return Err(ClusterError::ClusterEvent(format!(
@@ -3846,7 +3846,7 @@ impl ElectionHost for ConsensusModuleAgent {
             );
         }
 
-        // `:1999-2010`: no append position has moved within a heartbeat
+        // `:2026-2037`: no append position has moved within a heartbeat
         // timeout. Only while ACTIVE — a SUSPEND is allowed to be quiet.
         if now_ns
             > self.time_of_last_append_position_update_ns + self.config.leader_heartbeat_timeout_ns
@@ -3871,7 +3871,7 @@ impl ElectionHost for ConsensusModuleAgent {
     }
 
     fn is_catchup_near_live(&mut self, position: i64) -> bool {
-        // `:2026-2038`: within a window of the leader, where the window is a
+        // `:2053-2065`: within a window of the leader, where the window is a
         // quarter of an image's term or the live-add limit, whichever is
         // smaller — the same arithmetic `ReplayMerge` uses to decide a replay
         // may be joined to a live stream.
@@ -3891,7 +3891,7 @@ impl ElectionHost for ConsensusModuleAgent {
         leadership_term_id: i64,
         append_position_flags: i16,
     ) -> Result<(), ClusterError> {
-        // `:1946-1962`. Every ordinary heartbeat comes through here, so the
+        // `:1973-1989`. Every ordinary heartbeat comes through here, so the
         // gate is the first thing the reference does.
         let Some(index) = self
             .members
@@ -3914,7 +3914,7 @@ impl ElectionHost for ConsensusModuleAgent {
         if self.members[index].catchup_replay_correlation_id != NULL_VALUE {
             let replay_session_id = self.members[index].catchup_replay_session_id;
             // The reference clears the correlation id only when the stop
-            // landed (`:1955-1963`); a failed stop leaves it for the next
+            // landed (`:1982-1990`); a failed stop leaves it for the next
             // heartbeat to try again.
             if self
                 .archive
@@ -3938,7 +3938,7 @@ impl ElectionHost for ConsensusModuleAgent {
     }
 
     fn stop_all_catchups(&mut self) -> Result<(), ClusterError> {
-        // `:2037-2058`: stop every replay this leader is serving. A stop that
+        // `:2064-2085`: stop every replay this leader is serving. A stop that
         // fails is counted and the member's fields are cleared anyway — the
         // cluster is leaving the term these replays belong to.
         for index in 0..self.members.len() {
@@ -3991,7 +3991,7 @@ impl ElectionHost for ConsensusModuleAgent {
         // driver frees the endpoint — and the counters under it — once the
         // endpoint's last subscription goes *and* its images are gone
         // (`aeron_receive_channel_endpoint_try_remove_endpoint`,
-        // `media/aeron_receive_channel_endpoint.c:691-702`: the three stream
+        // `media/aeron_receive_channel_endpoint.c:696-707`: the three stream
         // refcounts at zero **and** `image_ref_count <= 0`). This build's driver
         // has the same condition, so the wait ends the same way — after the
         // image's liveness timeout. Thirty seconds is a bound on a wait that
@@ -4020,12 +4020,12 @@ impl ElectionHost for ConsensusModuleAgent {
     }
 
     fn set_leader_member_id(&mut self, leader_member_id: i32) {
-        // `updateMemberDetails(election.leader())` (`:1930`, `:2370-2381`).
+        // `updateMemberDetails(election.leader())` (`:1946`, `:2387-2398`).
         ClusterMember::set_is_leader(&mut self.members, leader_member_id);
     }
 
     fn set_leadership_term_id(&mut self, leadership_term_id: i64) {
-        // `electionComplete`'s first line (`ConsensusModuleAgent.java:1907`).
+        // `electionComplete`'s first line (`ConsensusModuleAgent.java:1923`).
         // For a leader `join_log_as_leader` has already set it; for a follower
         // this is the only place the steady state ever learns its term.
         self.leadership_term_id = leadership_term_id;
@@ -4046,13 +4046,13 @@ impl ElectionHost for ConsensusModuleAgent {
 
         if self.role == Role::Leader {
             self.time_of_last_log_update_ns = now_ns - self.config.leader_heartbeat_interval_ns;
-            // `electionComplete` (`:1909`): the wheel's tick moves to the
+            // `electionComplete` (`:1936`): the wheel's tick moves to the
             // cluster's clock in one step, not one tick per poll.
             self.timer.current_time(self.clock.time());
             for tracker in self.trackers.iter_mut() {
                 tracker.set_leadership_term_id(self.leadership_term_id);
             }
-            // `updateMemberDetails` (`:2370-2381`) marks the leader on every
+            // `updateMemberDetails` (`:2387-2398`) marks the leader on every
             // member; `ClusterTermination.canTerminate` reads that flag to know
             // it is not waiting for itself. A follower learns the leader id
             // from the log replication (P3-6b) and has nothing to terminate.
@@ -4085,9 +4085,9 @@ impl ElectionHost for ConsensusModuleAgent {
             .position(|member| member.id == self.config.member_id)
             .unwrap_or(self.this_member_index);
 
-        // `electionComplete` (`ConsensusModuleAgent.java:1905-1944`):
+        // `electionComplete` (`ConsensusModuleAgent.java:1921-1960`):
         // `prepareSessionsForNewTerm(isLeaderStartup)` **only on the leader**
-        // (`:1911-1922` is inside its role check), and then `connectIngress`,
+        // (`:1927-1938` is inside its role check), and then `connectIngress`,
         // which every role does.
         //
         // The role gate is load-bearing now that preparing a session means
@@ -4113,19 +4113,19 @@ impl ElectionHost for ConsensusModuleAgent {
     fn poll_archive_events(&mut self) -> Result<usize, ClusterError> {
         use deepmsg_codec::archive::recording_signal::RecordingSignal as CodecSignal;
 
-        // `pollArchiveEvents` (`:2061-2140`). The recording signal channel is
+        // `pollArchiveEvents` (`:2077-2156`). The recording signal channel is
         // read **every turn**, not only while a replication is running: a log
-        // recording that stops is read here (`:2105-2116`), an archive that
+        // recording that stops is read here (`:2121-2132`), an archive that
         // refused a copy is read here, and a control subscription that lost its
         // image is read here — the last one being the reference's own
-        // "local archive is not connected" (`:2123-2128`).
+        // "local archive is not connected" (`:2139-2144`).
         let mut work = usize::from(self.client.poll());
 
         match self.archive.poll_recording_event(&mut self.client) {
             Ok(Some(RecordingEvent::Signal(signal))) => {
                 work += 1;
 
-                // `:2105-2116`: the **log** recording stopping is this member
+                // `:2121-2132`: the **log** recording stopping is this member
                 // losing its stream, not a copy's progress. The reference
                 // records where it stopped and, if nothing is being elected and
                 // this member is active, asks the closed image whether that
@@ -4531,7 +4531,7 @@ fn replace_port_with_wildcard(endpoint: &str) -> Option<String> {
 /// nomination deadlines equal to the millisecond (`records/P3-6c.md`).
 ///
 /// The reference has no such coupling to have to avoid: its `Random`
-/// (`ConsensusModule.java:2131`) is seeded from `System.nanoTime`, which is
+/// (`ConsensusModule.java:2166`) is seeded from `System.nanoTime`, which is
 /// nanoseconds and per-process.
 fn election_rng_seed(now_ns: i64, member_id: i32) -> u64 {
     (now_ns as u64) ^ (member_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -4573,7 +4573,7 @@ fn allocate_counters(
     let cluster_id = config.cluster_id;
 
     // The reference refuses to start a second module for the same cluster id
-    // (`ConsensusModule.java:1941-1945`), by the counter that names it.
+    // (`ConsensusModule.java:1968-1972`), by the counter that names it.
     if let Some(counters) = client.counters_reader() {
         if counters::find_cluster_counter(
             &counters,
@@ -4831,7 +4831,7 @@ fn is_multicast_endpoint(uri: &ChannelUri) -> bool {
         .unwrap_or(false)
 }
 
-/// `ConsensusModuleAgent.refineResponseChannel` (`ConsensusModuleAgent.java:3459-3475`).
+/// `ConsensusModuleAgent.refineResponseChannel` (`ConsensusModuleAgent.java:3491-3507`).
 ///
 /// `aeron.cluster.egress.channel`, when set, is a template: its parameters are
 /// put onto a client's response channel. An IPC response channel is special —
@@ -5187,7 +5187,7 @@ impl ConsensusModuleAgent {
             .remove_destination(registration_id, destination, COMMAND_TIMEOUT);
     }
 
-    /// `connectIngress` (`ConsensusModuleAgent.java:3387-3415`): the ingress
+    /// `connectIngress` (`ConsensusModuleAgent.java:3419-3447`): the ingress
     /// subscription, and the IPC one when a leader allows IPC ingress.
     fn connect_ingress(&mut self) -> Result<(), ClusterError> {
         let this_member = &self.members[self.this_member_index];
@@ -5199,7 +5199,7 @@ impl ConsensusModuleAgent {
 
         if self.role != Role::Leader && is_multicast_endpoint(&uri) {
             // The reference does not subscribe a follower to a multicast
-            // ingress channel (`:3395-3398`).
+            // ingress channel (`:3427-3430`).
             return Ok(());
         }
 
@@ -5225,7 +5225,7 @@ impl ConsensusModuleAgent {
         Ok(())
     }
 
-    /// `consensusWork`'s `ingressAdapter.poll()` (`ConsensusModuleAgent.java:2494`):
+    /// `consensusWork`'s `ingressAdapter.poll()` (`ConsensusModuleAgent.java:2512`):
     /// the client poll and then the deferred work that needs the client back.
     fn poll_ingress(&mut self) -> Result<usize, ClusterError> {
         if !self.ingress.is_connected() {
@@ -5546,7 +5546,7 @@ struct AgentServiceHandler<'a> {
     /// after the poll because it needs the archive and the recording log.
     deferred_termination: Option<i64>,
     /// A `QUITTING` ack: `closeAndTerminate()`, after the poll. Nothing in
-    /// 1.53.2 sets `QUITTING` (`ConsensusModule.java:168`), so this branch is
+    /// 1.53.2 sets `QUITTING` (`ConsensusModule.java:171`), so this branch is
     /// transcribed and unreachable, as in the reference.
     deferred_close: bool,
 }
@@ -5581,7 +5581,7 @@ impl ServiceControlHandler for AgentServiceHandler<'_> {
     ) -> Result<(), ClusterError> {
         // A timer the replayed log already expired is not scheduled again; the
         // count is what `onReplayTimerEvent` left behind
-        // (`ConsensusModuleAgent.java:1449-1459`).
+        // (`ConsensusModuleAgent.java:1457-1467`).
         let expired = self
             .expired_timer_count
             .get(&correlation_id)
@@ -5618,7 +5618,7 @@ impl ServiceControlHandler for AgentServiceHandler<'_> {
             )));
         };
 
-        // `captureServiceAck` (`:2715-2723`).
+        // `captureServiceAck` (`:2738-2746`).
         if ack_id == 0 {
             let already_received = self
                 .service_client_ids
@@ -5636,7 +5636,7 @@ impl ServiceControlHandler for AgentServiceHandler<'_> {
             match self.state {
                 ModuleState::Active => {}
                 ModuleState::Snapshot => {
-                    // `onServiceAck` (`:1472-1480`): the next ack id, then the
+                    // `onServiceAck` (`:1488-1496`): the next ack id, then the
                     // collected acks; a null relevant id is reported and the
                     // snapshot is not taken.
                     *self.service_ack_id += 1;
@@ -5657,7 +5657,7 @@ impl ServiceControlHandler for AgentServiceHandler<'_> {
                     self.deferred_close = true;
                 }
                 ModuleState::Terminating => {
-                    // `onServiceAck` (`:1486-1487`): the last service ack for
+                    // `onServiceAck` (`:1502-1503`): the last service ack for
                     // this position ends the wait.
                     self.deferred_termination = Some(log_position);
                 }
@@ -5683,7 +5683,7 @@ impl ServiceControlHandler for AgentServiceHandler<'_> {
 }
 
 impl ConsensusModuleAgent {
-    /// `sweepUncommittedEntriesTo` (`ConsensusModuleAgent.java:2998-3018`):
+    /// `sweepUncommittedEntriesTo` (`ConsensusModuleAgent.java:3021-3041`):
     /// timers, then the pending service messages, then the sessions.
     fn sweep_uncommitted_entries_to(&mut self, commit_position: i64) {
         while let Some(&(append_position, _correlation_id)) = self.uncommitted_timers.front() {
@@ -5700,7 +5700,7 @@ impl ConsensusModuleAgent {
 
         let _ = self.sessions.sweep_uncommitted_sessions(commit_position);
 
-        // `:3013-3017`: a previous state whose action has now been committed
+        // `:3036-3040`: a previous state whose action has now been committed
         // is no longer a rollback candidate.
         while let Some(&(append_position, _state)) = self.uncommitted_previous_state.front() {
             if append_position > commit_position {
@@ -5711,7 +5711,7 @@ impl ConsensusModuleAgent {
         }
     }
 
-    /// `restoreUncommittedEntries` (`ConsensusModuleAgent.java:3020-3052`):
+    /// `restoreUncommittedEntries` (`ConsensusModuleAgent.java:3043-3075`):
     /// timers the commit position did not reach expire at once (the replay
     /// will produce their events again), and the service messages go back to
     /// "not appended".
@@ -5729,7 +5729,7 @@ impl ConsensusModuleAgent {
 
         self.sessions.restore_uncommitted_sessions(commit_position);
 
-        // `:3041-3057`: committed previous states are dropped; if one is left,
+        // `:3064-3080`: committed previous states are dropped; if one is left,
         // its action never made it, so the state before it is the committed
         // one — the reference's "rollback".
         while let Some(&(append_position, _state)) = self.uncommitted_previous_state.front() {
@@ -5756,7 +5756,7 @@ impl ConsensusModuleAgent {
         self.uncommitted_previous_state.clear();
     }
 
-    /// `awaitServicesReady` (`ConsensusModuleAgent.java:1801-1838`): a no-op
+    /// `awaitServicesReady` (`ConsensusModuleAgent.java:1817-1854`): a no-op
     /// without services, otherwise send `JoinLog` and wait for every service's
     /// ack at `log_position`.
     #[allow(clippy::too_many_arguments)]
@@ -5808,7 +5808,7 @@ impl ConsensusModuleAgent {
         Ok(())
     }
 
-    /// `timerService.poll(timestamp)` (`:2489`).
+    /// `timerService.poll(timestamp)` (`:2507`).
     fn poll_timers(&mut self, timestamp: i64) -> Result<usize, ClusterError> {
         let position_limit = self.log_publisher.position_limit(&self.client);
         let leadership_term_id = self.leadership_term_id;
@@ -5828,7 +5828,7 @@ impl ConsensusModuleAgent {
         Ok(timer.poll(timestamp, &mut handler))
     }
 
-    /// Each `PendingServiceMessageTracker.poll()` (`:2490-2493`).
+    /// Each `PendingServiceMessageTracker.poll()` (`:2508-2511`).
     fn poll_trackers(&mut self, timestamp: i64) -> Result<usize, ClusterError> {
         if self.trackers.is_empty() {
             return Ok(0);
@@ -5846,7 +5846,7 @@ impl ConsensusModuleAgent {
         Ok(work)
     }
 
-    /// `consensusModuleAdapter.poll()` (`:2535`) and the deferred work that
+    /// `consensusModuleAdapter.poll()` (`:2561`) and the deferred work that
     /// needs the client and the sessions back.
     fn poll_service_control(&mut self) -> Result<usize, ClusterError> {
         if !self.service_control.is_connected() {
@@ -5982,7 +5982,7 @@ impl ConsensusModuleAgent {
         };
 
         if let Some((log_position, timestamp, acks)) = deferred_snapshot {
-            // `snapshotOnServiceAck` (`:3104-3146`): take it, then ACTIVE — or,
+            // `snapshotOnServiceAck` (`:3127-3169`): take it, then ACTIVE — or,
             // for a `SHUTDOWN`'s snapshot, start the termination half.
             self.snapshot_on_service_ack(log_position, timestamp, &acks)?;
         }
@@ -6199,7 +6199,7 @@ impl SnapshotLoadHandler for AgentSnapshotLoadHandler<'_> {
 }
 
 impl ConsensusModuleAgent {
-    /// `takeSnapshot` (`ConsensusModuleAgent.java:3153-3191`), with no service
+    /// `takeSnapshot` (`ConsensusModuleAgent.java:3176-3214`), with no service
     /// snapshots (the 0-service path). The trigger itself — ClusterControl and
     /// admin requests — is P3-4e; this is the seam it will call.
     ///
@@ -6218,7 +6218,7 @@ impl ConsensusModuleAgent {
     }
 
     /// The same with the service acks whose `relevantId`s name their snapshot
-    /// recordings (`:3177-3185`).
+    /// recordings (`:3198-3206`).
     ///
     /// # Errors
     ///
@@ -6314,7 +6314,7 @@ impl ConsensusModuleAgent {
         let _ = self
             .client
             .remove_publication(registration_id, COMMAND_TIMEOUT);
-        // `takeSnapshot` (`:3189`): the duration the operator sees on counters
+        // `takeSnapshot` (`:3210`): the duration the operator sees on counters
         // 234/235, measured from the trigger (the replayed action or the
         // toggle), not from this call.
         let now_ns = self.clock.time_nanos();
@@ -6323,7 +6323,7 @@ impl ConsensusModuleAgent {
         Ok(())
     }
 
-    /// `termBaseLogPosition()` (`ConsensusModuleAgent.java:3214-3218`): the
+    /// `termBaseLogPosition()` (`ConsensusModuleAgent.java:3241-3245`): the
     /// current term's entry, or the recovery plan's last term base when the
     /// entry is not in the log (a snapshot taken immediately after a restart).
     fn term_base_log_position(&self) -> i64 {
@@ -6334,7 +6334,7 @@ impl ConsensusModuleAgent {
             })
     }
 
-    /// `snapshotState` (`:3221-3253`): the record order and the iteration
+    /// `snapshotState` (`:3248-3280`): the record order and the iteration
     /// containers are documented in [`crate::snapshot`].
     fn snapshot_state(
         &mut self,
@@ -6410,7 +6410,7 @@ impl ConsensusModuleAgent {
         Ok(())
     }
 
-    /// `awaitRecordingCounter` (`:3208-3219`).
+    /// `awaitRecordingCounter` (`:3235-3246`).
     fn await_recording_counter(&mut self, session_id: i32) -> Result<i32, ClusterError> {
         let archive_id = self.archive.archive_id();
         loop {
@@ -6427,7 +6427,7 @@ impl ConsensusModuleAgent {
         }
     }
 
-    /// `awaitRecordingComplete` (`:3193-3206`).
+    /// `awaitRecordingComplete` (`:3220-3233`).
     fn await_recording_complete(
         &mut self,
         recording_id: i64,
@@ -6458,7 +6458,7 @@ impl ConsensusModuleAgent {
         }
     }
 
-    /// `loadSnapshot` (`:2787-2836`).
+    /// `loadSnapshot` (`:2810-2859`).
     ///
     /// # Errors
     ///
@@ -6542,7 +6542,7 @@ impl ConsensusModuleAgent {
         }
     }
 
-    /// `recoverFromSnapshotAndLog` (`:3495-3533`) for a module with no
+    /// `recoverFromSnapshotAndLog` (`:3527-3565`) for a module with no
     /// extension and (in this slice) no services.
     ///
     /// # Errors
@@ -6596,7 +6596,7 @@ impl ConsensusModuleAgent {
         Ok(())
     }
 
-    /// `addRecoveryStateCounter` (`:2850-2875`): a counter the container finds
+    /// `addRecoveryStateCounter` (`:2873-2898`): a counter the container finds
     /// its snapshot ids through, alive only for the recovery.
     fn add_recovery_state_counter(&mut self) -> Option<Counter> {
         let snapshot = self.recovery_plan.snapshots.first();
@@ -6641,7 +6641,7 @@ impl ConsensusModuleAgent {
             .ok()
     }
 
-    /// `captureServiceClientIds` (`:2877-2883`).
+    /// `captureServiceClientIds` (`:2900-2906`).
     fn capture_service_client_ids(&mut self, acks: &[ServiceAck]) {
         for (index, ack) in acks.iter().enumerate() {
             if let Some(slot) = self.service_client_ids.get_mut(index) {
@@ -6661,10 +6661,10 @@ struct AgentLogReplayHandler<'a> {
     /// The agent's own `leadership_term_id`, written **inside the poll**.
     ///
     /// The reference applies a replayed `NewLeadershipTerm` where it meets it
-    /// (`ConsensusModuleAgent.java:1626`), and that matters beyond bookkeeping:
+    /// (`ConsensusModuleAgent.java:1642`), and that matters beyond bookkeeping:
     /// the records **after it in the same poll** are cluster actions whose
     /// `onReplayClusterAction` decides by comparing the record's term with this
-    /// one (`:1580`). Deferring the write to the end of the poll — which this
+    /// one (`:1596`). Deferring the write to the end of the poll — which this
     /// did — makes every action that shares a poll with its own term record be
     /// judged against the *previous* term and dropped, while the service
     /// container executes it anyway and acks: the orphaned acks of
@@ -6706,7 +6706,7 @@ impl LogReplayHandler for AgentLogReplayHandler<'_> {
     fn on_replay_timer_event(&mut self, correlation_id: i64) -> Result<(), ClusterError> {
         if !self.timer.cancel_timer_by_correlation_id(correlation_id) {
             // The timer was already replayed as expired; a later schedule for
-            // the same id is absorbed (`ConsensusModuleAgent.java:1539-1545`).
+            // the same id is absorbed (`ConsensusModuleAgent.java:1555-1561`).
             let count = self
                 .expired_timer_count
                 .get(&correlation_id)
@@ -6768,7 +6768,7 @@ impl LogReplayHandler for AgentLogReplayHandler<'_> {
                 self.state_change = Some(ModuleState::Snapshot);
                 self.snapshot_began = true;
                 if self.service_count == 0 {
-                    // `onReplayClusterAction` (`:1587`): with no services the
+                    // `onReplayClusterAction` (`:1603`): with no services the
                     // snapshot set is complete immediately.
                     self.deferred_snapshot = Some((log_position, timestamp));
                 }
@@ -6789,7 +6789,7 @@ impl LogReplayHandler for AgentLogReplayHandler<'_> {
     ) -> Result<(), ClusterError> {
         // Applied **here**, not after the poll: the reference's
         // `leadershipTermId(leadershipTermId)` is synchronous
-        // (`ConsensusModuleAgent.java:1626`) for exactly that reason.
+        // (`ConsensusModuleAgent.java:1642`) for exactly that reason.
         *self.agent_term = leadership_term_id;
         self.leadership_term_id = leadership_term_id;
         for tracker in self.trackers.iter_mut() {
@@ -6821,7 +6821,7 @@ impl LogReplayHandler for AgentLogReplayHandler<'_> {
 }
 
 impl ConsensusModuleAgent {
-    /// Start replaying our own log tail (`newLogReplay`, `:1840-1843`).
+    /// Start replaying our own log tail (`newLogReplay`, `:1856-1859`).
     ///
     /// # Errors
     ///
@@ -6876,7 +6876,7 @@ impl ConsensusModuleAgent {
         Ok(crate::handles::LogReplay::shared(done, position))
     }
 
-    /// The agent's `replayLogPoll` (`:1845-1867`): advance the replay, commit
+    /// The agent's `replayLogPoll` (`:1861-1883`): advance the replay, commit
     /// what it has reached, and finish it at the stop position.
     ///
     /// # Errors
@@ -7120,11 +7120,11 @@ impl ConsensusModuleAgent {
     }
 
     /// A `NewLeadershipTerm` replayed out of the log — the agent's half of
-    /// `onReplayNewLeadershipTermEvent` (`ConsensusModuleAgent.java:1593-1637`).
+    /// `onReplayNewLeadershipTermEvent` (`ConsensusModuleAgent.java:1609-1653`).
     ///
     /// The **agent** takes the term (`leadershipTermId(leadershipTermId)`,
-    /// `:1626`, which also carries it to the trackers); the **election** is
-    /// told (`:1628-1631`), because the recording log's coherence and the
+    /// `:1642`, which also carries it to the trackers); the **election** is
+    /// told (`:1644-1647`), because the recording log's coherence and the
     /// replayed term's applied position are its (`Election.java:590-608`).
     ///
     /// Three ways in, because the election is only reachable when it is not in

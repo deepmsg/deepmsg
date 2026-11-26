@@ -59,7 +59,7 @@ pub const STATUS_MESSAGE_TIMEOUT_NS: i64 = 200_000_000;
 pub const RECEIVE_DESTINATION_TIMEOUT_NS: i64 = 5 * 1000 * 1000 * 1000;
 
 /// What an image is built with when nothing configures one
-/// (`AERON_IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT`, `aeron_driver_context.c:204`).
+/// (`AERON_IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT`, `aeron_driver_context.c:206`).
 ///
 /// The value a driver actually uses is
 /// [`DriverConfig::image_liveness_timeout_ns`](crate::config::DriverConfig::image_liveness_timeout_ns);
@@ -75,12 +75,12 @@ pub const IMAGE_SM_EOS_MULTIPLE: i64 = 5;
 /// The value [`PublicationImage::response_session_id`] holds when this image
 /// owes nobody a response setup
 /// (`AERON_PUBLICATION_RESPONSE_NULL_RESPONSE_SESSION_ID`,
-/// `aeron-driver/src/main/c/aeron_publication_image.c:28`).
+/// `aeron-driver/src/main/c/aeron_publication_image.c:33`).
 ///
 /// It is deliberately **not** a valid session id and deliberately not zero: a
 /// session id is an `i32`, and the sentinel is far outside that range, which is
 /// the whole of how "is there one?" is answered
-/// (`aeron_publication_image_check_and_get_response_session_id`, `:59-66`
+/// (`aeron_publication_image_check_and_get_response_session_id`, `:64-71`
 /// casts to `i32` and asks whether the cast was lossless).
 /// Written through `u64` because the reference writes the same bit pattern as
 /// `INT64_C(0xF000000000000000)`, which C makes negative — the value here is
@@ -90,7 +90,7 @@ pub const RESPONSE_NULL_SESSION_ID: i64 = 0xF000_0000_0000_0000u64 as i64;
 /// How much of the term buffer one pass may zero behind the slowest reader.
 ///
 /// The reference zeroes the whole of what a status message leaves behind, in
-/// the same breath as that message (`aeron_publication_image.c:551`). With
+/// the same breath as that message (`aeron_publication_image.c:556`). With
 /// `aeron.rcv.initial.window.length` at 2 MiB the status message is owed every
 /// quarter window, so that is a 512 KiB `memset` — and it runs **on the
 /// conductor**, where nothing is waiting on it, while ours runs on the receiver
@@ -140,7 +140,7 @@ pub enum ImageState {
 
 /// What an image's counters are
 /// (`aeron_counter_receiver_hwm_allocate` / `_position_allocate`,
-/// `aeron-driver/src/main/c/aeron_position.c:155-202`).
+/// `aeron-driver/src/main/c/aeron_position.c:160-207`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageCounters {
     /// `rcv-hwm`: the highest position a packet has been seen for.
@@ -149,7 +149,7 @@ pub struct ImageCounters {
     pub rcv_pos: i32,
     /// `rcv-naks-sent`: the gap reports this image has asked for
     /// (`aeron_counter_receiver_naks_sent_allocate`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:6680-6683`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:6773-6776`).
     pub rcv_naks_sent: i32,
 }
 
@@ -246,13 +246,13 @@ pub struct PublicationImage {
     /// When a packet was last seen, which is what decides draining.
     pub time_of_last_packet_ns: i64,
     /// Who sends this stream, formatted the way a source identity is
-    /// (`aeron_publication_image.c:336-343`). It is what a loss report record
+    /// (`aeron_publication_image.c:341-348`). It is what a loss report record
     /// carries beside the channel, so a reader of `LossStat` can tell which
     /// sender's packets went missing.
     pub source_identity: Vec<u8>,
     /// Where this image's record is in the loss report file, or `None` when
     /// none has been made yet or the file refused one
-    /// (`aeron_publication_image.c:123-155`).
+    /// (`aeron_publication_image.c:128-160`).
     ///
     /// The file is a fixed length and never wraps: a record that would not fit
     /// leaves the image with [`PublicationImage::loss_report_given_up`] set
@@ -265,16 +265,16 @@ pub struct PublicationImage {
     loss_report_given_up: bool,
     /// The span of the last report made, which is what keeps a hole that is
     /// found again and again from being counted again and again
-    /// (`:452-479`).
+    /// (`:457-484`).
     loss_report_term_id: i32,
     loss_report_term_offset: i32,
     loss_report_length: usize,
     /// Whether a subscription has ever been linked to this image.
     ///
     /// The reference links a subscription to the image **before** the receiver
-    /// is given it — `aeron_driver_conductor.c:6763` links the subscribable,
-    /// `:6782` hands the image over — so an image it creates is never one with
-    /// no readers, and its `has_working_positions` test (`:1318`) never has to
+    /// is given it — `aeron_driver_conductor.c:6856` links the subscribable,
+    /// `:6875` hands the image over — so an image it creates is never one with
+    /// no readers, and its `has_working_positions` test (`:1342`) never has to
     /// tell "not linked yet" from "everyone left".
     ///
     /// Here the two are separate commands on the receiver's queue, and the time
@@ -297,7 +297,7 @@ pub struct PublicationImage {
     /// water mark, which may have moved on.
     pub eos_position: i64,
     /// Why this image was rejected, when it was — an image that cannot be
-    /// built still has to tell its sender so (`:974-996`).
+    /// built still has to tell its sender so (`:1015-1037`).
     ///
     /// Bytes and not a string: the reason is a client's, it crosses the wire in
     /// a `REJECT_IMAGE` and goes back out in an `ERR` frame, and nothing
@@ -321,14 +321,14 @@ pub struct PublicationImage {
     /// The change number the last status message was sent for.
     last_sm_change_number: i64,
     /// Bumped whenever the position or the window a status message would carry
-    /// moves: an image sends one because *something changed* (`:936`).
+    /// moves: an image sends one because *something changed* (`:977`).
     sm_change_number: i64,
     /// When the next status message is due.
     next_sm_deadline_ns: i64,
     /// How often a status message is forced (`status.message.timeout`).
     sm_timeout_ns: i64,
     /// The strategy this image runs, named by the endpoint channel's `cc=`
-    /// (`congestion_control`, `aeron_publication_image.c:290`).
+    /// (`congestion_control`, `aeron_publication_image.c:295`).
     ///
     /// It is where both windows come from, and — for `cubic` — the thing the
     /// rebuild and the round-trip measurements go through. The image keeps no
@@ -347,7 +347,7 @@ pub struct PublicationImage {
     /// inherits these rather than setting them).
     pub untethered_window_limit_timeout_ns: i64,
     /// Whether the readers still have to be told this image is gone
-    /// (`aeron_driver_conductor_image_transition_to_linger`, `:1642-1675`,
+    /// (`aeron_driver_conductor_image_transition_to_linger`, `:1683-1716`,
     /// which runs as the image leaves DRAINING for LINGER).
     ///
     /// A flag rather than a question about the state, because it is about a
@@ -360,7 +360,7 @@ pub struct PublicationImage {
     /// `reliable=false` is the one channel parameter that changes what an image
     /// *does* rather than what it advertises: a hole is filled with a padding
     /// frame instead of being asked for, and the data in it is simply not
-    /// recovered (`aeron_publication_image.c:1024-1066`). It is stored here
+    /// recovered (`aeron_publication_image.c:1029-1071`). It is stored here
     /// because the branch is taken on the receiver thread, long after the
     /// subscription parameters it came from are gone
     /// (`aeron_publication_image_conductor_fields_stct.is_reliable`, `.h:57`).
@@ -377,9 +377,9 @@ pub struct PublicationImage {
     /// [`RESPONSE_NULL_SESSION_ID`] when it owes one to nobody.
     ///
     /// Written by the conductor, once a response publication has named this
-    /// image and linked to it (`aeron_driver_conductor.c:4227-4232`), and
+    /// image and linked to it (`aeron_driver_conductor.c:4324-4329`), and
     /// cleared once the publication has heard from a live receiver of its own
-    /// (`aeron_driver_conductor_on_response_connected`, `:7117-7131`). Until
+    /// (`aeron_driver_conductor_on_response_connected`, `:7213-7227`). Until
     /// then the image says the session on every status-message period, because
     /// the publisher cannot ask again and has nothing else to learn it from.
     response_session_id: i64,
@@ -396,7 +396,7 @@ pub struct PublicationImage {
 }
 
 /// Where a stream starts, and the term geometry that says so, from the `SETUP`
-/// that described it (`aeron_publication_image.c:377-392`).
+/// that described it (`aeron_publication_image.c:382-397`).
 ///
 /// The stream begins at the sender's **active** term and offset, not at zero:
 /// an image is created for a stream that is already running, and a subscription
@@ -423,7 +423,7 @@ pub fn stream_start(setup: &crate::protocol::SetupFrame) -> (i64, u32) {
 impl PublicationImage {
     /// Create an image over a log buffer the conductor has already mapped
     /// (`aeron_publication_image_create`,
-    /// `aeron-driver/src/main/c/aeron_publication_image.c:140-330`).
+    /// `aeron-driver/src/main/c/aeron_publication_image.c:145-335`).
     ///
     /// `setup` is the frame that started it: the stream begins where the
     /// sender's *active* term and offset say, not at zero, because a
@@ -453,7 +453,7 @@ impl PublicationImage {
         let (initial_position, bits) = stream_start(setup);
 
         // The two windows are the strategy's and are not computed here at all:
-        // the reference reads them off it (`aeron_publication_image.c:377-380`)
+        // the reference reads them off it (`aeron_publication_image.c:382-385`)
         // and keeps no window of its own, which is what makes `cc=` mean
         // anything. `static` answers the channel's window cut to half a term —
         // `aeron_receiver_window_length`, which the strategy applies — and
@@ -462,7 +462,7 @@ impl PublicationImage {
         let max_window = congestion_control.max_window_length();
 
         // The tails, so a reader that maps this file sees the stream where it
-        // starts rather than at zero (`aeron_publication_image.c:250-300`).
+        // starts rather than at zero (`aeron_publication_image.c:255-305`).
         log.initialise_tails(
             setup.initial_term_id,
             Some((setup.active_term_id, setup.term_offset)),
@@ -482,9 +482,9 @@ impl PublicationImage {
                     publication_window_length: 0,
                     // **Uncut by the term**, which is what the reference writes
                     // here: it passes `params.initial_window_length` straight
-                    // through (`aeron_publication_image.c:250-262`), and that
+                    // through (`aeron_publication_image.c:255-267`), and that
                     // is the context default or the channel's own `rcv-wnd=`
-                    // (`aeron_driver_uri.c:466`, `:502`) with no cap on it. The
+                    // (`aeron_driver_uri.c:471`, `:507`) with no cap on it. The
                     // cap belongs to whoever uses the value as a window.
                     receiver_window_length: channel_window_length,
                     socket_sndbuf_length: 0,
@@ -505,7 +505,7 @@ impl PublicationImage {
                     // The two the channel and the `SETUP` decide, rather than
                     // the image: whether this stream is one of a group, and
                     // whether this subscription exists to carry the answers to
-                    // a request (`aeron_publication_image.c:277-278`, which
+                    // a request (`aeron_publication_image.c:282-283`, which
                     // reads `treat_as_multicast` and `params.is_response`).
                     //
                     // Both are read off the *channel*'s URI and the frame that
@@ -518,9 +518,9 @@ impl PublicationImage {
                     // The two the *subscription* decides, rather than the
                     // channel or the sender. `reliable` is not decoration: it
                     // is the image's own behaviour, whether it asks for its
-                    // holes or fills them (`aeron_publication_image.c:307`,
-                    // `:1024`), and the metadata carries a copy of it for
-                    // whoever reads the image later (`:280`).
+                    // holes or fills them (`aeron_publication_image.c:312`,
+                    // `:1029`), and the metadata carries a copy of it for
+                    // whoever reads the image later (`:285`).
                     //
                     // Both are read off the channel's parameters because an
                     // image is created by a `SETUP` and has no subscription of
@@ -565,7 +565,7 @@ impl PublicationImage {
                 // keeps no copy of its own — the reference hands it straight to
                 // the first connection it tracks
                 // (`new_connection->destination = destination`,
-                // `aeron_publication_image.c:1131`).
+                // `aeron_publication_image.c:1136`).
                 destination,
                 control_address: Some(control_address),
                 time_of_last_activity_ns: now_ns,
@@ -576,7 +576,7 @@ impl PublicationImage {
             time_of_last_packet_ns: now_ns,
             // The source identity is the reference's own formatting of the
             // address the first packet came from — the same string
-            // `ON_AVAILABLE_IMAGE` carries (`aeron_publication_image.c:336-343`).
+            // `ON_AVAILABLE_IMAGE` carries (`aeron_publication_image.c:341-348`).
             source_identity: crate::udp_channel::format_source_identity(source)
                 .unwrap_or_default()
                 .into_bytes(),
@@ -610,18 +610,18 @@ impl PublicationImage {
             liveness_timeout_ns,
             // The channel's own delays, when it named one. `nak-delay=` is the
             // whole of what a subscription may say about how its gaps are asked
-            // for (`aeron_publication_image.c:100-118`), and until this line
+            // for (`aeron_publication_image.c:105-123`), and until this line
             // the parameter was parsed by nobody and changed nothing.
             //
             // `reliable=false` outranks it: the reference checks that first and
             // returns a static generator at zero, so an unreliable channel's
             // gap is fillable the moment it is seen and `nak-delay=` on the
-            // same channel is never read (`:92-95`, which returns before the
+            // same channel is never read (`:97-100`, which returns before the
             // two branches below it).
             //
             // And group semantics outrank it too, which is the same reading in
             // the other direction: a group gets the randomised generator
-            // instead of a fixed pair (`:97-100`), so `nak-delay=` on a
+            // instead of a fixed pair (`:102-105`), so `nak-delay=` on a
             // group's channel is a parameter the reference reads and then
             // ignores.
             loss_detector: LossDetector::for_channel(
@@ -650,7 +650,7 @@ impl PublicationImage {
     ///
     /// The two together — the session and the request that the timer be brought
     /// forward — are one act in the reference's caller
-    /// (`aeron_driver_conductor.c:4227-4232`), and they are one act here too:
+    /// (`aeron_driver_conductor.c:4324-4329`), and they are one act here too:
     /// an image told a session it will not say for another period has been told
     /// nothing the publisher can use.
     pub fn set_response_session_id(&mut self, response_session_id: i64) {
@@ -659,7 +659,7 @@ impl PublicationImage {
     }
 
     /// Stop owing a response setup
-    /// (`aeron_publication_image_remove_response_session_id`, `:1389-1392`).
+    /// (`aeron_publication_image_remove_response_session_id`, `:1415-1418`).
     pub fn remove_response_session_id(&mut self) {
         self.set_response_session_id(RESPONSE_NULL_SESSION_ID);
     }
@@ -1094,7 +1094,7 @@ impl PublicationImage {
     ///
     /// When a client adds a destination to a subscription, every image already
     /// running on that subscription's endpoint gets a connection for it
-    /// (`aeron_driver_receiver.c:489-495`) — so that the status messages and
+    /// (`aeron_driver_receiver.c:499-505`) — so that the status messages and
     /// NAKs about this stream go to the new source as well as to the ones that
     /// were already there.
     ///
@@ -1102,7 +1102,7 @@ impl PublicationImage {
     /// twice, and the identity is the **handle**: one destination is one
     /// socket. The reference reaches the same place from the other side, by
     /// looking the connection up before it calls this
-    /// (`aeron_publication_image_track_connection`, `:564-571`), and a handle
+    /// (`aeron_publication_image_track_connection`, `:574-581`), and a handle
     /// is never handed out twice, so a second one here is a caller asking again
     /// rather than a second place answers go.
     ///
@@ -1154,13 +1154,13 @@ impl PublicationImage {
     /// image's side: the second publication's `SETUP` arrives on the second
     /// destination, and without a connection for it the image has no socket to
     /// send the status message the second sender is waiting for — so it never
-    /// connects and its offers stay refused (`aeron_data_packet_dispatcher.c:499-502`,
+    /// connects and its offers stay refused (`aeron_data_packet_dispatcher.c:504-507`,
     /// `shouldMergeStreamsFromMultiplePublicationsWithSameParams`).
     ///
     /// It is the same connection a data packet would find or make. Only the
     /// address it starts with is different, and the reference's is the same
     /// one: a destination whose channel named a `control=` is answered there
-    /// (`:1131-1132`) rather than at whoever happened to write, and the caller
+    /// (`:1136-1137`) rather than at whoever happened to write, and the caller
     /// resolves it because the handle knows only which socket it is.
     pub fn add_connection_if_unknown(
         &mut self,
@@ -1174,9 +1174,9 @@ impl PublicationImage {
 
     /// The connection a packet arrived on, adding one if this is the first the
     /// image has heard from that destination
-    /// (`aeron_publication_image_track_connection`, `:557-592`).
+    /// (`aeron_publication_image_track_connection`, `:562-597`).
     ///
-    /// The lookup is by **destination** (`:564-571`:
+    /// The lookup is by **destination** (`:569-576`:
     /// `array[i].destination == destination`), not by the address a packet came
     /// from: one destination is one socket and one connection. A second source
     /// writing to a destination the image already answers refreshes the
@@ -1185,8 +1185,8 @@ impl PublicationImage {
     ///
     /// A connection the image is meeting for the first time starts with the
     /// address the caller resolved for that destination — [`Self::add_destination`]'s
-    /// rule, `:1131-1132` — and one that has none yet takes the source this
-    /// packet came from (`:585-589`), which is how an implicit-unicast image
+    /// rule, `:1136-1137` — and one that has none yet takes the source this
+    /// packet came from (`:590-594`), which is how an implicit-unicast image
     /// learns where to answer.
     ///
     /// The `destination` is the socket the packet came in on: for a connection
@@ -1233,7 +1233,7 @@ impl PublicationImage {
     }
 
     /// Advance what a reader may read, and decide whether a status message is
-    /// due (`aeron_publication_image_track_rebuild`, `:481-556`).
+    /// due (`aeron_publication_image_track_rebuild`, `:486-561`).
     ///
     /// The rule for the position is the whole of the rebuild: a reader may be
     /// moved to the *start of the first gap* and no further, so a subscriber
@@ -1263,7 +1263,7 @@ impl PublicationImage {
 
         // Where the reader may go, and which hole is in the way
         // (`aeron_publication_image_track_rebuild`'s call to
-        // `aeron_loss_detector_scan`, `:519-528`).
+        // `aeron_loss_detector_scan`, `:524-533`).
         let index = Position::from_raw(rebuild_position).index(self.position_bits_to_shift);
         let scan = match self.log.term(index) {
             Some(term) => self.loss_detector.scan(
@@ -1290,7 +1290,7 @@ impl PublicationImage {
         system_counters::propose_max(counters, regions, self.counters.rcv_pos, rebuilt);
 
         // The strategy is asked what window this rebuild leaves, and whether
-        // the reader has to be told now (`:534-541`). What it is given is the
+        // the reader has to be told now (`:539-546`). What it is given is the
         // whole of what the reference gives it, `loss_found` included — CUBIC
         // shrinks on a loss and cannot see one from anywhere else.
         let rebuild = self.congestion_control.on_track_rebuild(
@@ -1309,7 +1309,7 @@ impl PublicationImage {
         let threshold = window_length / 4;
 
         // Three reasons to send one, and the first two are the reference's
-        // (`:543-553`): the strategy said so, the reader has moved a quarter of
+        // (`:548-558`): the strategy said so, the reader has moved a quarter of
         // a window, or the window itself changed — which is how a CUBIC image
         // tells its sender that a loss just cost it half of it.
         if rebuild.should_force_sm
@@ -1318,7 +1318,7 @@ impl PublicationImage {
         {
             // A term behind the slowest reader is a term that reader is done
             // with. The reference cleans it here, in the same breath as the
-            // status message that reports it (`:551`); this notes what is owed
+            // status message that reports it (`:556`); this notes what is owed
             // and lets [`Self::clean_buffer_ahead`] pay it off a chunk at a
             // time from the pass that is already running — see
             // [`CLEAN_BYTES_PER_PASS`] for why, and what it costs.
@@ -1348,7 +1348,7 @@ impl PublicationImage {
     }
 
     /// Zero the terms the readers have finished with, a chunk at a time
-    /// (`aeron_publication_image_clean_buffer_to`, `:430-451`).
+    /// (`aeron_publication_image_clean_buffer_to`, `:435-456`).
     ///
     /// Without this a reused term still holds the frames it held a full buffer
     /// ago, and `insert_packet`'s "write only into an empty slot" rule — the
@@ -1446,11 +1446,11 @@ impl PublicationImage {
         // frame per connection rather than a status message — and it is sent
         // **again on every period that times out**, because a datagram that
         // goes missing must not leave a publisher waiting for a reason nobody
-        // will send twice (`aeron_publication_image.c:877-896`).
+        // will send twice (`aeron_publication_image.c:882-901`).
         //
         // The reference's guard is `is_sm_enabled && next_sm_deadline_ns <
         // now`, where the flag is cleared once the image leaves its active
-        // state (`:1394-1400`). This build does not model that flag — the
+        // state (`:1420-1426`). This build does not model that flag — the
         // status-message path below has always run on the deadline alone — and
         // it does not have to here: an image that was just rejected is active
         // in both, which is the only state this branch is reached in.
@@ -1498,7 +1498,7 @@ impl PublicationImage {
         }
 
         // The response setup goes first, and on the same timer as the status
-        // message (`:899-923`): it is the answer to a `SETUP` that asked for a
+        // message (`:904-928`): it is the answer to a `SETUP` that asked for a
         // response channel, and the publisher is waiting on it before it can
         // complete the handshake, so it is not something to be deferred until
         // the ordinary message is due.
@@ -1538,7 +1538,7 @@ impl PublicationImage {
         };
 
         // One status message per connection that is still there
-        // (`aeron_publication_image_send_pending_status_message`, `:901-925`):
+        // (`aeron_publication_image_send_pending_status_message`, `:906-930`):
         // each receiver is told the position and window it needs to hear, and
         // a connection with nowhere to answer is skipped rather than guessed
         // at.
@@ -1573,7 +1573,7 @@ impl PublicationImage {
         self.next_sm_deadline_ns = now_ns + self.sm_timeout_ns;
 
         // A status message is also the moment the metadata is told how many
-        // senders are still there (`aeron_publication_image.c:987`), which is
+        // senders are still there (`aeron_publication_image.c:992`), which is
         // a *release* store in the reference because a client reads it from
         // another process (`AERON_SET_RELEASE`).
         self.publish_active_transport_count(now_ns);
@@ -1592,14 +1592,14 @@ impl PublicationImage {
     }
 
     /// Ask every live connection to measure a round trip
-    /// (`aeron_publication_image_initiate_rttm`, `:1075-1110`).
+    /// (`aeron_publication_image_initiate_rttm`, `:1080-1115`).
     ///
     /// Three conditions, all the reference's. The strategy has to want a
     /// measurement at all — `should_measure_rtt`, which is false for the static
     /// window and false for CUBIC until a setting turns it on. The connection
     /// has to be **alive**: a destination that has an address to answer at, and
     /// has been heard from within `AERON_RECEIVE_DESTINATION_TIMEOUT_NS`
-    /// (`:632-637`). And the request goes out **through the destination it
+    /// (`:637-642`). And the request goes out **through the destination it
     /// measures**, with the `REPLY` flag, so the answer comes back the way the
     /// data does.
     ///
@@ -1651,7 +1651,7 @@ impl PublicationImage {
         work
     }
 
-    /// A measurement came back (`aeron_publication_image_on_rttm`, `:849-857`):
+    /// A measurement came back (`aeron_publication_image_on_rttm`, `:854-862`):
     /// the round trip is what has passed since the timestamp the **far end**
     /// echoed, less the delta it reported for its own handling.
     ///
@@ -1673,7 +1673,7 @@ impl PublicationImage {
     }
 
     /// Whether a connection is one an RTTM may be sent through
-    /// (`aeron_publication_image_connection_is_alive`, `:632-637`).
+    /// (`aeron_publication_image_connection_is_alive`, `:637-642`).
     fn connection_is_alive(connection: &Connection, now_ns: i64) -> bool {
         connection.control_address.is_some()
             && now_ns
@@ -1684,12 +1684,12 @@ impl PublicationImage {
 
     /// How many senders have been heard from recently
     /// (`aeron_update_active_transport_count`,
-    /// `aeron_publication_image.c:40-57`).
+    /// `aeron_publication_image.c:45-62`).
     ///
     /// It counts **connections**, and a connection is a destination — not an
     /// interface, and not a source address. That matters most for a group: a
     /// multicast channel builds exactly one destination
-    /// (`aeron_driver_conductor.c:2099-2132`), so a multicast image's count is
+    /// (`aeron_driver_conductor.c:2150-2183`), so a multicast image's count is
     /// **zero or one** however many members are reading it, and it is one only
     /// while frames are still arriving. What the number is for is the client's
     /// answer to "is anybody publishing to me", which is why the test is the
@@ -1710,7 +1710,7 @@ impl PublicationImage {
     }
 
     /// The untethered subscriptions' state machine
-    /// (`aeron_publication_image_check_untethered_subscriptions`, `:1165-1283`).
+    /// (`aeron_publication_image_check_untethered_subscriptions`, `:1170-1288`).
     ///
     /// A **tethered** reader — which is the default — is never put aside: the
     /// loop below only advances its timestamp. An untethered one is the
@@ -1748,7 +1748,7 @@ impl PublicationImage {
         // the path `docs/adr/0003` keeps allocation-free. `TetherablePosition`
         // is `Copy`, so taking one out by value ends the same borrow and
         // allocates nothing, which is also how the reference walks the array
-        // (`aeron-driver/src/main/c/aeron_publication_image.c:494`).
+        // (`aeron-driver/src/main/c/aeron_publication_image.c:499`).
         //
         // The length is read once, as the reference reads it once: the loop
         // leaves every entry in place — a closed reader keeps its position with
@@ -1812,7 +1812,7 @@ impl PublicationImage {
 
                             // The position stays where it is with an id that
                             // is no longer a counter: the reference's
-                            // `AERON_NULL_COUNTER_ID` (`:1225-1240`). Removing
+                            // `AERON_NULL_COUNTER_ID` (`:1230-1245`). Removing
                             // it here would be a second way for a reader to
                             // leave this set, and the two would have to agree
                             // about the hooks, the count and the order.
@@ -1853,7 +1853,7 @@ impl PublicationImage {
         events
     }
 
-    /// A time event for this image (`on_time_event`, `:1294-1355`).
+    /// A time event for this image (`on_time_event`, `:1318-1379`).
     ///
     /// The three states are the whole of an image's life after it has been
     /// built, and the two transitions that matter are both "the sender stopped
@@ -1870,7 +1870,7 @@ impl PublicationImage {
     ) -> bool {
         match self.state {
             ImageState::Active => {
-                // `:1307-1311`: a revoked publication takes the image out of
+                // `:1331-1335`: a revoked publication takes the image out of
                 // ACTIVE at once. It is the one case that does not wait for the
                 // stream to go quiet — the sender has said the stream is over
                 // and a reader that keeps waiting is reading nothing.
@@ -1930,13 +1930,13 @@ impl PublicationImage {
     }
 
     /// Whether this image has just left DRAINING for LINGER, once
-    /// (`aeron_driver_conductor_image_transition_to_linger`, `:1642-1675`).
+    /// (`aeron_driver_conductor_image_transition_to_linger`, `:1683-1716`).
     pub fn take_linger_notice(&mut self) -> bool {
         std::mem::take(&mut self.linger_notice)
     }
 
     /// Reject the image, with the reason (`aeron_publication_image_invalidate`,
-    /// `:1383-1389`): a sender whose image could not be built is told with an
+    /// `:1409-1415`): a sender whose image could not be built is told with an
     /// `ERR` frame rather than left sending into silence.
     ///
     /// All this does is keep the words. The frames go out from
@@ -1997,7 +1997,7 @@ impl crate::subscribable::SubscribableHooks for NoHooks {
     fn position_removed(&mut self, _position: &TetherablePosition, _working_before: usize) {}
 }
 
-/// `aeron_publication_image_validate_packet` (`:645-738`), minus the
+/// `aeron_publication_image_validate_packet` (`:650-743`), minus the
 /// timestamping an ATS channel would add.
 ///
 /// Returns how far into the term the packet's frames reach: zero for a
@@ -2200,14 +2200,14 @@ mod tests {
         }
 
         /// The same, with the two bytes the channel and the `SETUP` decide set
-        /// rather than absent (`aeron_publication_image.c:277-278`).
+        /// rather than absent (`aeron_publication_image.c:282-283`).
         fn with(group_semantics: bool, is_response: bool) -> Self {
             Self::with_nak_delay(group_semantics, is_response, None)
         }
 
         /// The same, with the channel naming a `nak-delay` — the one parameter
         /// a subscription can say about its own gap timer
-        /// (`aeron_publication_image.c:100-118`).
+        /// (`aeron_publication_image.c:105-123`).
         fn with_nak_delay(
             group_semantics: bool,
             is_response: bool,
@@ -2217,14 +2217,14 @@ mod tests {
         }
 
         /// The same, for a channel that said `reliable=false`
-        /// (`aeron_publication_image.c:92-95`, `:1024`).
+        /// (`aeron_publication_image.c:97-100`, `:1029`).
         fn unreliable() -> Self {
             Self::build(false, false, None, false, true)
         }
 
         /// The same, for a channel that said `sparse=false` — the other
         /// parameter whose byte an image copies out of a subscription
-        /// (`aeron_publication_image.c:281`).
+        /// (`aeron_publication_image.c:286`).
         fn dense() -> Self {
             Self::build(false, false, None, true, false)
         }
@@ -2400,7 +2400,7 @@ mod tests {
 
         // Zero and zero: the hole is fillable the moment it is seen, and the
         // reference returns this generator before it reads `nak-delay=`
-        // (`aeron_publication_image.c:92-95`).
+        // (`aeron_publication_image.c:97-100`).
         assert_eq!((0, 0), fixture.image.loss_detector.delays());
 
         // And the fill is the image's own: the hole it was handed becomes a
@@ -2425,7 +2425,7 @@ mod tests {
 
     /// The same parameters, in the file: the two bytes a client that maps the
     /// image reads to decide how the stream it is looking at behaves and how
-    /// its buffer was written (`aeron_publication_image.c:280-281`).
+    /// its buffer was written (`aeron_publication_image.c:285-286`).
     ///
     /// The pair is the judgement again — one image of each kind — so a
     /// hardcoded answer satisfies neither half. It was hardcoded before: an
@@ -2471,7 +2471,7 @@ mod tests {
     /// The two metadata bytes that belong to the channel and the `SETUP`
     /// rather than to the image: whether this stream is one of a group, and
     /// whether this subscription exists to carry the answers to a request
-    /// (`aeron_publication_image.c:277-278`, which writes `treat_as_multicast`
+    /// (`aeron_publication_image.c:282-283`, which writes `treat_as_multicast`
     /// and `params.is_response`).
     ///
     /// Read back off the file rather than off the image, because the file is
@@ -2524,7 +2524,7 @@ mod tests {
     /// `validate_packet` requires: the frames in a datagram are aligned, so a
     /// packet's length is always a multiple of the frame alignment.
     /// A destination a client adds joins every image already running on that
-    /// endpoint (`aeron_driver_receiver.c:489-495`), so a stream that is already
+    /// endpoint (`aeron_driver_receiver.c:499-505`), so a stream that is already
     /// up sends its status messages and NAKs to the new source as well.
     ///
     /// A destination is the identity, not the address: the same handle is not
@@ -2573,11 +2573,11 @@ mod tests {
     /// The `SETUP` case: a session the image already serves, arriving on a
     /// destination it has no connection for — which is what two publications of
     /// one session look like from here
-    /// (`aeron_publication_image_add_connection_if_unknown`, `:639-644`).
+    /// (`aeron_publication_image_add_connection_if_unknown`, `:644-649`).
     ///
     /// The connection it takes starts at the address the caller resolved for
     /// that destination, not at the one the `SETUP` came from: a channel that
-    /// named a `control=` is answered there (`:1131-1132`), and being answered
+    /// named a `control=` is answered there (`:1136-1137`), and being answered
     /// is the whole of what the second sender is waiting for — an image that
     /// keeps one socket leaves it offering into a stream nobody hears about.
     #[test]
@@ -2665,7 +2665,7 @@ mod tests {
     /// by the **aligned** length, because the validator advances its read
     /// offset by `AERON_ALIGN(frame_length)` — the frames inside a term are
     /// aligned, so a datagram carries the padding between them
-    /// (`aeron_publication_image.c:695`, `:728`).
+    /// (`aeron_publication_image.c:700`, `:733`).
     fn push_frame(bytes: &mut Vec<u8>, frame_type: i16, frame_length: i32, term_offset: i32) {
         let start = bytes.len();
         bytes.resize(start + 32, 0);
@@ -2685,7 +2685,7 @@ mod tests {
 
     /// The last datagram of a term is a DATA frame and the PAD that fills the
     /// term out, in one packet — and the PAD is not a reason to refuse it
-    /// (`aeron_publication_image.c:685-688`).
+    /// (`aeron_publication_image.c:690-693`).
     #[test]
     fn a_data_frame_followed_by_a_pad_is_valid() {
         let mut bytes = Vec::new();
@@ -2701,7 +2701,7 @@ mod tests {
 
         // A sender may leave the PAD's fill off the end of the datagram: the
         // frames before it are complete, and the reference accepts a trailing
-        // PAD whether or not its fill arrived (`:732-737`).
+        // PAD whether or not its fill arrived (`:737-742`).
         assert_eq!(validate_packet(65536, 64416, &bytes[..1088]), Some(1120));
     }
 
@@ -2716,7 +2716,7 @@ mod tests {
     }
 
     /// A term offset that is not on a frame boundary is refused before any
-    /// frame is read (`aeron_publication_image.c:655`).
+    /// frame is read (`aeron_publication_image.c:660`).
     #[test]
     fn an_unaligned_term_offset_is_refused() {
         let mut bytes = Vec::new();
@@ -2808,7 +2808,7 @@ mod tests {
         // A second source writing to the **same destination** is not a second
         // connection: the image answers that socket either way, and it is the
         // destination the connection is keyed by, as the reference keys it
-        // (`aeron_publication_image.c:564-571`).
+        // (`aeron_publication_image.c:569-576`).
         let offset = bytes.len() as i32;
         let another = packet(INITIAL_TERM_ID, offset, b"another frame");
         fixture.image.insert_packet(
@@ -2832,7 +2832,7 @@ mod tests {
 
         // A second **destination** is a second connection, which is the case
         // the reference's own test asserts the number on
-        // (`aeron_publication_image_test.cpp:485`, `:497`, `:503` — its two
+        // (`aeron_publication_image_test.cpp:485`, `:502`, `:508` — its two
         // packets go to `dest_1` and `dest_2`, not to two addresses).
         let third_offset = offset + another.len() as i32;
         fixture.image.insert_packet(
@@ -3200,7 +3200,7 @@ mod tests {
         );
         // The position stays where it is, with an id that is no longer a
         // counter — the reference's `counter_id = AERON_NULL_COUNTER_ID`
-        // (`:1225-1240`). Not leaving the set is the point: the teardown that
+        // (`:1230-1245`). Not leaving the set is the point: the teardown that
         // gives every reader's counter back walks the whole set, so an id left
         // sitting there would be given back twice.
         let closed = fixture
@@ -3229,7 +3229,7 @@ mod tests {
     /// The image created in that window has no subscribers because nobody has
     /// been given the chance to add one — not because everyone left — and a
     /// drain here answers a sender that has done nothing wrong with an
-    /// end-of-stream (`aeron_driver_conductor.c:6763` links before `:6782`
+    /// end-of-stream (`aeron_driver_conductor.c:6856` links before `:6875`
     /// hands over, which is the ordering this stands in for).
     #[test]
     fn an_image_nobody_has_linked_yet_is_not_drained() {
@@ -3262,8 +3262,8 @@ mod tests {
     }
 
     /// A revoked image does not wait for anything: `ACTIVE → DRAINING` the
-    /// moment the flag is seen (`:1307-1311`), `DRAINING → LINGER` on the same
-    /// flag (`:1330-1349`), and out of `LINGER` without waiting out a liveness
+    /// moment the flag is seen (`:1331-1335`), `DRAINING → LINGER` on the same
+    /// flag (`:1371-1390`), and out of `LINGER` without waiting out a liveness
     /// window that exists for a sender that might come back — a revoked one
     /// will not.
     #[test]
@@ -3293,7 +3293,7 @@ mod tests {
     /// A frame header's worth added to it would be a high-water mark for eight
     /// bytes no sender is going to send, which the loss detector reads as a gap
     /// — so an idle stream NAKs forever for a packet that does not exist
-    /// (`aeron_publication_image.c:772`, `:821`).
+    /// (`aeron_publication_image.c:777`, `:826`).
     #[test]
     fn a_heartbeat_proposes_its_own_position() {
         let mut fixture = Fixture::new();
@@ -3355,8 +3355,8 @@ mod tests {
     /// advertises (`aeron_receiver_window_length`,
     /// `aeron_congestion_control.c:155-157`) while the block
     /// `aeron_logbuffer_metadata_init` is handed is `params.initial_window_length`
-    /// straight (`aeron_publication_image.c:250-262`), which is the channel's
-    /// own or the driver's default (`aeron_driver_uri.c:466`, `:502`).
+    /// straight (`aeron_publication_image.c:255-267`), which is the channel's
+    /// own or the driver's default (`aeron_driver_uri.c:471`, `:507`).
     ///
     /// A build that wrote the cut value into the block would be handing a
     /// reader of an image's metadata a window the image never advertised.
@@ -3380,7 +3380,7 @@ mod tests {
     }
 
     /// A CUBIC image is a CUBIC window. The image advertises what its strategy
-    /// says (`aeron_publication_image.c:377-380` — it keeps no window of its
+    /// says (`aeron_publication_image.c:382-385` — it keeps no window of its
     /// own), and with CUBIC that is the congestion window it starts at, not the
     /// channel's `rcv-wnd=` that the static strategy would have offered.
     ///
@@ -3410,7 +3410,7 @@ mod tests {
 
     /// A measurement that comes back is a round trip: what has passed since the
     /// timestamp the far end echoed, less the delta it reported for its own
-    /// handling (`aeron_publication_image.c:849-857`) — and the image hands both
+    /// handling (`aeron_publication_image.c:854-862`) — and the image hands both
     /// numbers to its strategy, which is where CUBIC keeps the estimate.
     #[test]
     fn an_rttm_that_comes_back_is_the_round_trip_it_measures() {

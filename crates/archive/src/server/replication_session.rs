@@ -28,7 +28,7 @@
 //!   [`crate::server::conductor::ReplicationSettings::client_context`] for the
 //!   measurement and the reasoning.
 //! * **There is more than one at a time.** `replicationSessionByIdMap`
-//!   (`ArchiveConductor.java:148`) is keyed by the replication's id and holds
+//!   (`ArchiveConductor.java:147`) is keyed by the replication's id and holds
 //!   every session in flight, so a consumer of a descriptor cannot be a `fn`
 //!   pointer reaching for a `static` — see the client's descriptor poller,
 //!   which hands the descriptor to a `&mut dyn FnMut` for exactly this caller.
@@ -49,7 +49,7 @@
 //! live-merge pair. They are named and documented rather than stubbed, and that
 //! is deliberate: a state method with a plausible-looking body is worse than
 //! one that does nothing, because the next reader cannot tell the two apart.
-//! What leads to them is a `live_destination` (`:380-399`), which no criterion
+//! What leads to them is a `live_destination` (`:379-398`), which no criterion
 //! this build is held to names — and the branch a **tagged** request reaches
 //! instead is a different one, which [`State`] has the note on.
 
@@ -79,33 +79,33 @@ use crate::server::conductor::{
 use crate::server::control_adapter::{ExtendRecordingRequest, ReplicationRequest};
 use deepmsg_core::uri::ChannelUri;
 
-/// `CommonContext.REJOIN_PARAM_NAME` (`CommonContext.java:229`).
+/// `CommonContext.REJOIN_PARAM_NAME` (`CommonContext.java:231`).
 const REJOIN_KEY: &str = "rejoin";
-/// `CommonContext.SESSION_ID_PARAM_NAME` (`CommonContext.java:135`).
+/// `CommonContext.SESSION_ID_PARAM_NAME` (`CommonContext.java:137`).
 const SESSION_ID_KEY: &str = "session-id";
 /// `CommonContext.MDC_CONTROL_MODE_PARAM_NAME`'s key.
 const CONTROL_MODE_KEY: &str = "control-mode";
 /// `ChannelUri.hasControlModeResponse`'s value (`ChannelUri.java:653-656`).
 const CONTROL_MODE_RESPONSE: &str = "response";
-/// `CommonContext.ENDPOINT_PARAM_NAME` (`CommonContext.java:239`).
+/// `CommonContext.ENDPOINT_PARAM_NAME` (`CommonContext.java:241`).
 const ENDPOINT_KEY: &str = "endpoint";
-/// `CommonContext.LINGER_PARAM_NAME` (`CommonContext.java:243`).
+/// `CommonContext.LINGER_PARAM_NAME` (`CommonContext.java:245`).
 const LINGER_KEY: &str = "linger";
-/// `CommonContext.EOS_PARAM_NAME` (`CommonContext.java:231`).
+/// `CommonContext.EOS_PARAM_NAME` (`CommonContext.java:233`).
 const EOS_KEY: &str = "eos";
-/// `CommonContext.TAGS_PARAM_NAME` (`CommonContext.java:334`).
+/// `CommonContext.TAGS_PARAM_NAME` (`CommonContext.java:336`).
 const TAGS_KEY: &str = "tags";
-/// `CommonContext.MDC_CONTROL_MODE_MANUAL` (`CommonContext.java:303`).
+/// `CommonContext.MDC_CONTROL_MODE_MANUAL` (`CommonContext.java:305`).
 const CONTROL_MODE_MANUAL: &str = "manual";
 /// `CommonContext.RESPONSE_CORRELATION_ID_PARAM_NAME`.
 const RESPONSE_CORRELATION_ID_KEY: &str = "response-correlation-id";
-/// `CommonContext.TERM_LENGTH_PARAM_NAME` (`CommonContext.java:263`).
+/// `CommonContext.TERM_LENGTH_PARAM_NAME` (`CommonContext.java:265`).
 const TERM_LENGTH_KEY: &str = "term-length";
-/// `CommonContext.TERM_ID_PARAM_NAME` (`CommonContext.java:267`).
+/// `CommonContext.TERM_ID_PARAM_NAME` (`CommonContext.java:269`).
 const TERM_ID_KEY: &str = "term-id";
-/// `CommonContext.INITIAL_TERM_ID_PARAM_NAME` (`CommonContext.java:271`).
+/// `CommonContext.INITIAL_TERM_ID_PARAM_NAME` (`CommonContext.java:273`).
 const INITIAL_TERM_ID_KEY: &str = "initial-term-id";
-/// `CommonContext.TERM_OFFSET_PARAM_NAME` (`CommonContext.java:275`).
+/// `CommonContext.TERM_OFFSET_PARAM_NAME` (`CommonContext.java:277`).
 const TERM_OFFSET_KEY: &str = "term-offset";
 /// `AeronArchive.NULL_LENGTH` (`AeronArchive.java:106`), which is `NULL_VALUE`:
 /// a replay with no length follows the source (`:115-117`).
@@ -121,7 +121,7 @@ const RETRY_ATTEMPTS: i32 = 3;
 
 /// What a session offers the **source** when it connects.
 ///
-/// Two cases, and the reference has both (`ArchiveConductor.java:1443-1446`):
+/// Two cases, and the reference has both (`ArchiveConductor.java:1450-1453`):
 /// a request that carried credentials gets
 /// [`ReplicationCredentials`] — offered as they are, and **no challenge
 /// answered** — and a request that carried none leaves the context's own
@@ -322,10 +322,10 @@ pub struct ReplicationSession {
     ///
     /// The reference holds the id twice — here, and as
     /// `replicationSessionByIdMap`'s key — and reads the field in one place
-    /// only: the source archive's client name (`ArchiveConductor.java:1456`).
-    /// A stop takes the session out of the **map** (`:1482`), not out of the
+    /// only: the source archive's client name (`ArchiveConductor.java:1463`).
+    /// A stop takes the session out of the **map** (`:1489`), not out of the
     /// worker's array, so the two are not the same fact: after a stop the
-    /// session is still driven, and it is its own `close()` (`:196-213`) that
+    /// session is still driven, and it is its own `close()` (`:195-212`) that
     /// ends it and sends `REPLICATE_END`. `None` here is the map having let go
     /// — see [`ReplicationSession::unregister`].
     replication_id: Option<i64>,
@@ -333,11 +333,11 @@ pub struct ReplicationSession {
     request: ReplicationRequest,
     /// The channel the copy really runs over: the request's own, or the
     /// archive's configured one when the request named none
-    /// (`ArchiveConductor.java:1394-1395`).
+    /// (`ArchiveConductor.java:1401-1402`).
     #[allow(dead_code)] // read when EXTEND builds the destination's channel
     replication_channel: String,
     /// The context the **source** archive is reached with
-    /// (`ArchiveConductor.java:1430-1437`): the archive's own client context,
+    /// (`ArchiveConductor.java:1437-1444`): the archive's own client context,
     /// with the request's control channel and stream written over it.
     context: ArchiveContext,
     /// The session id the connect needs, asked for and not yet answered.
@@ -389,7 +389,7 @@ pub struct ReplicationSession {
     /// under, which is what `AWAIT_IMAGE` looks for at the destination.
     src_replay_session_id: i64,
     /// What this session offers the **source** when it connects, which is what
-    /// the replication request carried (`ArchiveConductor.java:1443-1446`).
+    /// the replication request carried (`ArchiveConductor.java:1450-1453`).
     ///
     /// **The reference keeps this on the context** the session connects with
     /// (`remoteArchiveContext.credentialsSupplier(new ReplicationCredentialsSupplier(...))`)
@@ -401,7 +401,7 @@ pub struct ReplicationSession {
     /// **Measured**: without it every replication against the C suite's archives
     /// died at `CONNECT` with `authentication rejected` — the suite configures
     /// the sample authenticator (`TestArchive.h:50`) and sends `admin:admin`
-    /// with every replication request (`aeron_archive_test.cpp:78`).
+    /// with every replication request (`aeron_archive_test.cpp:82`).
     credentials: SessionCredentials,
     /// The clock this turn is running on, which [`Self::go_to`] reads — the
     /// reference's `epochClock`, which its own `state` asks for the time
@@ -552,15 +552,15 @@ fn extend_channel_uri(
         // destination and no tags — the only way to reach this branch without
         // a tag — asks for a subscription on `tags=-1,-1`. That is
         // `Aeron.NULL_VALUE` written as a tag: the Java driver reads it as a
-        // **real** tag of `-1` (`UdpChannel.java:216-218`, and `matchesTag`
-        // matches on equal tags, `:786`), and the C driver refuses the channel
-        // outright (`aeron_udp_channel.c:385-390`, because its "no tag"
+        // **real** tag of `-1` (`UdpChannel.java:243-245`, and `matchesTag`
+        // matches on equal tags, `:834`), and the C driver refuses the channel
+        // outright (`aeron_udp_channel.c:386-391`, because its "no tag"
         // sentinel is the same `-1` its parser returns for a value it cannot
         // read).
         //
         // `ChannelUriStringBuilder.tags(Long, Long)` — the way every other
         // caller writes this parameter — says "no tags" by leaving it out
-        // (`ChannelUriStringBuilder.java:1250-1264`), and that is what this
+        // (`ChannelUriStringBuilder.java:1253-1267`), and that is what this
         // does. See `docs/compat.md`, "The channel URIs this driver serves";
         // the criterion is
         // `a_live_replication_merges_into_the_stream_it_is_copying` (in
@@ -625,7 +625,7 @@ impl ReplicationSession {
     /// (`ReplicationSession.java:110`).
     ///
     /// `replication_id` is minted by the conductor from its session counter
-    /// (`ArchiveConductor.java:1455`) and handed in: the request carries a
+    /// (`ArchiveConductor.java:1462`) and handed in: the request carries a
     /// **correlation** id, which is a different number.
     ///
     /// `destination` is the catalog's summary of the recording the request
@@ -644,7 +644,7 @@ impl ReplicationSession {
     ) -> Self {
         let action_timeout_ms = context.message_timeout_ns / 1_000_000;
         // Read out before the request moves into the session: `REPLAY` passes
-        // it on to the source (`:712`).
+        // it on to the source (`:711`).
         let file_io_max_length = request.file_io_max_length;
         let credentials = SessionCredentials::for_request(&request.encoded_credentials);
         let (replay_position, replay_stream_id, is_destination_recording_empty) = match destination
@@ -712,7 +712,7 @@ impl ReplicationSession {
     }
 
     /// `replicationSessionByIdMap.remove(replicationId)`
-    /// (`ArchiveConductor.java:1482`), which the **stop** does and the session
+    /// (`ArchiveConductor.java:1489`), which the **stop** does and the session
     /// does not: what is given up is the id, and the session goes on.
     pub fn unregister(&mut self) {
         self.replication_id = None;
@@ -724,11 +724,11 @@ impl ReplicationSession {
         self.state
     }
 
-    /// `ReplicationSession.abort(reason)` (`:188-191`), whose whole body is
+    /// `ReplicationSession.abort(reason)` (`:187-190`), whose whole body is
     /// `state(DONE, "abort")`.
     ///
     /// **The state change alone is not what ends a replication**: what ends it
-    /// is the `close()` that follows (`:196-213`), which is where the teardown
+    /// is the `close()` that follows (`:195-212`), which is where the teardown
     /// and `REPLICATE_END` live. So a session that has been aborted still owes
     /// one, and
     /// [`Sessions::drive_replication_sessions`](super::conductor::Sessions) is
@@ -744,7 +744,7 @@ impl ReplicationSession {
         self.control_session_id
     }
 
-    /// One turn (`ReplicationSession.doWork`, `:217-293` — the reference has no
+    /// One turn (`ReplicationSession.doWork`, `:244-320` — the reference has no
     /// such method and instead *is* a `Session`, which the conductor's worker
     /// calls `doWork` on).
     ///
@@ -822,7 +822,7 @@ impl ReplicationSession {
     /// is borrowed from `src_archive`, which is a field of `self`, so a
     /// consumer that wrote to the session would be a second borrow of it. The
     /// reference has no such problem: its consumer *is* the session
-    /// (`:454` passes `this`), and Java has no borrow checker to object with.
+    /// (`:453` passes `this`), and Java has no borrow checker to object with.
     fn replicate_descriptor(
         &mut self,
         client: &mut Client,
@@ -836,7 +836,7 @@ impl ReplicationSession {
         if self.active_correlation_id == NULL_VALUE {
             // The borrow of the source is taken and given back around each
             // step, because `track_action` writes to `self` and the archive is
-            // a field of it. The reference has one line here (`:451-455`).
+            // a field of it. The reference has one line here (`:450-454`).
             let correlation_id = {
                 let Some(archive) = self.src_archive.as_mut() else {
                     return Ok(());
@@ -873,7 +873,7 @@ impl ReplicationSession {
 
         let mut descriptors: Vec<RecordingDescriptor> = Vec::new();
 
-        // `poller.isDispatchComplete() && remainingRecordCount() > 0` (`:466`):
+        // `poller.isDispatchComplete() && remainingRecordCount() > 0` (`:465`):
         // the listing ended without handing over the one descriptor it was asked
         // for, which is the source saying it has no such recording.
         let listing_over_with_one_owed = {
@@ -912,7 +912,7 @@ impl ReplicationSession {
         Ok(())
     }
 
-    /// `ReplicationSession.extend` (`:525-568`): make the **destination**
+    /// `ReplicationSession.extend` (`:524-567`): make the **destination**
     /// recording — the subscription that will receive the replay.
     ///
     /// What the reference does in one call is two things here, because the call
@@ -930,7 +930,7 @@ impl ReplicationSession {
     /// answer comes back on a later turn, written onto this session by
     /// [`Sessions::record_extend_outcome`]. A refusal is **already answered to
     /// the client** by the conductor — `extendRecording` sends that response
-    /// itself (`ArchiveConductor.java:1085-1111`) — so ending the session here
+    /// itself (`ArchiveConductor.java:1086-1112`) — so ending the session here
     /// says nothing more, which is what the reference's `state(DONE, msg)`
     /// (`:566`) does too.
     ///
@@ -1030,7 +1030,7 @@ impl ReplicationSession {
     ///
     /// The reference's name for the branch is the condition, which reads
     /// backwards: `isTagged` is the field it keeps for the two tag ids
-    /// (`:95`, `:150`), and a **live destination** joins it because a copy
+    /// (`:95`, `:149`), and a **live destination** joins it because a copy
     /// that has to follow a stream which comes and goes cannot take its
     /// address from a channel — it has to be a destination that is added and
     /// removed, and a destination needs the manual shape to be addable.
@@ -1164,7 +1164,7 @@ impl ReplicationSession {
                     .is_ok()
             };
 
-            // `else if (time >= …) throw` (`:498-501`): a request that could
+            // `else if (time >= …) throw` (`:497-500`): a request that could
             // not be published is retried until the action deadline, not
             // failed on the spot — the publication it goes out on is one the
             // source may not have connected yet.
@@ -1193,7 +1193,7 @@ impl ReplicationSession {
 
         self.src_recording_position = position;
 
-        // `:509-512` — a live destination is the only caller that needs the
+        // `:508-511` — a live destination is the only caller that needs the
         // source to still be recording, and it is the one case where finding
         // out it is not is fatal. The message is the reference's, and it
         // travels as the state's failure, so it is answered `GENERIC`.
@@ -1216,7 +1216,7 @@ impl ReplicationSession {
         self.src_stop_position = descriptor.stop_position;
         self.replay_stream_id = descriptor.stream_id;
 
-        // `replaySessionId` (`:308-315`), which the reference settles here and
+        // `replaySessionId` (`:307-314`), which the reference settles here and
         // `EXTEND` puts on the destination's channel. A request that named one
         // keeps it; otherwise the source's own session id is what the replay
         // will arrive under — **unless a live destination is in play**, which is
@@ -1229,7 +1229,7 @@ impl ReplicationSession {
             _ => descriptor.session_id,
         };
 
-        // `:324-330`. A source that reads less per turn than the recording's
+        // `:323-329`. A source that reads less per turn than the recording's
         // MTU could not keep up with it, and the reference refuses the
         // replication rather than replaying it badly — "than than" and all.
         if self.file_io_max_length != NULL_VALUE as i32
@@ -1248,7 +1248,7 @@ impl ReplicationSession {
 
         if let Some(destination) = self.destination_row(descriptor, catalog) {
             if self.request.dst_recording_id == NULL_VALUE {
-                // `:336`: a copy into a **new** row starts where the source's
+                // `:335`: a copy into a **new** row starts where the source's
                 // recording does.
                 self.replay_position = descriptor.start_position;
 
@@ -1274,7 +1274,7 @@ impl ReplicationSession {
                     }
                 }
             } else if self.is_destination_recording_empty {
-                // `:360`: and so does one into a row that exists but is empty.
+                // `:359`: and so does one into a row that exists but is empty.
                 self.replay_position = descriptor.start_position;
 
                 if let Err(error) = catalog.replace_recording(&destination) {
@@ -1290,7 +1290,7 @@ impl ReplicationSession {
             return;
         }
 
-        // `:380-399`. The live branch is out of reach for every criterion this
+        // `:379-398`. The live branch is out of reach for every criterion this
         // build is held to (`live_destination` is empty in every one of them)
         // and the state it names does not walk yet; the transition is written
         // down because the **refusal** in front of it is the reference's, and
@@ -1309,7 +1309,7 @@ impl ReplicationSession {
             return;
         }
 
-        // `:393-398`: the shortcut. A source with nothing to copy, or a
+        // `:392-397`: the shortcut. A source with nothing to copy, or a
         // destination already at the source's stop, is **in sync** — the client
         // is told so with a `SYNC` and the replication is over before a byte
         // moves.
@@ -1335,10 +1335,10 @@ impl ReplicationSession {
     }
 
     /// The row [`Self::on_recording_descriptor`] writes: the source's facts
-    /// under this archive's recording id (`:336-348`, `:356-370`).
+    /// under this archive's recording id (`:335-347`, `:355-369`).
     ///
     /// `None` when the descriptor cannot make one, which is the file-io guard
-    /// the reference makes before either branch (`:323-330`): a request that
+    /// the reference makes before either branch (`:322-329`): a request that
     /// asked for a smaller block than the recording's MTU is refused with
     /// `GENERIC` rather than copied badly.
     fn destination_row(
@@ -1785,7 +1785,7 @@ impl ReplicationSession {
             .is_ok_and(|uri| uri.get(CONTROL_MODE_KEY) == Some(CONTROL_MODE_RESPONSE))
     }
 
-    /// `(int)srcReplaySessionId` (`:760`), which is what the image is looked up
+    /// `(int)srcReplaySessionId` (`:785`), which is what the image is looked up
     /// by — and the cast is not a formality.
     ///
     /// The id the source answers with is the archive's own replay counter in
@@ -1802,7 +1802,7 @@ impl ReplicationSession {
     /// The destination's image, if it still has one.
     ///
     /// The reference holds the `Image` object and asks *it* whether it is
-    /// closed (`:781`, `:826`, `:884`); this looks the image up each turn, so
+    /// closed (`:780`, `:825`, `:884`); this looks the image up each turn, so
     /// **an image that is no longer there is the closed one**. The two readings
     /// agree on what every caller does about it: nothing arrives any more.
     ///
@@ -1830,7 +1830,7 @@ impl ReplicationSession {
     /// source's replay publication and the destination's subscription meet, and
     /// what the session does about it is notice.
     ///
-    /// **A live destination goes to `CATCHUP` instead** (`:762-766`): the copy
+    /// **A live destination goes to `CATCHUP` instead** (`:761-765`): the copy
     /// has a stream to join, and joining it before the replay has caught up
     /// would leave a gap in the recording.
     fn await_image(&mut self, client: &mut Client, now_ms: i64) -> Result<(), String> {
@@ -1866,11 +1866,11 @@ impl ReplicationSession {
     /// `ReplicationSession.replicate` (`:777-815`): follow the image until the
     /// copy is done, and say so.
     ///
-    /// **Done** is any of four things (`:784-785`): the destination's reader has
+    /// **Done** is any of four things (`:783-784`): the destination's reader has
     /// caught up with where the source's recording stopped, it has reached the
     /// stop the request asked for, the image is at end-of-stream, or it is
     /// closed. The first is the one a client is told about — a `SYNC` at the
-    /// position reached (`:797-800`) — and it is the one every bounded copy this
+    /// position reached (`:796-799`) — and it is the one every bounded copy this
     /// build serves ends on.
     ///
     /// The reference holds the image and asks *it* whether it is closed; this
@@ -1878,7 +1878,7 @@ impl ReplicationSession {
     /// the closed one**. Both readings agree on what the session does about it:
     /// nothing is copied any more, so the session is over.
     ///
-    /// The reference logs the ending through its `ArchiveLog`
+    /// The reference logs the ending through its `ArchiveTracing`
     /// (`logReplicationSessionDone`, `:1017-1041`), which this build does not
     /// have (the same gap `recording_session.rs` records).
     fn replicate(&mut self, client: &mut Client, now_ms: i64) -> Result<(), String> {
@@ -1965,7 +1965,7 @@ impl ReplicationSession {
     /// (`:826-829`) — and it is a **failure**, not the end of the copy.
     ///
     /// Nothing is asked of the source here: `srcRecordingPosition` was settled
-    /// before `EXTEND` (`:509`), when the state that asks it ran for the
+    /// before `EXTEND` (`:514`), when the state that asks it ran for the
     /// reason this one needs it.
     fn catchup(&mut self, client: &mut Client) -> Result<(), String> {
         let Some(position) = self.image_view(client).map(|image| image.position()) else {
@@ -2131,7 +2131,7 @@ impl ReplicationSession {
         Ok(())
     }
 
-    /// `ReplicationSession.close` (`:196-211`): the teardown, and the **one**
+    /// `ReplicationSession.close` (`:201-216`): the teardown, and the **one**
     /// `REPLICATE_END` — the signal the reference's own fixture waits for, and
     /// the only one of them that is sent exactly once.
     ///
@@ -2139,7 +2139,7 @@ impl ReplicationSession {
     /// stopped, the source is told to stop the replay it was asked for, the
     /// source archive's client is closed, and the client is told the session is
     /// over. The reference also removes the session from the conductor's map
-    /// here (`:209`); in this build that is the same act as the session leaving
+    /// here (`:214`); in this build that is the same act as the session leaving
     /// [`Sessions::drive_replication_sessions`]'s list, which is where `close`
     /// is called from.
     ///
@@ -2160,7 +2160,7 @@ impl ReplicationSession {
         }
 
         // `CloseHelper.close(countedErrorHandler, responsePublication)`
-        // (`:207`): the second publication is this session's, and a copy over a
+        // (`:212`): the second publication is this session's, and a copy over a
         // response channel would leave one behind per replication otherwise.
         if self.response_publication_registration_id != NULL_VALUE {
             let registration_id =
@@ -2237,7 +2237,7 @@ impl ReplicationSession {
             // **This failure answers for itself** and does not travel as the
             // state's error: the reference's `catch` around the whole of
             // `connect` answers `REPLICATION_CONNECTION_FAILURE` and returns
-            // (`:437-442`), where every other state's failure is the outer
+            // (`:442-447`), where every other state's failure is the outer
             // `catch`'s and gets `GENERIC`.
             // The two fields are taken apart because one is read and the other
             // written for the length of the call.
@@ -2279,7 +2279,7 @@ impl ReplicationSession {
         match connect.poll(client, credentials) {
             Ok(Polled::Awaiting) => Ok(()),
             Ok(Polled::Done(connected)) => {
-                // `srcArchive = archive` (`:433`), built from what the connect
+                // `srcArchive = archive` (`:438`), built from what the connect
                 // assembled rather than from a second one. The handlers are the
                 // defaults: a replication session has no signal handler of its
                 // own, and the recording signals it acts on are the ones **the
@@ -2364,8 +2364,8 @@ impl ReplicationSession {
     /// every caller in front of it makes.
     ///
     /// The message is the caller's, because the reference's two errors are:
-    /// `doWork`'s outer `catch` passes the exception's own words (`:275-277`)
-    /// and `connect`'s prefixes `"Replication connection failed="` (`:441`).
+    /// `doWork`'s outer `catch` passes the exception's own words (`:278-280`)
+    /// and `connect`'s prefixes `"Replication connection failed="` (`:445`).
     fn fail(&mut self, code: i64, message: String) {
         self.go_to(State::Done);
         self.notices.push(ReplicationNotice::Error {
@@ -2500,7 +2500,7 @@ mod tests {
     /// one departure from the reference's channel text and the reason
     /// `docs/compat.md` has a row about it: the reference writes
     /// `tags=-1,-1` there, and the C driver refuses that channel outright
-    /// (`aeron_udp_channel.c:385-390`).
+    /// (`aeron_udp_channel.c:386-391`).
     #[test]
     fn a_live_replication_without_tags_names_none() {
         let channel =
@@ -2514,7 +2514,7 @@ mod tests {
             !channel.contains("tags="),
             "and it says \"no tags\" by leaving the parameter out, which is \
              what the reference's own client library does \
-             (`ChannelUriStringBuilder.java:1250-1264`): {channel}"
+             (`ChannelUriStringBuilder.java:1253-1267`): {channel}"
         );
         assert!(!channel.contains("endpoint="), "{channel}");
     }

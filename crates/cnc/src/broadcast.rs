@@ -72,7 +72,7 @@ use crate::layout;
 /// region this type constructed, and exists so that the impossible case has
 /// somewhere to go other than a panic — a driver that cannot broadcast must
 /// count the failure and keep running
-/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:2233-2241`).
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:2296-2304`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransmitError {
     /// The payload is longer than `capacity / 8`

@@ -1,6 +1,6 @@
 //! Walking frames as a reader does.
 //!
-//! Mirrors the read loop of `aeron-client/src/main/c/aeron_image.c:246-325`,
+//! Mirrors the read loop of `aeron-client/src/main/c/aeron_image.c:250-329`,
 //! which is short because the frame lengths do the work: a reader steps from
 //! frame to frame by each frame's own length and never keeps an index of its
 //! own.

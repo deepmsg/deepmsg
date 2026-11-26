@@ -1,7 +1,7 @@
 //! The container's configuration: the names `ClusteredServiceContainer` reads
 //! and the defaults it attaches to them.
 //!
-//! The reference's `Context.conclude` (`ClusteredServiceContainer.java:824-1060`)
+//! The reference's `Context.conclude` (`ClusteredServiceContainer.java:853-1089`)
 //! settles a much larger surface — an `Aeron` client, an archive context, two
 //! trackers and five counters. P3-2a needs the names that shape the S2 seam and
 //! the mark file; the counters and the archive belong to later slices and are
@@ -19,20 +19,20 @@ use deepmsg_cluster_common::config::{ConfigError, Properties};
 
 /// `aeron.cluster.id` (`ConsensusModule.java`).
 pub const CLUSTER_ID_PROP_NAME: &str = "aeron.cluster.id";
-/// `CLUSTER_ID_DEFAULT` (`ClusteredServiceContainer.java:217`).
+/// `CLUSTER_ID_DEFAULT` (`ClusteredServiceContainer.java:225`).
 pub const CLUSTER_ID_DEFAULT: i32 = 0;
-/// `aeron.cluster.service.id` (`ClusteredServiceContainer.java:465`).
+/// `aeron.cluster.service.id` (`ClusteredServiceContainer.java:481`).
 pub const SERVICE_ID_PROP_NAME: &str = "aeron.cluster.service.id";
-/// `SERVICE_ID_DEFAULT` (`ClusteredServiceContainer.java:229`).
+/// `SERVICE_ID_DEFAULT` (`ClusteredServiceContainer.java:237`).
 pub const SERVICE_ID_DEFAULT: i32 = 0;
-/// `MAX_SERVICE_COUNT` (`ClusteredServiceContainer.java:234`).
+/// `MAX_SERVICE_COUNT` (`ClusteredServiceContainer.java:242`).
 pub const MAX_SERVICE_COUNT: i32 = 10;
-/// `aeron.cluster.service.name` (`:240`).
+/// `aeron.cluster.service.name` (`:248`).
 pub const SERVICE_NAME_PROP_NAME: &str = "aeron.cluster.service.name";
-/// `SERVICE_NAME_DEFAULT` (`:246`) — the name the reference's static accessor
+/// `SERVICE_NAME_DEFAULT` (`:262`) — the name the reference's static accessor
 /// falls back to. `ClusteredServiceContainer.Context` itself does **not** use
-/// it: its field starts from the raw system property (`:755`) and is replaced
-/// by the computed thread name when empty (`:926-930`). See
+/// it: its field starts from the raw system property (`:782`) and is replaced
+/// by the computed thread name when empty (`:955-959`). See
 /// [`container_thread_name`].
 pub const SERVICE_NAME_DEFAULT: &str = "clustered-service";
 /// `deepmsg.cluster.service`: this build's name for **which compiled-in
@@ -42,60 +42,60 @@ pub const SERVICE_NAME_DEFAULT: &str = "clustered-service";
 /// [`SERVICE_CLASS_NAME_PROP_NAME`]. A deployment that migrates from Java keeps
 /// `aeron.cluster.service.name` as its role name and picks the business here.
 pub const SERVICE_REGISTRY_PROP_NAME: &str = "deepmsg.cluster.service";
-/// `aeron.thread.naming` (`CommonContext.java:534`), which picks between the
-/// two spellings of the container's thread name (`:926-930`).
+/// `aeron.thread.naming` (`CommonContext.java:541`), which picks between the
+/// two spellings of the container's thread name (`:955-959`).
 pub const THREAD_NAMING_PROP_NAME: &str = "aeron.thread.naming";
-/// `aeron.cluster.service.class.name` (`:252`) — names a Java class, refused.
+/// `aeron.cluster.service.class.name` (`:254`) — names a Java class, refused.
 pub const SERVICE_CLASS_NAME_PROP_NAME: &str = "aeron.cluster.service.class.name";
-/// `aeron.cluster.control.channel` (`:282`).
+/// `aeron.cluster.control.channel` (`:284`).
 pub const CONTROL_CHANNEL_PROP_NAME: &str = "aeron.cluster.control.channel";
-/// `CONTROL_CHANNEL_DEFAULT` (`:289`).
+/// `CONTROL_CHANNEL_DEFAULT` (`:305`).
 pub const CONTROL_CHANNEL_DEFAULT: &str = "aeron:ipc?term-length=128k";
 /// `aeron.cluster.service.stream.id` (`:294`).
 pub const SERVICE_STREAM_ID_PROP_NAME: &str = "aeron.cluster.service.stream.id";
-/// `SERVICE_STREAM_ID_DEFAULT` (`:301`) — the container reads 104.
+/// `SERVICE_STREAM_ID_DEFAULT` (`:317`) — the container reads 104.
 pub const SERVICE_STREAM_ID_DEFAULT: i32 = 104;
 /// `aeron.cluster.consensus.module.stream.id` (`:306`).
 pub const CONSENSUS_MODULE_STREAM_ID_PROP_NAME: &str = "aeron.cluster.consensus.module.stream.id";
-/// `CONSENSUS_MODULE_STREAM_ID_DEFAULT` (`:313`) — the container writes 105.
+/// `CONSENSUS_MODULE_STREAM_ID_DEFAULT` (`:329`) — the container writes 105.
 pub const CONSENSUS_MODULE_STREAM_ID_DEFAULT: i32 = 105;
-/// `aeron.cluster.replay.channel` (`:264`).
+/// `aeron.cluster.replay.channel` (`:266`).
 pub const REPLAY_CHANNEL_PROP_NAME: &str = "aeron.cluster.replay.channel";
-/// `REPLAY_CHANNEL_DEFAULT` (`:270`).
+/// `REPLAY_CHANNEL_DEFAULT` (`:272`).
 pub const REPLAY_CHANNEL_DEFAULT: &str = "aeron:ipc";
 /// `aeron.cluster.replay.stream.id` (`:275`).
 pub const REPLAY_STREAM_ID_PROP_NAME: &str = "aeron.cluster.replay.stream.id";
-/// `REPLAY_STREAM_ID_DEFAULT` (`:282`).
+/// `REPLAY_STREAM_ID_DEFAULT` (`:284`).
 pub const REPLAY_STREAM_ID_DEFAULT: i32 = 103;
-/// `aeron.cluster.snapshot.channel` (`:318`).
+/// `aeron.cluster.snapshot.channel` (`:320`).
 pub const SNAPSHOT_CHANNEL_PROP_NAME: &str = "aeron.cluster.snapshot.channel";
-/// `SNAPSHOT_CHANNEL_DEFAULT` (`:324`).
+/// `SNAPSHOT_CHANNEL_DEFAULT` (`:326`).
 pub const SNAPSHOT_CHANNEL_DEFAULT: &str = "aeron:ipc?alias=snapshot";
-/// `aeron.cluster.snapshot.stream.id` (`:330`).
+/// `aeron.cluster.snapshot.stream.id` (`:332`).
 pub const SNAPSHOT_STREAM_ID_PROP_NAME: &str = "aeron.cluster.snapshot.stream.id";
-/// `SNAPSHOT_STREAM_ID_DEFAULT` (`:337`).
+/// `SNAPSHOT_STREAM_ID_DEFAULT` (`:353`).
 pub const SNAPSHOT_STREAM_ID_DEFAULT: i32 = 106;
-/// `aeron.cluster.dir` (`:342`).
+/// `aeron.cluster.dir` (`:344`).
 pub const CLUSTER_DIR_PROP_NAME: &str = "aeron.cluster.dir";
-/// `CLUSTER_DIR_DEFAULT` (`:348`).
+/// `CLUSTER_DIR_DEFAULT` (`:350`).
 pub const CLUSTER_DIR_DEFAULT: &str = "aeron-cluster";
-/// `aeron.cluster.mark.file.dir` (`:355`).
+/// `aeron.cluster.mark.file.dir` (`:357`).
 pub const MARK_FILE_DIR_PROP_NAME: &str = "aeron.cluster.mark.file.dir";
 /// `aeron.cluster.service.error.buffer.length` (`:367`).
 pub const ERROR_BUFFER_LENGTH_PROP_NAME: &str = "aeron.cluster.service.error.buffer.length";
-/// `ERROR_BUFFER_LENGTH_DEFAULT` (`:373`) — 1 MiB.
+/// `ERROR_BUFFER_LENGTH_DEFAULT` (`:375`) — 1 MiB.
 pub const ERROR_BUFFER_LENGTH_DEFAULT: i32 = 1024 * 1024;
-/// `aeron.cluster.service.responder` (`:379`).
+/// `aeron.cluster.service.responder` (`:381`).
 pub const RESPONDER_SERVICE_PROP_NAME: &str = "aeron.cluster.service.responder";
-/// `RESPONDER_SERVICE_DEFAULT` (`:385`).
+/// `RESPONDER_SERVICE_DEFAULT` (`:387`).
 pub const RESPONDER_SERVICE_DEFAULT: bool = true;
-/// `aeron.cluster.log.fragment.limit` (`:392`).
+/// `aeron.cluster.log.fragment.limit` (`:408`).
 pub const LOG_FRAGMENT_LIMIT_PROP_NAME: &str = "aeron.cluster.log.fragment.limit";
-/// `LOG_FRAGMENT_LIMIT_DEFAULT` (`:398`).
+/// `LOG_FRAGMENT_LIMIT_DEFAULT` (`:414`).
 pub const LOG_FRAGMENT_LIMIT_DEFAULT: i32 = 50;
-/// `aeron.cluster.idle.strategy` (`:575`).
+/// `aeron.cluster.idle.strategy` (`:622`).
 pub const IDLE_STRATEGY_PROP_NAME: &str = "aeron.cluster.idle.strategy";
-/// `DEFAULT_IDLE_STRATEGY` (`:569`).
+/// `DEFAULT_IDLE_STRATEGY` (`:596`).
 pub const IDLE_STRATEGY_DEFAULT: &str = "org.agrona.concurrent.BackoffIdleStrategy";
 /// `aeron.dir`, the driver's directory (`CommonContext`).
 pub const AERON_DIR_PROP_NAME: &str = "aeron.dir";
@@ -114,13 +114,13 @@ pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_PROP_NAME: &str =
     "aeron.archive.control.response.stream.id";
 /// `CONTROL_RESPONSE_STREAM_ID_DEFAULT` (`AeronArchive.java:2764`).
 pub const ARCHIVE_CONTROL_RESPONSE_STREAM_ID_DEFAULT: i32 = 20;
-/// `CYCLE_THRESHOLD_PROP_NAME` (`ClusteredServiceContainer.java:413`).
+/// `CYCLE_THRESHOLD_PROP_NAME` (`ClusteredServiceContainer.java:429`).
 pub const CYCLE_THRESHOLD_PROP_NAME: &str = "aeron.cluster.service.cycle.threshold";
-/// `CYCLE_THRESHOLD_DEFAULT_NS` (`:422`) — 100 ms.
+/// `CYCLE_THRESHOLD_DEFAULT_NS` (`:438`) — 100 ms.
 pub const CYCLE_THRESHOLD_DEFAULT_NS: i64 = 100_000_000;
-/// `SNAPSHOT_DURATION_THRESHOLD_PROP_NAME` (`ClusteredServiceContainer.java:430`).
+/// `SNAPSHOT_DURATION_THRESHOLD_PROP_NAME` (`ClusteredServiceContainer.java:446`).
 pub const SNAPSHOT_DURATION_THRESHOLD_PROP_NAME: &str = "aeron.cluster.service.snapshot.threshold";
-/// `SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS` (`:438`) — 1 s.
+/// `SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS` (`:454`) — 1 s.
 pub const SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS: i64 = 1_000_000_000;
 /// The application version stamped into `NewLeadershipTermEvent.appVersion`.
 pub const APP_VERSION_DEFAULT: i32 = 1;
@@ -176,7 +176,7 @@ pub struct ServiceContainerConfig {
     /// guessing a business.
     pub service: Option<String>,
     /// `aeron.thread.naming`: which spelling of the container's thread name
-    /// applies (`:926-930`).
+    /// applies (`:955-959`).
     pub thread_naming: ThreadNaming,
     /// `aeron.dir`.
     pub aeron_dir: PathBuf,
@@ -215,13 +215,13 @@ pub struct ServiceContainerConfig {
     pub archive_local_control_stream_id: i32,
     /// `aeron.archive.control.response.stream.id`, as the container computes it:
     /// `clusterId * 100 + 100 + controlResponseStreamId + (serviceId + 1)`
-    /// (`ClusteredServiceContainer.java:1015-1020`).
+    /// (`ClusteredServiceContainer.java:1049-1054`).
     pub archive_control_response_stream_id: i32,
     /// `aeron.cluster.service.snapshot.threshold`: how long a snapshot may take
     /// before it is counted in counter 237.
     pub snapshot_duration_threshold_ns: i64,
     /// `aeron.cluster.service.cycle.threshold`: when a duty cycle counts as
-    /// over its budget (`:413-422`), for counters 218/219.
+    /// over its budget (`:429-438`), for counters 218/219.
     pub cycle_threshold_ns: i64,
 }
 
@@ -273,7 +273,7 @@ impl ServiceContainerConfig {
                 value: value.to_owned(),
             })?,
         };
-        // `Context.conclude` (`:755`, `:926-930`): the property's value, or —
+        // `Context.conclude` (`:782`, `:955-959`): the property's value, or —
         // when it is absent **or empty** — the name computed from the ids.
         let service_name = match properties.get(SERVICE_NAME_PROP_NAME) {
             None | Some("") => container_thread_name(cluster_id, service_id, thread_naming),
@@ -361,12 +361,12 @@ impl ServiceContainerConfig {
     }
 
     /// The archive this container records and replays with
-    /// (`ClusteredServiceContainer.java:1011-1045`): a **local** archive, on
+    /// (`ClusteredServiceContainer.java:1045-1079`): a **local** archive, on
     /// IPC, with a response stream of its own so two services of one cluster do
     /// not share a control session.
     #[must_use]
     pub fn archive_context(&self) -> ArchiveContext {
-        // `concludeArchiveContext` (`ClusteredServiceContainer.java:1011-1045`):
+        // `concludeArchiveContext` (`ClusteredServiceContainer.java:1045-1079`):
         // both control channels carry an alias naming this service and
         // cluster, so two services of one cluster do not share an archive
         // control session.
@@ -390,24 +390,24 @@ impl ServiceContainerConfig {
     }
 
     /// Where this container's own mark file lives
-    /// (`ClusterMarkFile.markFilenameForService`, `ClusterMarkFile.java:573-581`).
+    /// (`ClusterMarkFile.markFilenameForService`, `ClusterMarkFile.java:588-596`).
     pub fn mark_file_path(&self) -> PathBuf {
         let directory = self.mark_file_dir.as_ref().unwrap_or(&self.cluster_dir);
         directory.join(format!("cluster-mark-service-{}.dat", self.service_id))
     }
 
-    /// The link name in the cluster directory (`:584-592`).
+    /// The link name in the cluster directory (`:599-607`).
     pub fn mark_file_link_name(&self) -> String {
         format!("cluster-mark-service-{}.dat", self.service_id)
     }
 }
 
 /// What `aeron.cluster.service.name` becomes when it is absent or empty
-/// (`ClusteredServiceContainer.java:926-930`): `aeron-cl-cs-<serviceId>` under
+/// (`ClusteredServiceContainer.java:955-959`): `aeron-cl-cs-<serviceId>` under
 /// `aeron.thread.naming=new`, `clustered-service-<clusterId>-<serviceId>` under
 /// `classic` (the default).
 ///
-/// The same value is the container's Aeron client name (`:942`, `:1042`) and
+/// The same value is the container's Aeron client name (`:976`, `:1076`) and
 /// the thread the agent runs on.
 #[must_use]
 pub fn container_thread_name(cluster_id: i32, service_id: i32, naming: ThreadNaming) -> String {
@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(config.cluster_id, 0);
         assert_eq!(config.service_id, 0);
         // `Context.conclude` computes the name when the property is empty
-        // (`:926-930`); `classic` is the default naming (`CommonContext.java:547`).
+        // (`:955-959`); `classic` is the default naming (`CommonContext.java:554`).
         assert_eq!(config.service_name, "clustered-service-0-0");
         assert_eq!(config.thread_naming, ThreadNaming::Classic);
         // No business is picked for you: the binary refuses an absent name.

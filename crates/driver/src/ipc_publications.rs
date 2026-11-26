@@ -1,10 +1,10 @@
 //! The publications a driver owns, and the state machine that makes them.
 //!
 //! Mirrors the IPC half of `aeron-driver/src/main/c/aeron_driver_conductor.c`:
-//! the command's four states (`:3956-4080`), the session id speculation
-//! (`:1062-1105`), the shared-publication lookup (`:1765-1785`), and the link
+//! the command's four states (`:4053-4177`), the session id speculation
+//! (`:1103-1146`), the shared-publication lookup (`:1806-1826`), and the link
 //! that turns a client's request into a publication plus a reply
-//! (`:3693-3767`). (M20)
+//! (`:3790-3864`). (M20)
 //!
 //! # Four states, one of them asynchronous
 //!
@@ -83,7 +83,7 @@ pub enum AddError {
     /// behalf.
     NoClientRecord,
     /// An existing publication on this stream has this session id and cannot
-    /// be shared with (`aeron_driver_conductor.c:3919-3952`).
+    /// be shared with (`aeron_driver_conductor.c:4016-4049`).
     SessionClash {
         /// The session id both asked for.
         session_id: i32,
@@ -97,12 +97,12 @@ pub enum AddError {
     Channel(Box<crate::udp_channel::UdpChannelError>),
     /// A channel a *publication* may not use — the checks the reference makes
     /// on the endpoint and the control address before it creates anything
-    /// (`aeron_driver_conductor.c:569-608`). Its message is the reference's,
+    /// (`aeron_driver_conductor.c:610-649`). Its message is the reference's,
     /// error code and all.
     InvalidChannel(String),
     /// A `SETUP` whose sender MTU this receiver cannot serve
     /// (`aeron_receiver_channel_endpoint_validate_sender_mtu_length`,
-    /// `media/aeron_receive_channel_endpoint.c:984-1044`).
+    /// `media/aeron_receive_channel_endpoint.c:989-1049`).
     ///
     /// The one fault here whose *recorded* code and whose *client* code are
     /// both reachable and different — see [`Self::recorded_error_code`] — and
@@ -121,7 +121,7 @@ pub enum AddError {
     },
     /// A publication named a `response-correlation-id` that no network
     /// subscription on this driver carries
-    /// (`aeron_driver_conductor.c:631-656`).
+    /// (`aeron_driver_conductor.c:672-697`).
     ///
     /// The id is a **registration id**, which never crosses the wire: a
     /// publication that names one nobody holds is one that could never be
@@ -131,14 +131,14 @@ pub enum AddError {
         correlation_id: i64,
     },
     /// A `control-mode=response` publication that named no correlation id
-    /// (`aeron_driver_conductor.c:1796-1800`).
+    /// (`aeron_driver_conductor.c:1837-1841`).
     ///
     /// A response channel is one this driver has to *find* an image for, and
     /// the correlation id is the whole of how it is named.
     NoResponseCorrelationId,
     /// A publication's `response-correlation-id` names an image whose `SETUP`
     /// never asked for a response channel
-    /// (`aeron_driver_conductor.c:1812-1818`).
+    /// (`aeron_driver_conductor.c:1853-1859`).
     ///
     /// The image exists, so the id is not a typo — it is an image whose sender
     /// wanted an ordinary channel, and answering it would be answering a
@@ -148,7 +148,7 @@ pub enum AddError {
         correlation_id: i64,
     },
     /// A publication's `response-correlation-id` names no image on this driver
-    /// (`aeron_driver_conductor.c:1823-1826`).
+    /// (`aeron_driver_conductor.c:1864-1867`).
     ImageNotFound {
         /// The id it named.
         correlation_id: i64,
@@ -204,19 +204,19 @@ impl AddError {
     ///
     /// The reference's code comes from what the failing function *set*, not
     /// from where in the state machine it failed
-    /// (`aeron_driver_conductor.c:2344-2352`: a negative `aeron_errcode()`
+    /// (`aeron_driver_conductor.c:2407-2415`: a negative `aeron_errcode()`
     /// becomes its own negation, anything else becomes the generic code). The
     /// two codes that matter are therefore:
     ///
     /// * [`ERROR_CODE_INVALID_CHANNEL`] for a channel whose URI the driver
     ///   cannot read — the scheme, the transport, the length, the *shape* of a
     ///   parameter — and for a session id clash: the places the reference
-    ///   raises `-AERON_ERROR_CODE_INVALID_CHANNEL` (`aeron_uri.c:269-273`,
-    ///   `:311-314`, `:48`, `:84`).
+    ///   raises `-AERON_ERROR_CODE_INVALID_CHANNEL` (`aeron_uri.c:275-279`,
+    ///   `:317-320`, `:48`, `:84`).
     /// * [`ERROR_CODE_GENERIC_ERROR`] for a parameter *value* the reference's
     ///   readers reject, because those return a bare `-1` or raise `EINVAL`,
     ///   which the conductor's composition turns into the generic code
-    ///   (`aeron_driver_conductor.c:2326-2341`) — and for every other
+    ///   (`aeron_driver_conductor.c:2389-2404`) — and for every other
     ///   parameter check that refuses.
     ///
     /// The unsupported transport has no reference answer — the reference serves
@@ -247,7 +247,7 @@ impl AddError {
             | Self::ImageNotFound { .. }
             | Self::NoCounterRecord
             // A positive `EINVAL` reaches a client as the generic code
-            // (`aeron_driver_conductor.c:2334-2338`) — which is what this
+            // (`aeron_driver_conductor.c:2397-2401`) — which is what this
             // would have been told, had anything been told.
             | Self::SenderMtu(_)
             | Self::AgentStopped => ERROR_CODE_GENERIC_ERROR,
@@ -259,8 +259,8 @@ impl AddError {
     ///
     /// The reference has one value — whatever `AERON_SET_ERR` was handed — and
     /// two consumers that transform it differently: `log_explicit_error` takes
-    /// it as it stands (`aeron_driver_conductor.c:1215`) while `on_error` sends
-    /// a positive one as the generic code (`:2334-2338`). A fault that is only
+    /// it as it stands (`aeron_driver_conductor.c:1256`) while `on_error` sends
+    /// a positive one as the generic code (`:2397-2401`). A fault that is only
     /// ever *recorded* therefore carries two different numbers, and the log
     /// gets this one.
     ///
@@ -269,7 +269,7 @@ impl AddError {
     /// is [`Self::error_code`], which is the same number for a variant that is
     /// only ever answered to a client. `AgentStopped` falls back on purpose:
     /// the reference sets its code from the log-buffer agent's own result
-    /// (`:6579`), which this build does not carry.
+    /// (`:6674`), which this build does not carry.
     /// The lines the reference's URI parse left behind, when this failure is
     /// one of its (`channel_uri::UriError::parse_failure`).
     ///
@@ -311,7 +311,7 @@ impl From<crate::channel_uri::UriError> for AddError {
 /// The session ids this driver hands out for its publications.
 ///
 /// The reference keeps two fields and three functions for this
-/// (`aeron_driver_conductor.c:1062-1105`), and the rule they implement is worth
+/// (`aeron_driver_conductor.c:1103-1146`), and the rule they implement is worth
 /// seeing whole: the cursor is *random*, the reserved range is skipped rather
 /// than used, and a speculation asks which of the ids from the cursor onwards
 /// this stream is not already running under. Two publications created a moment
@@ -326,7 +326,7 @@ pub struct SessionIds {
 
 impl SessionIds {
     /// Start from a random id, as the conductor does when it initialises
-    /// (`:826`).
+    /// (`:867`).
     pub fn start(reserved_low: i32, reserved_high: i32) -> Self {
         Self {
             next: sys::random_i32(),
@@ -336,7 +336,7 @@ impl SessionIds {
     }
 
     /// Where the next speculation starts, skipping the reserved range
-    /// (`:1062-1069`).
+    /// (`:1103-1110`).
     ///
     /// The skipped-to value is `high + 1` **wrapping**, because these are
     /// `i32`s a client compares for equality and never does arithmetic on.
@@ -349,7 +349,7 @@ impl SessionIds {
     }
 
     /// The first id at or after the cursor that no publication in `used` holds
-    /// (`:1077-1105`).
+    /// (`:1118-1146`).
     ///
     /// `used` is `(stream_id, session_id)` for the publications that count:
     /// the ones that are `ACTIVE` or `DRAINING`, which is the state test the
@@ -379,7 +379,7 @@ impl SessionIds {
         cursor.wrapping_add(first_free as i32)
     }
 
-    /// Move the cursor past `session_id` (`:1071-1075`).
+    /// Move the cursor past `session_id` (`:1112-1116`).
     ///
     /// Only a *speculated* id moves it: a URI that named its own session is
     /// not an allocation, and advancing on one would skip ids for no reason.
@@ -430,7 +430,7 @@ impl IpcPublications {
     ///
     /// The agent is the driver's **native resource agent** — one for the whole
     /// driver, as the reference has it, with the name resolver on it
-    /// (`aeron_driver_native_resource_agent.c:224-270`).
+    /// (`aeron_driver_native_resource_agent.c:229-275`).
     pub fn start(
         reserved_session_id_low: i32,
         reserved_session_id_high: i32,
@@ -503,7 +503,7 @@ impl IpcPublications {
     /// Hand out the next session id and move the cursor past it
     /// (`aeron_driver_conductor_next_session_id` followed by
     /// `aeron_driver_conductor_update_next_session_id`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1062-1075`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1103-1116`).
     ///
     /// The two are one act here because a caller that read the cursor and
     /// forgot to move it would hand the same id out twice — which is what the
@@ -541,7 +541,7 @@ impl IpcPublications {
         events: &mut impl ClientEvents,
         find_by_tag: impl Fn(i64) -> Option<TaggedPublication>,
     ) -> Result<(), AddError> {
-        // VALIDATE (`:3963-3981`).
+        // VALIDATE (`:4060-4078`).
         let uri = ChannelUri::parse(request.channel)?;
         if uri.transport() != Transport::Ipc {
             return Err(AddError::UnsupportedTransport);
@@ -549,13 +549,13 @@ impl IpcPublications {
 
         // A tag is looked up among the **network** publications even here: the
         // reference's reader is given the conductor, not the IPC half of it
-        // (`aeron_driver_uri.c:163`), and both add-publication paths call it
-        // (`aeron_driver_conductor.c:3984-3988`).
+        // (`aeron_driver_uri.c:168`), and both add-publication paths call it
+        // (`aeron_driver_conductor.c:4081-4085`).
         let params = PublicationParams::resolve(&uri, config, find_by_tag)?;
 
         // The client is registered before anything else happens for this
         // command — the reference's `get_or_add_client` is the first thing the
-        // link does (`:3733-3739`) — and it is what keeps a slow log buffer
+        // link does (`:3830-3836`) — and it is what keeps a slow log buffer
         // from looking like a dead client: registering it starts the heartbeat
         // that the timeout tier reads.
         let Some(client) = clients.get_or_add(
@@ -572,7 +572,7 @@ impl IpcPublications {
         let registration_id = request.correlation_id;
         let stream_id = request.stream_id;
 
-        // RESOLVE_PUBLICATION (`:3989-4008`): a concurrent publication on the
+        // RESOLVE_PUBLICATION (`:4086-4105`): a concurrent publication on the
         // same stream in the same response scope may be shared, and then no log
         // buffer is created and no counter is allocated.
         if !is_exclusive {
@@ -590,7 +590,7 @@ impl IpcPublications {
 
         // The clash check runs *after* the shared lookup: an exclusive or
         // draining publication is not shareable, so a session id one of those
-        // holds is a clash rather than a sharing (`:4011-4015`).
+        // holds is a clash rather than a sharing (`:4108-4112`).
         if let Some(session_id) = params.session_id {
             if self.find_session_clash(stream_id, session_id) {
                 return Err(AddError::SessionClash {
@@ -600,7 +600,7 @@ impl IpcPublications {
             }
         }
 
-        // The log buffer's name, then AWAIT_LOG_BUFFER (`:4017-4047`).
+        // The log buffer's name, then AWAIT_LOG_BUFFER (`:4114-4144`).
         let path = publication_path(&config.aeron_dir, registration_id);
 
         self.agent
@@ -633,7 +633,7 @@ impl IpcPublications {
 
     /// Write `pub-pos` and recompute `pub-lmt` for every publication
     /// (`aeron_ipc_publication_update_pub_pos_and_lmt`,
-    /// `aeron-driver/src/main/c/aeron_ipc_publication.c:278-328`), and return
+    /// `aeron-driver/src/main/c/aeron_ipc_publication.c:283-333`), and return
     /// how many of them did work.
     pub fn update_limits(
         &mut self,
@@ -652,7 +652,7 @@ impl IpcPublications {
     }
 
     /// What the untethered machine's three outcomes become for a client
-    /// (`aeron_ipc_publication.c:396-402`, `:435-448`, `:421-425`).
+    /// (`aeron_ipc_publication.c:401-407`, `:431-444`, `:426-430`).
     ///
     /// The same three messages a *network* reader gets from its image, and the
     /// same shapes: an unavailable image naming the subscription, an available
@@ -794,8 +794,8 @@ impl IpcPublications {
     }
 
     /// Let go of the publications a client held, as its death or its
-    /// `REMOVE_PUBLICATION` requires (`aeron_client_delete`, `:1218-1226`, and
-    /// `aeron_driver_conductor_on_remove_publication`, `:4705-4735`).
+    /// `REMOVE_PUBLICATION` requires (`aeron_client_delete`, `:1259-1267`, and
+    /// `aeron_driver_conductor_on_remove_publication`, `:4802-4832`).
     ///
     /// Every link is released, and a publication whose last link that was
     /// starts draining: its limit is pulled back, its log says where the stream
@@ -820,7 +820,7 @@ impl IpcPublications {
     }
 
     /// Cut a publication off from its readers, because a client asked
-    /// (`aeron_ipc_publication_reject`, `aeron_ipc_publication.c:216-277`).
+    /// (`aeron_ipc_publication_reject`, `aeron_ipc_publication.c:221-282`).
     ///
     /// Three things, in the reference's order, and the order is the part a
     /// caller has to keep:
@@ -843,7 +843,7 @@ impl IpcPublications {
     /// The reason is at most 1023 bytes when it gets here — that bound is the
     /// decoder's, refused before the handler runs
     /// ([`deepmsg_cnc::command::MAX_REASON_TEXT_LENGTH`]) — so the clipping the
-    /// reference does inside its own version (`:227`) has nothing to clip.
+    /// reference does inside its own version (`:232`) has nothing to clip.
     ///
     /// # Returns
     ///
@@ -882,19 +882,19 @@ impl IpcPublications {
             registration_id,
             // An IPC publication answers no destination and hears from no
             // receiver, so three of these are the reference's `AERON_NULL_VALUE`
-            // (`aeron_ipc_publication.c:238-243`).
+            // (`aeron_ipc_publication.c:243-248`).
             destination_registration_id: NULL_VALUE,
             session_id,
             stream_id,
             receiver_id: NULL_VALUE,
             group_tag: NULL_VALUE,
             // …and its source is a freshly zeroed `sockaddr_in` with a zero
-            // port whose address is `INADDR_LOOPBACK` (`:231-236`).
+            // port whose address is `INADDR_LOOPBACK` (`:236-241`).
             //
             // Those octets are **reversed**, and that is not a typo here: the
             // reference assigns the host-order constant straight into
             // `sin_addr.s_addr` — `s_addr = INADDR_LOOPBACK`, with no `htonl` —
-            // so what is memcpy'd out at `aeron_driver_conductor.c:2303` is the
+            // so what is memcpy'd out at `aeron_driver_conductor.c:2366` is the
             // little-endian image of `0x7f000001`, which is `1.0.0.127`. Its
             // network path is not affected, because a `sockaddr_in` filled in
             // by the kernel holds the octets in order.
@@ -937,7 +937,7 @@ impl IpcPublications {
     /// positions and its own two counters back, hand the log buffer to the
     /// agent, and drop it from the list — the reference's
     /// `aeron_ipc_publication_entry_delete` (`:1428-1446`) followed by
-    /// `aeron_ipc_publication_close` (`aeron_ipc_publication.c:196-214`).
+    /// `aeron_ipc_publication_close` (`aeron_ipc_publication.c:201-219`).
     ///
     /// Returns the work done, for the cycle counter.
     pub fn on_time_event(
@@ -956,7 +956,7 @@ impl IpcPublications {
             // The revoke is the active state's only duty here: a publication
             // whose client asked for `REMOVE_PUBLICATION` with the revoke flag
             // cuts its stream off at the next timeout tier, and tells its
-            // readers (`aeron_ipc_publication.c:492-520`).
+            // readers (`aeron_ipc_publication.c:516-544`).
             if self.publications[index].state() == State::Active
                 && self.publications[index].is_revoked()
             {
@@ -1005,7 +1005,7 @@ impl IpcPublications {
 
                 // A publication rejected a liveness timeout ago is readable
                 // again, and this is where it comes back
-                // (`aeron_ipc_publication_check_cooldown_status`, `:546`).
+                // (`aeron_ipc_publication_check_cooldown_status`, `:570`).
                 // Without it a rejection would be permanent, which is not what
                 // the reference's cool down means: it is a *pause*, and the
                 // readers that were unlinked are re-linked to the same
@@ -1021,7 +1021,7 @@ impl IpcPublications {
 
             // The moment a publication finishes draining, its readers are told
             // the image is gone: they hold a mapping of a log buffer that is
-            // about to be deleted (`aeron_ipc_publication.c:561-577` sends one
+            // about to be deleted (`aeron_ipc_publication.c:587-603` sends one
             // message per linked subscription, naming the *constant* channel
             // rather than the one the client subscribed with).
             if before == State::Draining && self.publications[index].state() == State::Linger {
@@ -1071,7 +1071,7 @@ impl IpcPublications {
     /// stop the agent.
     ///
     /// The counters go back first and the files after, which is the
-    /// reference's order at shutdown (`aeron_driver_conductor.c:3427-3436`:
+    /// reference's order at shutdown (`aeron_driver_conductor.c:3524-3533`:
     /// `aeron_ipc_publication_close` then
     /// `aeron_driver_conductor_delete_log_buffer`).
     pub fn close(
@@ -1094,7 +1094,7 @@ impl IpcPublications {
         // agent finishes and nobody collects: the conductor's `shutdown` waits
         // for the queue to drain, so the file exists and is removed by nothing.
         // The reference has the same shape — its commands are freed without
-        // their mappings being deleted (`:3415-3425`) — and a restarted driver
+        // their mappings being deleted (`:3512-3522`) — and a restarted driver
         // removes a stale log buffer by name.
         //
         // The agent's own thread is stopped by the **conductor**, after every
@@ -1104,7 +1104,7 @@ impl IpcPublications {
     }
 
     /// The create: speculate a session id, allocate the counters, write the
-    /// metadata, link the client and answer it (`:3786-3911`, `:3729-3767`).
+    /// metadata, link the client and answer it (`:3883-4008`, `:3826-3864`).
     #[allow(clippy::too_many_arguments)] // one per collaborator
     fn create_publication(
         &mut self,
@@ -1122,7 +1122,7 @@ impl IpcPublications {
 
         // The session id: what the URI asked for, or the first one this stream
         // is not already running under. Only a speculated id moves the cursor
-        // (`:3827-3832`).
+        // (`:3924-3929`).
         let session_id = match pending.params.session_id {
             Some(session_id) => session_id,
             None => {
@@ -1136,7 +1136,7 @@ impl IpcPublications {
         // A response publication's subscription is pointed at this session, or
         // refused if it named another
         // (`aeron_driver_conductor_find_and_update_ipc_response_subscription`,
-        // `:1711-1760`). The reference runs this one state later, after the
+        // `:1752-1801`). The reference runs this one state later, after the
         // publication object exists and its counters are allocated, and
         // unwinds all of that on the error; here it runs before any of it is
         // made, which is the same answer to the client with less to undo. The
@@ -1195,7 +1195,7 @@ impl IpcPublications {
         };
 
         // A publication resuming a stream starts both counters at the position
-        // it resumes from (`:3860-3870`); one that is not resuming leaves them
+        // it resumes from (`:3957-3967`); one that is not resuming leaves them
         // at zero, which is where the counter allocator leaves a fresh counter.
         if let Err(message) = start_counters_at_position(
             pending,
@@ -1245,7 +1245,7 @@ impl IpcPublications {
         // CREATE_PUBLICATION ends in the link, and the client is looked up
         // again rather than carried from the request: it may have been
         // reclaimed while the log buffer was being built, and the reference
-        // re-registers it here too (`:3733-3739`).
+        // re-registers it here too (`:3830-3836`).
         let registration_id = pending.identity.registration_id;
         let is_exclusive = pending.identity.is_exclusive;
 
@@ -1302,7 +1302,7 @@ impl IpcPublications {
 
     /// Link a client to a publication that exists, and tell it so.
     ///
-    /// The order is the reference's (`:3744-3767`): the link is recorded and
+    /// The order is the reference's (`:3841-3864`): the link is recorded and
     /// the publication's reference count goes up, then the client is answered.
     /// (Attaching the subscriptions that are already waiting for this stream is
     /// the next thing that happens, in `remove_publication`'s counterpart —
@@ -1340,7 +1340,7 @@ impl IpcPublications {
     }
 
     /// The publications that count towards a session id speculation: the ones
-    /// that are `ACTIVE` or `DRAINING` (`:3792-3802`).
+    /// that are `ACTIVE` or `DRAINING` (`:3889-3899`).
     fn used_sessions(&self) -> Vec<(i32, i32)> {
         self.publications
             .iter()
@@ -1350,7 +1350,7 @@ impl IpcPublications {
     }
 
     /// The publication this request may share, if any
-    /// (`aeron_driver_conductor_find_shared_ipc_publication`, `:1765-1785`).
+    /// (`aeron_driver_conductor_find_shared_ipc_publication`, `:1806-1826`).
     ///
     /// The state test is the reference's and looks redundant — the outer test
     /// admits `ACTIVE` or `DRAINING` and the inner one then requires `ACTIVE`.
@@ -1369,7 +1369,7 @@ impl IpcPublications {
 
     /// Whether an existing publication on this stream already runs under
     /// `session_id` (`aeron_driver_conductor_check_session_clash_ipc_publication`,
-    /// `:3931-3952`).
+    /// `:4028-4049`).
     fn find_session_clash(&self, stream_id: i32, session_id: i32) -> bool {
         self.publications.iter().any(|publication| {
             publication.stream_id == stream_id
@@ -1386,7 +1386,7 @@ impl IpcPublications {
 /// in both: the publication is inside `self` and the subscriptions are beside
 /// it, so the call needs the manager's own field split off by hand.
 /// The error code the reference composes for a log buffer that could not be
-/// made (`aeron_driver_conductor.c:2326-2341`): an `ENOSPC` — the kernel's or
+/// made (`aeron_driver_conductor.c:2389-2404`): an `ENOSPC` — the kernel's or
 /// the pre-creation storage check's — becomes `STORAGE_SPACE`, and everything
 /// else the generic code.
 ///
@@ -1418,7 +1418,7 @@ fn link_subscriptions(
 }
 
 /// Put both position counters on the position a resumed stream resumes from
-/// (`aeron_driver_conductor.c:3860-3870`).
+/// (`aeron_driver_conductor.c:3957-3967`).
 ///
 /// Returns the message to report when the position cannot be written, which is
 /// a term length that is not a power of two — impossible here, because the
@@ -1465,7 +1465,7 @@ fn start_counters_at_position(
 }
 
 /// Where a publication's log buffer lives
-/// (`aeron_ipc_publication_location`, `aeron-client/src/main/c/util/aeron_fileutil.c:1208-1214`):
+/// (`aeron_ipc_publication_location`, `aeron-client/src/main/c/util/aeron_fileutil.c:1207-1213`):
 /// `<aeron_dir>/publications/<registration_id>.logbuffer`.
 pub fn publication_path(aeron_dir: &std::path::Path, registration_id: i64) -> PathBuf {
     aeron_dir
@@ -1483,7 +1483,7 @@ mod tests {
         // `AERON_SET_ERR` was handed a positive `EINVAL`, so the *log* gets 22
         // — the value `log_explicit_error` records — while a client, had it
         // been told, would have got the generic code `on_error` derives from a
-        // positive errno (`aeron_driver_conductor.c:1215`, `:2334-2338`).
+        // positive errno (`aeron_driver_conductor.c:1256`, `:2397-2401`).
         let refused = AddError::SenderMtu("(22) Invalid argument\n".to_string());
 
         assert_eq!(ERROR_CODE_GENERIC_ERROR, refused.error_code());
@@ -1499,7 +1499,7 @@ mod tests {
 
     #[test]
     fn an_out_of_space_log_buffer_keeps_its_own_error_code() {
-        // The reference's composition (`aeron_driver_conductor.c:2326-2341`):
+        // The reference's composition (`aeron_driver_conductor.c:2389-2404`):
         // an `ENOSPC` — the kernel's or the pre-creation check's — arrives as
         // `STORAGE_SPACE`, and everything else as the generic code.
         assert_eq!(
@@ -1571,7 +1571,7 @@ mod tests {
     #[test]
     fn only_a_speculated_id_moves_the_cursor() {
         // `update_next_session_id` is the reference's, and it is called only
-        // when the URI did not name a session (`:3827-3832`).
+        // when the URI did not name a session (`:3924-3929`).
         let mut ids = SessionIds::start(-1, 1000);
         ids.next = 1001;
 

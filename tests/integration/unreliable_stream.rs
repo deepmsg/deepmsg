@@ -7,7 +7,7 @@
 //! remove, in the one place where the difference is not a message but the data
 //! itself.
 //!
-//! What the reference does with it (`aeron_publication_image.c:1024-1066`): an
+//! What the reference does with it (`aeron_publication_image.c:1029-1071`): an
 //! unreliable image does not ask. It covers the hole with a padding frame and
 //! reads on, so the frames that were in it are **gone** — never retransmitted,
 //! never delivered — and `loss-gap-fills` is the only trace. That is a
@@ -163,11 +163,11 @@ fn an_unreliable_subscription_reads_past_the_holes_it_does_not_ask_for() {
         received < MESSAGES,
         "{received} of {MESSAGES} messages arrived: an unreliable image fills its holes rather \
          than asking for them, so the ones lost on the wire are lost for good \
-         (`aeron_publication_image.c:1053-1066`)"
+         (`aeron_publication_image.c:1058-1071`)"
     );
     assert_eq!(
         0, naks,
-        "an unreliable image sends no NAK at all (`:1024`), so nothing may have asked"
+        "an unreliable image sends no NAK at all (`:1029`), so nothing may have asked"
     );
     assert_eq!(
         0, retransmits,

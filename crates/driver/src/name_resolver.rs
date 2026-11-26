@@ -50,7 +50,7 @@ pub enum Resolution {
 
 /// Something a resolver could not do, on its way to the driver's error log
 /// (`aeron_name_resolver_log_and_clear_error`,
-/// `aeron_driver_name_resolver.c:718-723`, which records the thread-local error
+/// `aeron_driver_name_resolver.c:719-724`, which records the thread-local error
 /// and bumps the errors counter beside it).
 ///
 /// The reference's resolver writes straight into the shared error log; this
@@ -115,9 +115,9 @@ pub trait Resolver {
     /// argument here because it is one in the reference too: its `resolve_func`
     /// is handed an **out**-parameter whose family the caller has already set,
     /// and the driver's resolver reads it back to decide *which cached row*
-    /// answers the question (`aeron_driver_name_resolver.c:1210-1211`, and the
+    /// answers the question (`aeron_driver_name_resolver.c:1211-1212`, and the
     /// reference's own test sets it before every call,
-    /// `aeron_name_resolver_test.cpp:529-531`, `:567-569`). The synchronous
+    /// `aeron_name_resolver_test.cpp:529-531`, `:568-570`). The synchronous
     /// resolvers have nothing to choose between and ignore it.
     fn resolve(
         &mut self,
@@ -148,7 +148,7 @@ pub trait Resolver {
     ///
     /// The counters come with it because the driver's resolver resolves its
     /// bootstrap neighbors here — and labels their counters with what they
-    /// resolved to (`aeron_driver_name_resolver_on_start`, `:1238-1250`, which
+    /// resolved to (`aeron_driver_name_resolver_on_start`, `:1239-1251`, which
     /// calls `resolve_bootstrap_neighbors`). The default resolver and the CSV
     /// table do nothing at all on start.
     ///
@@ -199,12 +199,12 @@ pub trait Resolver {
 /// The three resolvers the reference's supplier table maps names to
 /// (`aeron_name_resolver.c:214-229`, whose entries are `default`, `csv_table`
 /// and `driver`), and what a driver picks one with
-/// (`aeron.name.resolver.supplier`, `aeronmd.h:808-809`).
+/// (`aeron.name.resolver.supplier`, `aeronmd.h:842-843`).
 ///
 /// The name is checked where the setting is read, so a name that is none of the
 /// three fails the driver's start-up — which is what the reference's
 /// `aeron_name_resolver_supplier_load` returning `NULL` does to its context
-/// init (`aeron_driver_context.c:588-594`).
+/// init (`aeron_driver_context.c:595-601`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Supplier {
     /// `aeron_default_name_resolver_supplier`: the system's own lookup.
@@ -246,7 +246,7 @@ impl Supplier {
     ///
     /// `Send`, because the reference hands the built resolver to the native
     /// resource agent's thread, which then runs its clock
-    /// (`aeron_driver_native_resource_agent.c:260`).
+    /// (`aeron_driver_native_resource_agent.c:265`).
     ///
     /// `driver` is the parameters the gossip resolver needs — read from the
     /// settings either way, and ignored by the two that do not gossip.
@@ -477,7 +477,7 @@ impl CsvTableResolver {
 }
 
 /// The name the driver reads a resolver's arguments from
-/// (`AERON_NAME_RESOLVER_INIT_ARGS`, `aeronmd.h:818`) — which is **not** the
+/// (`AERON_NAME_RESOLVER_INIT_ARGS`, `aeronmd.h:852`) — which is **not** the
 /// `AERON_NAME_RESOLVER_CSV_TABLE_ARGS_ENV_VAR` the header declares
 /// (`aeron_name_resolver.h:29`): that macro has no user in the C driver, and
 /// the harness sets this one (`CTestMediaDriver.java:292`).

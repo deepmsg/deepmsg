@@ -3,7 +3,7 @@
 //! # What is judged here
 //!
 //! `shouldCloseCleanlyDuringReplay` — the reference's case
-//! (`…_persistent_subscription_test.cpp:3732`) — and, because that case is thin,
+//! (`…_persistent_subscription_test.cpp:3734`) — and, because that case is thin,
 //! what can be said about a close beyond "nothing crashed".
 //!
 //! # What the reference's own case asserts, and what it does not
@@ -32,7 +32,7 @@
 //! # ★ What is *not* judged, and why
 //!
 //! The close sends the archive a **`stop_replay`** before it lets go
-//! (`clean_up_replay`, `:741-760`), and **that request is not witnessed here.**
+//! (`clean_up_replay`, `:743-762`), and **that request is not witnessed here.**
 //! It is a control request on a wire the test cannot see, and the two things
 //! that would make it visible are both missing: this build has no counter for
 //! replay sessions, and an archive that keeps replaying to nobody is not
@@ -40,7 +40,7 @@
 //! to a subscription that no longer exists either way.
 //!
 //! So what this file holds is the *order* and the *release*: the cleanup runs in
-//! the reference's order (`:1074-1097`) and gives back everything the
+//! the reference's order (`:1076-1099`) and gives back everything the
 //! subscription was holding. The request itself is recorded as sent and
 //! unwitnessed rather than claimed.
 //!
@@ -76,7 +76,7 @@ const LIVE_STREAM_ID: i32 = 4258;
 const REPLAY_CHANNEL: &str = "aeron:ipc?alias=ps-close-replay";
 const REPLAY_STREAM_ID: i32 = 4259;
 
-/// What the recording holds — the reference's twenty (`:3736`).
+/// What the recording holds — the reference's twenty (`:3920`).
 const MESSAGES: usize = 20;
 
 /// What the application's handler was handed.
@@ -271,7 +271,7 @@ fn closing_a_replay_in_flight_leaves_everything_usable() {
 /// ★ **Closing at every point of the replay's set-up.**
 ///
 /// The reference's `shouldCancelPendingAsyncOpsOnCloseDuringReplaySubscriptionSetup`
-/// (`…_resilience_test.cpp:4917`), which is a loop and nothing else: create a
+/// (`…_resilience_test.cpp:4920`), which is a loop and nothing else: create a
 /// subscription, poll it `0..=20` times, close it, and do that once per count —
 /// so that one of the twenty-one closes lands while the replay subscription's
 /// add is **in flight**. Its own comment says as much, and what it asserts is
@@ -282,7 +282,7 @@ fn closing_a_replay_in_flight_leaves_everything_usable() {
 /// commit: an add the driver has not answered yet has to be **cancelled**, not
 /// forgotten, or the driver makes a subscription this machine no longer knows
 /// about — one nothing polls and nothing will ever give back. The reference
-/// cancels in both of its cleanups (`:725-745`, `:747-777`); this build removed
+/// cancels in both of its cleanups (`:727-747`, `:749-779`); this build removed
 /// what had arrived and dropped the id of what had not.
 ///
 /// The assertion added here is the one thing a loop like that can be held to

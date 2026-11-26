@@ -1,6 +1,6 @@
 //! Writing a consensus-module snapshot (`ConsensusModuleSnapshotTaker.java`).
 //!
-//! The record order is the contract (`ConsensusModuleAgent.java:3221-3253`):
+//! The record order is the contract (`ConsensusModuleAgent.java:3248-3280`):
 //!
 //! 1. `SnapshotMarker` BEGIN (100, mark 0)
 //! 2. `ConsensusModule` (105) — **one** record
@@ -18,7 +18,7 @@
 //! * **Consensus module state**: not an iteration — the reference reads
 //!   `sessionManager.nextCommittedSessionId()` and **tracker zero's**
 //!   `nextServiceSessionId` / `logServiceSessionId` / `size`, or zeroes when
-//!   there are no services (`:3225-3235`).
+//!   there are no services (`:3255-3265`).
 //! * **Sessions**: `SessionManager.sessions` is an `ArrayList` kept ascending by
 //!   id (`addSession`, `:1134-1157`), and only `OPEN` and `CLOSING` are
 //!   written (`:1107-1119`). A session's `timeOfLastActivity` is written as
@@ -59,7 +59,7 @@ use crate::service_control::tracker::PendingServiceMessageTracker;
 use crate::session::ClusterSession;
 use crate::timer::TimerSnapshotTaker;
 
-/// `ConsensusModule.Configuration.SNAPSHOT_TYPE_ID` (`ConsensusModule.java:421`).
+/// `ConsensusModule.Configuration.SNAPSHOT_TYPE_ID` (`ConsensusModule.java:428`).
 pub const SNAPSHOT_TYPE_ID: i64 = 1;
 
 /// `Aeron.NULL_VALUE`, the `timeOfLastActivity` a snapshot always carries.
@@ -142,7 +142,7 @@ impl<'a> ConsensusModuleSnapshotTaker<'a> {
         self.failed
     }
 
-    /// `SnapshotTaker.markBegin` (`SnapshotTaker.java:108-136`).
+    /// `SnapshotTaker.markBegin` (`SnapshotTaker.java:120-148`).
     ///
     /// # Errors
     ///
@@ -180,7 +180,7 @@ impl<'a> ConsensusModuleSnapshotTaker<'a> {
         )
     }
 
-    /// `snapshotConsensusModuleState` (`:56-83`).
+    /// `snapshotConsensusModuleState` (`:58-85`).
     ///
     /// # Errors
     ///

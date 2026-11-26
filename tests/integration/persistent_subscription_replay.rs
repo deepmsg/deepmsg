@@ -6,7 +6,7 @@
 //! **replayed into the application through the subscription's own poll**, in
 //! order, while the subscription says it is replaying. That is the whole of the
 //! first half of `shouldReplayExistingRecordingThenJoinLive` — the reference's
-//! case (`…_persistent_subscription_test.cpp:1011`) — up to the point where the
+//! case (`…_persistent_subscription_test.cpp:1013`) — up to the point where the
 //! live stream would be joined, which is the next commit.
 //!
 //! # What the state machine has to get right for this to pass
@@ -27,7 +27,7 @@
 //! # What this criterion does *not* judge, measured rather than assumed
 //!
 //! The session id the archive names is written into the replay channel before
-//! the subscription goes on it (`:1448-1471`). **Leaving that write out does not
+//! the subscription goes on it (`:1450-1473`). **Leaving that write out does not
 //! fail this test** — tried — because one channel with one publication on it is
 //! found by its session id whether the subscription asked for that session or
 //! not. What *is* judged is the value written: handing the driver the whole
@@ -139,7 +139,7 @@ fn a_recording_is_replayed_through_the_subscriptions_own_poll() {
     subscription_context.replay_channel = Some(REPLAY_CHANNEL.to_owned());
     subscription_context.replay_stream_id = REPLAY_STREAM_ID;
     // The reference's case asks for the recording from its start, which is the
-    // position `validate_descriptor` turns into the recording's own (`:1287-1290`).
+    // position `validate_descriptor` turns into the recording's own (`:1353-1356`).
     subscription_context.start_position = FROM_START;
 
     let mut subscription =

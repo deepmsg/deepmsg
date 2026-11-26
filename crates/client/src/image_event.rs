@@ -8,7 +8,7 @@
 //! The reference delivers both through callbacks registered per subscription
 //! (`Aeron.addSubscription(…, availableImageHandler, unavailableImageHandler)`,
 //! `Aeron.java:417`; `aeron_async_add_subscription(…, on_available_image_handler,
-//! …, on_unavailable_image_handler, …)`, `aeronc.h:606-611`), and Java also
+//! …, on_unavailable_image_handler, …)`, `aeronc.h:609-614`), and Java also
 //! takes a default pair on the context (`Aeron.java:1134`). Both hand over the
 //! [`Image`](crate::image::Image) itself, and both forbid calling back into the
 //! client from inside the callback (`AvailableImageHandler.java:21-28`).

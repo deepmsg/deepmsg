@@ -231,8 +231,8 @@ pub fn read_all(buffer: &AtomicBuffer<'_, ReadOnly>) -> Vec<LossReportEntry> {
 /// The file is created **exclusively** and at a length fixed by the driver's
 /// configuration, exactly as the reference creates it
 /// (`aeron_map_new_file(..., fill_with_zeroes = true, page_size)`,
-/// `aeron-driver/src/main/c/aeron_driver.c:324-345`, over an `O_CREAT|O_EXCL`
-/// open at `util/aeron_fileutil.c:967`). A file already in the directory is a
+/// `aeron-driver/src/main/c/aeron_driver.c:341-362`, over an `O_CREAT|O_EXCL`
+/// open at `util/aeron_fileutil.c:966`). A file already in the directory is a
 /// driver already using it, and this says so rather than overwriting it.
 pub struct LossReportFile {
     mapping: MappedFile,
@@ -244,7 +244,7 @@ impl LossReportFile {
     ///
     /// `length` is the caller's to round: the reference aligns the configured
     /// length up to the file page size before creating
-    /// (`aeron_driver.c:329-330`).
+    /// (`aeron_driver.c:346-347`).
     ///
     /// # Errors
     ///

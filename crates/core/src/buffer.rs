@@ -33,7 +33,7 @@
 //! | counter `label_length` | acquire | `aeron_counters_manager.c:302` |
 //! | counter `counter_value`, `registration_id` | acquire | `aeron_counters_manager.h:187` |
 //! | counter `type_id`, `key`, `owner_id`, `reference_id` | relaxed | ordered by the `state` acquire |
-//! | mpsc ring `tail_position` … `consumer_heartbeat` | acquire | `aeron_mpsc_rb.h:66,76`, `aeron_mpsc_rb.c:347` |
+//! | mpsc ring `tail_position` … `consumer_heartbeat` | acquire | `aeron_mpsc_rb.h:66,76`, `aeron_mpsc_rb.c:350` |
 //! | broadcast `tail_intent_counter`, `tail_counter`, `latest_counter` | acquire | `aeron_broadcast_receiver.h:49,68` |
 //! | error-log `length` | acquire | `aeron_distinct_error_log.c:231` |
 //! | error-log text, counter `label` | relaxed copy | `aeron_distinct_error_log.c:248` |
@@ -636,7 +636,7 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
     /// The reference has this as well as the 8-byte form
     /// (`aeron_cas_int32`, `aeron-client/src/main/c/concurrent/aeron_atomic64_gcc_x86_64.h:23-33`),
     /// and the log's `active_term_count` is exactly four bytes wide
-    /// (`aeron_logbuffer_descriptor.h:186-191`). Reaching for the 8-byte form
+    /// (`aeron_logbuffer_descriptor.h:187-192`). Reaching for the 8-byte form
     /// there would compare and write the four bytes of structure padding after
     /// it — which happens to be zero today and is promised by nothing.
     pub fn compare_exchange_i32(&self, offset: usize, expected: i32, new: i32) -> Option<bool> {
@@ -651,7 +651,7 @@ impl<'a> AtomicBuffer<'a, ReadWrite> {
     ///
     /// The MPSC consumer's obligation rather than an optimisation: the
     /// reference zeroes what it consumed *before* it publishes `head_position`
-    /// (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:236-238`), and the
+    /// (`aeron-client/src/main/c/concurrent/aeron_mpsc_rb.c:239-241`), and the
     /// producer's claim path is written against that — freshly claimed space is
     /// assumed to start zero, and a stale positive record length left behind
     /// would look to the next claim like a record that is already published.

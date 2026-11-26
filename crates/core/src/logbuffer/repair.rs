@@ -227,7 +227,7 @@ pub enum UnblockStatus {
     Unblocked,
     /// A run was covered with padding that reaches the **end of the term**, so
     /// the caller must rotate to the next one
-    /// (`concurrent/aeron_logbuffer_unblocker.c:54-56`,
+    /// (`concurrent/aeron_logbuffer_unblocker.c:59-61`,
     /// `LogBufferUnblocker.java:69-71`).
     UnblockedToEnd,
 }
@@ -307,7 +307,7 @@ impl<'a> Unblocker<'a> {
     /// `term_id` and `blocked_offset` are what the padding header is stamped
     /// with, and the reference's caller passes them from the term the blocked
     /// position falls in, not from the active one
-    /// (`concurrent/aeron_logbuffer_unblocker.c:58-62`).
+    /// (`concurrent/aeron_logbuffer_unblocker.c:63-67`).
     pub fn unblock(
         &self,
         term_length: i32,
@@ -431,7 +431,7 @@ fn reset_as_padding(
 ) -> Option<()> {
     // How much of the template is valid is a field, not a constant: the C
     // reference copies exactly this many bytes
-    // (`aeron_logbuffer_descriptor.h:323`), while the Java one hardcodes 32. The
+    // (`aeron_logbuffer_descriptor.h:324`), while the Java one hardcodes 32. The
     // clamp is this build's — C would `memcpy` whatever a corrupt field said —
     // and it is the only guard here: a block whose length reads zero copies
     // nothing and still gets its padding frame, because the four fields below
@@ -470,7 +470,7 @@ fn reset_as_padding(
 /// datagram may carry several frames, and they are contiguous from
 /// `dest_offset` because the receiver validated exactly that before calling
 /// (`aeron_publication_image_validate_packet`,
-/// `aeron-driver/src/main/c/aeron_publication_image.c:645-735`).
+/// `aeron-driver/src/main/c/aeron_publication_image.c:650-740`).
 ///
 /// The order is the reference's and it is the publish protocol itself: the
 /// payload and the header's last three words go first, plainly, and the first

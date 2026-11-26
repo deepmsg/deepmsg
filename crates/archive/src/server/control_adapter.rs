@@ -15,7 +15,7 @@
 //!   the reference logs it and drops it. A session created over UDP is
 //!   therefore not drivable over IPC, and the two control subscriptions, which
 //!   share stream 10, are what makes that matter
-//!   (`ArchiveConductor.java:239-240`).
+//!   (`ArchiveConductor.java:238-239`).
 //! * **Authorisation is asked once per request, by template id**, and a refusal
 //!   is the one gate that answers the client: `ERROR` carrying
 //!   `ArchiveException.UNAUTHORISED_ACTION` as the relevant id and
@@ -27,7 +27,7 @@
 //! local one, each for `FRAGMENT_LIMIT` fragments, both through the *same*
 //! assembler (`ControlSessionAdapter.java:87`, `:107-119`). The local
 //! subscription is the one the reference always creates
-//! (`ArchiveConductor.java:240`); the remote one is the one
+//! (`ArchiveConductor.java:239`); the remote one is the one
 //! `aeron.archive.control.channel.enabled` can take away.
 //!
 //! # What is not the reference's shape, and why
@@ -43,7 +43,7 @@
 //!
 //!   That is also why the control plane is **lent per call** rather than held.
 //!   The reference hands its conductor to the adapter's constructor and the
-//!   conductor keeps the adapter (`ArchiveConductor.java:242-243`) — one
+//!   conductor keeps the adapter (`ArchiveConductor.java:241-242`) — one
 //!   object reachable from the other both ways, which is free in Java and
 //!   impossible for a value. The client's publication side gets the same
 //!   treatment for the same reason.
@@ -205,7 +205,7 @@ pub const UNAUTHORISED_ACTION_MSG: &str = "unauthorised action";
 /// for the length of a poll, so what is kept is what the driver put on the
 /// publication — its registration id, which is `Image.correlationId()`, the id
 /// the conductor writes into a response channel that asked for one
-/// (`ArchiveConductor.java:478-481`) — together with the session the driver
+/// (`ArchiveConductor.java:477-480`) — together with the session the driver
 /// gave it, which is what a log line wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageId {
@@ -262,7 +262,7 @@ pub struct ConnectRequest<'a> {
     /// The stream the client wants its responses on.
     pub response_stream_id: i32,
     /// The client's protocol version, whose **major** decides acceptance
-    /// (`ArchiveConductor.java:483-488`). Absent reads as zero, as it does in
+    /// (`ArchiveConductor.java:482-487`). Absent reads as zero, as it does in
     /// the reference's decoder.
     pub version: i32,
     /// The channel it wants them on.
@@ -369,7 +369,7 @@ pub struct StartReplayRequest {
 ///
 /// **Nothing here is resolved.** Which channel a replication really runs on —
 /// this request's, or the archive's configured one — is the conductor's
-/// question (`ArchiveConductor.java:1394-1395`), and so is every refusal.
+/// question (`ArchiveConductor.java:1401-1402`), and so is every refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicationRequest {
     /// The session that asked.
@@ -383,7 +383,7 @@ pub struct ReplicationRequest {
     /// Where the copy stops; `NULL_POSITION` copies a source that has not
     /// stopped yet, and follows it.
     pub stop_position: i64,
-    /// A tag for the source channel, for tagged replication (`:1399-1410`),
+    /// A tag for the source channel, for tagged replication (`:1406-1417`),
     /// which is one of the two conditions behind `EXTEND`'s multi-destination
     /// branch (`ReplicationSession.java:527`).
     ///
@@ -411,7 +411,7 @@ pub struct ReplicationRequest {
     /// this build serves.
     pub live_destination: String,
     /// The channel the copy itself runs over. Empty means the archive's
-    /// configured one (`ArchiveConductor.java:1394-1395`).
+    /// configured one (`ArchiveConductor.java:1401-1402`).
     pub replication_channel: String,
     /// Credentials for the source archive. Empty before version 8, and empty
     /// whenever the source wants none.
@@ -434,13 +434,13 @@ pub struct ExtendRecordingRequest {
     pub correlation_id: i64,
     /// The recording being appended to.
     pub recording_id: i64,
-    /// The stream it must already be on (`:1090-1097` refuses any other).
+    /// The stream it must already be on (`:1091-1098` refuses any other).
     pub stream_id: i32,
     /// Whether the archive is local to the driver, which is what decides
-    /// whether the recording goes through a spy link (`:1129-1131`).
+    /// whether the recording goes through a spy link (`:1130-1132`).
     pub source_location: SourceLocation,
     /// Whether the recording stops when the client that asked goes away
-    /// (`:2044`).
+    /// (`:2066`).
     pub auto_stop: bool,
     /// The channel as the client wrote it.
     pub original_channel: String,
@@ -500,7 +500,7 @@ impl std::error::Error for ControlError {}
 pub trait ControlPlane {
     /// A connect request, which is the only request that makes a session
     /// (`ControlSessionAdapter.java:766-802`). Answers with the id the client
-    /// will be answered on (`ArchiveConductor.java:490`).
+    /// will be answered on (`ArchiveConductor.java:489`).
     fn new_session(&mut self, image: ImageId, request: ConnectRequest<'_>, now_ms: i64) -> i64;
 
     /// What the authenticator vouched for, for the authorisation gate
@@ -539,7 +539,7 @@ pub trait ControlPlane {
 
     /// `ControlSession.onArchiveId` (`ControlSession.java:541-548`), which the
     /// conductor answers with `ctx.archiveId()`
-    /// (`ArchiveConductor.java:525-528`).
+    /// (`ArchiveConductor.java:524-527`).
     fn on_archive_id(&mut self, session_id: i64, correlation_id: i64, now_ms: i64);
 
     /// `ControlSession.sendErrorResponse(correlationId, relevantId, message)`
@@ -554,7 +554,7 @@ pub trait ControlPlane {
         now_ms: i64,
     );
 
-    /// `ArchiveConductor.logWarning` (`ArchiveConductor.java:443-446`), which
+    /// `ArchiveConductor.logWarning` (`ArchiveConductor.java:442-445`), which
     /// the reference routes into the archive's error handler.
     fn log_warning(&mut self, message: &str);
 
@@ -606,7 +606,7 @@ pub trait ControlPlane {
     /// The channel fragment is **bytes**: the request's field is a `varData`,
     /// and the test it is put to on the far side is over the channel's own
     /// bytes (`ControlSessionAdapter.java:305-313`,
-    /// `Catalog.originalChannelContains` at `Catalog.java:585-625`).
+    /// `Catalog.originalChannelContains` at `Catalog.java:588-628`).
     #[allow(clippy::too_many_arguments)] // one per field the request carries
     fn on_list_recordings_for_uri(
         &mut self,
@@ -621,7 +621,7 @@ pub trait ControlPlane {
 
     /// `ControlSession.onStartRecording` (`ControlSession.java:340-352`), which
     /// the conductor answers with the recording subscription's registration id
-    /// (`ArchiveConductor.java:530-583`).
+    /// (`ArchiveConductor.java:529-582`).
     ///
     /// The request asks the archive to **add a subscription**, which the
     /// reference does inside this call and this build cannot: the add is a
@@ -633,7 +633,7 @@ pub trait ControlPlane {
     /// brings (`:1329-1363`).
     fn on_start_recording(&mut self, request: StartRecordingRequest, now_ms: i64);
 
-    /// `ArchiveConductor.getReplaySession` (`:2654-2667`): which session a
+    /// `ArchiveConductor.getReplaySession` (`:2689-2702`): which session a
     /// replay token stands for, or `None` for a token that was never issued,
     /// belongs to another recording, or has expired.
     ///
@@ -795,7 +795,7 @@ pub trait ControlPlane {
 
     /// `ControlSession.onStopRecordingSubscription`
     /// (`ControlSession.java:331-338`), which the conductor answers with an `OK`
-    /// or with `UNKNOWN_SUBSCRIPTION` (`ArchiveConductor.java:612-624`).
+    /// or with `UNKNOWN_SUBSCRIPTION` (`ArchiveConductor.java:611-623`).
     fn on_stop_recording_subscription(
         &mut self,
         session_id: i64,
@@ -806,7 +806,7 @@ pub trait ControlPlane {
 
     /// `ControlSession.onStopRecording` (`ControlSession.java:322-329`), which
     /// stops the recording registered under a channel and stream
-    /// (`ArchiveConductor.java:585-610`).
+    /// (`ArchiveConductor.java:584-609`).
     fn on_stop_recording(
         &mut self,
         session_id: i64,
@@ -876,7 +876,7 @@ pub trait ControlPlane {
 /// to.
 pub struct ControlAdapter<A: AuthorisationService> {
     /// The control subscription, absent when `aeron.archive.control.channel
-    /// .enabled` is false (`ArchiveConductor.java:227-237`).
+    /// .enabled` is false (`ArchiveConductor.java:226-236`).
     remote_subscription_id: Option<i64>,
     /// The local one, which is always there (`:239-240`).
     local_subscription_id: i64,
@@ -1552,7 +1552,7 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
 
         // The last of the questions about a recording, and the one that does not
         // name one: it asks which recording matches a session, a stream and a
-        // piece of a channel (`ArchiveConductor.java:742-761`).
+        // piece of a channel (`ArchiveConductor.java:741-760`).
         find_last_matching_recording_request_codec::SBE_TEMPLATE_ID => {
             let mut decoder = FindLastMatchingRecordingRequestDecoder::default().header(header, 0);
 
@@ -1588,7 +1588,7 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
-        // One recording's descriptor (`ArchiveConductor.java:688-706`). The
+        // One recording's descriptor (`ArchiveConductor.java:687-705`). The
         // answer is not this turn's to send: the listing session the conductor
         // starts is what offers the message until the client takes it.
         list_recording_request_codec::SBE_TEMPLATE_ID => {
@@ -1612,7 +1612,7 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
             }
         }
 
-        // A page of recordings (`ArchiveConductor.java:638-657`), which is the
+        // A page of recordings (`ArchiveConductor.java:637-656`), which is the
         // same session shape as the one above with a walk in it instead of one
         // descriptor. Where it starts and how many it answers with are the
         // request's own two fields.
@@ -1645,7 +1645,7 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
         }
 
         // The same page narrowed to a stream and a channel
-        // (`ArchiveConductor.java:659-687`). The C client sends both this and
+        // (`ArchiveConductor.java:658-686`). The C client sends both this and
         // the one above (`aeron_archive_proxy.c:530-563` against `:505-528`),
         // and `streamId` with the channel fragment are the whole of the
         // difference between them.
@@ -1684,7 +1684,7 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
 
         // Asking an archive to record a channel. Two templates, and the only
         // difference between them is what the second one added: `autoStop`
-        // (`ArchiveConductor.java:530-536` against `:162-186` of the adapter,
+        // (`ArchiveConductor.java:529-535` against `:161-185` of the adapter,
         // whose v1 arm reads four fields and not five). The C client uses the
         // second (`aeron_archive_proxy.c:248-280`), and the first is answered
         // the same way, as a request that did not ask for it.
@@ -2060,7 +2060,7 @@ fn dispatch<C: ControlPlane, A: AuthorisationService>(
 
         // The two stops that are not named by a subscription id: one names the
         // channel and stream a recording was started with
-        // (`ArchiveConductor.java:585-610`), the other the recording itself
+        // (`ArchiveConductor.java:584-609`), the other the recording itself
         // (`:1301-1327`).
         stop_recording_request_codec::SBE_TEMPLATE_ID => {
             let mut decoder = StopRecordingRequestDecoder::default().header(header, 0);
@@ -3638,7 +3638,7 @@ mod tests {
     }
 
     /// The channel the reference's own response-channel replay tests use
-    /// (`client/aeron_archive_test.cpp:3434`).
+    /// (`client/aeron_archive_test.cpp:3451`).
     const RESPONSE_CHANNEL: &str = "aeron:udp?control-mode=response|control=localhost:10002";
 
     /// The recording id every request below names, which is what a token is
@@ -4718,7 +4718,7 @@ mod tests {
     /// Two sessions on two images are told apart, which is the whole of what
     /// the first gate is for: the UDP control subscription and the local IPC
     /// one are two images on one stream
-    /// (`ArchiveConductor.java:239-240`).
+    /// (`ArchiveConductor.java:238-239`).
     #[test]
     fn two_images_are_two_sessions() {
         let (mut adapter, mut control) = adapter_with(AllowAll);
@@ -5162,7 +5162,7 @@ mod tests {
 
     /// The two stops that name something other than a subscription id: the
     /// channel and stream a recording was started with
-    /// (`ArchiveConductor.java:585-610`), and the recording itself (`:1301-1327`).
+    /// (`ArchiveConductor.java:584-609`), and the recording itself (`:1301-1327`).
     ///
     /// The channel travels whole, because it is what `makeKey` is built from —
     /// a fragment of it would name a different recording.
@@ -5212,7 +5212,7 @@ mod tests {
     }
 
     /// A stop names the subscription the start answered with, and nothing else
-    /// (`ArchiveConductor.java:612-624`).
+    /// (`ArchiveConductor.java:611-623`).
     #[test]
     fn a_stop_names_the_subscription_the_start_answered_with() {
         let (mut adapter, mut control) = adapter_with(AllowAll);
@@ -5348,7 +5348,7 @@ mod tests {
 
     /// A match reaches the session as a question with its channel fragment
     /// whole — the fragment is bytes on the wire and is compared as the client
-    /// wrote it (`ArchiveConductor.java:742-761` over `Catalog.findLast`).
+    /// wrote it (`ArchiveConductor.java:741-760` over `Catalog.findLast`).
     #[test]
     fn a_match_reaches_the_session_with_its_fragment_whole() {
         let (mut adapter, mut control) = adapter_with(AllowAll);
@@ -5383,7 +5383,7 @@ mod tests {
 
     /// A listing request reaches the session as an intent of its own — not as a
     /// question, because the answer is a message the conductor offers over
-    /// several turns (`ArchiveConductor.java:688-706`).
+    /// several turns (`ArchiveConductor.java:687-705`).
     #[test]
     fn a_listing_request_reaches_the_session_as_its_own_intent() {
         let (mut adapter, mut control) = adapter_with(AllowAll);
@@ -5411,7 +5411,7 @@ mod tests {
     /// The two requests for a page of recordings reach the session as their own
     /// calls, and the second one carries its filter — a stream and a channel
     /// fragment that is **bytes**, because that is what the far side compares
-    /// (`ArchiveConductor.java:638-657`, `:659-687`;
+    /// (`ArchiveConductor.java:637-656`, `:659-687`;
     /// `ControlSessionAdapter.java:275-294`, `:296-318`).
     ///
     /// One test for both because the two arms decode the same first four fields

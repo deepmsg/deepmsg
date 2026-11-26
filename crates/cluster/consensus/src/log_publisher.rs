@@ -1,7 +1,7 @@
 //! Writing to the cluster log (`LogPublisher.java`).
 //!
 //! Seven writes, all aimed at one exclusive publication created by the
-//! election (`addLogPublication`, `ConsensusModuleAgent.java:1639-1686`):
+//! election (`addLogPublication`, `ConsensusModuleAgent.java:1655-1702`):
 //!
 //! | Here | Reference |
 //! |---|---|
@@ -10,7 +10,7 @@
 //! | [`LogPublisher::append_session_close`] | `appendSessionClose` (`:180-211`) |
 //! | [`LogPublisher::append_timer`] | `appendTimer` (`:213-239`) |
 //! | [`LogPublisher::append_cluster_action`] | `appendClusterAction` (`:241-276`) |
-//! | [`LogPublisher::append_new_leadership_term_event`] | `appendNewLeadershipTermEvent` (`:278-319`) |
+//! | [`LogPublisher::append_new_leadership_term_event`] | `appendNewLeadershipTermEvent` (`:277-318`) |
 //! | [`LogPublisher::add_destination`] | `addDestination` (`:107-113`) |
 //!
 //! # Where the publication lives
@@ -100,7 +100,7 @@ impl Default for LogPublisher {
 
 impl LogPublisher {
     /// An empty publisher; [`Self::publication`] is set by the agent in
-    /// `addLogPublication` (`ConsensusModuleAgent.java:1639-1686`).
+    /// `addLogPublication` (`ConsensusModuleAgent.java:1655-1702`).
     pub fn new() -> Self {
         Self {
             publication: None,
@@ -119,7 +119,7 @@ impl LogPublisher {
     /// that can never advance and is never told it is over. A re-elected
     /// cluster then cannot join the new term at all: the container waits in
     /// `joinActiveLog` for an image it will not let go of
-    /// (`BoundedLogAdapter.isDone`, `BoundedLogAdapter.java:115-118`), and the
+    /// (`BoundedLogAdapter.isDone`, `BoundedLogAdapter.java:130-133`), and the
     /// consensus module waits for the ack that join never sends.
     ///
     /// # Errors
@@ -168,7 +168,7 @@ impl LogPublisher {
     }
 
     /// The publication, for an extension or a snapshot taker that needs the
-    /// log's own handle (`ConsensusModuleAgent.java:1941`).
+    /// log's own handle (`ConsensusModuleAgent.java:1957`).
     pub fn publication(&self) -> Option<&ExclusivePublication> {
         self.publication.as_ref()
     }

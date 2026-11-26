@@ -154,7 +154,7 @@ with `CountersReader::get`, which is `for_each` with a filter and built a
 descriptor for **every counter in the file** to answer a question about one id.
 It cost 6.6 µs per poll, on the loop every client runs. The reference asks the
 same question of the slot the id names, in constant time
-(`aeron_client_conductor.c:1234-1249`), and so does this build now.
+(`aeron_client_conductor.c:1264-1279`), and so does this build now.
 
 Removing it took the round trip from 8.8 µs to 0.9 µs and throughput from
 116,544/s to 2,758,084/s — with `attempts/msg` at 1.00 before *and* after, which

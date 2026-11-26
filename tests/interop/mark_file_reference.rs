@@ -72,7 +72,7 @@ fn cnc_in(directory: &Path) -> PathBuf {
     let mut cnc = CncFile::create(&aeron_dir, &layout, &identity).expect("a CnC file");
 
     // The order a driver publishes in: its first heartbeat, then the version
-    // (`aeron-driver/src/main/c/aeron_driver.c:971-972`). This file is standing
+    // (`aeron-driver/src/main/c/aeron_driver.c:1011-1012`). This file is standing
     // in for a driver's, so it says the same two things in the same order —
     // which is what `publish` refuses to do without.
     cnc.write_consumer_heartbeat(NOW).expect("the heartbeat");

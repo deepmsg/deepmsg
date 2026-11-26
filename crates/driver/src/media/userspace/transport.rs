@@ -134,7 +134,7 @@ impl UserspaceTransport {
     /// The address a frame for this transport would be sent to: the connected
     /// peer when there is one, and the caller's argument otherwise — which is
     /// the kernel's own choice (`aeron_udp_channel_transport_send`,
-    /// `aeron_udp_channel_transport.c:818-902`).
+    /// `aeron_udp_channel_transport.c:845-929`).
     #[allow(clippy::unused_self)]
     fn destination(&self, address: Option<SocketAddr>) -> Option<SocketAddr> {
         self.peer.or(address)
@@ -341,7 +341,7 @@ impl Transport for UserspaceTransport {
     ///
     /// An unconnected transport is left alone, and that is the reference's own
     /// test (`NULL != transport->connected_address`,
-    /// `aeron_udp_channel_transport.c:380`): it names the address on every
+    /// `aeron_udp_channel_transport.c:394`): it names the address on every
     /// send, so there is nothing to reconnect.
     fn reconnect(&mut self, address: SocketAddr) -> io::Result<()> {
         if self.peer.is_none() {

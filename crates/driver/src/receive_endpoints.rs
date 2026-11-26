@@ -2,7 +2,7 @@
 //!
 //! Mirrors the conductor's other half of
 //! `aeron-driver/src/main/c/aeron_driver_conductor.c`:
-//! `get_or_add_receive_channel_endpoint` (`:2046-2115`) and the lookups that
+//! `get_or_add_receive_channel_endpoint` (`:2097-2166`) and the lookups that
 //! decide whether a subscription joins an endpoint that exists
 //! (`find_existing_receive_channel_endpoint`, `:288-340`).
 //!
@@ -46,7 +46,7 @@ pub struct ReceiveChannelEndpointEntry {
     /// its channel's `local_control` until a re-resolution moves it
     /// (`current_control_addr` of the one destination whose channel is the
     /// endpoint's own and which named an explicit control,
-    /// `media/aeron_receive_channel_endpoint.c:668-689`).
+    /// `media/aeron_receive_channel_endpoint.c:673-694`).
     ///
     /// It is here rather than read off the endpoint because the endpoint itself
     /// has been moved to the receiver by the time a second subscription
@@ -67,7 +67,7 @@ pub struct ReceiveChannelEndpointEntry {
     /// The `SO_RCVBUF` the socket was opened with: the creating channel's own
     /// number when it named one, the context's otherwise, and zero when
     /// neither did (`aeron_udp_channel_socket_so_rcvbuf`,
-    /// `media/aeron_udp_channel.c:629-632`).
+    /// `media/aeron_udp_channel.c:650-653`).
     ///
     /// The endpoint itself carries these too, but it has been *moved to the
     /// receiver* by the time a second subscription arrives — and this is the
@@ -79,8 +79,8 @@ pub struct ReceiveChannelEndpointEntry {
     /// default.
     pub socket_tos: i32,
     /// How many destinations the endpoint has (`destinations.length`,
-    /// `aeron_driver_conductor.c:2184`): one for a channel that named an
-    /// endpoint, none for a `control-mode=manual` one (`:2099-2114`), and it
+    /// `aeron_driver_conductor.c:2235`): one for a channel that named an
+    /// endpoint, none for a `control-mode=manual` one (`:2150-2165`), and it
     /// grows as an MDS subscription adds them.
     ///
     /// Counted here because the agreement check is gated on it and the
@@ -100,7 +100,7 @@ pub enum ReceiveEndpointErrorKind {
     /// case of two clients naming the same channel.
     Socket(std::io::Error),
     /// A channel parameter the endpoint cannot honour
-    /// (`aeron_driver_conductor.c:2116-2223`).
+    /// (`aeron_driver_conductor.c:2167-2274`).
     ///
     /// The message is the reference's own, verbatim, because it is what the
     /// client's `RegistrationException` carries — the checks that produce it
@@ -109,11 +109,11 @@ pub enum ReceiveEndpointErrorKind {
     /// The **bind** failed. The composition arrives already started — the
     /// syscall, the transport and the destination each wrote a line — and this
     /// layer adds the correlation id the reference names here
-    /// (`aeron_driver_conductor.c:2110`).
+    /// (`aeron_driver_conductor.c:2161`).
     Bind(deepmsg_cnc::error_log::ErrorReport),
     /// The wildcard port manager had no port to give: every one in the range is
     /// spoken for (`aeron_wildcard_port_manager_allocate_open_port`,
-    /// `aeron_port_manager.c:93-104`).
+    /// `aeron_port_manager.c:98-109`).
     ///
     /// The message is the manager's, and it travels verbatim: it is what a
     /// client that has run the driver out of ports reads in its
@@ -137,7 +137,7 @@ impl std::error::Error for ReceiveEndpointErrorKind {}
 
 /// The endpoints a driver receives through, and the receiver ids they hold.
 /// The id the first receiver of a driver introduces itself with
-/// (`aeron_driver_context.c:1306-1313`).
+/// (`aeron_driver_context.c:1350-1357`).
 fn first_receiver_id() -> i64 {
     loop {
         let id = i64::from(sys::random_i32()) * i64::from(sys::random_i32());
@@ -154,10 +154,10 @@ pub struct ReceiveChannelEndpoints {
     next_id: u64,
     /// The id the next endpoint introduces itself with
     /// (`context->next_receiver_id++`,
-    /// `aeron-driver/src/main/c/media/aeron_receive_channel_endpoint.c:92`).
+    /// `aeron-driver/src/main/c/media/aeron_receive_channel_endpoint.c:97`).
     next_receiver_id: i64,
     /// Which ports a subscription whose channel named port zero listens on
-    /// (`context->receiver_port_manager`, `aeron_driver_context.c:428-437`).
+    /// (`context->receiver_port_manager`, `aeron_driver_context.c:431-440`).
     ///
     /// The receiver's half of what [`crate::send_endpoints`] keeps for the
     /// sender, and one range each: a deployment can give the two directions
@@ -175,7 +175,7 @@ impl Default for ReceiveChannelEndpoints {
 impl ReceiveChannelEndpoints {
     /// No endpoints, and the first receiver id.
     ///
-    /// That id is **random and not one** (`aeron_driver_context.c:1303-1313`):
+    /// That id is **random and not one** (`aeron_driver_context.c:1347-1357`):
     /// the product of two randomised `int32`s, retried until it is not zero.
     /// A driver that started at one would hand out the same receiver ids as
     /// every other driver, and a sender that keeps its receivers keyed by that
@@ -193,14 +193,14 @@ impl ReceiveChannelEndpoints {
 
     /// The range a subscription whose channel named port zero is given one out
     /// of, set once at start-up from the driver's settings
-    /// (`aeron_wildcard_port_manager_set_range`, `aeron_port_manager.c:58-65`).
+    /// (`aeron_wildcard_port_manager_set_range`, `aeron_port_manager.c:63-70`).
     pub fn set_port_range(&mut self, range: PortRange) {
         self.receiver_port_manager.set_range(range);
     }
 
     /// Give a managed port back, which is what a destination the receiver has
     /// released does (`aeron_receive_destination_delete`,
-    /// `media/aeron_receive_destination.c:152-156`).
+    /// `media/aeron_receive_destination.c:158-162`).
     pub fn free_managed_port(&mut self, port: u16) {
         self.receiver_port_manager.free_managed_port(port);
     }
@@ -209,7 +209,7 @@ impl ReceiveChannelEndpoints {
     ///
     /// For the one caller that builds a destination outside this registry: the
     /// conductor, when a client adds one to a multi-destination subscription
-    /// (`aeron_driver_conductor.c:5903`, which hands the create the context's
+    /// (`aeron_driver_conductor.c:6000`, which hands the create the context's
     /// manager the same way).
     pub fn port_manager(&mut self) -> &mut WildcardPortManager {
         &mut self.receiver_port_manager
@@ -263,7 +263,7 @@ impl ReceiveChannelEndpoints {
     }
 
     /// Whether a tagged channel joins this endpoint
-    /// (`aeron_receive_channel_endpoint_matches_tag`, `:668-689`, which hands
+    /// (`aeron_receive_channel_endpoint_matches_tag`, `:673-694`, which hands
     /// `aeron_udp_channel_matches_tag` the endpoint's **current control address**
     /// as the local-side override).
     ///
@@ -298,7 +298,7 @@ impl ReceiveChannelEndpoints {
         channel.remote_data == entry.channel.remote_data && control_matches
     }
 
-    /// `aeron_udp_channel_is_wildcard` (`media/aeron_udp_channel.h:98-102`): both of
+    /// `aeron_udp_channel_is_wildcard` (`media/aeron_udp_channel.h:99-103`): both of
     /// a channel's data addresses are the wildcard, which is what `aeron:udp?tags=`
     /// names.
     fn is_wildcard(channel: &UdpChannel) -> bool {
@@ -309,7 +309,7 @@ impl ReceiveChannelEndpoints {
     ///
     /// `initial_window_length` is `params->initial_window_length`: the
     /// subscription's `rcv-wnd=`, or the driver's own when it named none
-    /// (`aeron_driver_uri.c:466`, `:502`). It is what the receive side's one
+    /// (`aeron_driver_uri.c:471`, `:507`). It is what the receive side's one
     /// *window* check measures, in place of the send side's MTU check.
     ///
     /// # Errors
@@ -332,14 +332,14 @@ impl ReceiveChannelEndpoints {
     ) -> Result<(u64, i32, Option<Box<ReceiveChannelEndpoint>>), ReceiveEndpointErrorKind> {
         // The kernel's own receive buffer, the arm the window check falls to
         // when the channel named no `so-rcvbuf` and the context has none
-        // either (`context->os_buffer_lengths`, `aeron_driver_context.c:1315-1320`,
-        // read at `aeron_driver_conductor.c:2119`).
+        // either (`context->os_buffer_lengths`, `aeron_driver_context.c:1359-1364`,
+        // read at `aeron_driver_conductor.c:2170`).
         let os_default_socket_rcvbuf = usize::try_from(Self::os_defaults().rcvbuf).unwrap_or(0);
 
         if let Some(id) = self.find(&channel) {
             let entry = self.get(id).expect("just found");
 
-            // `:2184`: the comparison is skipped for a `control-mode=manual`
+            // `:2235`: the comparison is skipped for a `control-mode=manual`
             // channel and for an endpoint that no longer has exactly one
             // destination. A manual endpoint's destinations arrive one at a
             // time from clients, so it has no single socket shape to agree
@@ -359,7 +359,7 @@ impl ReceiveChannelEndpoints {
             return Ok((id, entry.channel_status_counter_id, None));
         }
 
-        // `:2116-2130`: a window that does not fit the buffer the socket is
+        // `:2167-2181`: a window that does not fit the buffer the socket is
         // about to be opened with is refused before the socket is made. The
         // buffer is the arriving channel's own — at this point there is no
         // endpoint to have one.
@@ -378,7 +378,7 @@ impl ReceiveChannelEndpoints {
         // `:105` reads the group tag before anything else is built, and takes
         // the channel's own `gtag=` when it named one: a channel that names
         // none is not a channel that named `-1`
-        // (`aeron_receive_channel_endpoint_set_group_tag`, `:39-46`).
+        // (`aeron_receive_channel_endpoint_set_group_tag`, `:38-45`).
         let group_tag = channel.group_tag.or(config.receiver_group_tag);
 
         // What this endpoint drops as it receives, decided **here** because
@@ -412,7 +412,7 @@ impl ReceiveChannelEndpoints {
             ReceiveEndpointError::Socket(error) => ReceiveEndpointErrorKind::Socket(error),
             ReceiveEndpointError::Port(error) => ReceiveEndpointErrorKind::Port(error),
             ReceiveEndpointError::Bind(mut report) => {
-                // `:2110`: `AERON_APPEND_ERR("correlation_id=%" PRId64, …)`.
+                // `:2161`: `AERON_APPEND_ERR("correlation_id=%" PRId64, …)`.
                 report.append(
                     "aeron_driver_conductor_get_or_add_receive_channel_endpoint",
                     "aeron_driver_conductor.c",
@@ -425,7 +425,7 @@ impl ReceiveChannelEndpoints {
 
         // The same status the send side writes, for the same reason: a
         // subscription's counter is how a client learns its socket is up
-        // (`aeron_driver_conductor.c:2160`).
+        // (`aeron_driver_conductor.c:2211`).
         endpoint.set_status(counters, regions, EndpointStatus::Active);
 
         let id = self.next_id;
@@ -436,12 +436,12 @@ impl ReceiveChannelEndpoints {
         // What the socket was opened with and how many destinations it
         // started with, read off the endpoint before the receiver takes it —
         // `aeron_receive_channel_endpoint_create` is given a destination for
-        // every channel but a manual one (`aeron_driver_conductor.c:2099-2114`).
+        // every channel but a manual one (`aeron_driver_conductor.c:2150-2165`).
         let socket_rcvbuf = endpoint.socket_rcvbuf;
         let socket_sndbuf = endpoint.socket_sndbuf;
         let destination_count = endpoint.destination_count();
 
-        // `:668-679`: the override is the endpoint's **own** destination's
+        // `:673-684`: the override is the endpoint's **own** destination's
         // current control address, and only when that destination is the one
         // the endpoint was made for and named an explicit control.
         let control_addr = endpoint
@@ -489,7 +489,7 @@ impl ReceiveChannelEndpoints {
 
     /// Mark an endpoint as on its way out, and say whether *this* call is the
     /// one that did it (`aeron_receive_channel_endpoint_try_remove_endpoint`,
-    /// `media/aeron_receive_channel_endpoint.c:691-702`).
+    /// `media/aeron_receive_channel_endpoint.c:696-707`).
     ///
     /// The condition is the reference's: every stream count at zero — which is
     /// what [`Self::detach_subscription`] has just answered — and no images.
@@ -525,14 +525,14 @@ impl ReceiveChannelEndpoints {
     }
 
     /// An MDS subscription added a destination to an endpoint
-    /// (`aeron_driver_conductor.c:5901-5940`).
+    /// (`aeron_driver_conductor.c:5998-6037`).
     pub fn attach_destination(&mut self, id: u64) {
         if let Some(entry) = self.get_mut(id) {
             entry.destination_count += 1;
         }
     }
 
-    /// A destination left an endpoint (`:6120-6160`).
+    /// A destination left an endpoint (`:6217-6257`).
     ///
     /// Saturating because a removal names a channel the endpoint may not
     /// have — the reference searches its list and finds nothing
@@ -586,7 +586,7 @@ impl ReceiveChannelEndpoints {
 
     /// The receiver window a subscription's channel resolves to: its own
     /// `rcv-wnd=`, or the driver's when it named none
-    /// (`params.initial_window_length`, `uri/aeron_driver_uri.c:466`, `:502`).
+    /// (`params.initial_window_length`, `uri/aeron_driver_uri.c:471`, `:507`).
     ///
     /// Read here rather than at the image because this is where a channel URI
     /// is read at all — and because the agreement check below measures a
@@ -616,15 +616,15 @@ impl ReceiveChannelEndpoints {
 }
 
 /// The checks a subscription must pass before it may share an endpoint
-/// (`aeron_driver_conductor.c:2184-2223`).
+/// (`aeron_driver_conductor.c:2235-2274`).
 ///
 /// The receive side's three, and they are not the send side's three: where a
 /// publication measures its MTU against the send buffer, a subscription
 /// measures its **receiver window** against the receive buffer, and the order
-/// of the two buffer comparisons is reversed (`:2202`, `:2213`).
+/// of the two buffer comparisons is reversed (`:2255`, `:2276`).
 ///
 /// One asymmetry is the reference's and is reproduced deliberately: the window
-/// is measured against the *arriving* channel's receive buffer (`:2193`),
+/// is measured against the *arriving* channel's receive buffer (`:2246`),
 /// not the endpoint's, so a channel that narrows its own `so-rcvbuf` without
 /// narrowing `rcv-wnd=` is refused even when the socket it is joining is
 /// wider.
@@ -763,7 +763,7 @@ mod tests {
     }
 
     /// Two drivers must not introduce their receivers with the same id
-    /// (`aeron_driver_context.c:1306-1313`).
+    /// (`aeron_driver_context.c:1350-1357`).
     ///
     /// A sender keys its receivers by that id — the liveness tracker does, and
     /// so does every group strategy (`aeron_min_flow_control.c:185`) — so a
@@ -922,8 +922,8 @@ mod tests {
             .expect("an endpoint");
 
         // The reference writes the name, the channel, and the address the
-        // socket was **actually** bound to (`aeron_position.c:229-244`, called
-        // from `aeron_driver_conductor.c:2157-2165`). The channel named a port,
+        // socket was **actually** bound to (`aeron_position.c:234-249`, called
+        // from `aeron_driver_conductor.c:2208-2216`). The channel named a port,
         // so the address is that port — and a reader that gets the whole label
         // knows which socket it is looking at.
         assert_eq!(
@@ -1015,7 +1015,7 @@ mod tests {
         // And the asymmetry with the send side, which is the reference's and
         // not an accident of this port: a receive channel that names *no*
         // buffer is compared at the **context's** length
-        // (`aeron_udp_channel_socket_so_rcvbuf`, passed at `:2213`), where a
+        // (`aeron_udp_channel_socket_so_rcvbuf`, passed at `:2276`), where a
         // publication's is compared at the raw URI value and so is skipped
         // when it named none. The driver's 128k is not the socket's 1m, so
         // this is a refusal where the send side would have said nothing.
@@ -1114,7 +1114,7 @@ mod tests {
             )
             .expect("an endpoint");
 
-        // `:2184`'s second clause. Nothing in this build can add a destination
+        // `:2235`'s second clause. Nothing in this build can add a destination
         // to an endpoint that is not manual — only an MDS subscription may,
         // and an MDS subscription is manual — so the count is moved by hand to
         // show that the clause is what decides, and not the luck of the count

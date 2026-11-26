@@ -36,23 +36,23 @@
 //!
 //! **ERR is 40 bytes, not 32.** The group tag is a field of the *fixed* header
 //! (`:102`) and is written unconditionally
-//! (`aeron_receive_channel_endpoint.c:489`); the `AERON_ERROR_HAS_GROUP_TAG_FLAG`
-//! bit in `flags` (`:227`) only says whether the receiver should *believe* the
+//! (`aeron_receive_channel_endpoint.c:494`); the `AERON_ERROR_HAS_GROUP_TAG_FLAG`
+//! bit in `flags` (`:232`) only says whether the receiver should *believe* the
 //! value it finds there (`aeron_network_publication.c:880`). The message text
 //! therefore begins at offset 40, not 32
-//! (`aeron_receive_channel_endpoint.c:491`, `aeron_network_publication.c:867`).
+//! (`aeron_receive_channel_endpoint.c:496`, `aeron_network_publication.c:867`).
 //!
 //! **RTTM is 40 bytes, and `reception_delta` is an `int64_t`.** It is a
 //! nanosecond interval — `now - echo_timestamp - reception_delta`
-//! (`aeron_publication_image.c:854`) — and travels as 64 bits on both sides
-//! (`aeron_receive_channel_endpoint.c:400`, `:414`). Reading it as 32 bits
+//! (`aeron_publication_image.c:859`) — and travels as 64 bits on both sides
+//! (`aeron_receive_channel_endpoint.c:405`, `:419`). Reading it as 32 bits
 //! would misplace `receiver_id` and silently corrupt the round-trip estimate.
 //!
 //! # Little-endian, and only little-endian
 //!
 //! Every field is little-endian on the wire. The reference gets there by not
 //! trying: it assigns struct members into a stack buffer and hands the buffer
-//! to `sendmsg` (`aeron_receive_channel_endpoint.c:407-418`), so what travels
+//! to `sendmsg` (`aeron_receive_channel_endpoint.c:412-423`), so what travels
 //! is whatever the host's byte order made of those members. Every platform
 //! Aeron is built for is little-endian, which is what makes that work; a
 //! big-endian host would need swapping on both sides, and the reference has the
@@ -66,7 +66,7 @@
 //! Both ride *after* the fixed header, and in both cases the fixed header is
 //! what says whether they are there: `frame_length` of 36 versus 44 for the SM
 //! (`aeron_udp_protocol.c:33`), and `error_length + 40` for the ERR
-//! (`aeron_send_channel_endpoint.c:666-667`). See [`ErrorFrame::text`] and
+//! (`aeron_send_channel_endpoint.c:659-660`). See [`ErrorFrame::text`] and
 //! [`StatusMessageFrame::group_tag`].
 //!
 //! # What is not here
@@ -110,7 +110,7 @@ pub const MAX_MESSAGE_LENGTH: i32 = 16 * 1024 * 1024;
 
 /// `AERON_ERROR_MAX_TEXT_LENGTH` (`aeron_udp_protocol.h:225`) — the most text
 /// an ERR frame may carry, which is exactly what an arriving `error_length` is
-/// validated against (`aeron_send_channel_endpoint.c:666`).
+/// validated against (`aeron_send_channel_endpoint.c:659`).
 pub const MAX_ERROR_TEXT_LENGTH: i32 = 1023;
 
 /// The frame type in a header's last two bytes (`aeron_udp_protocol.h:172-184`).
@@ -267,7 +267,7 @@ fn write_i64(buffer: &mut [u8], offset: usize, value: i64) -> Option<()> {
 ///
 /// This is the check every frame's `read` opens with: the reference dispatches
 /// on `frame_header->type` first and interprets the rest of the bytes only
-/// afterwards (`aeron_receive_channel_endpoint.c:533-545`), so reading the
+/// afterwards (`aeron_receive_channel_endpoint.c:538-550`), so reading the
 /// wrong frame's fields is not something a caller may do by accident here.
 fn header_of(buffer: &[u8], expected: i16) -> Option<FrameHeader> {
     let header = FrameHeader::read(buffer)?;
@@ -283,9 +283,9 @@ fn header_of(buffer: &[u8], expected: i16) -> Option<FrameHeader> {
 /// The constructors in the reference all do exactly this —
 /// `frame_length = sizeof(struct)`, `version = AERON_FRAME_HEADER_VERSION`,
 /// `type = AERON_HDR_TYPE_*`, `flags = the caller's or 0` — whether they are
-/// sending a NAK (`aeron_receive_channel_endpoint.c:354-357`), an SM
+/// sending a NAK (`aeron_receive_channel_endpoint.c:359-362`), an SM
 /// (`:313-316`), a setup (`aeron_network_publication.c:396-399`), a response
-/// setup (`aeron_receive_channel_endpoint.c:445-447`) or a RTTM (`:407-410`).
+/// setup (`aeron_receive_channel_endpoint.c:450-452`) or a RTTM (`:412-415`).
 fn fixed_header(frame_type: i16, length: usize, flags: u8) -> FrameHeader {
     FrameHeader {
         frame_length: length as i32,
@@ -366,8 +366,8 @@ impl FrameHeader {
     /// The reference pairs the two wherever the distinction from control
     /// frames matters — one branch of `aeron_is_frame_valid`
     /// (`aeron_udp_protocol.h:235`), one `case` pair in the receiver's dispatch
-    /// (`aeron_receive_channel_endpoint.c:535-536`), one loop over frames in
-    /// the publication image (`aeron_publication_image.c:687`). A padding frame
+    /// (`aeron_receive_channel_endpoint.c:540-541`), one loop over frames in
+    /// the publication image (`aeron_publication_image.c:692`). A padding frame
     /// carries no payload but is still a frame of the term buffer, and code
     /// that reads "not NAK/SM/SETUP, therefore data" gets PAD wrong in a way
     /// nothing notices until a term boundary.
@@ -400,9 +400,9 @@ impl FrameHeader {
 /// `default: return false` (`:259-260`).
 ///
 /// A caller that wants the reference's *per-destination* rules — the ones that
-/// also validate `error_length` (`aeron_send_channel_endpoint.c:666-667`) or
+/// also validate `error_length` (`aeron_send_channel_endpoint.c:659-660`) or
 /// the log-buffer frame length a data frame must have
-/// (`aeron_publication_image.c:732`) — still has to ask those questions
+/// (`aeron_publication_image.c:737`) — still has to ask those questions
 /// separately; this function is the shared envelope and nothing more.
 pub fn is_frame_valid(header: &FrameHeader, packet_length: usize) -> bool {
     if packet_length < HEADER_LENGTH || header.frame_length < 0 || header.version != VERSION {
@@ -500,7 +500,7 @@ impl DataFrame {
     /// `None` if the buffer is shorter than [`DataFrame::LENGTH`] or the header
     /// is not DATA. `frame_length` is not checked against the length of the
     /// buffer: the reference validates frames at the point of use, not here
-    /// (`aeron_publication_image.c:732`).
+    /// (`aeron_publication_image.c:737`).
     pub fn read(buffer: &[u8]) -> Option<Self> {
         header_of(buffer, frame_type::DATA)?;
 
@@ -510,7 +510,7 @@ impl DataFrame {
     /// Read the data header a **term** holds at `buffer`: DATA **or** PAD.
     ///
     /// A term holds those two and nothing else (`0 == (frame_type & 0xFFFE)`,
-    /// `aeron_publication_image.c:685-688`), and they are one layout —
+    /// `aeron_publication_image.c:690-693`), and they are one layout —
     /// `AERON_HDR_TYPE_PAD` is a data header with a zero payload
     /// (`aeron_udp_protocol.h:172`). [`DataFrame::read`] refuses a PAD on
     /// purpose, for a caller that asked for a *frame*; a receiver has admitted
@@ -555,7 +555,7 @@ impl DataFrame {
     /// admits a frame whose type passes `0 == (frame_type & 0xFFFE)` — DATA and
     /// PAD, the only two it expects in a term — and then takes
     /// `frame->term_offset` without looking at the type again
-    /// (`aeron_publication_image.c:685-690`). The header layouts are the same
+    /// (`aeron_publication_image.c:690-695`). The header layouts are the same
     /// struct: `AERON_HDR_TYPE_PAD` is a data header with a zero payload
     /// (`aeron_udp_protocol.h:172`), and `term_offset` sits at `:59` of the
     /// same `:56-65` layout.
@@ -723,7 +723,7 @@ impl SetupFrame {
 /// the header's `session_id`/`stream_id`, which are the pair the far end
 /// looks its publication up by; the correlation id is read from that
 /// publication's own `response_correlation_id`
-/// (`aeron_send_channel_endpoint.c:738-748`).
+/// (`aeron_send_channel_endpoint.c:731-741`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RspSetupFrame {
     /// `(aeron_udp_protocol.h:161)` — the session the *sender's* publication
@@ -733,7 +733,7 @@ pub struct RspSetupFrame {
     pub stream_id: i32,
     /// `(aeron_udp_protocol.h:163)` — the session the far end's subscription
     /// should adopt for the response stream it is about to read
-    /// (`aeron_driver_conductor.c:7100-7105`).
+    /// (`aeron_driver_conductor.c:7196-7201`).
     pub response_session_id: i32,
 }
 
@@ -762,7 +762,7 @@ impl RspSetupFrame {
     ///
     /// The flags byte is zero and there is no `write_with_flags`: the
     /// reference sets it to `UINT8_C(0)` and reads nothing from it
-    /// (`aeron_receive_channel_endpoint.c:446`), so the type defines no flag
+    /// (`aeron_receive_channel_endpoint.c:451`), so the type defines no flag
     /// bits for a caller to choose between.
     ///
     /// # Errors
@@ -788,7 +788,7 @@ impl RspSetupFrame {
 /// multiple of [`FRAME_ALIGNMENT`]. That is fine and deliberate: alignment is a
 /// property of the term buffer, and a NAK is only ever a datagram. The
 /// reference sends NAKs with `flags` set to zero
-/// (`aeron_receive_channel_endpoint.c:356`); the type defines no flag bits, so
+/// (`aeron_receive_channel_endpoint.c:361`); the type defines no flag bits, so
 /// there is no `write_with_flags` here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NakFrame {
@@ -830,7 +830,7 @@ impl NakFrame {
     }
 
     /// Write a NAK frame to `buffer`, with `flags` zeroed as the reference
-    /// sends it (`aeron_receive_channel_endpoint.c:356`).
+    /// sends it (`aeron_receive_channel_endpoint.c:361`).
     ///
     /// # Errors
     ///
@@ -860,7 +860,7 @@ impl NakFrame {
 /// The frame may be **44** bytes instead. When the endpoint has a group tag to
 /// gossip, the reference appends `aeron_status_message_optional_header_t`
 /// (`:90-94`) and sets `frame_length` to 36 + 8
-/// (`aeron_receive_channel_endpoint.c:309-316`); a reader tells the two forms
+/// (`aeron_receive_channel_endpoint.c:314-321`); a reader tells the two forms
 /// apart by `frame_length` alone. See [`StatusMessageFrame::group_tag`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatusMessageFrame {
@@ -1010,8 +1010,8 @@ impl StatusMessageFrame {
 /// [`ErrorFrame::LENGTH`] is 40 and the text follows it. Both halves of that
 /// sentence are load-bearing: the group tag is a fixed field even when the
 /// frame does not carry the flag that makes it meaningful
-/// (`aeron_receive_channel_endpoint.c:489`), and the text begins at offset 40
-/// (`aeron_receive_channel_endpoint.c:491`). See [`ErrorFrame::text`] for that
+/// (`aeron_receive_channel_endpoint.c:494`), and the text begins at offset 40
+/// (`aeron_receive_channel_endpoint.c:496`). See [`ErrorFrame::text`] for that
 /// second half, and [`MAX_ERROR_TEXT_LENGTH`] for how long it may be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ErrorFrame {
@@ -1064,9 +1064,9 @@ impl ErrorFrame {
     ///
     /// The frame's `frame_length` is written as
     /// `LENGTH + error_length` — the whole frame including the text, which is
-    /// what the reference stores (`aeron_receive_channel_endpoint.c:480-481`)
+    /// what the reference stores (`aeron_receive_channel_endpoint.c:485-486`)
     /// and what a receiver's own validity check tests
-    /// (`aeron_send_channel_endpoint.c:666-667`). The text itself is *not*
+    /// (`aeron_send_channel_endpoint.c:659-660`). The text itself is *not*
     /// written: this stores 40 bytes, and the caller writes the message
     /// `error_length` names into `buffer[`[`ErrorFrame::LENGTH`]`..]`
     /// afterwards. A length that claims text the caller does not write is the
@@ -1086,7 +1086,7 @@ impl ErrorFrame {
     ///
     /// The only flag the reference sets on an ERR frame is
     /// [`header_flags::ERR_HAS_GROUP_TAG`], and only when the endpoint has a
-    /// group tag (`aeron_receive_channel_endpoint.c:483`).
+    /// group tag (`aeron_receive_channel_endpoint.c:488`).
     ///
     /// # Errors
     ///
@@ -1115,10 +1115,10 @@ impl ErrorFrame {
     /// struct in the reference either — it is `error + 1`, the byte after the
     /// 40-byte header, whose length is `error_length`
     /// (`aeron_network_publication.c:867`,
-    /// `aeron_receive_channel_endpoint.c:491`), and the reference's own
+    /// `aeron_receive_channel_endpoint.c:496`), and the reference's own
     /// validity check is exactly the arithmetic this method performs
     /// (`error_length` non-negative, within its own maximum, and within the
-    /// frame: `aeron_send_channel_endpoint.c:666-667`).
+    /// frame: `aeron_send_channel_endpoint.c:659-660`).
     ///
     /// The returned slice borrows the caller's buffer, so it lives no longer
     /// than the datagram does.
@@ -1156,9 +1156,9 @@ pub struct RttmFrame {
     pub echo_timestamp: i64,
     /// `(aeron_udp_protocol.h:114)` — nanoseconds spent inside the receiver,
     /// subtracted alongside the echo when the round trip is computed
-    /// (`aeron_publication_image.c:854`). The reply the reference sends zeroes
+    /// (`aeron_publication_image.c:859`). The reply the reference sends zeroes
     /// it (`aeron_network_publication.c:907`). It is an `i64` on the wire, and
-    /// the send path passes it as one (`aeron_receive_channel_endpoint.c:400`).
+    /// the send path passes it as one (`aeron_receive_channel_endpoint.c:405`).
     pub reception_delta: i64,
     /// `(aeron_udp_protocol.h:115)` — which receiver measured.
     pub receiver_id: i64,
@@ -1201,8 +1201,8 @@ impl RttmFrame {
     ///
     /// The one flag here is [`header_flags::RTTM_REPLY`], which a receiver sets
     /// on its **request** — it is a request to be answered, not a mark on the
-    /// answer (`aeron_receive_channel_endpoint.c:409`, reached with `is_reply`
-    /// true from `aeron_publication_image.c:1096`). The answer a publication
+    /// answer (`aeron_receive_channel_endpoint.c:414`, reached with `is_reply`
+    /// true from `aeron_publication_image.c:1101`). The answer a publication
     /// sends carries no flags (`aeron_network_publication.c:893`, `:902`),
     /// which is what stops it being answered in turn.
     ///
@@ -1655,12 +1655,12 @@ mod tests {
             }
         );
         // The text starts after all 40 bytes, which is the whole point of
-        // `ErrorFrame::LENGTH` (`aeron_receive_channel_endpoint.c:491`).
+        // `ErrorFrame::LENGTH` (`aeron_receive_channel_endpoint.c:496`).
         assert_eq!(frame.text(&bytes), Some(&b"boom"[..]));
 
         // `write` writes the fixed header with `frame_length` counted over the
         // text, and leaves the text to its caller
-        // (`aeron_receive_channel_endpoint.c:480-491`).
+        // (`aeron_receive_channel_endpoint.c:485-496`).
         let mut out = [0u8; 40 + 4];
         frame
             .write_with_flags(&mut out, header_flags::ERR_HAS_GROUP_TAG)
@@ -1686,7 +1686,7 @@ mod tests {
         // A length the datagram does not hold is not a truncated text.
         assert_eq!(frame.text(&bytes[..41]), None);
 
-        // A negative length is refused before any slicing (`:666`).
+        // A negative length is refused before any slicing (`:659`).
         frame.error_length = -1;
         assert_eq!(frame.text(&bytes), None);
 
@@ -1734,7 +1734,7 @@ mod tests {
     #[test]
     fn a_negative_reception_delta_keeps_its_sign() {
         // The measured interval is subtracted, not compared, so a negative one
-        // has to survive the wire (`aeron_publication_image.c:854`).
+        // has to survive the wire (`aeron_publication_image.c:859`).
         let frame = RttmFrame {
             session_id: -1,
             stream_id: -2,
@@ -2199,7 +2199,7 @@ mod tests {
 /// that header is a *run* of entries rather than one struct: the reference
 /// packs as many as fit into one datagram and pads each up to the next
 /// eight-byte boundary, so that a reader can walk them without knowing how long
-/// a name is (`aeron_driver_name_resolver.c:1034-1082`,
+/// a name is (`aeron_driver_name_resolver.c:1035-1083`,
 /// `aeron_res_header_entry_length_ipv4`, `aeron_udp_protocol.c:52-64`).
 ///
 /// Reading the entry structs alone — the packed little struct the type names —
@@ -2212,7 +2212,7 @@ mod tests {
 pub struct ResolutionFrame<'a> {
     /// The frame header: `type` is [`frame_type::RES`], `version` is
     /// [`VERSION`], and `frame_length` counts the entries and their padding
-    /// (`aeron_driver_name_resolver.c:948-953`).
+    /// (`aeron_driver_name_resolver.c:949-954`).
     pub header: FrameHeader,
     /// The datagram the header was read from, entries and all.
     packet: &'a [u8],
@@ -2224,12 +2224,12 @@ impl<'a> ResolutionFrame<'a> {
     /// `None` when there is no whole header, when its `version` is not
     /// [`VERSION`], or when its `type` is not [`frame_type::RES`] — the checks
     /// the reference's receive callback makes before it looks at any entry
-    /// (`aeron_driver_name_resolver.c:737-755`).
+    /// (`aeron_driver_name_resolver.c:738-756`).
     ///
     /// The entries run to the end of **the datagram** and not to
     /// `frame_length`: the reference's receive loop walks
     /// `length - sizeof(aeron_frame_header_t)` bytes and never reads the length
-    /// it was sent (`:738`, `:746`, `:822`).
+    /// it was sent (`:739`, `:747`, `:823`).
     pub fn read(packet: &'a [u8]) -> Option<Self> {
         let header = FrameHeader::read(packet)?;
 
@@ -2244,14 +2244,14 @@ impl<'a> ResolutionFrame<'a> {
     ///
     /// What a caller walks when it has to tell *why* the run ended — the
     /// reference's receive loop counts a truncated datagram and an entry of an
-    /// unknown type differently (`aeron_driver_name_resolver.c:769-774` versus
-    /// `:794-799`), and an iterator that stops cannot say which happened.
+    /// unknown type differently (`aeron_driver_name_resolver.c:770-775` versus
+    /// `:795-800`), and an iterator that stops cannot say which happened.
     pub fn entry_bytes(&self) -> &'a [u8] {
         self.packet.get(HEADER_LENGTH..).unwrap_or_default()
     }
 
     /// The entries, walked the way the reference's receive loop walks them
-    /// (`:748-823`).
+    /// (`:749-824`).
     pub fn entries(&self) -> ResolutionEntries<'a> {
         ResolutionEntries {
             remaining: self.entry_bytes(),
@@ -2264,7 +2264,7 @@ impl<'a> ResolutionFrame<'a> {
 ///
 /// A walk ends early when it meets something that is not an entry, and that is
 /// not the same thing as reaching the end: the reference counts the datagram as
-/// invalid and returns (`aeron_driver_name_resolver.c:751-756`, `:769-774`), so
+/// invalid and returns (`aeron_driver_name_resolver.c:752-757`, `:770-775`), so
 /// [`ResolutionEntries::malformed`] is how a caller tells the two apart — an
 /// iterator's `None` says "no more" either way.
 #[derive(Clone, Copy, Debug)]
@@ -2299,7 +2299,7 @@ impl<'a> Iterator for ResolutionEntries<'a> {
         // An entry is padded up to the boundary the next one starts on, and a
         // datagram that does not carry that padding is not one the reference
         // reads: it compares what it received with the *padded* entry length
-        // (`:769-770`, `:783-784`).
+        // (`:770-771`, `:784-785`).
         let Some(rest) = self.remaining.get(entry.entry_length()..) else {
             self.malformed = true;
             self.remaining = &[];
@@ -2326,7 +2326,7 @@ pub struct ResolutionDatagram<'a> {
     /// what says how long the address that follows is.
     pub res_type: i8,
     /// `AERON_RES_HEADER_SELF_FLAG` when the sender is resolving its own name
-    /// (`aeron_driver_name_resolver.c:801`, `:941`).
+    /// (`aeron_driver_name_resolver.c:802`, `:942`).
     pub res_flags: u8,
     /// The port the name resolves to. The address that follows carries no port
     /// of its own, so this is where it lives.
@@ -2382,7 +2382,7 @@ impl<'a> ResolutionDatagram<'a> {
 
     /// Read the entry at the front of `entry` — which may be a whole datagram
     /// or the run of bytes a [`ResolutionFrame`] walk is standing on
-    /// (`aeron_driver_name_resolver_receive`, `aeron_driver_name_resolver.c:756-799`,
+    /// (`aeron_driver_name_resolver_receive`, `aeron_driver_name_resolver.c:757-800`,
     /// which reads the type, then the header, then the address the type names).
     ///
     /// `None` when the bytes are shorter than the entry says they are, or when
@@ -2437,11 +2437,11 @@ impl<'a> ResolutionDatagram<'a> {
     ///
     /// `None` when the buffer is too small for the entry and its padding: the
     /// reference answers `0` there and its caller stops filling the datagram,
-    /// leaving the entry for the next one (`aeron_driver_name_resolver.c:1043-1058`).
+    /// leaving the entry for the next one (`aeron_driver_name_resolver.c:1044-1059`).
     ///
     /// The bytes between the name and the next boundary are written as **zero**.
     /// The reference leaves them as whatever the buffer held, because it appends
-    /// into one reused buffer (`:1031-1062`), so nothing about them is a wire
+    /// into one reused buffer (`:1032-1063`), so nothing about them is a wire
     /// format and no reader looks at them.
     pub fn write(&self, out: &mut [u8]) -> Option<usize> {
         let length = self.length();
@@ -2647,7 +2647,7 @@ mod resolution_tests {
     /// The frame header is not optional: the entries on their own are not a
     /// datagram the reference reads. Its receive callback refuses anything whose
     /// `version` is not the frame version before it looks at an entry
-    /// (`aeron_driver_name_resolver.c:740-742`).
+    /// (`aeron_driver_name_resolver.c:741-743`).
     #[test]
     fn a_bare_entry_is_not_a_frame() {
         let entry = ResolutionDatagram {
@@ -2686,7 +2686,7 @@ mod resolution_tests {
     /// A name that does not fit the bytes it claims is not an entry either, and
     /// an entry whose padding the datagram does not carry ends the walk as a
     /// **malformed** one rather than as the end of the run
-    /// (`aeron_driver_name_resolver.c:769-774`, where that costs a datagram).
+    /// (`aeron_driver_name_resolver.c:770-775`, where that costs a datagram).
     #[test]
     fn a_truncated_entry_is_malformed_and_not_the_end() {
         let entry = ResolutionDatagram {

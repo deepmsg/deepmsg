@@ -58,14 +58,14 @@ pub const PATCH_VERSION: i32 = 0;
 pub const SEMANTIC_VERSION: i32 = (MAJOR_VERSION << 16) | (MINOR_VERSION << 8) | PATCH_VERSION;
 
 /// How often a running archive stamps its mark file
-/// (`Archive.Configuration.MARK_FILE_UPDATE_INTERVAL_MS`, `Archive.java:668`).
+/// (`Archive.Configuration.MARK_FILE_UPDATE_INTERVAL_MS`, `Archive.java:697`).
 pub const MARK_FILE_UPDATE_INTERVAL_MS: i64 = 1_000;
 
 /// How long a mark file's timestamp may go unstamped before the archive that
-/// owns it is taken to be gone: ten intervals (`Archive.java:673`).
+/// owns it is taken to be gone: ten intervals (`Archive.java:702`).
 pub const LIVENESS_TIMEOUT_MS: i64 = 10 * MARK_FILE_UPDATE_INTERVAL_MS;
 
-/// `Archive.Configuration.ERROR_BUFFER_LENGTH_DEFAULT` (`Archive.java:633`).
+/// `Archive.Configuration.ERROR_BUFFER_LENGTH_DEFAULT` (`Archive.java:662`).
 pub const ERROR_BUFFER_LENGTH_DEFAULT: usize = 1024 * 1024;
 
 /// Where the version field sits in the file: the SBE message header is eight
@@ -80,10 +80,10 @@ pub const ACTIVITY_TIMESTAMP_OFFSET: usize = 16;
 /// The archive's own SBE header: which archive this is, on what channels, and
 /// how big its error log is.
 ///
-/// The fields `ArchiveMarkFile.encode` sets (`:491-505`) are all here, because
+/// The fields `ArchiveMarkFile.encode` sets (`:502-516`) are all here, because
 /// a reader decodes the same header the reference's `ArchiveTool` prints. The
 /// two the archive *does not* choose are not: `pid` is stamped by whoever
-/// creates the file (`:196`) and `version` by [`ArchiveMarkFile::signal_ready`],
+/// creates the file (`:202`) and `version` by [`ArchiveMarkFile::signal_ready`],
 /// which is the whole of what the generic half owns.
 #[derive(Clone, Debug)]
 pub struct Header<'a> {
@@ -115,7 +115,7 @@ pub enum ArchiveMarkError {
     Mark(MarkFileError),
     /// The version it holds is not this build's: the reference's
     /// `validateVersion` compares the **major** and nothing else
-    /// (`ArchiveMarkFile.java:507-517`).
+    /// (`ArchiveMarkFile.java:518-528`).
     Version {
         /// The file's path.
         path: PathBuf,
@@ -125,7 +125,7 @@ pub enum ArchiveMarkError {
         expected: i32,
     },
     /// The archive has more to say about itself than the header holds
-    /// (`:458-462`).
+    /// (`:469-473`).
     HeaderTooLong {
         /// The length the fields need.
         needed: usize,
@@ -212,7 +212,7 @@ impl ArchiveMarkFile {
     /// already there**.
     ///
     /// The reference's `ArchiveMarkFile` opens as readily as it creates —
-    /// `new ArchiveMarkFile(ctx)` (`Archive.java:1323`) reaches Agrona's
+    /// `new ArchiveMarkFile(ctx)` (`Archive.java:1389`) reaches Agrona's
     /// `MarkFile`, which maps the file it finds and makes one only when there is
     /// none — and that is what lets an archive be restarted over its own
     /// directory: the C suite's kill-and-restart cases start one with
@@ -224,7 +224,7 @@ impl ArchiveMarkFile {
     /// What is written over it is this process's own header, which is the same
     /// thing the reference does with the file it mapped.
     ///
-    /// The length is the reference's `alignedTotalFileLength` (`:450-471`): the
+    /// The length is the reference's `alignedTotalFileLength` (`:461-482`): the
     /// header and the error buffer together, rounded up to the page size —
     /// because a mapping is whole pages whatever the file asks for, and the
     /// error buffer has to be what the reader expects to find behind the
@@ -234,7 +234,7 @@ impl ArchiveMarkFile {
     /// for.
     ///
     /// The pid is this process's, stamped once, here: `ArchiveMarkFile`'s
-    /// creating constructor does the same (`:196`) and its opening one does
+    /// creating constructor does the same (`:202`) and its opening one does
     /// not, so a reader that finds a stale file learns who wrote it rather than
     /// who looked at it last.
     ///
@@ -253,7 +253,7 @@ impl ArchiveMarkFile {
         let length = total_length(error_buffer_length, page_size);
 
         // Counted before anything is written, which is what the reference does
-        // with the same numbers in `alignedTotalFileLength` (`:450-462`): a
+        // with the same numbers in `alignedTotalFileLength` (`:461-473`): a
         // header that does not fit is a refusal, not a truncated file, and a
         // refusal only works if it happens before the writing.
         let needed = header_length(header, error_buffer_length);
@@ -286,7 +286,7 @@ impl ArchiveMarkFile {
     /// The version is checked here rather than in [`crate::mark`], because it is
     /// this product's format that decides what a major means — the reference
     /// hands the generic file a `versionCheck` callback for the same reason
-    /// (`:543-552`).
+    /// (`:572-581`).
     ///
     /// # Errors
     ///
@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     /// `headerLength > headerLengthCapacity` is a refusal, not a truncation
-    /// (`ArchiveMarkFile.java:458-462`): an archive whose channels do not fit
+    /// (`ArchiveMarkFile.java:469-473`): an archive whose channels do not fit
     /// the header has to say so rather than write half of itself.
     #[test]
     fn an_archive_too_big_for_its_header_is_refused() {

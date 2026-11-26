@@ -125,7 +125,7 @@ pub struct Ports {
     ///
     /// The defaults are the reference's own. They are fields rather than
     /// literals so H5's second arm can rest the *same ports* on a different
-    /// term buffer length and MTU (`ClusterTest.java:1892-1895`).
+    /// term buffer length and MTU (`ClusterTest.java:1896-1899`).
     shape: ChannelShape,
 }
 
@@ -218,7 +218,7 @@ impl Ports {
     }
 
     /// Sit the same ports on a new channel shape — H5's second arm, which
-    /// restarts the cluster with the new one (`ClusterTest.java:1892-1895`).
+    /// restarts the cluster with the new one (`ClusterTest.java:1896-1899`).
     pub fn set_channel_shape(&mut self, shape: ChannelShape) {
         self.shape = shape;
     }
@@ -406,7 +406,7 @@ pub fn members(ports: &Ports) -> String {
 
 /// [`members`] for a cluster of `count` members — the reference's five-member
 /// cases need the same string with two more entries
-/// (`ClusterTest.java:1877-1905` is written for any count).
+/// (`ClusterTest.java:1881-1909` is written for any count).
 #[must_use]
 pub fn members_of(ports: &Ports, count: i32) -> String {
     (0..count)
@@ -536,7 +536,7 @@ pub struct Node {
     /// The test business's name, kept so a restart starts the same one.
     service_name: Option<&'static str>,
     /// The member's authenticator, when a case supplies one — the equivalent
-    /// of the reference's `authenticatorSupplier` (`ConsensusModule.java:807`).
+    /// of the reference's `authenticatorSupplier` (`ConsensusModule.java:814`).
     authenticator: Option<TestAuthenticator>,
     /// `None` only while [`Self::restart_whole`] is between two drivers: the
     /// old one has to be **dropped** before the new one starts, because its
@@ -773,7 +773,7 @@ impl Node {
                 ports.consensus_channel(id)
             ),
             // No endpoint: the reference calls that shape MDC
-            // (`ConsensusModule.java:2145`), and the module puts
+            // (`ConsensusModule.java:2180`), and the module puts
             // `control-mode=manual` on the publication itself.
             format!("-Daeron.cluster.log.channel={}", ports.log_channel()),
             format!(
@@ -854,7 +854,7 @@ impl Node {
         let mut config = ConsensusModuleConfig::from_properties(&properties)
             .expect("the module's configuration settles");
         // This build has no class loader; the flag is the programmatic
-        // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+        // extension seam a zero-service cluster needs (`ConsensusModule.java:2193`).
         // A member with a container has no such gap.
         config.consensus_module_extension = self.service_name.is_none();
         let idle_strategy = config.idle_strategy.clone();
@@ -882,7 +882,7 @@ impl Node {
                     authenticator: authenticator
                         .map(|authenticator| Box::new(authenticator) as Box<dyn Authenticator>),
                     // The other half of `ClusterTest`'s
-                    // `ClusterTests.errorHandler` (`ClusterTest.java:565`,
+                    // `ClusterTests.errorHandler` (`ClusterTest.java:570`,
                     // `ClusterTests.java:77-98`): a **WARN** is printed by the
                     // agent and goes no further, an **ERROR** is a failure —
                     // and here a failure is what a case's waits panic with.
@@ -1050,7 +1050,7 @@ impl Node {
     /// Re-settle the module's three channel arguments from `ports`.
     ///
     /// The channels are the one part of a launch this harness lets a test
-    /// change between restarts (`ClusterTest.java:1892-1895`), so they are
+    /// change between restarts (`ClusterTest.java:1896-1899`), so they are
     /// re-read rather than frozen at [`Self::start`]. Everything else — the
     /// directories, the member list, the stream ids — settles from the same
     /// values.
@@ -1330,7 +1330,7 @@ impl Node {
     /// it neither keeps the last term entry nor deletes the mark files: the
     /// cluster is meant to come back with **no log at all**, only the snapshot
     /// state, which is what lets the next term be recorded with a different
-    /// term buffer length and MTU (`ClusterTest.java:1823-1933`).
+    /// term buffer length and MTU (`ClusterTest.java:1827-1937`).
     ///
     /// The module and the driver must both be stopped, as for the truncation:
     /// the next start is what reads the rewritten log.
@@ -2751,7 +2751,7 @@ pub fn connect_request_with_credentials(
 
 /// The longest payload an ingress message may carry on a channel of this term
 /// length: `computeMaxMessageLength(term) - SESSION_HEADER_LENGTH`
-/// (`ClusterTest.java:1850`).
+/// (`ClusterTest.java:1854`).
 ///
 /// The message *is* the session header plus the payload —
 /// `AeronCluster.SESSION_HEADER_LENGTH = MessageHeaderEncoder.ENCODED_LENGTH +
@@ -2885,7 +2885,7 @@ pub fn offer_message(client: &ClientSide, faults: &Faults, message: &[u8]) {
 
 /// `TestCluster.takeSnapshot` (`TestCluster.java:1502`): put `SNAPSHOT` on the
 /// **leader's** cluster-control toggle. The leader proposes it and every member
-/// snapshots at that position (`ConsensusModuleAgent.java:3221-3253`).
+/// snapshots at that position (`ConsensusModuleAgent.java:3248-3280`).
 pub fn take_snapshot(counters: &NodeCounters) {
     counters.set(
         CLUSTER_CONTROL_TOGGLE_TYPE_ID,

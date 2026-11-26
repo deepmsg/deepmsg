@@ -57,7 +57,7 @@ pub use udp_transport::UdpTransport;
 
 /// The knobs a transport is opened with
 /// (`aeron_udp_channel_transport_params_t`,
-/// `aeron-driver/src/main/c/media/aeron_udp_channel_transport.h:39-47`).
+/// `aeron-driver/src/main/c/media/aeron_udp_channel_transport.h:40-48`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransportParams {
     /// `SO_RCVBUF`, in bytes; zero leaves the kernel's default.
@@ -68,11 +68,11 @@ pub struct TransportParams {
     /// when the channel and the driver both name none.
     pub socket_tos: i32,
     /// The channel's interface index, which the IPv6 multicast options take in
-    /// place of an address (`aeron_udp_channel_transport.c:213-227`, `:230-235`).
+    /// place of an address (`aeron_udp_channel_transport.c:227-241`, `:257-262`).
     pub multicast_if_index: u32,
     /// The `ttl=` parameter, for the sockets that honour it
     /// (`0 != channel->multicast_ttl ? channel->multicast_ttl : context->multicast_ttl`,
-    /// `media/aeron_send_channel_endpoint.c:129`). Zero leaves the kernel's
+    /// `media/aeron_send_channel_endpoint.c:122`). Zero leaves the kernel's
     /// own hop limit, because the reference and the channel agree on zero
     /// meaning "not set".
     pub ttl: u8,
@@ -124,7 +124,7 @@ impl Default for TransportParams {
 ///
 /// `Send` because an endpoint is created on the conductor and then *moved* to
 /// the sender or the receiver, which is where its socket lives from then on
-/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:2015` hands it over the
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:2066` hands it over the
 /// same way).
 pub trait Transport: Send {
     /// Send up to sixteen datagrams, one per buffer, and answer with how many
@@ -133,7 +133,7 @@ pub trait Transport: Send {
     /// `address` is where an unconnected transport sends; a connected one
     /// ignores it and uses the address it was connected to, which is what
     /// `aeron_udp_channel_transport_send` decides between
-    /// (`aeron_udp_channel_transport.c:818-902`).
+    /// (`aeron_udp_channel_transport.c:845-929`).
     ///
     /// # Errors
     ///
@@ -162,7 +162,7 @@ pub trait Transport: Send {
 
     /// Point the socket at a different address, which is what a name that
     /// resolved somewhere else needs
-    /// (`aeron_udp_channel_transport_reconnect`, `:376-392`).
+    /// (`aeron_udp_channel_transport_reconnect`, `:390-406`).
     ///
     /// Deliberately **not** a defaulted method: a transport that quietly
     /// ignored this would leave a re-resolution looking applied.
@@ -174,7 +174,7 @@ pub trait Transport: Send {
 
     /// The local address the socket is bound to, which the channel status
     /// counter reports (`aeron_udp_channel_transport_bind_addr_and_port`,
-    /// `aeron_udp_channel_transport.c:917-930`).
+    /// `aeron_udp_channel_transport.c:944-957`).
     ///
     /// # Errors
     ///
@@ -183,7 +183,7 @@ pub trait Transport: Send {
 
     /// The socket's receive buffer, as the kernel reports it — what a
     /// subscription's window has to fit inside
-    /// (`aeron_udp_channel_transport_get_so_rcvbuf`, `:904-915`).
+    /// (`aeron_udp_channel_transport_get_so_rcvbuf`, `:931-942`).
     ///
     /// # Errors
     ///

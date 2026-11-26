@@ -29,11 +29,11 @@ use crate::client::context::ArchiveContext;
 use crate::client::persistent_subscription::counters::Provided;
 use crate::client::proxy::NULL_VALUE;
 
-/// `AERON_ARCHIVE_PERSISTENT_SUBSCRIPTION_FROM_START` (`aeron_archive.h:1348`):
+/// `AERON_ARCHIVE_PERSISTENT_SUBSCRIPTION_FROM_START` (`aeron_archive.h:1352`):
 /// replay the recording from where it starts.
 pub const FROM_START: i64 = -1;
 
-/// `AERON_ARCHIVE_PERSISTENT_SUBSCRIPTION_FROM_LIVE` (`aeron_archive.h:1349`):
+/// `AERON_ARCHIVE_PERSISTENT_SUBSCRIPTION_FROM_LIVE` (`aeron_archive.h:1353`):
 /// start from the live position, replaying nothing — and the default a context
 /// has before anything sets one.
 pub const FROM_LIVE: i64 = -2;
@@ -76,7 +76,7 @@ pub struct PersistentSubscriptionContext {
     pub start_position: i64,
 
     /// Where the driver is, for the client a subscription makes when it was not
-    /// handed one (`:505-514`).
+    /// handed one (`:508-517`).
     pub aeron_directory_name: Option<String>,
 
     /// Whether a client was handed to this context. See
@@ -88,7 +88,7 @@ pub struct PersistentSubscriptionContext {
     /// (`context_set_state_counter` and the three beside it, `:283-337`).
     ///
     /// Which ones are missing is what says which ones to allocate: the reference
-    /// guards each with its own `if (NULL == context->…_counter)` (`:541-584`).
+    /// guards each with its own `if (NULL == context->…_counter)` (`:544-587`).
     pub counters: Provided,
     // The listener is the one field of the reference's context that is not
     // here yet: its type is what `on_live_joined` and friends are called on,
@@ -129,7 +129,7 @@ impl PersistentSubscriptionContext {
     ///
     /// This is the reference's ten refusals and its replay-channel rewrite, and
     /// nothing that needs a driver: the client a subscription makes for itself
-    /// (`:505-514`) is made where it is used.
+    /// (`:508-517`) is made where it is used.
     ///
     /// # Errors
     ///
@@ -226,7 +226,7 @@ pub struct Concluded {
     /// The replay channel **with `rejoin=false` written into it** — the one to
     /// ask for, not the one that was configured.
     pub replay_channel: String,
-    /// Whether the subscription must make its own client (`:505-514`) rather
+    /// Whether the subscription must make its own client (`:508-517`) rather
     /// than use one it was handed.
     pub owns_aeron: bool,
     /// Which recording to subscribe to.
@@ -376,7 +376,7 @@ mod tests {
         );
     }
 
-    /// `shouldFailIfRecordingIdNotSet` (`:47`).
+    /// `shouldFailIfRecordingIdNotSet` (`:50`).
     #[test]
     fn a_recording_id_must_be_set() {
         let mut context = a_context();
@@ -397,7 +397,7 @@ mod tests {
         );
     }
 
-    /// `shouldFailIfLiveChannelNotSet` (`:67`).
+    /// `shouldFailIfLiveChannelNotSet` (`:70`).
     #[test]
     fn a_live_channel_must_be_set() {
         let mut context = a_context();
@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(Err(ConcludeError::LiveChannelRequired), context.conclude());
     }
 
-    /// `shouldFailIfLiveStreamIdNotSet` (`:87`).
+    /// `shouldFailIfLiveStreamIdNotSet` (`:90`).
     #[test]
     fn a_live_stream_id_must_be_set() {
         let mut context = a_context();
@@ -515,7 +515,7 @@ mod tests {
     }
 
     /// Whether the subscription makes its own client, which the reference
-    /// decides by whether one was handed to it (`:505-514`).
+    /// decides by whether one was handed to it (`:508-517`).
     #[test]
     fn a_context_that_was_handed_a_client_does_not_own_one() {
         let mut context = a_context();

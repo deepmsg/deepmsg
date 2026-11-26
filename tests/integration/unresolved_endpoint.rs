@@ -37,7 +37,7 @@ const STREAM_ID: i32 = 1001;
 /// The divergence underneath is real and belongs to a slice of its own: the
 /// reference's add-publication command is a state machine that waits while the
 /// **native resource agent** parses the channel
-/// (`aeron_driver_conductor.c:4113-4131`,
+/// (`aeron_driver_conductor.c:4210-4228`,
 /// `AERON_DRIVER_NATIVE_RESOURCE_AGENT_COMMAND_STATE_PENDING`), so its
 /// conductor never waits on a nameserver, and `AsyncResourceTest` passes there
 /// on this same host. It is written up in `docs/compat.md`.

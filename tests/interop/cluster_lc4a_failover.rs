@@ -47,7 +47,7 @@ fn options(base: u16) -> Options {
         node_properties: vec![
             // The probes speak IPC to the leader's driver; a cluster only
             // subscribes to IPC ingress when it is told to
-            // (`ConsensusModuleAgent.java:3387-3415`).
+            // (`ConsensusModuleAgent.java:3419-3447`).
             (
                 "aeron.cluster.ingress.ipc.allowed".to_owned(),
                 "true".to_owned(),

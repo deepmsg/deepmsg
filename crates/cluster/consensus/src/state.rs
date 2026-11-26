@@ -29,7 +29,7 @@ impl Role {
 }
 
 /// The consensus module's lifecycle state. Counterpart of
-/// `ConsensusModule.State` (`ConsensusModule.java:148-178`), written to
+/// `ConsensusModule.State` (`ConsensusModule.java:151-181`), written to
 /// counter 200 by `ConsensusModuleAgent.state(..)`
 /// (`ConsensusModuleAgent.java:1310`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -45,7 +45,7 @@ pub enum ModuleState {
 }
 
 impl ModuleState {
-    /// The code the counter carries (`ConsensusModule.java:148-178`).
+    /// The code the counter carries (`ConsensusModule.java:151-181`).
     pub const fn code(self) -> i32 {
         self as i32
     }
@@ -64,7 +64,7 @@ impl ModuleState {
         }
     }
 
-    /// `ConsensusModule.State.get(code)` (`ConsensusModule.java:148-178`):
+    /// `ConsensusModule.State.get(code)` (`ConsensusModule.java:151-181`):
     /// the state a code names, or `None` for one outside the table.
     pub fn from_code(code: i32) -> Option<Self> {
         match code {

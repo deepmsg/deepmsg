@@ -36,11 +36,11 @@ use crate::segment::{SegmentError, SegmentSpec, SegmentWriter};
 /// What a write tells the archive's recorder, so that the three counters it
 /// publishes (105, 106, 107) get their numbers
 /// (`ArchiveConductor.Recorder.bytesWritten` and `writeTimeNs`,
-/// `ArchiveConductor.java:2717-2730`).
+/// `ArchiveConductor.java:2752-2765`).
 ///
 /// A trait rather than a counter handle because the reference separates the two
 /// deliberately: `RecordingWriter` reports, and the `Recorder` is what keeps
-/// the running totals and decides when they are published (`:2732-2743`). The
+/// the running totals and decides when they are published (`:2767-2778`). The
 /// writer has no business knowing about a counter.
 pub trait WriteStats {
     /// The bytes a block put in the file — the reference's `dataLength`, which
@@ -492,7 +492,7 @@ mod tests {
 
         // Where it *is* comes from the join position it was made with, not from
         // the file's length: the bytes a reader is continuing from are the ones
-        // the image told it about (`ArchiveConductor.java:2109`).
+        // the image told it about (`ArchiveConductor.java:2144`).
         assert_eq!(0, second.position());
 
         second

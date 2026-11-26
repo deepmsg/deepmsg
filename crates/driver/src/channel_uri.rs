@@ -1,9 +1,9 @@
 //! Channel URIs, as the driver reads the ones clients send it.
 //!
 //! Mirrors `aeron-client/src/main/c/uri/aeron_uri.c`: the scheme and transport
-//! test at `:253-330` and the parameter scanner at `:34-110`. (M16) The value
+//! test at `:259-336` and the parameter scanner at `:34-110`. (M16) The value
 //! readers reproduce `aeron_uri_get_int32`/`_get_bool`/`_get_timeout`
-//! (`aeron-client/src/main/c/uri/aeron_uri.c:355-430`) and
+//! (`aeron-client/src/main/c/uri/aeron_uri.c:359-434`) and
 //! `aeron_parse_size64`/`aeron_parse_duration_ns`
 //! (`aeron-client/src/main/c/util/aeron_parse_util.c:42-105`, `:170-268`).
 //!
@@ -37,7 +37,7 @@
 //! * `aeron_parse_duration_ns` accepts `5m` (and `5mx`) as five milliseconds
 //!   (`:180-200`).
 //! * `aeron_uri_get_bool` compares only the first four characters
-//!   (`aeron-client/src/main/c/uri/aeron_uri.c:411-414`), so `sparse=truex` is
+//!   (`aeron-client/src/main/c/uri/aeron_uri.c:415-418`), so `sparse=truex` is
 //!   true.
 //!
 //! Where the reference is *destructive* rather than permissive this refuses,
@@ -49,7 +49,7 @@
 //!   silently not have it.
 //! * `key=` at the end of the URI reaches the reference's callback with a
 //!   **null** value, which its readers treat as the parameter not being there
-//!   at all (`aeron_uri.c:357-361`): the channel is served, without the
+//!   at all (`aeron_uri.c:361-365`): the channel is served, without the
 //!   parameter. Here it is an error, because a parameter whose value went
 //!   missing is not the same channel as one that never had the parameter.
 //! * A URI that is not valid UTF-8 is refused: the reference compares bytes,
@@ -62,7 +62,7 @@ use std::fmt;
 pub const SCHEME: &str = "aeron:";
 
 /// The longest URI accepted, including nothing for a terminator
-/// (`AERON_URI_MAX_LENGTH`, `aeron-client/src/main/c/uri/aeron_uri.h:90`).
+/// (`AERON_URI_MAX_LENGTH`, `aeron-client/src/main/c/uri/aeron_uri.h:91`).
 pub const MAX_LENGTH: usize = 4096;
 
 const UDP_TRANSPORT: &str = "udp";
@@ -196,9 +196,9 @@ impl UriError {
     /// read off the source, because the composition is not one function's: the
     /// scanner sets the code and its own site (`aeron_uri_parse_params`,
     /// `aeron-client/src/main/c/uri/aeron_uri.c:51`, `:60`, `:78`), the parse
-    /// that called it appends the URI it was given (`aeron_uri.c:296`), and
+    /// that called it appends the URI it was given (`aeron_uri.c:302`), and
     /// the failure the scanner cannot see — a URI that names no transport —
-    /// is set and sited on the parse itself (`:271`, `:318`). What the
+    /// is set and sited on the parse itself (`:277`, `:324`). What the
     /// conductor adds after this is its own line, which is the caller's.
     ///
     /// `None` for a failure the reference has no site for: a URI that is not
@@ -210,13 +210,13 @@ impl UriError {
         let (function, line, message, appends_uri) = match self {
             Self::InvalidScheme => (
                 "aeron_uri_parse",
-                318,
+                324,
                 format!("invalid URI scheme or transport: {text}"),
                 false,
             ),
             Self::TooLong { length } => (
                 "aeron_uri_parse",
-                271,
+                277,
                 format!(
                     "URI length ({length}) exceeds max supported length ({}): {text}",
                     MAX_LENGTH - 1
@@ -255,7 +255,7 @@ impl UriError {
         );
 
         if appends_uri {
-            composed.push_str(&format!("[aeron_uri_parse, aeron_uri.c:296] {text}\n"));
+            composed.push_str(&format!("[aeron_uri_parse, aeron_uri.c:302] {text}\n"));
         }
 
         Some(composed)
@@ -291,7 +291,7 @@ impl<'a> ChannelUri<'a> {
             "" if transport == Transport::Ipc => Vec::new(),
             // `aeron:udp` without a `?` is not a channel: the reference reads
             // the next byte as the separator and finds the terminator
-            // (`aeron_uri.c:281-290`).
+            // (`aeron_uri.c:287-296`).
             "" => return Err(UriError::InvalidScheme),
             rest => {
                 let rest = rest.strip_prefix('?').ok_or(UriError::InvalidScheme)?;
@@ -315,7 +315,7 @@ impl<'a> ChannelUri<'a> {
     /// The value of `key`, or `None` if it is not there.
     ///
     /// The **first** match wins and a repeat is not an error — the same rule as
-    /// `aeron_uri_find_param_value` (`aeron-client/src/main/c/uri/aeron_uri.c:337-352`),
+    /// `aeron_uri_find_param_value` (`aeron-client/src/main/c/uri/aeron_uri.c:343-358`),
     /// which scans forward and returns on the first hit.
     pub fn value(&self, key: &str) -> Option<&'a str> {
         self.params
@@ -325,7 +325,7 @@ impl<'a> ChannelUri<'a> {
     }
 
     /// An `int32` parameter (`aeron_uri_get_int32`,
-    /// `aeron-client/src/main/c/uri/aeron_uri.c:355-385`).
+    /// `aeron-client/src/main/c/uri/aeron_uri.c:359-389`).
     ///
     /// # Errors
     ///
@@ -353,7 +353,7 @@ impl<'a> ChannelUri<'a> {
     }
 
     /// An `int64` parameter (`aeron_uri_get_int64`,
-    /// `aeron-client/src/main/c/uri/aeron_uri.c:384-407`).
+    /// `aeron-client/src/main/c/uri/aeron_uri.c:388-411`).
     ///
     /// The same base and the same consumption rule as [`i64`](Self::i64)'s
     /// smaller sibling, and the same two errors — the reference has one reader
@@ -384,7 +384,7 @@ impl<'a> ChannelUri<'a> {
     }
 
     /// A `bool` parameter (`aeron_uri_get_bool`,
-    /// `aeron-client/src/main/c/uri/aeron_uri.c:409-430`).
+    /// `aeron-client/src/main/c/uri/aeron_uri.c:413-434`).
     ///
     /// # Errors
     ///
@@ -503,7 +503,7 @@ fn scan_params<'a>(text: &'a str) -> Result<Vec<Param<'a>>, UriError> {
 /// `None` for anything else, including a value that is empty or has trailing
 /// characters. The reference's reader checks the same way round: it requires
 /// `*end_ptr == '\0'` after the call
-/// (`aeron-client/src/main/c/uri/aeron_uri.c:365-370`).
+/// (`aeron-client/src/main/c/uri/aeron_uri.c:369-374`).
 pub(crate) fn parse_base_zero(value: &str) -> Option<i128> {
     let (negative, magnitude) = match value.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(
             concat!(
                 "(-1) invalid channel\n",
-                "[aeron_uri_parse, aeron_uri.c:318] invalid URI scheme or transport: invalidaeron:ipc\n",
+                "[aeron_uri_parse, aeron_uri.c:324] invalid URI scheme or transport: invalidaeron:ipc\n",
             ),
             UriError::InvalidScheme
                 .parse_failure(b"invalidaeron:ipc")
@@ -645,13 +645,13 @@ mod tests {
         );
 
         // The parameter scanner sets its own site **and** the parse appends the
-        // URI it was given (`aeron_uri.c:296`), which is why these are three
+        // URI it was given (`aeron_uri.c:302`), which is why these are three
         // lines before the conductor has said anything.
         assert_eq!(
             concat!(
                 "(-1) invalid channel\n",
                 "[aeron_uri_parse_params, aeron_uri.c:51] empty key not allowed\n",
-                "[aeron_uri_parse, aeron_uri.c:296] aeron:udp?=value\n",
+                "[aeron_uri_parse, aeron_uri.c:302] aeron:udp?=value\n",
             ),
             UriError::EmptyKey {
                 text: "=value".to_owned()
@@ -663,7 +663,7 @@ mod tests {
             concat!(
                 "(-1) invalid channel\n",
                 "[aeron_uri_parse_params, aeron_uri.c:60] invalid end of key\n",
-                "[aeron_uri_parse, aeron_uri.c:296] aeron:udp?key|endpoint=localhost:24325\n",
+                "[aeron_uri_parse, aeron_uri.c:302] aeron:udp?key|endpoint=localhost:24325\n",
             ),
             UriError::MissingKey {
                 text: "key".to_owned()
@@ -675,7 +675,7 @@ mod tests {
             concat!(
                 "(-1) invalid channel\n",
                 "[aeron_uri_parse_params, aeron_uri.c:78] empty value not allowed\n",
-                "[aeron_uri_parse, aeron_uri.c:296] aeron:udp?endpoint=|control=localhost:24326\n",
+                "[aeron_uri_parse, aeron_uri.c:302] aeron:udp?endpoint=|control=localhost:24326\n",
             ),
             UriError::MissingValue {
                 key: "endpoint".to_owned()
@@ -687,7 +687,7 @@ mod tests {
         assert_eq!(
             concat!(
                 "(-1) invalid channel\n",
-                "[aeron_uri_parse, aeron_uri.c:271] URI length (4147) exceeds max supported length (4095): x\n",
+                "[aeron_uri_parse, aeron_uri.c:277] URI length (4147) exceeds max supported length (4095): x\n",
             ),
             UriError::TooLong { length: 4147 }
                 .parse_failure(b"x")
@@ -709,7 +709,7 @@ mod tests {
                 "invalidaeron:ipc",
                 concat!(
                     "(-1) invalid channel\n",
-                    "[aeron_uri_parse, aeron_uri.c:318] invalid URI scheme or transport: invalidaeron:ipc\n",
+                    "[aeron_uri_parse, aeron_uri.c:324] invalid URI scheme or transport: invalidaeron:ipc\n",
                 ),
             ),
             (
@@ -717,7 +717,7 @@ mod tests {
                 concat!(
                     "(-1) invalid channel\n",
                     "[aeron_uri_parse_params, aeron_uri.c:51] empty key not allowed\n",
-                    "[aeron_uri_parse, aeron_uri.c:296] aeron:udp?=value\n",
+                    "[aeron_uri_parse, aeron_uri.c:302] aeron:udp?=value\n",
                 ),
             ),
             (
@@ -725,7 +725,7 @@ mod tests {
                 concat!(
                     "(-1) invalid channel\n",
                     "[aeron_uri_parse_params, aeron_uri.c:60] invalid end of key\n",
-                    "[aeron_uri_parse, aeron_uri.c:296] aeron:udp?key|endpoint=localhost:24325\n",
+                    "[aeron_uri_parse, aeron_uri.c:302] aeron:udp?key|endpoint=localhost:24325\n",
                 ),
             ),
             (
@@ -733,7 +733,7 @@ mod tests {
                 concat!(
                     "(-1) invalid channel\n",
                     "[aeron_uri_parse_params, aeron_uri.c:78] empty value not allowed\n",
-                    "[aeron_uri_parse, aeron_uri.c:296] aeron:udp?endpoint=|control=localhost:24326\n",
+                    "[aeron_uri_parse, aeron_uri.c:302] aeron:udp?endpoint=|control=localhost:24326\n",
                 ),
             ),
         ] {

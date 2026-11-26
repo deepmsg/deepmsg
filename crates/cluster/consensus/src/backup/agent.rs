@@ -36,7 +36,7 @@
 //!   block for the archive's message timeout (10 s) instead of returning to the
 //!   duty cycle.
 //! * **No state-change logging.** The reference writes one line per transition
-//!   through `ClusterLog`; this build has no cluster log, and inventing a
+//!   through `ClusterTracing`; this build has no cluster log, and inventing a
 //!   format would be a new diagnostic artifact nobody asked for.
 //! * **`aeron.cluster.member.endpoints` is not consulted** (`P3-0e`), so the
 //!   seventh member attribute (`archiveResponseEndpoint`) is the only source of

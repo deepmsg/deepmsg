@@ -61,7 +61,7 @@ use crate::error::ClusterClientError;
 const FRAGMENT_LIMIT: usize = 10;
 
 /// `ConsensusModule.Configuration.LEADER_HEARTBEAT_TIMEOUT_DEFAULT_NS`
-/// (`ConsensusModule.java:751`): ten seconds.
+/// (`ConsensusModule.java:758`): ten seconds.
 const LEADER_HEARTBEAT_TIMEOUT_DEFAULT_NS: i64 = 10 * 1_000 * 1_000 * 1_000;
 
 /// `Aeron.NULL_VALUE` as an `i32` — the reference stores `leaderMemberId`
@@ -1071,7 +1071,7 @@ fn client_error(error: CommandError) -> ClusterClientError {
 }
 
 /// `aeron_subscription_should_replace_wildcard_port`
-/// (`aeron_subscription.c:660-672`): a **UDP** channel whose endpoint names
+/// (`aeron_subscription.c:648-660`): a **UDP** channel whose endpoint names
 /// port **zero**, and which is not `control-mode=manual`.
 fn should_replace_wildcard_port(uri: &ChannelUri) -> bool {
     if "udp" != uri.media() {

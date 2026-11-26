@@ -116,9 +116,9 @@ fn both_drivers_record_the_same_entry_for_an_mtu_the_window_cannot_carry() {
     assert_eq!(
         "(22) Invalid argument\n\
          [aeron_receiver_channel_endpoint_validate_sender_mtu_length, \
-         aeron_receive_channel_endpoint.c:1022] mtuLength=1408 > initialWindowLength=1376\n\
+         aeron_receive_channel_endpoint.c:1027] mtuLength=1408 > initialWindowLength=1376\n\
          [aeron_driver_conductor_execute_create_publication_image_validate, \
-         aeron_driver_conductor.c:6509] stream_id=10001 session_id=<masked>\n",
+         aeron_driver_conductor.c:6604] stream_id=10001 session_id=<masked>\n",
         masked(&theirs_entry)
     );
 

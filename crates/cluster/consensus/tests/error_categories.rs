@@ -4,7 +4,7 @@
 //! It is a test rather than a comment because the category is a **behaviour**:
 //! the reference's counted-error handler is the deployment's, and `TestCluster`
 //! passes one that fails a test on `ERROR` and only prints `WARN`
-//! (`ClusterTest.java:565`, `ClusterTests.java:77-98`). The harness in
+//! (`ClusterTest.java:570`, `ClusterTests.java:77-98`). The harness in
 //! `tests/src/cluster_harness.rs` is that handler's other half, so a variant
 //! that moves between the two changes what fails a case.
 

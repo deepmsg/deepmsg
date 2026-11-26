@@ -895,7 +895,7 @@ fn the_cluster_starts_from_a_recording_log_truncated_to_its_latest_snapshot() {
 /// One batch of maximum-sized ingress messages for a channel of
 /// `term_length`: `computeMaxMessageLength(term) - SESSION_HEADER_LENGTH`
 /// payload bytes each, so every message fills exactly `term / 8` of the log
-/// (`ClusterTest.java:1850-1865`).
+/// (`ClusterTest.java:1854-1869`).
 fn send_max_sized_batch(
     client: &ClientSide,
     faults: &Faults,
@@ -922,7 +922,7 @@ fn commit_of(counters: &[NodeCounters], node: usize) -> Option<i64> {
 /// after its recording log is truncated to the latest snapshot.
 ///
 /// The reference (`ClusterTest.shouldAllowChangingTermBufferLengthAndMtuAfter-
-/// RecordingLogIsTruncatedToTheLatestSnapshot`, `ClusterTest.java:1823-1933`)
+/// RecordingLogIsTruncatedToTheLatestSnapshot`, `ClusterTest.java:1827-1937`)
 /// starts on 256 KiB terms with an MTU of 1408, fills the log with messages of
 /// the largest size that term allows, snapshots, sends more, then stops the
 /// whole cluster, seeds every `recording.log` from its latest snapshot

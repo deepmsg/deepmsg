@@ -34,7 +34,7 @@ impl<'a> StreamPositionKey<'a> {
     /// The key as the bytes a reader would find.
     ///
     /// The reference builds this as a designated initialiser
-    /// (`aeron_position.c:41-42`), so everything it does not name is **zero** —
+    /// (`aeron_position.c:46-47`), so everything it does not name is **zero** —
     /// including the channel's tail past what fits. Writing a shorter array and
     /// leaving the rest of the buffer alone would put whatever was on the stack
     /// into a file other processes read.

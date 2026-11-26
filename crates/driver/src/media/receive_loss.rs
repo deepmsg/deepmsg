@@ -2,7 +2,7 @@
 //!
 //! The reference keeps this family apart from the driver's own generators: they
 //! live in `aeron-test-support` and are linked into the one test binary that
-//! needs them (`aeron-archive/src/test/c/CMakeLists.txt:67-72`). This module is
+//! needs them (`aeron-archive/src/test/c/CMakeLists.txt:68-73`). This module is
 //! the same thing — **test-only decision rules**, built from the driver's
 //! settings rather than from a caller's supplier, because a driver here is a
 //! process and the reference's is started in-process by its test.
@@ -361,7 +361,7 @@ impl LossGenerator for DataInRange {
 
 /// Drop one stream's frames **for a while**, and then stop
 /// (`drop_payloads_after_threshold`,
-/// `aeron-archive/src/test/c/client/aeron_archive_persistent_subscription_resilience_test.cpp:1926-1939`;
+/// `aeron-archive/src/test/c/client/aeron_archive_persistent_subscription_resilience_test.cpp:1929-1942`;
 /// the time-bounded predicate beside it is `:1952`).
 ///
 /// The first `pass_first` frames of the stream go through, everything after them

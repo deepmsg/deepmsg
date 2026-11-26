@@ -46,7 +46,7 @@ the interop test runs `ArchiveTool` with.
 
 **The bytes are not identical across runs, and cannot be.** The reference
 stamps the pid from `SystemUtil.getPid()` when it creates the file
-(`ArchiveMarkFile.java:196`), and there is no parameter for it. So a
+(`ArchiveMarkFile.java:207`), and there is no parameter for it. So a
 regeneration changes the pid — and therefore the file's digest — which is why
 `mark-file.tsv` records the pid the run had rather than the generator pretending
 to a fixed one. Everything else in the file is fixed: the timestamps, the two

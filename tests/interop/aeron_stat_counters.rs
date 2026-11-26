@@ -176,7 +176,7 @@ fn aeron_stat_shows_a_client_heartbeat_after_a_client_registers() {
 
     // The client exists to the driver from its first resource command, and
     // that command is what allocates the counter this test looks for
-    // (`aeron_driver_conductor.c:982-1035`).
+    // (`aeron_driver_conductor.c:1023-1076`).
     let mut add_counter = Vec::new();
     add_counter.extend_from_slice(&7i64.to_le_bytes()); // client_id
     add_counter.extend_from_slice(&99i64.to_le_bytes()); // correlation_id

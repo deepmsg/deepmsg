@@ -52,7 +52,7 @@
 //!   handler cannot, so the error is put aside and the same two things are done
 //!   with it — the message is kept for the client, and the session stops.
 //! * **The reason a state changed is not logged.** The reference logs one line
-//!   per transition (`:283-298`) through its `ArchiveLog`, which this build does
+//!   per transition (`:283-298`) through its `ArchiveTracing`, which this build does
 //!   not have. What is kept is the transition itself.
 //!
 //! # The recording events, and the one thing this build reads early
@@ -114,7 +114,7 @@ pub trait RecordingImage: Send {
     /// after the poll (`crate::client::Client::block_poll_image`, the
     /// `if position > position_before` store). That counter is what the driver
     /// takes `min_sub_pos` from to raise the publisher's window
-    /// (`aeron_ipc_publication.c:296-313`), so a reader that stops publishing
+    /// (`aeron_ipc_publication.c:301-318`), so a reader that stops publishing
     /// it **blocks the publisher**: the archive would sit on a stream that had
     /// gone quiet, which is exactly what moving the image out of the client
     /// does if this step does not come with it.
@@ -278,7 +278,7 @@ pub struct RecordingSession {
     join_position: i64,
     /// The **image's** session id, which is what the `started` event carries
     /// (`:218-220`) and what an extension writes into the catalog row
-    /// (`ArchiveConductor.java:2120`).
+    /// (`ArchiveConductor.java:2155`).
     image_session_id: i32,
     /// The stream id of the **subscription the image arrived on**
     /// (`image.subscription().streamId()`, `:220`) — not the events channel's.
@@ -403,7 +403,7 @@ impl RecordingSession {
     }
 
     /// The recording this session is making, which is what the conductor files
-    /// it under (`ArchiveConductor.java:2054`).
+    /// it under (`ArchiveConductor.java:2076`).
     #[must_use]
     pub const fn recording_id(&self) -> i64 {
         self.recording_id
@@ -415,14 +415,14 @@ impl RecordingSession {
         self.session_id
     }
 
-    /// The request that started it (`:2051`).
+    /// The request that started it (`:2073`).
     #[must_use]
     pub const fn correlation_id(&self) -> i64 {
         self.correlation_id
     }
 
     /// The subscription whose image it is reading, which is what a stop takes
-    /// off (`:1766-1780`).
+    /// off (`:1773-1787`).
     #[must_use]
     pub const fn subscription_id(&self) -> i64 {
         self.subscription_id

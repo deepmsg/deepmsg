@@ -830,7 +830,7 @@ struct ControlProperties {
     consensus_module_stream_id: i32,
 }
 
-/// `ClusterMarkFile.loadControlProperties` (`ClusterMarkFile.java:595-609`).
+/// `ClusterMarkFile.loadControlProperties` (`ClusterMarkFile.java:610-624`).
 fn control_properties(
     mark_file: &deepmsg_cluster_common::mark::ClusterMarkFile,
 ) -> Result<ControlProperties, ()> {

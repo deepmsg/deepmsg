@@ -1,7 +1,7 @@
 //! Two publications on one channel, which are two handles on one publication.
 //!
 //! The reference's wire answers a client with **two** ids
-//! (`aeron_publication_buffers_ready_t`, `aeron_driver_conductor.c:2387-2388`):
+//! (`aeron_publication_buffers_ready_t`, `aeron_driver_conductor.c:2450-2451`):
 //! the `correlation_id` of the `ADD_PUBLICATION` that is being answered, which
 //! is the handle the client keeps and removes by, and the publication's own
 //! `registration_id`, which every client on that channel shares. A client that

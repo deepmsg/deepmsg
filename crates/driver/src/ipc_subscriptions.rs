@@ -2,8 +2,8 @@
 //!
 //! Mirrors the IPC half of the subscription path in
 //! `aeron-driver/src/main/c/aeron_driver_conductor.c`: `on_add_ipc_subscription`
-//! (`:4741-4824`), the match rule (`:110-117`), and `link_subscribable`
-//! (`:3547-3617`), which is where a subscription becomes a *reader* — a
+//! (`:4838-4921`), the match rule (`:110-117`), and `link_subscribable`
+//! (`:3644-3714`), which is where a subscription becomes a *reader* — a
 //! position counter, an entry in the publication's subscribable set, and an
 //! `ON_AVAILABLE_IMAGE` telling the client where the log buffer is. (M20)
 //!
@@ -82,7 +82,7 @@ pub enum SubscriptionTarget {
     /// A **network publication's** log buffer, read locally without a socket:
     /// what a spy reads (`aeron_driver_conductor_link_subscribable` called
     /// with a network publication's subscribable,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:4897-4921`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:4994-5018`).
     ///
     /// It is the same kind of thing to a link as the other two — a log buffer
     /// in this process and a counter the client advances — and it is *not* an
@@ -130,7 +130,7 @@ pub enum SetupStatus {
     Complete,
     /// A RSP_SETUP arrived with a session the subscription's own `session-id=`
     /// contradicts. It will never be read, and later response setups for the
-    /// same correlation id are ignored (`aeron_driver_conductor.c:7069-7070`).
+    /// same correlation id are ignored (`aeron_driver_conductor.c:7165-7166`).
     Error,
 }
 
@@ -147,7 +147,7 @@ pub enum SetupStatus {
 /// The endpoint was left out until something needed it. `ADD_RCV_DESTINATION`
 /// is what needs it: a client adds a source to **a subscription**, and what a
 /// destination is added to is that subscription's receive endpoint
-/// (`aeron_driver_conductor.c:5879-5910`).
+/// (`aeron_driver_conductor.c:5976-6007`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionLink {
     /// The client's correlation id for the `ADD_SUBSCRIPTION`.
@@ -344,7 +344,7 @@ impl SubscriptionLink {
         // The session clause is the reference's
         // `is_wildcard_or_session_id_match` (`:74-79`), the same one the image
         // rule uses — a spy link is never a response one
-        // (`:4886` sets `is_response` false), so the two shapes agree.
+        // (`:4983` sets `is_response` false), so the two shapes agree.
         let session_matches =
             (self.session_id.is_none() && !self.is_response) || self.session_id == Some(session_id);
 
@@ -428,7 +428,7 @@ impl AddSubscriptionError {
             Self::NotManualControl => deepmsg_cnc::command::ERROR_CODE_INVALID_CHANNEL,
             // Not one of Aeron's codes: the reference hands `AERON_SET_ERR` the
             // platform's `EINVAL` here (`:323`), and `aeron_errcode()` returns
-            // whatever it was given (`util/aeron_error.c:355`), so 22 is what
+            // whatever it was given (`util/aeron_error.c:375`), so 22 is what
             // the client reads back. It is the one refusal in this family whose
             // code is an errno rather than an `AERON_ERROR_CODE_*`.
             Self::Clashing { .. } => ERROR_CODE_EINVAL,
@@ -506,12 +506,12 @@ impl IpcSubscriptions {
     /// The subscription a client holds by the id it was answered with, which is
     /// what `ADD_RCV_DESTINATION` names
     /// (`aeron_driver_conductor_find_mds_subscription`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5581-5615`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5678-5712`).
     ///
     /// A destination is added to **a subscription**, not to a channel or an
     /// endpoint: the client holds the subscription's registration id, and the
     /// endpoint is what that subscription happens to read through
-    /// (`:5879-5910`).
+    /// (`:5976-6007`).
     ///
     /// The endpoint clause is the reference's — it walks
     /// `network_subscriptions` and nothing else — and it earns its place
@@ -531,7 +531,7 @@ impl IpcSubscriptions {
         self.links.iter().map(|link| link.subscribables.len()).sum()
     }
 
-    /// Serve an `ADD_SUBSCRIPTION` (`aeron_driver_conductor.c:4741-4824`).
+    /// Serve an `ADD_SUBSCRIPTION` (`aeron_driver_conductor.c:4838-4921`).
     ///
     /// The reply goes out **before** the matching: a client is told its
     /// subscription exists first, and the images it already matches follow as
@@ -591,7 +591,7 @@ impl IpcSubscriptions {
             subscribables: Vec::new(),
         };
 
-        // The reply first (`:4788-4789`).
+        // The reply first (`:4885-4886`).
         events.subscription_ready(
             request.correlation_id,
             CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED,
@@ -620,15 +620,15 @@ impl IpcSubscriptions {
 
     /// Serve an `ADD_SUBSCRIPTION` for a spy channel
     /// (`aeron_driver_conductor_on_add_spy_subscription`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:4926-4966`, and the
-    /// executor the parse ends in, `:4827-4924`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5023-5063`, and the
+    /// executor the parse ends in, `:4924-5021`).
     ///
     /// This is the one kind of subscription that is **not a socket**. What it
     /// reads is a publication's log buffer, in this process, which the
     /// publisher is already writing into — so there is no endpoint to make, no
     /// session to elicit and no channel status to report: the reply carries
     /// [`CHANNEL_STATUS_INDICATOR_NOT_ALLOCATED`], which is the reference
-    /// saying exactly that (`:4892-4894`).
+    /// saying exactly that (`:4989-4991`).
     ///
     /// # Errors
     ///
@@ -649,7 +649,7 @@ impl IpcSubscriptions {
         events: &mut impl ClientEvents,
     ) -> Result<(), AddSubscriptionError> {
         // The prefix comes off first and the rest is an ordinary UDP channel
-        // (`:4939-4942`): the reference parses the stripped bytes and keeps the
+        // (`:5036-5039`): the reference parses the stripped bytes and keeps the
         // result as the link's `spy_channel`, which is what the match rule
         // compares against a publication's endpoint channel.
         let spy_channel = crate::udp_channel::resolve_spy_channel(request.channel)
@@ -698,12 +698,12 @@ impl IpcSubscriptions {
 
         self.links.push(link);
 
-        // Then every publication it already matches (`:4900-4921`), and — the
+        // Then every publication it already matches (`:4997-5018`), and — the
         // other half of the same question — every publication that appears
         // after it ([`Self::link_spy_subscriptions`]).
         //
         // The reference asks `is_accepting_subscriptions` of each candidate
-        // before linking it (`aeron_network_publication.h:290-297`), which is
+        // before linking it (`aeron_network_publication.h:299-306`), which is
         // about its three-state life: an ACTIVE publication takes readers, and
         // a DRAINING one only while it still has some and its producer is
         // ahead of its sender. A network publication here has no draining
@@ -731,7 +731,7 @@ impl IpcSubscriptions {
     }
 
     /// Give a network publication to every spy subscription that was waiting
-    /// for it (`aeron_driver_conductor.c:4201-4226`, run from the create).
+    /// for it (`aeron_driver_conductor.c:4298-4323`, run from the create).
     ///
     /// The reverse of the scan [`Self::add_spy_subscription`] makes, and it has
     /// to exist for the same reason the IPC one does: a client is allowed to
@@ -776,7 +776,7 @@ impl IpcSubscriptions {
 
     /// Serve an `ADD_RCV_DESTINATION` whose channel is a spy
     /// (`aeron_driver_conductor_execute_add_receive_spy_destination`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5704-5806`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5801-5903`).
     ///
     /// This is the third way a spy link is made, and it is a *destination*
     /// rather than a subscription: a client takes a channel it already
@@ -788,7 +788,7 @@ impl IpcSubscriptions {
     /// been spied from the start.
     ///
     /// The link is stored under the **subscription's** registration id, not the
-    /// destination's (`:5763`), which is what makes the pair one thing: a
+    /// destination's (`:5860`), which is what makes the pair one thing: a
     /// `REMOVE_SUBSCRIPTION` for that id takes the spied images with it, and
     /// the destination is removed by naming the channel it was added with.
     ///
@@ -820,7 +820,7 @@ impl IpcSubscriptions {
 
         // The subscription the destination is added to, and the one thing it
         // has to be: a network subscription on a channel that allows manual
-        // control (`aeron_driver_conductor_find_mds_subscription`, `:5990-6021`).
+        // control (`aeron_driver_conductor_find_mds_subscription`, `:6087-6118`).
         let Some(mds) = self.find_mds(request.registration_id) else {
             return Err(AddSubscriptionError::UnknownSubscription);
         };
@@ -838,7 +838,7 @@ impl IpcSubscriptions {
         }
 
         // The subscription's stream, the destination's session — the reference
-        // reads each off the thing that owns it (`:5759-5763`), and the channel
+        // reads each off the thing that owns it (`:5856-5860`), and the channel
         // it records is the **destination's**, which is what the reader's
         // counter is labelled with and what a removal names.
         let link = SubscriptionLink {
@@ -860,7 +860,7 @@ impl IpcSubscriptions {
         };
 
         // An acknowledgement, not a subscription ready: the client asked for a
-        // destination and that is what it is told about (`:5774`).
+        // destination and that is what it is told about (`:5871`).
         events.operation_succeeded(request.correlation_id);
 
         self.links.push(link);
@@ -886,7 +886,7 @@ impl IpcSubscriptions {
     }
 
     /// Serve an `ADD_RCV_DESTINATION` whose channel is `aeron:ipc`
-    /// (`aeron_driver_conductor_on_add_receive_ipc_destination`, `:5617-5700`).
+    /// (`aeron_driver_conductor_on_add_receive_ipc_destination`, `:5714-5797`).
     ///
     /// An IPC destination is a **source** rather than a socket, like a spy's,
     /// and the difference between the two is where the bytes come from: a spy
@@ -896,7 +896,7 @@ impl IpcSubscriptions {
     /// reference's one way to mix IPC and UDP publishers on one stream.
     ///
     /// The link is built the same way the spy link is and the reference builds
-    /// both in one shape (`:5646-5665` against `:5808-5870`): the channel is
+    /// both in one shape (`:5743-5762` against `:5905-5967`): the channel is
     /// the **destination's**, the stream is the **subscription's**, the session
     /// and the options are the destination URI's, and the registration id is
     /// the subscription's — because a destination is not a subscription and
@@ -928,7 +928,7 @@ impl IpcSubscriptions {
 
         // The subscription the destination is added to, and the one thing it
         // has to be: a network subscription whose channel allows manual control
-        // (`aeron_driver_conductor_find_mds_subscription`, `:5581-5599`, which
+        // (`aeron_driver_conductor_find_mds_subscription`, `:5678-5696`, which
         // is the same lookup the spy path makes).
         let Some(mds) = self.find_mds(request.registration_id) else {
             return Err(AddSubscriptionError::UnknownSubscription);
@@ -965,7 +965,7 @@ impl IpcSubscriptions {
             subscribables: Vec::new(),
         };
 
-        // An acknowledgement, not a subscription ready (`:5668`), and it goes
+        // An acknowledgement, not a subscription ready (`:5765`), and it goes
         // out **before** the publications are read: what follows is the images
         // the client is told about, as separate messages.
         events.operation_succeeded(request.correlation_id);
@@ -982,7 +982,7 @@ impl IpcSubscriptions {
             }
 
             // The reference stops at the first failure rather than carrying on
-            // (`:5682-5686` goes to its cleanup), and the link it has already
+            // (`:5779-5783` goes to its cleanup), and the link it has already
             // added stays where it is.
             link_subscribable(link, publication, counters, regions, now, events)
                 .map_err(|()| AddSubscriptionError::Link)?;
@@ -993,7 +993,7 @@ impl IpcSubscriptions {
 
     /// Serve a `REMOVE_RCV_DESTINATION` whose channel is `aeron:ipc`
     /// (`aeron_driver_conductor_on_remove_receive_ipc_destination`,
-    /// `:5984-6018`).
+    /// `:6081-6115`).
     ///
     /// The link is found by its registration id **and** the channel it was
     /// added with — an id alone would name either of two destinations on one
@@ -1039,7 +1039,7 @@ impl IpcSubscriptions {
         // No receiver and no sender: an IPC link's readers are the
         // publication's own, and `unlink_all` finds it by the registration id
         // in the target (`aeron_driver_conductor_unlink_all_subscribable`,
-        // `:3620-3691`).
+        // `:3717-3788`).
         unlink_all(
             link,
             counters,
@@ -1054,7 +1054,7 @@ impl IpcSubscriptions {
     }
 
     /// Serve a `REMOVE_RCV_DESTINATION` whose channel is a spy
-    /// (`aeron_driver_conductor_on_remove_receive_spy_destination`, `:6024-6065`).
+    /// (`aeron_driver_conductor_on_remove_receive_spy_destination`, `:6121-6162`).
     ///
     /// The link is found by its registration id **and** the channel it was
     /// added with, which is what tells two spy destinations on one subscription
@@ -1117,7 +1117,7 @@ impl IpcSubscriptions {
 
     /// Give a publication to every subscription that was waiting for it
     /// (`aeron_driver_conductor_link_ipc_subscriptions`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:3693-3727`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:3790-3824`).
     ///
     /// This is the other half of the match: a subscription that arrives before
     /// its publisher is linked from [`Self::add_subscription`], and a
@@ -1144,7 +1144,7 @@ impl IpcSubscriptions {
             // A failure here is a counter or a log buffer that would not take
             // the reader; the publication exists and its client has been told,
             // so the pass carries on — which is what the reference does with
-            // the error it gets back from its own link (`:3763-3766` appends it
+            // the error it gets back from its own link (`:3860-3863` appends it
             // and keeps the publication).
             let _ = link_subscribable(link, publication, counters, regions, now, events);
         }
@@ -1153,8 +1153,8 @@ impl IpcSubscriptions {
     /// Point a response **subscription** at the session of the response
     /// publication that has just been created for it
     /// (`aeron_driver_conductor_find_and_update_ipc_response_subscription`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1711-1760`, reached
-    /// from `execute_add_ipc_publication_create_publication`, `:3895`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1752-1801`, reached
+    /// from `execute_add_ipc_publication_create_publication`, `:3992`).
     ///
     /// The chain is three links long and each is a registration id, which is
     /// why none of it crosses the wire: the response publication's
@@ -1220,7 +1220,7 @@ impl IpcSubscriptions {
 
     /// The subscriptions reading a publication, for the caller that has to tell
     /// them it is going away (`aeron_driver_conductor_unlink_ipc_subscriptions`,
-    /// `:6453-6475`, which sends one message per reader).
+    /// `:6550-6572`, which sends one message per reader).
     pub fn readers_of(&self, publication_registration_id: i64) -> Vec<&SubscriptionLink> {
         self.links
             .iter()
@@ -1231,11 +1231,11 @@ impl IpcSubscriptions {
     /// A network publication is going away: tell every spy that reads it, and
     /// give up their readers
     /// (`aeron_driver_conductor_cleanup_spies`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1502-1519`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1543-1560`).
     ///
     /// The reference splits this in three. It sends the message here, drops the
     /// entries from each link in `aeron_network_publication_entry_delete`
-    /// (`:1481-1489`), and frees the counters in the publication's own close —
+    /// (`:1522-1530`), and frees the counters in the publication's own close —
     /// which walks the subscribable set it is about to destroy
     /// (`aeron_network_publication.c:340-343`).
     ///
@@ -1291,7 +1291,7 @@ impl IpcSubscriptions {
 
     /// Forget a publication that no longer exists: drop the entries that point
     /// at it, without freeing anything — its own close owns the counters
-    /// (`aeron_driver_conductor_unlink_subscribable`, `:3662-3677`).
+    /// (`aeron_driver_conductor_unlink_subscribable`, `:3759-3774`).
     pub fn forget_publication(&mut self, publication_registration_id: i64) {
         for link in &mut self.links {
             link.subscribables
@@ -1302,19 +1302,19 @@ impl IpcSubscriptions {
     /// A publication is being rejected: tell every subscription reading it
     /// that the image is gone, and drop those readers from the subscriptions
     /// (`aeron_driver_conductor_unlink_ipc_subscriptions`,
-    /// `aeron_driver_conductor.c:6453-6473`).
+    /// `aeron_driver_conductor.c:6550-6570`).
     ///
     /// Nothing is freed here. The counter a reader was given belongs to the
     /// publication's own set, and that set is what gives it back a step later
-    /// (`aeron_ipc_publication.c:256-271`: `unlink_subscribable` drops the
+    /// (`aeron_ipc_publication.c:261-276`: `unlink_subscribable` drops the
     /// link's entries, then the subscribable's array is freed) — freeing it
     /// here as well would give the same counter back twice.
     ///
     /// The message names what the **link** holds — its own stream id and its
     /// own channel — where the revoke path names the publication's stream and
     /// the constant `aeron:ipc`. That asymmetry is the reference's, and the two
-    /// are thirty lines apart in the conductor (`:6462-6468` against
-    /// `:503-517`).
+    /// are thirty lines apart in the conductor (`:6559-6565` against
+    /// `:527-541`).
     ///
     /// # Returns
     ///
@@ -1352,7 +1352,7 @@ impl IpcSubscriptions {
     }
 
     /// Whether a **network** subscription with this registration id exists
-    /// (`aeron_driver_conductor.c:641-648`, which walks
+    /// (`aeron_driver_conductor.c:682-689`, which walks
     /// `network_subscriptions`).
     ///
     /// The distinction is the reference's and it matters here: a publication
@@ -1367,7 +1367,7 @@ impl IpcSubscriptions {
 
     /// Whether a subscription with this registration id exists, which is what
     /// decides between an acknowledgement and an error before the removal
-    /// itself happens (`aeron_driver_conductor.c:5203-5266`).
+    /// itself happens (`aeron_driver_conductor.c:5300-5363`).
     pub fn has(&self, registration_id: i64) -> bool {
         self.links
             .iter()
@@ -1375,7 +1375,7 @@ impl IpcSubscriptions {
     }
 
     /// Remove a subscription (`aeron_driver_conductor_on_remove_subscription`,
-    /// `:5199-5267`).
+    /// `:5296-5364`).
     ///
     /// Every reader position is detached from its publication and its counter
     /// given back, and the link is dropped — with **no image message**: the
@@ -1393,7 +1393,7 @@ impl IpcSubscriptions {
     ///
     /// **Every** link carrying that id goes, not the first one found. The
     /// reference walks all three of its arrays and removes each match
-    /// (`:5204-5251`), and a registration id can name more than one link: a spy
+    /// (`:5301-5348`), and a registration id can name more than one link: a spy
     /// added as a receive destination is stored under the subscription's id
     /// ([`Self::add_spy_destination`]), and removing the subscription has to
     /// take it too — otherwise the subscription is gone and something is still
@@ -1439,7 +1439,7 @@ impl IpcSubscriptions {
 
     /// Give up every subscription a client owned, without telling it anything:
     /// it is gone, and a message to a client that is not there is a message
-    /// nobody reads (`aeron_client_delete`, `:1234-1250`).
+    /// nobody reads (`aeron_client_delete`, `:1275-1291`).
     #[allow(clippy::too_many_arguments)] // the collaborators a removal needs
     pub fn remove_for_client(
         &mut self,
@@ -1464,7 +1464,7 @@ impl IpcSubscriptions {
 
             let link = self.links.swap_remove(index);
             // `aeron_client_delete` takes the same two steps in the same order
-            // for a client's network subscriptions (`:1246-1258`).
+            // for a client's network subscriptions (`:1287-1299`).
             unlink_from_endpoint(&link, counters, regions, endpoints, receiver);
             unlink_all(
                 link,
@@ -1485,7 +1485,7 @@ impl IpcSubscriptions {
     ///
     /// No counters are freed here: a reader's `sub-pos` belongs to the
     /// *publication's* set, and the publication's close is what frees it
-    /// (`aeron_ipc_publication_close`, `aeron_ipc_publication.c:196-214`).
+    /// (`aeron_ipc_publication_close`, `aeron_ipc_publication.c:201-219`).
     /// Freeing them in both places would hand the same counter back twice, and
     /// the ordering here is the reference's — publications first.
     pub fn close(&mut self) {
@@ -1496,7 +1496,7 @@ impl IpcSubscriptions {
 impl IpcSubscriptions {
     /// A responder answered a publication that asked for a response channel
     /// (`aeron_driver_conductor_on_response_setup`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:7060-7115`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:7156-7211`).
     ///
     /// This is where a response subscription stops being one. Until a
     /// RSP_SETUP arrives it reads nothing — it is not registered with the
@@ -1530,7 +1530,7 @@ impl IpcSubscriptions {
             if link.setup_status == SetupStatus::Complete {
                 // A second response setup for a subscription that is already
                 // reading. The answer is to ask the far end to describe itself
-                // again (`aeron_driver_receiver.c:412-427`), which is what
+                // again (`aeron_driver_receiver.c:422-437`), which is what
                 // re-opens a publication that has met a receiver before
                 // (`aeron_network_publication.c:586-589`).
                 if let (Some(endpoint_id), Some(session_id)) = (link.endpoint_id, link.session_id) {
@@ -1547,7 +1547,7 @@ impl IpcSubscriptions {
                     // drops the named session as well as poisoning the link,
                     // and **returns** rather than continuing — so a later
                     // link with the same correlation id is not examined
-                    // (`:7094-7098`).
+                    // (`:7190-7194`).
                     link.session_id = None;
                     link.setup_status = SetupStatus::Error;
 
@@ -1653,7 +1653,7 @@ impl IpcSubscriptions {
 
     /// Serve an `ADD_SUBSCRIPTION` for a UDP channel
     /// (`aeron_driver_conductor_on_add_network_subscription`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5156-5280`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:5253-5377`).
     ///
     /// The reply goes out before the matching, as it does for IPC and for the
     /// same reason; what is different is that the subscription's endpoint has
@@ -1690,7 +1690,7 @@ impl IpcSubscriptions {
         validate_for_subscription(&channel)?;
 
         // Before the endpoint is made, as the reference checks it before it
-        // makes one (`aeron_driver_conductor.c:5035-5041`): a subscription whose
+        // makes one (`aeron_driver_conductor.c:5132-5138`): a subscription whose
         // options disagree with one already reading that endpoint and stream
         // cannot be served, because the image they would share can only behave
         // one way.
@@ -1725,7 +1725,7 @@ impl IpcSubscriptions {
 
         // `params->initial_window_length`, read before the channel moves into
         // the endpoint: the endpoint's create compares the arriving channel's
-        // receive buffer against it (`aeron_driver_conductor.c:2116-2130`).
+        // receive buffer against it (`aeron_driver_conductor.c:2167-2181`).
         let initial_window_length =
             ReceiveChannelEndpoints::initial_window_length(config, &channel);
 
@@ -1744,7 +1744,7 @@ impl IpcSubscriptions {
             .map_err(|error| AddSubscriptionError::Endpoint {
                 message: match error {
                     ReceiveEndpointErrorKind::Bind(mut report) => {
-                        // `:5043`: the last `AERON_APPEND_ERR` on the way up,
+                        // `:5140`: the last `AERON_APPEND_ERR` on the way up,
                         // and the one with an **empty message** — the site
                         // line alone says "this is where the subscription was
                         // being added", and the reference writes it that way.
@@ -1766,7 +1766,7 @@ impl IpcSubscriptions {
                 .map_err(|_| AddSubscriptionError::Receiver)?;
         }
 
-        // `aeron_driver_conductor.c:5072-5092`: a response subscription is
+        // `aeron_driver_conductor.c:5169-5189`: a response subscription is
         // **not** registered with the receiver — the reference calls
         // `incref_to_response_stream` where every other mode calls
         // `add_network_subscription_to_receiver`. There is no session to read
@@ -1775,7 +1775,7 @@ impl IpcSubscriptions {
         // published yet.
         //
         // The reference's response refcount (`response_stream_id_to_refcnt_map`,
-        // `aeron_receive_channel_endpoint.c:746-779`) is what holds the
+        // `aeron_receive_channel_endpoint.c:751-784`) is what holds the
         // endpoint open in the meantime; this build keeps no such count because
         // it releases no endpoint when its last subscription leaves
         // (`receive_endpoints.rs::detach_subscription` has no caller), and a
@@ -1814,7 +1814,7 @@ impl IpcSubscriptions {
 
         self.links.push(link);
 
-        // Then every image that already matches (`aeron_driver_conductor.c:5121-5143`,
+        // Then every image that already matches (`aeron_driver_conductor.c:5218-5240`,
         // whose guard is the link's own endpoint as much as its stream and
         // session).
         let index = self.links.len() - 1;
@@ -1838,8 +1838,8 @@ impl IpcSubscriptions {
 
     /// Give a subscription a reader position in an image, and tell its client
     /// where the log buffer is
-    /// (`aeron_driver_conductor_link_subscribable`'s image case, `:3547-3617`
-    /// through `:5137`).
+    /// (`aeron_driver_conductor_link_subscribable`'s image case, `:3644-3714`
+    /// through `:5234`).
     ///
     /// The order is the same one IPC's link uses, and the same steps: allocate
     /// the counter with the *join* position in its label, add the position to
@@ -2039,7 +2039,7 @@ impl IpcSubscriptions {
 
 /// The checks a subscription's channel has to pass
 /// (`validate_control_for_subscription`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:614-628`).
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:655-669`).
 ///
 /// # Errors
 ///
@@ -2058,12 +2058,12 @@ fn validate_for_subscription(channel: &UdpChannel) -> Result<(), AddSubscription
 }
 
 /// The endpoint's own bookkeeping for a subscription that is going away
-/// (`aeron_driver_conductor_unlink_from_endpoint`, `:1179-1201`).
+/// (`aeron_driver_conductor_unlink_from_endpoint`, `:1220-1242`).
 ///
 /// It runs **before** the subscribable unlink, and it is the half a network
 /// subscription cannot do without: the endpoint's reference count for the
 /// stream drops, and at zero the receiver is told the stream has no readers
-/// left (`aeron_receive_channel_endpoint_decref_to_stream`, `:720-744`) — so
+/// left (`aeron_receive_channel_endpoint_decref_to_stream`, `:725-749`) — so
 /// the dispatcher stops feeding it, and an image nobody reads stops sending
 /// status messages. Without this a removed subscription's image lives on, and
 /// a group strategy on the far side waits for a receiver that will never
@@ -2101,14 +2101,14 @@ fn unlink_from_endpoint(
 
 /// Let an idle endpoint go: mark it, then ask the receiver, which owns the
 /// socket (`aeron_receive_channel_endpoint_try_remove_endpoint`,
-/// `media/aeron_receive_channel_endpoint.c:691-702`, whose CLOSING is
-/// `conductor_fields.status` at `:699`).
+/// `media/aeron_receive_channel_endpoint.c:696-707`, whose CLOSING is
+/// `conductor_fields.status` at `:704`).
 ///
 /// The `rcv-channel` counter is **not** written here: the reference writes it
 /// once, ACTIVE, when the endpoint is made
-/// (`aeron_driver_conductor.c:2013`) and then gives the record back
+/// (`aeron_driver_conductor.c:2064`) and then gives the record back
 /// (`aeron_receive_channel_endpoint_delete`,
-/// `media/aeron_receive_channel_endpoint.c:163-168`, which is where the counter
+/// `media/aeron_receive_channel_endpoint.c:168-173`, which is where the counter
 /// goes back — the receiver owns the endpoint, but the counters are the
 /// conductor's, so the giving back happens on this side).
 pub(crate) fn try_remove_endpoint(
@@ -2179,7 +2179,7 @@ fn unlink_all(
 
 /// Give a subscription a reader position in a publication, and tell its client
 /// where the log buffer is (`aeron_driver_conductor_link_subscribable`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:3547-3617`).
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:3644-3714`).
 ///
 /// The order is the reference's, and each step is load-bearing:
 ///
@@ -2251,8 +2251,8 @@ fn link_subscribable(
 
 /// Give a **spy** subscription a reader position in a network publication
 /// (`aeron_driver_conductor_link_subscribable` called from the two spy scans,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:4897-4921` and
-/// `:4201-4226`).
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:4994-5018` and
+/// `:4298-4323`).
 ///
 /// The same five steps as [`link_subscribable`], with one missing and one
 /// different:
@@ -2271,7 +2271,7 @@ fn link_subscribable(
 ///
 /// What the client is told is an ordinary image message whose source identity
 /// is the **IPC constant** and whose log file is the publication's own
-/// (`:4913-4914`): a spy reads a log buffer in this process, and the constant
+/// (`:5010-5011`): a spy reads a log buffer in this process, and the constant
 /// is how the reference says so.
 fn link_spy_publication(
     link: &mut SubscriptionLink,
@@ -2365,7 +2365,7 @@ fn spy_matched_indices(publications: &NetworkPublications, link: &SubscriptionLi
 
 /// The first two steps of a link: the reader's counter, with the join position
 /// in its label, owned by the client and referenced by what it reads
-/// (`aeron_driver_conductor_link_subscribable`, `:3561-3578`).
+/// (`aeron_driver_conductor_link_subscribable`, `:3658-3675`).
 ///
 /// # Errors
 ///
@@ -2406,7 +2406,7 @@ fn allocate_reader_position(
 }
 
 /// The last three steps: the entry that makes the link a reader, the seed, and
-/// the message (`aeron_driver_conductor_link_subscribable`, `:3582-3605`).
+/// the message (`aeron_driver_conductor_link_subscribable`, `:3679-3702`).
 ///
 /// # Errors
 ///
@@ -2718,7 +2718,7 @@ mod tests {
     fn an_ipc_publication_is_read_by_no_link_that_is_not_an_ipc_one() {
         // The reference never asks the question: the two kinds of subscription
         // live in different arrays and an IPC publication is offered to one of
-        // them (`aeron_driver_conductor_link_ipc_subscriptions`, `:3693-3705`).
+        // them (`aeron_driver_conductor_link_ipc_subscriptions`, `:3790-3802`).
         // This build has the one list, so the split has to be in the rule.
         //
         // Getting it wrong is not academic. A real archive subscribes on a UDP
@@ -2764,7 +2764,7 @@ mod tests {
         assert!(!response.matches_image(3, 1001, 100));
 
         // Once the setup completes, the reference clears `is_response` and pins
-        // the session (`:7100-7105`), and the rule reads it like any other.
+        // the session (`:7196-7201`), and the rule reads it like any other.
         let mut completed = link(1001, Some(100), false);
         completed.endpoint_id = Some(3);
 
@@ -2902,7 +2902,7 @@ mod tests {
         // An ordinary publication names no correlation id, and a response
         // publication whose request publication has gone names one that is not
         // there. Neither is a client's mistake, so neither is refused
-        // (`aeron_driver_conductor.c:1714-1716` guards the whole walk).
+        // (`aeron_driver_conductor.c:1755-1757` guards the whole walk).
         let mut subscriptions = IpcSubscriptions::new();
         let mut response_sub = link(1001, Some(42), true);
         response_sub.registration_id = 9;

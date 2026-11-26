@@ -68,7 +68,7 @@ against a DPDK build at all only because that fallback exists.
 
 1. **`dpdk` is a second media binding, compiled in and off by default.** The
    setting keeps the reference's own name,
-   `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` (`aeronmd.h:731`), and its
+   `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` (`aeronmd.h:748`), and its
    default stays `default` — the kernel's sockets. `dpdk` is served only by a
    binary built with the `dpdk` cargo feature; a build without it stops the
    driver with a reason that says so, as any other name it does not serve does.

@@ -55,7 +55,7 @@ pub const WINDOW_COUNTER_NAME: &str = "rcv-cc-cubic-wnd";
 
 /// Which supplier a **driver** names for its images
 /// (`aeron_congestion_control_strategy_supplier_load`, `:45-62`, loaded from
-/// the context at `aeron_driver_context.c:579-585`).
+/// the context at `aeron_driver_context.c:586-592`).
 ///
 /// The three names are the reference's table, and the first is the default: a
 /// driver that names none gets the *chooser*, which is what makes a channel's
@@ -116,7 +116,7 @@ impl Strategy {
     /// The reference's chooser: a channel that names nothing gets the static
     /// window, `static` and `cubic` get themselves, and **any other name is
     /// `None`** — which is the reference's `result` left at `-1`, with no error
-    /// set anywhere (`:200-204`), so what a client hears about a name this
+    /// set anywhere (`:202-206`), so what a client hears about a name this
     /// build cannot serve is decided by the caller at image creation and not
     /// here.
     ///
@@ -160,7 +160,7 @@ impl CongestionControl {
     /// `channel_window_length` is the **endpoint channel's** receiver window —
     /// its own `rcv-wnd=` or the driver's default
     /// (`aeron_udp_channel_receiver_window`, read by the reference at
-    /// `aeron_driver_conductor.c:6631`, which hands the supplier
+    /// `aeron_driver_conductor.c:6724`, which hands the supplier
     /// `endpoint->conductor_fields.udp_channel` and not the subscription's).
     ///
     /// # Errors
@@ -238,7 +238,7 @@ impl CongestionControl {
 
     /// One came back (`on_rttm`): `rtt_ns` is what the frame's echo timestamp
     /// and reception delta worked out to
-    /// (`aeron_publication_image.c:849-857`).
+    /// (`aeron_publication_image.c:854-862`).
     pub fn on_rttm(
         &mut self,
         counters: &CounterManager,
@@ -315,7 +315,7 @@ impl CongestionControl {
 
 /// The window a channel resolves to
 /// (`aeron_udp_channel_receiver_window` + `aeron_receiver_window_length`,
-/// `:155-157`): the channel's own, capped at half a term — the cap is what
+/// `:160-162`): the channel's own, capped at half a term — the cap is what
 /// makes a small term the thing that limits a window rather than the buffer.
 fn window_for_channel(channel_window_length: i32, term_length: i32) -> i32 {
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -327,14 +327,14 @@ fn window_for_channel(channel_window_length: i32, term_length: i32) -> i32 {
     window
 }
 
-/// `static`'s whole state: the window (`:65-68`).
+/// `static`'s whole state: the window (`:70-73`).
 #[derive(Clone, Copy, Debug)]
 pub struct StaticWindow {
     window_length: i32,
 }
 
 /// CUBIC's state (`aeron_cubic_congestion_control_strategy_state_stct`,
-/// `:210-240`), field for field.
+/// `:215-245`), field for field.
 #[derive(Debug)]
 pub struct Cubic {
     tcp_mode: bool,
@@ -357,13 +357,13 @@ pub struct Cubic {
     last_rtt_timestamp_ns: i64,
 
     /// `rcv-cc-cubic-rtt` and `rcv-cc-cubic-wnd`, in the order the reference
-    /// allocates them (`:432-462`).
+    /// allocates them (`:437-467`).
     counters: [i32; 2],
 }
 
 impl Cubic {
     /// The supplier (`aeron_cubic_congestion_control_strategy_supplier`,
-    /// `:361-491`): read the three settings, take the two lengths off the
+    /// `:366-496`): read the three settings, take the two lengths off the
     /// channel, seed the window, allocate the two counters.
     #[allow(clippy::too_many_arguments)] // the supplier's arguments, one per field
     fn new(
@@ -379,7 +379,7 @@ impl Cubic {
         now_ms: i64,
         now_ns: i64,
     ) -> Option<Self> {
-        // The three settings, read where the reference reads them (`:392-402`).
+        // The three settings, read where the reference reads them (`:397-407`).
         let initial_rtt_ns = config.cubic_initial_rtt_ns()?;
 
         let mtu = mtu_length.max(1);
@@ -388,7 +388,7 @@ impl Cubic {
 
         // The two counters are per **image**, with no client as their owner —
         // `AERON_NULL_VALUE` in the reference's `aeron_stream_counter_allocate`
-        // (`:437`, `:455`).
+        // (`:442`, `:460`).
         let allocate = |counters: &mut CounterManager, name: &str| {
             allocate_stream_counter(
                 counters,
@@ -425,7 +425,7 @@ impl Cubic {
             max_cwnd,
             cwnd,
             // Initially the maximum and acting in the TCP and concave region
-            // (`:425-427`).
+            // (`:430-432`).
             w_max: max_cwnd,
             k: cbrt(f64::from(max_cwnd) * B / C),
             initial_rtt_ns,
@@ -433,7 +433,7 @@ impl Cubic {
             window_update_timeout_ns: initial_rtt_ns,
             rtt_timeout_ns: initial_rtt_ns * RTT_TIMEOUT_MULTIPLE,
             // The two timestamps are the receiver clock's reading at creation
-            // (`:464-466`), which the caller passes in.
+            // (`:469-471`), which the caller passes in.
             last_loss_timestamp_ns: now_ns,
             last_update_timestamp_ns: now_ns,
             last_rtt_timestamp_ns: 0,
@@ -476,7 +476,7 @@ impl Cubic {
         self.rtt_timeout_ns = rtt_ns.max(self.initial_rtt_ns) * RTT_TIMEOUT_MULTIPLE;
     }
 
-    /// `on_track_rebuild` (`:280-334`).
+    /// `on_track_rebuild` (`:285-339`).
     #[allow(clippy::too_many_arguments)] // the reference's own list of inputs
     fn on_track_rebuild(
         &mut self,
@@ -494,7 +494,7 @@ impl Cubic {
 
         if loss_occurred {
             // Multiplicative decrease, and the window this loss came from is
-            // where the curve grows back towards (`:294-301`).
+            // where the curve grows back towards (`:299-306`).
             should_force_sm = true;
             self.w_max = self.cwnd;
             self.k = cbrt(f64::from(self.w_max) * B / C);
@@ -526,7 +526,7 @@ impl Cubic {
 
             // The TCP-friendly region, which is what `tcp_mode` buys: while the
             // cubic window is still below where it started, a window that grows
-            // at the AIMD rate is taken instead if it is larger (`:315-324`).
+            // at the AIMD rate is taken instead if it is larger (`:320-329`).
             if self.tcp_mode && self.cwnd < self.w_max {
                 let rtt_in_seconds = (self.rtt_ns as f64) / SECOND_IN_NS;
                 let w_tcp = f64::from(self.w_max) * (1.0 - B)
@@ -544,7 +544,7 @@ impl Cubic {
             self.last_update_timestamp_ns = now_ns;
         } else if 1 == self.cwnd && new_consumption_position > last_sm_position {
             // A window of one MTU is a window the sender is waiting on: the
-            // reader moving means another status message is owed now (`:326-330`).
+            // reader moving means another status message is owed now (`:331-335`).
             should_force_sm = true;
         }
 

@@ -2,7 +2,7 @@
 //!
 //! The reference looks at a dead driver's CnC file and, before deleting the
 //! directory, writes a `<aeron_dir>-<datestamp>-error.log` beside it
-//! (`aeron-driver/src/main/c/aeron_driver.c:83-132`, called at `:205-212`).
+//! (`aeron-driver/src/main/c/aeron_driver.c:83-132`, called at `:222-229`).
 //! Our driver does the same thing. This test makes the two read the *same*
 //! CnC bytes and compares what each wrote, body and stderr line.
 //!

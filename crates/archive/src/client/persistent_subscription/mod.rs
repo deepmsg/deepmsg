@@ -25,7 +25,7 @@
 //! The reference's `set_listener` refuses a null listener
 //! (`aeron_archive_persistent_subscription.c:268-280`) — setting one to null is
 //! a programming error — but never setting one at all is legal, which is what
-//! `shouldNotRequireEventListener` (`…_persistent_subscription_test.cpp:2878`)
+//! `shouldNotRequireEventListener` (`…_persistent_subscription_test.cpp:2880`)
 //! is about. So when the listener arrives here it arrives as an `Option`, and
 //! the reference's null refusal has no counterpart: **one of its thirty-nine
 //! client-unit cases is a case Rust cannot have**, which is recorded rather than

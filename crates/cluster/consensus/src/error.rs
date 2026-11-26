@@ -69,7 +69,7 @@ impl ClusterError {
     ///
     /// It matters because the reference's counted-error handler is the
     /// deployment's (`TestCluster` passes `ClusterTests.errorHandler`,
-    /// `ClusterTest.java:565`) and that handler fails a test on an ERROR while
+    /// `ClusterTest.java:570`) and that handler fails a test on an ERROR while
     /// a WARN is only printed (`ClusterTests.java:77-98`).
     #[must_use]
     pub const fn is_warning(&self) -> bool {

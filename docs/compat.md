@@ -11,8 +11,8 @@ covers it.
 | Archive protocol SBE | schema id / version | 101 / 14 (semanticVersion 5.2) | `schemas/aeron-archive-codecs.xml` |
 | Archive mark SBE | schema id / version | 100 / 2 (semanticVersion 5.2) | `schemas/aeron-archive-mark-codecs.xml` |
 | Archive mark **file** | `ArchiveMarkFile.SEMANTIC_VERSION` | **3.1.0**; only the **major** is compared, so a minor ahead is read | `aeron-archive/src/main/java/io/aeron/archive/ArchiveMarkFile.java:55-72` |
-| Archive catalog **file** | `Catalog.CATALOG_FILE_NAME` | **`archive.catalog`** | `aeron-archive/src/main/java/io/aeron/archive/Archive.java:284` |
-| Archive catalog record | `Catalog.DEFAULT_ALIGNMENT` | records are **variable length**, aligned to the header's `alignment` (1024 by default); `DEFAULT_RECORD_LENGTH = 1024` is `@Deprecated` | `aeron-archive/src/main/java/io/aeron/archive/Catalog.java:57-95`, `:113-119` |
+| Archive catalog **file** | `Catalog.CATALOG_FILE_NAME` | **`archive.catalog`** | `aeron-archive/src/main/java/io/aeron/archive/Archive.java:290` |
+| Archive catalog record | `Catalog.DEFAULT_ALIGNMENT` | records are **variable length**, aligned to the header's `alignment` (1024 by default); `DEFAULT_RECORD_LENGTH = 1024` is `@Deprecated` | `aeron-archive/src/main/java/io/aeron/archive/Catalog.java:59-97`, `:115-121` |
 | Archive protocol version | `AeronArchive.Configuration.PROTOCOL_SEMANTIC_VERSION` | **1.12.0** (major 1, minor 12, patch 0); `1.11.0` is the archive-id **threshold**, not this value | `aeron-archive/src/main/java/io/aeron/archive/client/AeronArchive.java:2648-2668`, `:3839` |
 | Cluster protocol SBE | schema id / version | 111 / 18 (semanticVersion 5.4); v18 adds the optional `termBaseLogPosition` to `ClusterActionRequest` (id 6) and `SnapshotMarker` (id 8) | `schemas/aeron-cluster-codecs.xml` |
 | Cluster mark SBE | schema id / version | 110 / 2 (semanticVersion 5.4) | `schemas/aeron-cluster-mark-codecs.xml` |
@@ -25,7 +25,7 @@ Rules:
 
 - A CnC file is accepted when its major matches
   (`aeron-client/src/main/c/aeron_cnc_file_descriptor.c:103`) **and** its minor
-  is >= ours (`aeron-client/src/main/java/io/aeron/CommonContext.java:1432`,
+  is >= ours (`aeron-client/src/main/java/io/aeron/CommonContext.java:1493`,
   `aeron-client/src/main/c/aeron_context.c:617`). The C reference disagrees
   with itself on the second rule — its read path omits it and its command path
   applies it — so `deepmsg` applies both everywhere and the choice is recorded
@@ -73,7 +73,7 @@ the one thing no case can reach.
 
 Two of the forty-six system counter labels name the build that wrote the file:
 `Errors: version=… commit=…` (id 15) and `Aeron software: …` (id 34)
-(`aeron-driver/src/main/c/aeron_system_counters.c:41,60`). The reference writes
+(`aeron-driver/src/main/c/aeron_system_counters.c:46,60`). The reference writes
 `AERON_VERSION_TXT` and its git sha. deepmsg writes `version=1.53.2` — the
 version whose contracts it implements, and the same version its value field
 packs as `79106` — and `commit=deepmsg-<crate version>`.
@@ -98,7 +98,7 @@ below instead.
 
 The other labels the reference suffixes at runtime — the driver's threading
 mode, the resolver's name, the duty-cycle thresholds
-(`aeron_driver_conductor.c:848-951`) — are *configuration*, not contract: the
+(`aeron_driver_conductor.c:889-992`) — are *configuration*, not contract: the
 reference's own text changes with its settings, and deepmsg's now follows its
 own. All eight suffixes are built from the settings at allocation
 (`crates/driver/src/system_counters.rs`): `: driverName=<name>` on 25, the
@@ -163,7 +163,7 @@ naming the test that covers it.
 - **A blocking add.** The reference's C client registers a counter
   asynchronously — `aeron_add_counter` returns before any reply, and the
   counter surfaces through the available-counter callback the caller
-  registered (`aeron_client_conductor.c:850-895` pairs the reply to the
+  registered (`aeron_client_conductor.c:888-933` pairs the reply to the
   registration). deepmsg's `Client::add_counter` blocks until the reply
   lands or a caller-supplied deadline passes, and `remove_counter` waits the
   same way for its acknowledgement — the Java client's shape rather than the
@@ -174,7 +174,7 @@ naming the test that covers it.
 - **Events, not callbacks.** The reference fires registered handlers inside
   its conductor's duty cycle — available handlers on every
   `ON_COUNTER_READY`, unavailable ones on every `ON_UNAVAILABLE_COUNTER`
-  (`aeron_client_conductor.c:850-906`), whatever else the client was doing.
+  (`aeron_client_conductor.c:888-944`), whatever else the client was doing.
   deepmsg queues `CounterEvent`s on the same response pass and hands them
   over when the caller asks (`Client::counter_events`), so a handler can
   never run re-entrant inside the client's own poll. Covered by
@@ -186,12 +186,12 @@ naming the test that covers it.
   reference's way — allocated with an owner id of `NULL_VALUE`, answered with
   `ON_STATIC_COUNTER` (`0x0F0B`, `:56`), reused when the same type id and
   registration id are asked for again
-  (`aeron-driver/src/main/c/aeron_driver_conductor.c:6255-6316`) — but what a
+  (`aeron-driver/src/main/c/aeron_driver_conductor.c:6352-6413`) — but what a
   *client* gets back is a different type. The reference tracks one as an
   `AERON_CLIENT_MANAGED_RESOURCE_TYPE_STATIC_COUNTER` and matches that type
   when a removal arrives
-  (`aeron-client/src/main/c/aeron_client_conductor.c:3061-3070`), and its close
-  for one is a no-op (`:1283-1287`); here `Client::add_static_counter` returns a
+  (`aeron-client/src/main/c/aeron_client_conductor.c:3123-3132`), and its close
+  for one is a no-op (`:1313-1317`); here `Client::add_static_counter` returns a
   `StaticCounter` and `Client::remove_counter` takes a `Counter`, so the removal
   that must never happen cannot be written. Same outcome, no runtime match.
   Covered by `crates/driver/src/conductor.rs::a_static_counter_belongs_to_the_driver_and_not_to_the_client`
@@ -204,13 +204,13 @@ naming the test that covers it.
 
 Two drivers cannot share an aeron directory, and the question "is somebody else
 living here?" is the to-driver ring's consumer heartbeat — there is no lock file
-anywhere (`aeron-driver/src/main/c/aeron_driver.c:136-235`). Two rules around it
+anywhere (`aeron-driver/src/main/c/aeron_driver.c:153-252`). Two rules around it
 are worth recording, because deepmsg answers them the way the *contract* does
 rather than the way the reference's code happens to:
 
 - **A file whose version is still zero is not a dead driver.** The reference
   waits for the version to appear before it judges anything, up to
-  `aeron.driver.timeout` (`aeron_is_driver_active_with_cnc`, `aeron_driver_context.c:1603-1612`),
+  `aeron.driver.timeout` (`aeron_is_driver_active_with_cnc`, `aeron_driver_context.c:1647-1656`),
   because a driver creating a 46 MB file looks exactly like a dead one. So does
   deepmsg. Past the window, a file that never got a version is taken over. The
   *wait* is measured with a monotonic clock rather than the reference's epoch
@@ -229,16 +229,16 @@ A CnC file is also *published* differently: `CncFile::publish` refuses to store
 the version until the to-driver ring has a heartbeat, because the reference
 writes the heartbeat first for a reason — a file that passes a client's version
 gate and then fails its liveness rule is a file every client reads as a driver
-that is already gone (`aeron-driver/src/main/c/aeron_driver.c:971-972`).
+that is already gone (`aeron-driver/src/main/c/aeron_driver.c:1011-1012`).
 
 ## The space a log buffer needs
 
 Before a log buffer is created, the filesystem it will land on is asked
 whether it has room — the reference's check, on by default
-(`perform.storage.checks`, `aeron_driver_context.c:1354-1375`) — and a
+(`perform.storage.checks`, `aeron_driver_context.c:1398-1419`) — and a
 refusal reaches the client as `STORAGE_SPACE`, the code the reference
 composes for an `ENOSPC`, whether the check's or the kernel's
-(`aeron_driver_conductor.c:2326-2341`). The setting's names and defaults
+(`aeron_driver_conductor.c:2389-2404`). The setting's names and defaults
 are pinned by `crates/driver/src/config.rs::the_storage_check_answers_to_the_references_names`,
 and the refusal by the native resource agent's own tests.
 
@@ -248,7 +248,7 @@ driver's distinct error log, in the reference's own words and under its
 code (`-STORAGE_SPACE`, negated as its `AERON_SET_ERR` left it), and the
 create goes ahead — the reference records the warning directly rather than
 through its `log_explicit_error`, so the errors counter does not move
-(`aeron_driver_context.c:1368-1377`). The reference's agent thread writes
+(`aeron_driver_context.c:1412-1421`). The reference's agent thread writes
 the entry itself; deepmsg's agent hands the numbers to the conductor, which
 owns the de-duplication table, so the entry lands on the duty cycle after
 the check rather than during it. The setting's default — ten of the
@@ -270,14 +270,14 @@ up).
 
 | Fact | Where |
 |---|---|
-| `loss-report.dat`, created by the driver before the conductor starts | `aeron-driver/src/main/c/aeron_driver.c:888`, `:324-345` |
-| Length = the configured length aligned up to the file page size; 1 MiB by default | `:329-330`; `aeron_driver_context.c:490`; `aeron.loss.report.buffer.length` at `:841` |
+| `loss-report.dat`, created by the driver before the conductor starts | `aeron-driver/src/main/c/aeron_driver.c:928`, `:324-345` |
+| Length = the configured length aligned up to the file page size; 1 MiB by default | `:329-330`; `aeron_driver_context.c:495`; `aeron.loss.report.buffer.length` at `:871` |
 | Counted in `Bytes currently mapped` | `:948` |
 | A 40-byte `#pragma pack(4)` header, then channel and source behind four-byte lengths, the record rounded up to a 64-byte cache line | `reports/aeron_loss_reporter.h:30-44` |
 | `observation_count` written **last**, with a release: a reader stops at the first non-positive one | `reports/aeron_loss_reporter.c:44-68`, `:120-126` |
-| The first report creates the record (channel and source included), later ones only add | `aeron_publication_image.c:123-155` |
-| A hole found again is only counted past what was already reported | `:452-479` |
-| A record that does not fit gives up for that image — no retry | `:145-150` |
+| The first report creates the record (channel and source included), later ones only add | `aeron_publication_image.c:128-160` |
+| A hole found again is only counted past what was already reported | `:457-484` |
+| A record that does not fit gives up for that image — no retry | `:150-155` |
 
 The one divergence is inside the reference, between its own writer and its own
 **C** reader. The stride a record takes is
@@ -313,7 +313,7 @@ report verbatim
 
 The description after the code is chosen by its sign, and that half arrived
 late: a **positive** code is an errno and is described by the OS's own
-`strerror` text, not by the protocol table (`aeron_error.c:361-373`). Until
+`strerror` text, not by the protocol table (`aeron_error.c:381-393`). Until
 G3-8b nothing here recorded one, so the composition modelled only the table;
 the sender-MTU refusal below is the first site that does. Both drivers are
 driven through that fault and their entries compared, masked only for the
@@ -329,12 +329,12 @@ the client is answered with are compared, masked only for the descriptor
 number, by `tests/interop/bind_fault_entry.rs`.
 
 One recorded text diverges: a broadcast transmit failure. The reference
-appends it with `AERON_APPEND_ERR` (`aeron_driver_conductor.c:2240`), which
+appends it with `AERON_APPEND_ERR` (`aeron_driver_conductor.c:2303`), which
 resets neither the code nor the thread's error buffer — so the entry is the
 tail of a chain that thread has accumulated, ended by the append's own site
 line, and reads `[aeron_driver_conductor_client_transmit,
-aeron_driver_conductor.c:2240] failed to transmit message\n` under code
-zero (`aeron-client/src/main/c/util/aeron_error.c:380-388`; appending never
+aeron_driver_conductor.c:2303] failed to transmit message\n` under code
+zero (`aeron-client/src/main/c/util/aeron_error.c:399-407`; appending never
 sets a code). deepmsg records the bare `"failed to transmit message"`: the
 same code, the same de-duplication, without the site line that only means
 something on the reference's own thread. Covered by
@@ -346,10 +346,10 @@ decision rather than a gap. All of them are in
 `aeron-driver/src/main/c/aeron_driver_native_resource_agent.c`:
 
 - An agent command its switch does not know is
-  `record(EINVAL, "unknown command")` (`:176-177`). This build's agent takes
+  `record(EINVAL, "unknown command")` (`:193-194`). This build's agent takes
   a typed enum, so the failure has no representation to report.
 - Two more are allocation failures — a deque that would not grow
-  (`:417-420`) and an error message it could not allocate (`:131-133`);
+  (`:422-425`) and an error message it could not allocate (`:136-138`);
   this build's agent hands work over an unbounded channel and allocates
   through Rust, so neither has a moment to fail at.
 
@@ -365,7 +365,7 @@ and, for the agent's side of it,
 A session id no client names is speculated: the driver takes the first id from
 its cursor that no live publication on that stream holds. The reference scans a
 bit set one longer than its publication count — there is always a free bit, so
-the answer always exists (`aeron-driver/src/main/c/aeron_driver_conductor.c:3787-3789`,
+the answer always exists (`aeron-driver/src/main/c/aeron_driver_conductor.c:3884-3886`,
 with the search itself at `:1089-1105`). deepmsg scans a fixed window of 1024
 (`SessionIds::MAX_SPECULATION`) instead of a per-driver-sized set, which finds
 the same id for every driver whose live publications on one stream number fewer
@@ -381,8 +381,8 @@ by name rather than dropping them:
 
 | Setting | What the reference does | Where |
 |---|---|---|
-| `aeron.driver.dynamic.libraries` | `aeron_dl_load_libs` at context init; an unloadable library stops the driver | `aeronmd.h:980`; `aeron_driver_context.c:539-546` |
-| `aeron.agent.on.start.function` | `aeron_dlsym(RTLD_DEFAULT, name)`; a symbol that is not there prints `could not find agent on_start func …: dlsym - …` and stops the driver | `aeronmd.h:513`; `aeron_driver_context.c:555-561`; `aeron-client/src/main/c/aeron_agent.c:337-348` |
+| `aeron.driver.dynamic.libraries` | `aeron_dl_load_libs` at context init; an unloadable library stops the driver | `aeronmd.h:1014`; `aeron_driver_context.c:546-553` |
+| `aeron.agent.on.start.function` | `aeron_dlsym(RTLD_DEFAULT, name)`; a symbol that is not there prints `could not find agent on_start func …: dlsym - …` and stops the driver | `aeronmd.h:530`; `aeron_driver_context.c:562-568`; `aeron-client/src/main/c/aeron_agent.c:337-348` |
 
 Neither can be served: ADR-0002 keeps FFI out of this build, so there is no
 `dlopen` and no `dlsym` to point at anything. Refusing is the same *outcome* the
@@ -419,7 +419,7 @@ dropped them was a driver reporting loss that never happened — the system test
 it broke assert on the NAK counter, which stayed at zero.
 
 A name outside that table still stops the driver, as it stops the reference's
-(`aeron_driver_context.c:1283-1290` is a `goto error`), and so does **any**
+(`aeron_driver_context.c:1313-1320` is a `goto error`), and so does **any**
 outgoing name: none of the three has an outgoing half (`outgoing_init_func` is
 `NULL` in all three `_load` functions), so every value
 `AERON_UDP_CHANNEL_OUTGOING_INTERCEPTORS` can hold is one the table cannot
@@ -434,9 +434,9 @@ covers the two refusals, and
 the binding of `AERON_NAK_UNICAST_DELAY` beside them.
 
 `aeron.driver.connect` is **not** one of these, though an earlier plan filed it
-here: it is a boolean (`aeron_driver_context.c:247,668`) that decides whether a
+here: it is a boolean (`aeron_driver_context.c:249,668`) that decides whether a
 send endpoint whose channel names an explicit endpoint connects its socket to it
-(`media/aeron_send_channel_endpoint.c:89`). It is read and acted on —
+(`media/aeron_send_channel_endpoint.c:81`). It is read and acted on —
 `crates/driver/src/media/send_endpoint.rs`, with the two outcomes pinned by
 `::an_endpoint_that_is_not_connected_can_send_somewhere_else` and
 `::a_connected_endpoint_sends_only_where_its_channel_points`.
@@ -446,7 +446,7 @@ driver recognises without defining.** The C reference's symbol table holds
 `allow` and `deny` and nothing else
 (`aeron-driver/src/main/c/aeron_termination_validator.c:28-40`), and a name that
 resolves to nothing stops context init
-(`:55-62` → `aeron_driver_context.c:1247-1251`), while the Java driver takes a
+(`:55-62` → `aeron_driver_context.c:1277-1281`), while the Java driver takes a
 **class** name. The reference's own C harnesses
 write the Java spelling every time they start a driver —
 `aeron-archive/src/test/c/TestArchive.h:49`,
@@ -474,7 +474,7 @@ which starts this driver with each spelling and sends it the harness's own
 compiles in.** `AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` picks the
 implementation the UDP data paths run on, and
 `AERON_CONDUCTOR_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA` the one the conductor's
-name resolver runs on (`aeronmd.h:731,736`; `aeron_driver_context.c:1258-1270`).
+name resolver runs on (`aeronmd.h:748,736`; `aeron_driver_context.c:1288-1300`).
 Both are environment-only in the reference, and both resolve against a table it
 compiles in — `default`, whose symbol is
 `aeron_udp_channel_transport_bindings_default`
@@ -584,7 +584,7 @@ channel reaches its destinations over the kernel, so the `localhost` ones the
 reference's own tests add (`MultipathTest`, `MdsAndMdcInteractionTest`) work,
 and destinations on a port this driver drives do not. The reference resolves the
 other way — it creates no transport at all for a manual subscription and one per
-destination as each is added (`aeron_driver_conductor.c:2099`, `:5903`) — which
+destination as each is added (`aeron_driver_conductor.c:2150`, `:6000`) — which
 puts ownership in the data path rather than at the open, and this build declined
 it for that reason (D5 record, 第 10 笔).
 
@@ -683,11 +683,11 @@ the variable is set and writes events to stdout, or to the file
 tree asserts on that output, and the only test that sets the variable
 (`aeron-driver/src/test/c/aeron_name_resolver_test.cpp:1034`) merely turns it
 on. Its **Java** driver writes into a ring buffer that a Java agent in the same
-JVM reads (`driver/logging/DriverEventLogger.java:46`,
-`logging/CollectingEventLogReaderAgent.java:76-78`), which is what
+JVM reads (`driver/logging/DriverTracer.java:46`,
+`logging/CollectingEventLogReaderAgent.java:77-79`), which is what
 `io.aeron.driver.DriverLoggingSystemTest` asserts on — a test the harness
 excludes from its `test` task and runs in one of its own that points at no
-external driver (`build.gradle:1145`, `:1148-1156`).
+external driver (`build.gradle:1145`, `:1157-1165`).
 
 So there is nothing to be compatible *with*, and refusing the names is not an
 option either: `CTestMediaDriver` sets `AERON_EVENT_LOG` and
@@ -744,7 +744,7 @@ went in.
 The four actions are the reference's, and the numbers are not a contract: Java
 numbers `ABORT, BREAK, COMMIT, CONTINUE` from zero
 (`logbuffer/ControlledFragmentHandler.java:30-53`) and C numbers the same order
-from one (`aeron-client/src/main/c/aeronc.h:1719-1737`). What each does to a
+from one (`aeron-client/src/main/c/aeronc.h:1722-1740`). What each does to a
 reader's position is the contract, and it is pinned by
 `crates/client/src/image.rs::the_four_actions_move_the_position_where_the_reference_moves_it`,
 with a refused message coming back assembled by the same last fragment
@@ -768,7 +768,7 @@ gracefully (`LogAdapter.isLogEndOfStream`, `LogAdapter.java:111-114`).
 
 This build does the same, and **Java is the authority here**: the C client's
 `aeron_image_is_publication_revoked` does not consult `is_closed`
-(`aeron_image.c:231-247`), Java's does, and the cluster exists in Java only. A
+(`aeron_image.c:236-252`), Java's does, and the cluster exists in Java only. A
 second reader holding an `ImageView` therefore sees `is_closed` after either
 close path, where it used to see the flag only for an image that had been
 handed over. Covered by
@@ -784,31 +784,31 @@ a parameter has silently gone missing rather than been absent: a trailing
 scanner, whose final flush only runs while it is inside a value
 (`aeron-client/src/main/c/uri/aeron_uri.c:96-102`) — and a trailing `key=`,
 whose null value the reference's readers treat as the parameter not being
-there at all (`:357-361`). Covered by
+there at all (`:361-365`). Covered by
 `crates/driver/src/channel_uri.rs::the_destructive_shapes_are_refused_here`.
 
 The error *codes* follow the reference's split rather than the shapes: a URI
 the driver cannot read is `INVALID_CHANNEL`, which is what the reference
 raises for a bad scheme, a bad transport, an over-long URI and a malformed
-parameter (`aeron_uri.c:269-273`, `:311-314`, `:48`, `:84`); a parameter
+parameter (`aeron_uri.c:275-279`, `:311-314`, `:48`, `:84`); a parameter
 *value* its readers would reject is the generic code, because that is what
 the reference's bare `-1` and `EINVAL` returns compose to
-(`aeron-driver/src/main/c/aeron_driver_conductor.c:2326-2341`). Covered by
+(`aeron-driver/src/main/c/aeron_driver_conductor.c:2389-2404`). Covered by
 `crates/driver/src/conductor.rs::a_parameter_value_the_reference_cannot_parse_is_generic`
 alongside `::a_channel_this_driver_cannot_serve_is_refused_with_a_code_and_an_answer`.
 
 The words that ride an `ON_ERROR` are diagnostic, not contract: the two
 "unknown publication/subscription" answers carry the reference's `client_id=`
-and `registration_id=` fields (`aeron_driver_conductor.c:4734`, `:5258`;
+and `registration_id=` fields (`aeron_driver_conductor.c:4831`, `:5355`;
 asserted by `crates/driver/src/conductor.rs::an_unknown_removal_is_answered_with_the_references_code`),
 and the rest are single lines where the reference sends an accumulated chain
-of every `AERON_SET_ERR` and `AERON_APPEND_ERR` on the path (e.g. `:4757`) —
+of every `AERON_SET_ERR` and `AERON_APPEND_ERR` on the path (e.g. `:4854`) —
 less context, the same code and the same correlation.
 
 Those words are also what an `ON_ERROR` records: answering an error and
 recording it are one act in the reference, which transmits the response and
-then falls through to its own `log_error:` label (`:2366-2370`), skipping the
-log only for `RESOURCE_TEMPORARILY_UNAVAILABLE` (`:2367`). This build keeps
+then falls through to its own `log_error:` label (`:2429-2433`), skipping the
+log only for `RESOURCE_TEMPORARILY_UNAVAILABLE` (`:2430`). This build keeps
 the two together the same way, so the entry holds the words the client was
 handed — which are the ones this paragraph just called diagnostic, rather
 than the composition an `AERON_SET_ERR` would have built. Asserted by
@@ -826,13 +826,13 @@ that, in opposite directions.
 
 **This driver serves the channel, and the reference's C driver refuses it.**
 `AERON_URI_INVALID_TAG` is `-1` and it is also what `aeron_uri_parse_tag`
-answers for a value it cannot read (`aeron-client/src/main/c/uri/aeron_uri.h:89`,
-`aeron-client/src/main/c/uri/aeron_uri.c:517-529`), so
+answers for a value it cannot read (`aeron-client/src/main/c/uri/aeron_uri.h:90`,
+`aeron-client/src/main/c/uri/aeron_uri.c:521-533`), so
 `aeron_udp_channel_finish_parse` refuses `tags=-1` outright
-(`aeron-driver/src/main/c/media/aeron_udp_channel.c:385-390`). The Java driver
+(`aeron-driver/src/main/c/media/aeron_udp_channel.c:386-391`). The Java driver
 accepts it and reads it as a **real** tag of `-1`
-(`aeron-driver/src/main/java/io/aeron/driver/media/UdpChannel.java:216-218`,
-matched by `:786`), which is not what the archive meant either. This driver
+(`aeron-driver/src/main/java/io/aeron/driver/media/UdpChannel.java:243-245`,
+matched by `:834`), which is not what the archive meant either. This driver
 takes the third reading — `-1` is the null value, so a channel that names it
 names no tag — which puts such a channel in exactly the state a channel with no
 `tags` parameter is in: an endpoint of its own and nothing a tag matcher will
@@ -858,7 +858,7 @@ archive adds to it.
 **This build's archive does not write it.** A replication that named no tag gets
 a channel with no `tags` parameter — which is how the reference's own client
 library says "no tags" (`ChannelUriStringBuilder.tags(Long, Long)` leaves the
-parameter out when there is no tag, `ChannelUriStringBuilder.java:1250-1264`)
+parameter out when there is no tag, `ChannelUriStringBuilder.java:1253-1267`)
 and what makes such a channel portable to a driver that follows the C one.
 Pinned by `tests/integration/archive_client_api.rs::a_live_replication_merges_into_the_stream_it_is_copying`,
 which reads the subscription the extend made and fails on a `tags=` in it (as
@@ -878,7 +878,7 @@ reference's `EINVAL`, which reaches a client as the generic error. A
 socket, like the buffer lengths — and a channel joining an existing endpoint
 must agree with the traffic class that socket already has, with the
 reference's `existingChannel=… channel=…` words otherwise
-(`aeron_udp_channel.c:410-427`, `aeron_driver_conductor.c:569-605`). Pinned by
+(`aeron_udp_channel.c:431-448`, `aeron_driver_conductor.c:610-646`). Pinned by
 `crates/driver/src/udp_channel.rs::tests::so_tos_is_read_bounded_and_is_not_a_destination_parameter`
 and `crates/driver/src/channel_validation.rs::tests::a_channel_that_named_a_different_tos_is_refused_by_name`.
 
@@ -892,25 +892,25 @@ be falsified.
 
 | Divergence | Why, and where it shows |
 |---|---|
-| **ATS and the timestamp-offset parameters are refused** rather than served | The reference serves them, and a driver that *ignored* them would serve a different channel: a timestamped image without timestamps, an ATS endpoint without encryption. Multicast endpoints, the subscription parameter `group=`, `gtag=` and now **`cc=`** were all on this list and are served: `group=` from G3-1, `gtag=` from G3-2, and `cc=` from G3-5, which carries the static window and CUBIC (`crates/driver/src/congestion_control.rs`, the reference's own `congestion_control_test` as the oracle). `cc=` is read where the reference reads it — when an *image* is built, off the endpoint's channel (`aeron_congestion_control.c:165-205`, called from `aeron_driver_conductor.c:6629`) — so a name this build cannot serve is a subscription that exists and never reads, which is what the reference does with it too. `crates/driver/src/publication_params.rs::a_congestion_control_is_a_subscriptions_to_name_and_the_images_to_read`, and the round trip end to end in `tests/integration/congestion_control.rs`. |
+| **ATS and the timestamp-offset parameters are refused** rather than served | The reference serves them, and a driver that *ignored* them would serve a different channel: a timestamped image without timestamps, an ATS endpoint without encryption. Multicast endpoints, the subscription parameter `group=`, `gtag=` and now **`cc=`** were all on this list and are served: `group=` from G3-1, `gtag=` from G3-2, and `cc=` from G3-5, which carries the static window and CUBIC (`crates/driver/src/congestion_control.rs`, the reference's own `congestion_control_test` as the oracle). `cc=` is read where the reference reads it — when an *image* is built, off the endpoint's channel (`aeron_congestion_control.c:165-205`, called from `aeron_driver_conductor.c:6722`) — so a name this build cannot serve is a subscription that exists and never reads, which is what the reference does with it too. `crates/driver/src/publication_params.rs::a_congestion_control_is_a_subscriptions_to_name_and_the_images_to_read`, and the round trip end to end in `tests/integration/congestion_control.rs`. |
 (`crates/driver/src/publication_params.rs::a_congestion_control_this_driver_does_not_carry_is_refused`, `crates/driver/src/conductor.rs::a_channel_parameter_this_driver_cannot_serve_is_answered_rather_than_ignored`). Response channels were on this list and are served now — see the destination-plane section below. `crates/driver/src/udp_channel.rs::a_group_tag_is_a_parameter_like_any_other`, `::the_unsupported_parameters_are_named_rather_than_dropped`. |
-| **The two flow-control supplier settings name a strategy, not a symbol to load** | `AERON_MULTICAST_FLOWCONTROL_SUPPLIER` and `AERON_UNICAST_FLOWCONTROL_SUPPLIER` are read and the four names the reference's own table holds are served, **under both the symbol and the short name each entry carries** — `aeron_unicast_flow_control_strategy_supplier`/`unicast_max`, `aeron_max_multicast_flow_control_strategy_supplier`/`multicast_max`, `aeron_min_flow_control_strategy_supplier`/`multicast_min`, `aeron_tagged_flow_control_strategy_supplier`/`multicast_tagged` (`aeron_flow_control.c:43-64`, whose scan takes either, and `aeronmd.h:286-289` for the short ones). The reference `dlsym`s the name, so a *custom* supplier compiles into a driver that loads it; this build has no dynamic loading (ADR-0002) and **refuses** a name it does not know, which is also what the reference does for one its table does not hold (its context init fails and the driver does not start). `crates/driver/src/config.rs::a_flow_control_supplier_is_named_by_its_the_references_symbol`, `crates/driver/src/flowcontrol.rs::Supplier::from_name`. |
-| **A reader is told an image is gone as it leaves DRAINING for LINGER — except when the image was revoked** | The normal path is the reference's: `aeron_driver_conductor_image_transition_to_linger` tells every linked subscription the image is unavailable, and unlinks as it tells (`aeron_driver_conductor.c:1642-1675`), so a reader stops polling a stream that has stopped rather than a linger window later. It was not always: this build used to announce only at release, and `NameReResolutionTest.shouldReResolveMdcDynamicControlOnNotConnected` is what found it — its `while (subscription.isConnected())` after a publication closes waited out the whole linger window and hit the test's own deadline. The two places announce the same message (`crates/driver/src/conductor.rs::announce_image_unavailable`), and the transition is carried from the receiver thread as `ReceiverEvent::ImageLingering` because this build's image state machine runs there rather than on the conductor (`crates/driver/src/publication_image.rs::take_linger_notice`). A **revoked** image is the exception, and stays this build's own divergence: it reaches LINGER without a linger to announce on — its heartbeats already said `REVOKED` and it walks to DONE without waiting (`crates/driver/src/publication_image.rs::a_revoked_image_walks_to_done_without_waiting`) — so it is announced when it is released. The reader sees the same two things, an unavailable image whose `Image.isPublicationRevoked` is true; what differs for a revoked one is that it is told a pass or two later and that the log buffer is freed without a linger. `PublicationRevokeTest`. |
-| **A multicast channel is served without `IP_MULTICAST_LOOP` ever being touched and without a leave-group call** | Both are what the reference does as well — they were looked for and are not there: `IP_MULTICAST_LOOP` appears **nowhere** in the tree, and a group is left by closing the socket rather than by `IP_DROP_MEMBERSHIP` (`aeron-driver/src/main/c/media/aeron_udp_channel_transport.c:394-409`). The kernel's own default of on is what both builds send with, and a group is left when its socket goes. `crates/driver/src/media/udp_transport.rs::two_subscribers_to_one_group_both_hear_what_is_sent_to_it`. |
-| **The two `AERON_LOSS_DETECTOR_NAK_*` names multicast is usually described by are not implemented** | They are **dead macros** in 1.53.2: `AERON_LOSS_DETECTOR_NAK_UNICAST_DELAY_NS` and `AERON_LOSS_DETECTOR_NAK_MULTICAST_MAX_BACKOFF_NS` are definitions with no reader anywhere in the tree (`aeron-driver/src/main/c/aeron_loss_detector.h:61`, `:76`), and both say 60 — sixty milliseconds and sixty million. What a driver actually reads is the context's own pair, where the backoff is **ten** milliseconds and the unicast delay is **one** (`aeron-driver/src/main/c/aeron_driver_context.c:220-223`). This build's constant is that live value, not the macro's: `crates/driver/src/loss_detector.rs::a_channels_nak_delay_becomes_a_static_detector_at_the_ratio` pins the unicast pair, and `::a_groups_delays_are_drawn_and_not_fixed` the multicast scale. |
-| **A `ttl=0` and a channel that named no `ttl` at all are one value** | `aeron_uri_multicast_ttl` answers zero for both (`aeron-client/src/main/c/uri/aeron_uri.c:323-334`) and an endpoint reads zero as "take the driver's default" (`aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:129`), so a channel that writes `ttl=0` meaning "this datagram never leaves the host" gets the driver's hop limit instead. The reference does exactly this; the divergence is only that a reader would not expect it from a parameter that can be written. `crates/driver/src/udp_channel.rs::the_hop_limit_is_read_the_way_strtoull_reads_it`. |
-| **`recvmmsg` is called without a timeout** | The reference passes a zero `timespec`, which the kernel reads as "return after the first datagram" — one syscall per datagram of a burst. This passes `NULL` on a non-blocking socket, which returns everything queued. Same datagrams, fewer syscalls (`aeron_udp_channel_transport.c:560`, `:577`). |
+| **The two flow-control supplier settings name a strategy, not a symbol to load** | `AERON_MULTICAST_FLOWCONTROL_SUPPLIER` and `AERON_UNICAST_FLOWCONTROL_SUPPLIER` are read and the four names the reference's own table holds are served, **under both the symbol and the short name each entry carries** — `aeron_unicast_flow_control_strategy_supplier`/`unicast_max`, `aeron_max_multicast_flow_control_strategy_supplier`/`multicast_max`, `aeron_min_flow_control_strategy_supplier`/`multicast_min`, `aeron_tagged_flow_control_strategy_supplier`/`multicast_tagged` (`aeron_flow_control.c:43-64`, whose scan takes either, and `aeronmd.h:303-306` for the short ones). The reference `dlsym`s the name, so a *custom* supplier compiles into a driver that loads it; this build has no dynamic loading (ADR-0002) and **refuses** a name it does not know, which is also what the reference does for one its table does not hold (its context init fails and the driver does not start). `crates/driver/src/config.rs::a_flow_control_supplier_is_named_by_its_the_references_symbol`, `crates/driver/src/flowcontrol.rs::Supplier::from_name`. |
+| **A reader is told an image is gone as it leaves DRAINING for LINGER — except when the image was revoked** | The normal path is the reference's: `aeron_driver_conductor_image_transition_to_linger` tells every linked subscription the image is unavailable, and unlinks as it tells (`aeron_driver_conductor.c:1683-1716`), so a reader stops polling a stream that has stopped rather than a linger window later. It was not always: this build used to announce only at release, and `NameReResolutionTest.shouldReResolveMdcDynamicControlOnNotConnected` is what found it — its `while (subscription.isConnected())` after a publication closes waited out the whole linger window and hit the test's own deadline. The two places announce the same message (`crates/driver/src/conductor.rs::announce_image_unavailable`), and the transition is carried from the receiver thread as `ReceiverEvent::ImageLingering` because this build's image state machine runs there rather than on the conductor (`crates/driver/src/publication_image.rs::take_linger_notice`). A **revoked** image is the exception, and stays this build's own divergence: it reaches LINGER without a linger to announce on — its heartbeats already said `REVOKED` and it walks to DONE without waiting (`crates/driver/src/publication_image.rs::a_revoked_image_walks_to_done_without_waiting`) — so it is announced when it is released. The reader sees the same two things, an unavailable image whose `Image.isPublicationRevoked` is true; what differs for a revoked one is that it is told a pass or two later and that the log buffer is freed without a linger. `PublicationRevokeTest`. |
+| **A multicast channel is served without `IP_MULTICAST_LOOP` ever being touched and without a leave-group call** | Both are what the reference does as well — they were looked for and are not there: `IP_MULTICAST_LOOP` appears **nowhere** in the tree, and a group is left by closing the socket rather than by `IP_DROP_MEMBERSHIP` (`aeron-driver/src/main/c/media/aeron_udp_channel_transport.c:408-423`). The kernel's own default of on is what both builds send with, and a group is left when its socket goes. `crates/driver/src/media/udp_transport.rs::two_subscribers_to_one_group_both_hear_what_is_sent_to_it`. |
+| **The two `AERON_LOSS_DETECTOR_NAK_*` names multicast is usually described by are not implemented** | They are **dead macros** in 1.53.2: `AERON_LOSS_DETECTOR_NAK_UNICAST_DELAY_NS` and `AERON_LOSS_DETECTOR_NAK_MULTICAST_MAX_BACKOFF_NS` are definitions with no reader anywhere in the tree (`aeron-driver/src/main/c/aeron_loss_detector.h:61`, `:76`), and both say 60 — sixty milliseconds and sixty million. What a driver actually reads is the context's own pair, where the backoff is **ten** milliseconds and the unicast delay is **one** (`aeron-driver/src/main/c/aeron_driver_context.c:222-225`). This build's constant is that live value, not the macro's: `crates/driver/src/loss_detector.rs::a_channels_nak_delay_becomes_a_static_detector_at_the_ratio` pins the unicast pair, and `::a_groups_delays_are_drawn_and_not_fixed` the multicast scale. |
+| **A `ttl=0` and a channel that named no `ttl` at all are one value** | `aeron_uri_multicast_ttl` answers zero for both (`aeron-client/src/main/c/uri/aeron_uri.c:329-340`) and an endpoint reads zero as "take the driver's default" (`aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:122`), so a channel that writes `ttl=0` meaning "this datagram never leaves the host" gets the driver's hop limit instead. The reference does exactly this; the divergence is only that a reader would not expect it from a parameter that can be written. `crates/driver/src/udp_channel.rs::the_hop_limit_is_read_the_way_strtoull_reads_it`. |
+| **`recvmmsg` is called without a timeout** | The reference passes a zero `timespec`, which the kernel reads as "return after the first datagram" — one syscall per datagram of a burst. This passes `NULL` on a non-blocking socket, which returns everything queued. Same datagrams, fewer syscalls (`aeron_udp_channel_transport.c:581`, `:618`). |
 | **A frame is copied into a scratch buffer before it is sent** | The reference hands `sendmmsg` an iovec pointing into the mapped term. `deepmsg_core::buffer` refuses to mint a `&[u8]` over memory another thread is writing — a false immutability promise is licence for the optimiser to hoist loads — and a syscall taking `&[u8]` is exactly that borrow. `crates/driver/src/network_publication.rs`'s module note. |
 | **A subscription's join position is the image's `rcv-pos`** | The reference takes the slowest *reader* when an image has several (`aeron_publication_image.h:376-396`), which needs the reader set — and that lives on the receiver thread that owns the image. `rcv-pos` is the position a reader may start at without seeing a hole, and for the one-reader case the two are the same number. `crates/driver/src/publication_images.rs::join_position`. |
 | **A resolution can be held on purpose, by a setting the reference does not have** | `deepmsg.debug.resolver.delay.millis` holds every resolution on the native resource agent for that many milliseconds before it is answered. There is no reference counterpart, for the reason the loss-injection row above gives about its own property: what it reproduces is a nameserver that does not answer, and no setting on a driver can make one of those — while the property it exists to pin, that the conductor keeps publishing its heartbeat while a channel's names are being resolved, is otherwise only observable on a host whose resolver happens to be slow, which is a test that passes on the days it is not. Zero, the default, delays nothing. Covered by `tests/integration/heartbeat.rs::the_heartbeat_advances_while_a_channel_is_being_parsed`. |
-| **A channel-status counter's key is zero-filled past the channel** | The reference `memcpy`s the channel into an uninitialized struct, so the key's tail is whatever was on its stack (`aeron_position.c:220-222`). The bytes here are the same for the same channel every time, which is what a key is for. |
-| **Loss injection is configured by this build's own property, and a datagram it withholds is reported as sent** | Two differences in one seam. The reference's debug loss surface is eight `AERON_DEBUG_{SEND,RECEIVE}_{DATA,CONTROL}_LOSS_{RATE,SEED}` variables (`media/aeron_debug_channel_endpoint_configuration.h:22-29`) read by an installer the driver context never calls — only a C++ test does (`aeron-driver/src/test/c/media/aeron_test_loss_generators_test.cpp:467`, `media/aeron_debug_channel_endpoint_configuration.c:126-172`) — so a driver started as a process has no way in, and every interop test here starts one. This build reads `deepmsg.debug.send.data.loss.drop.every` instead: a count, not a rate, over outgoing datagrams, on the send endpoint's data slot only. The second difference is what a withheld call reports: the reference answers `0` (`media/aeron_send_channel_endpoint.c:391-403`), so its sender never advances `snd-pos` and the frames go out on a later pass — no gap, nothing retransmitted. Here the withheld datagram counts as handed over, which is the only way a gap, a NAK and a retransmission become observable on a wire that does not lose anything. Covered by `tests/interop/udp_transport.rs::a_withheld_frame_is_retransmitted_until_the_reference_subscriber_has_it`; the generator itself is `crates/driver/src/media/loss_generator.rs`. |
+| **A channel-status counter's key is zero-filled past the channel** | The reference `memcpy`s the channel into an uninitialized struct, so the key's tail is whatever was on its stack (`aeron_position.c:225-227`). The bytes here are the same for the same channel every time, which is what a key is for. |
+| **Loss injection is configured by this build's own property, and a datagram it withholds is reported as sent** | Two differences in one seam. The reference's debug loss surface is eight `AERON_DEBUG_{SEND,RECEIVE}_{DATA,CONTROL}_LOSS_{RATE,SEED}` variables (`media/aeron_debug_channel_endpoint_configuration.h:22-29`) read by an installer the driver context never calls — only a C++ test does (`aeron-driver/src/test/c/media/aeron_test_loss_generators_test.cpp:467`, `media/aeron_debug_channel_endpoint_configuration.c:131-177`) — so a driver started as a process has no way in, and every interop test here starts one. This build reads `deepmsg.debug.send.data.loss.drop.every` instead: a count, not a rate, over outgoing datagrams, on the send endpoint's data slot only. The second difference is what a withheld call reports: the reference answers `0` (`media/aeron_send_channel_endpoint.c:384-396`), so its sender never advances `snd-pos` and the frames go out on a later pass — no gap, nothing retransmitted. Here the withheld datagram counts as handed over, which is the only way a gap, a NAK and a retransmission become observable on a wire that does not lose anything. Covered by `tests/interop/udp_transport.rs::a_withheld_frame_is_retransmitted_until_the_reference_subscriber_has_it`; the generator itself is `crates/driver/src/media/loss_generator.rs`. |
 | **A send-side loss that has to begin *after* a session is up is a blackout counted in `DATA` datagrams** | The reference's cluster reliability cases lose the client's sends from the test's own thread: `PortLossGenerator.startDropping(port, durationNs)` is called once the service has seen five messages (`aeron-test-support/src/main/java/io/aeron/test/driver/PortLossGenerator.java:29-35`, used from `aeron-system-tests/src/test/java/io/aeron/cluster/ClusterSessionReliabilityTest.java:178-183`). A driver here is configured before it starts, so the moment is made deterministic instead: `deepmsg.debug.send.data.loss.pass.first` counts datagrams that carry a **`DATA` frame with a payload** (a handshake does not spend the budget, and neither does the header-only `DATA` frame an `EOS` rides), and `deepmsg.debug.send.data.loss.hold.millis` withholds **every** datagram for that long from the one after the budget. Both are refused together with `drop.every` — a rate and a window are two rules, not one. The window is a duration rather than a count for the reason the receive-side row gives. Covered by `crates/driver/src/media/loss_generator.rs`'s generator tests and `crates/driver/src/config.rs`'s `the_send_loss_settings_become_one_rule`, and end to end by `tests/interop/cluster_lc1_reliability.rs`: the four ingress-image cases lose the client's datagrams this way and assert the session is closed for `TIMEOUT` at both ends. |
-| **The receive side has its own loss injection, and it cannot be switched on while a case runs** | The reference's `aeron-test-support` generators hang on a **receive endpoint** and are enabled and disabled from the test's own thread while it runs (`aeron_stream_id_loss_generator.c:60-72`, `aeron-archive/src/test/c/client/aeron_archive_persistent_subscription_resilience_test.cpp:1500-1600`), because its driver runs in the test's process. A driver here is a process of its own, so what it drops is decided **before it starts**: `deepmsg.debug.receive.data.loss.{stream.id,every,setup.at.position,data.in.range,endpoint.skip,pass.first,from.millis,until.millis,drop.heartbeats}`, **one rule at a time** — two are refused rather than ordered — and a case that wants loss to begin at a chosen moment says so as a **bounded window** instead of a call — a position, or a **span of time measured from the stream's first frame** (`from.millis` with `until.millis`, or `pass.first` with `until.millis`; what the reference reaches for is the same shape, its composite predicate dropping `SETUP`s "until `g_setup_drop_until_ns`", `..._persistent_subscription_resilience_test.cpp:1948-1950`). Where the window opens is a setting of its own because counting frames cannot name it: the frame a case wants to hold back is behind a handshake whose frame count is not a constant (measured at three and at four on this machine). The five rules are the reference's five, case for case (a stream; a rate over one stream; a rate over any; one `SETUP` at a named position; one run of one term, heartbeats excepted), including the per-endpoint skip that exempts the archive's own recording subscription by a substring of its channel URI. A blackout passes heartbeats and does not count them — a heartbeat is how an image knows its sender is alive, and one that swallowed them would drop the connection rather than the response — unless it is told to take them too (`drop.heartbeats=true`, which is the reference's `StreamIdLossGenerator` behaviour and is what can starve an image's liveness). Covered by `tests/integration/receive_loss_injection.rs`, the generators' own tests in `crates/driver/src/media/receive_loss.rs`, and `tests/interop/cluster_lc1_reliability.rs::client_should_not_rejoin_egress_image_from_the_same_node_to_prevent_silent_message_loss`, whose fault *is* the image going unavailable and whose assertion is that the client does not rejoin it. |
-| **An image's `sparse` byte is its channel's, not the oldest matching subscription's** | Both of the metadata bytes an image copies from a subscription (`aeron_publication_image.c:280-281`) are read here off the channel the `SETUP` carried (`crates/driver/src/publication_images.rs::begin_create`). The reference reads `reliable` off the link being linked and `sparse` off the **oldest** subscription matching the image (`aeron_driver_conductor_is_oldest_subscription_sparse`, `aeron_driver_conductor.c:6715-6717`). The channel that created the image is one of those subscriptions, so the two agree until two subscriptions that name different `sparse` share one image — a byte nothing in this build reads, and the only one of the pair where they can differ. Covered by `crates/driver/src/publication_image.rs::an_image_records_whether_it_is_reliable_and_whether_its_buffer_is_sparse`. |
+| **The receive side has its own loss injection, and it cannot be switched on while a case runs** | The reference's `aeron-test-support` generators hang on a **receive endpoint** and are enabled and disabled from the test's own thread while it runs (`aeron_stream_id_loss_generator.c:60-72`, `aeron-archive/src/test/c/client/aeron_archive_persistent_subscription_resilience_test.cpp:1503-1603`), because its driver runs in the test's process. A driver here is a process of its own, so what it drops is decided **before it starts**: `deepmsg.debug.receive.data.loss.{stream.id,every,setup.at.position,data.in.range,endpoint.skip,pass.first,from.millis,until.millis,drop.heartbeats}`, **one rule at a time** — two are refused rather than ordered — and a case that wants loss to begin at a chosen moment says so as a **bounded window** instead of a call — a position, or a **span of time measured from the stream's first frame** (`from.millis` with `until.millis`, or `pass.first` with `until.millis`; what the reference reaches for is the same shape, its composite predicate dropping `SETUP`s "until `g_setup_drop_until_ns`", `..._persistent_subscription_resilience_test.cpp:1951-1953`). Where the window opens is a setting of its own because counting frames cannot name it: the frame a case wants to hold back is behind a handshake whose frame count is not a constant (measured at three and at four on this machine). The five rules are the reference's five, case for case (a stream; a rate over one stream; a rate over any; one `SETUP` at a named position; one run of one term, heartbeats excepted), including the per-endpoint skip that exempts the archive's own recording subscription by a substring of its channel URI. A blackout passes heartbeats and does not count them — a heartbeat is how an image knows its sender is alive, and one that swallowed them would drop the connection rather than the response — unless it is told to take them too (`drop.heartbeats=true`, which is the reference's `StreamIdLossGenerator` behaviour and is what can starve an image's liveness). Covered by `tests/integration/receive_loss_injection.rs`, the generators' own tests in `crates/driver/src/media/receive_loss.rs`, and `tests/interop/cluster_lc1_reliability.rs::client_should_not_rejoin_egress_image_from_the_same_node_to_prevent_silent_message_loss`, whose fault *is* the image going unavailable and whose assertion is that the client does not rejoin it. |
+| **An image's `sparse` byte is its channel's, not the oldest matching subscription's** | Both of the metadata bytes an image copies from a subscription (`aeron_publication_image.c:285-286`) are read here off the channel the `SETUP` carried (`crates/driver/src/publication_images.rs::begin_create`). The reference reads `reliable` off the link being linked and `sparse` off the **oldest** subscription matching the image (`aeron_driver_conductor_is_oldest_subscription_sparse`, `aeron_driver_conductor.c:6808-6810`). The channel that created the image is one of those subscriptions, so the two agree until two subscriptions that name different `sparse` share one image — a byte nothing in this build reads, and the only one of the pair where they can differ. Covered by `crates/driver/src/publication_image.rs::an_image_records_whether_it_is_reliable_and_whether_its_buffer_is_sparse`. |
 | **A `loss` interceptor draws from its own generator, not the process's** | The reference has one process-wide `erand48` state — `static unsigned short data_loss_xsubi[3]` (`media/aeron_udp_channel_transport_loss.c:47`) — so which frames it drops depends on what every other transport has received, in order. Here each channel's interceptor keeps its own, seeded the same way, because the alternative is a global the receive threads would have to synchronise on. The **rate** and the **message-type mask** mean the same either way; the frames are a different draw from the same distribution. What is **not** the same is what a `rate` with no mask does: here it drops nothing, because the mask is the set of frames the rate applies to and it starts empty — and the reference does not define the case at all, since it parses the keys into a `malloc`ed struct it never initialises and writes only the ones it was given (`media/aeron_udp_channel_transport_loss.c:102-113`), so a rate alone there is whatever the allocator left behind. The harness always sends a mask, which is why neither end has had to decide. `crates/driver/src/media/interceptor.rs::the_generator_is_the_one_the_reference_draws_from` pins the generator against values taken from `erand48` itself — the three shorts are in glibc's order, least significant first, and getting that backwards still yields numbers in `[0, 1)` — and `::the_loss_interceptor_drops_only_what_the_mask_names` the mask, including that a mask leaving DATA out drops no data (DATA is frame type 1, so its bit is `0x2`, which is the arithmetic the `recv-msg-mask` example in that module's note got wrong until the mask was measured against a real stream). |
-| **A revoked publication lingers its whole window even when no receiver is live** | Not a divergence but the opposite — it is the reference's rule (`aeron_network_publication.c:1332-1344`: the linger ends on a unicast EOS or the timeout, never on "no receivers"). This build used to end a revoked publication as soon as its liveness detector had no live receiver, and that is wrong exactly when it matters: a publication revoked while the network is dark has receivers the detector has already timed out, so releasing it there means the `REVOKED` heartbeats never go out and the remote images stay `DRAINING` behind a reader that is waiting for a commit position the next term will never produce. Waiting the window gives the stream the span the reference gives it to say it is over. `crates/driver/src/network_publication.rs::a_revoked_publication_waits_the_linger_window_even_with_no_receivers`. |
-| **A gap on an unreliable stream is filled, not asked for** | Not a divergence but the opposite — it is the reference's behaviour, absent until now: `reliable=false` was parsed and dropped, so a client that named it got a reliable stream. An image whose channel said `false` now takes the reference's zero delay generator, which it returns **before** reading `nak-delay=` (`aeron_publication_image.c:92-95`), and covers each hole with a padding frame instead of sending a NAK, counting `loss-gap-fills` (`:1053-1066`). The data in the hole is gone, which is what the parameter means. Covered by `tests/integration/unreliable_stream.rs`; the reader half of it is `crates/client/src/image.rs`'s `Step::Padding`, which used to end the term at a padding frame where the reference steps over it (`aeron_image.c:375-379`) — invisible until an image started leaving padding **mid-term**. |
+| **A revoked publication lingers its whole window even when no receiver is live** | Not a divergence but the opposite — it is the reference's rule (`aeron_network_publication.c:1353-1365`: the linger ends on a unicast EOS or the timeout, never on "no receivers"). This build used to end a revoked publication as soon as its liveness detector had no live receiver, and that is wrong exactly when it matters: a publication revoked while the network is dark has receivers the detector has already timed out, so releasing it there means the `REVOKED` heartbeats never go out and the remote images stay `DRAINING` behind a reader that is waiting for a commit position the next term will never produce. Waiting the window gives the stream the span the reference gives it to say it is over. `crates/driver/src/network_publication.rs::a_revoked_publication_waits_the_linger_window_even_with_no_receivers`. |
+| **A gap on an unreliable stream is filled, not asked for** | Not a divergence but the opposite — it is the reference's behaviour, absent until now: `reliable=false` was parsed and dropped, so a client that named it got a reliable stream. An image whose channel said `false` now takes the reference's zero delay generator, which it returns **before** reading `nak-delay=` (`aeron_publication_image.c:97-100`), and covers each hole with a padding frame instead of sending a NAK, counting `loss-gap-fills` (`:1053-1066`). The data in the hole is gone, which is what the parameter means. Covered by `tests/integration/unreliable_stream.rs`; the reader half of it is `crates/client/src/image.rs`'s `Step::Padding`, which used to end the term at a padding frame where the reference steps over it (`aeron_image.c:379-383`) — invisible until an image started leaving padding **mid-term**. |
 
 The first row is the one a client can see from outside, and it is the reason
 the refusal exists: `NOT_SUPPORTED` is an answer, silence is not.
@@ -920,7 +920,7 @@ the refusal exists: `NOT_SUPPORTED` is an answer, silence is not.
 A publication on a **multi-destination** channel sends to every destination it
 holds, and which destinations those are is a property of the channel's control
 mode, not of whether one has been added
-(`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:147-151`):
+(`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:153-157`):
 a **manual** channel holds exactly the ones a client added and a destination
 never times out; a **dynamic** one also learns them from the status messages
 that arrive and drops one that has gone quiet. A subscription on the same shape
@@ -928,12 +928,12 @@ reads from each destination it was given, one socket each — the multi-destinat
 *receiver* — and both sides record the address their socket really bound in a
 `rcv-local-sockaddr` / `snd-local-sockaddr` counter, which is the only way a
 client learns the port a channel that named port zero was given
-(`aeron_counter_local_sockaddr_indicator_allocate`, `aeron_position.c:276-306`).
+(`aeron_counter_local_sockaddr_indicator_allocate`, `aeron_position.c:281-311`).
 
 An `aeron-spy:` subscription is served: it reads a **local** network
 publication's log buffer with no socket of its own, and the client is sent an
 ordinary image whose log file is that publication's own and whose source
-identity is the IPC constant (`aeron_driver_conductor.c:4904-4916`), so a
+identity is the IPC constant (`aeron_driver_conductor.c:5001-5013`), so a
 client that reads images reads this one unchanged. A publication **counts**
 such a reader when `aeron.spies.simulate.connection` is set — the `ssc`
 parameter, by the driver's setting or the channel's — which is what lets a
@@ -963,10 +963,10 @@ can be falsified.
 
 | Divergence | Why, and where it shows |
 |---|---|
-| **`aeron-spy:` is refused as a *send* destination only** — `INVALID_CHANNEL` | A spy names a publication's own log buffer rather than a place to put datagrams (`aeron_driver_conductor_validate_destination_uri_prefix`, `:392-407`). As a **receive** destination it is served, and has been since the spy link landed: it adds a local read of a publication to a `control-mode=manual` subscription (`aeron_driver_conductor_execute_add_receive_spy_destination`, `:5704-5806`). `crates/driver/src/udp_channel.rs::a_spy_is_refused_as_a_destination`, and the served half in `tests/integration/spy_subscription.rs::a_spy_can_be_added_to_a_subscription_as_a_source`. |
-| **`REMOVE_DESTINATION_BY_ID` that names no publication answers nothing** | The reference calls that handler without taking its result (`aeron_driver_conductor.c:3188-3200`), so the `-1` for a publication it cannot find (`:5562-5578`) never reaches the `result < 0` that would send an `ON_ERROR` (`:3222-3225`). Every other command in the family is answered. The silence is reproduced rather than improved on, so a client that named one waits out its own deadline. `crates/driver/src/conductor.rs::a_remove_destination_by_id_that_finds_nothing_answers_nothing`, and on the caller's side `tests/integration/client_round_trip.rs::removing_a_destination_by_id_waits_for_an_answer_that_never_comes`. |
+| **`aeron-spy:` is refused as a *send* destination only** — `INVALID_CHANNEL` | A spy names a publication's own log buffer rather than a place to put datagrams (`aeron_driver_conductor_validate_destination_uri_prefix`, `:392-407`). As a **receive** destination it is served, and has been since the spy link landed: it adds a local read of a publication to a `control-mode=manual` subscription (`aeron_driver_conductor_execute_add_receive_spy_destination`, `:5801-5903`). `crates/driver/src/udp_channel.rs::a_spy_is_refused_as_a_destination`, and the served half in `tests/integration/spy_subscription.rs::a_spy_can_be_added_to_a_subscription_as_a_source`. |
+| **`REMOVE_DESTINATION_BY_ID` that names no publication answers nothing** | The reference calls that handler without taking its result (`aeron_driver_conductor.c:3285-3297`), so the `-1` for a publication it cannot find (`:5659-5675`) never reaches the `result < 0` that would send an `ON_ERROR` (`:3222-3225`). Every other command in the family is answered. The silence is reproduced rather than improved on, so a client that named one waits out its own deadline. `crates/driver/src/conductor.rs::a_remove_destination_by_id_that_finds_nothing_answers_nothing`, and on the caller's side `tests/integration/client_round_trip.rs::removing_a_destination_by_id_waits_for_an_answer_that_never_comes`. |
 | **A publication's tether cycle is noticed on the sender's pass, not the conductor's timer** | The reference runs `aeron_network_publication_check_untethered_subscriptions` from the conductor, on the same tier as everything else that runs on a timer (`aeron_network_publication.c:1277`, reached from `:1692`). Here it runs where the readers are — the publication's own set belongs to the sender — so a reader that has stopped is put aside at the first send pass after its deadline rather than at the next tick. The deadlines are absolute, so the same transitions happen in the same order; what differs is how long after a deadline a client hears about it (microseconds against up to `aeron.timer.interval`). `tests/integration/spy_subscription.rs::a_publication_puts_its_laggards_aside_and_wakes_the_one_that_rejoins`. |
-| **The NAK delays are chosen but never re-armed; `nak-delay=` is, and so is a group's backoff** | The reference picks a *feedback* generator per image — a multicast-tuned one when the image has group semantics, a unicast one otherwise, or a static one when the channel names `nak-delay=` — and then re-arms it from the RTT measurements its RTTMs carry (`aeron_publication_image.c:85-118`). This build has all three of the generators and not the loop that adapts them: a group draws from the log-normal its backoff settings describe (`crates/driver/src/loss_detector.rs`, `MulticastBackoff`), a channel with a `nak-delay` gets that delay and its ratio, and everything else gets unicast's fixed pair. What no image here does is *move* with the network, because this build sends no RTTM and reads none. `crates/driver/src/loss_detector.rs::a_groups_delays_are_drawn_and_not_fixed`, `::a_channels_nak_delay_becomes_a_static_detector_at_the_ratio`, and `crates/driver/src/publication_image.rs::an_image_asks_for_gaps_at_the_delay_its_channel_named` for the wiring that makes a parameter reach the image at all. |
+| **The NAK delays are chosen but never re-armed; `nak-delay=` is, and so is a group's backoff** | The reference picks a *feedback* generator per image — a multicast-tuned one when the image has group semantics, a unicast one otherwise, or a static one when the channel names `nak-delay=` — and then re-arms it from the RTT measurements its RTTMs carry (`aeron_publication_image.c:90-123`). This build has all three of the generators and not the loop that adapts them: a group draws from the log-normal its backoff settings describe (`crates/driver/src/loss_detector.rs`, `MulticastBackoff`), a channel with a `nak-delay` gets that delay and its ratio, and everything else gets unicast's fixed pair. What no image here does is *move* with the network, because this build sends no RTTM and reads none. `crates/driver/src/loss_detector.rs::a_groups_delays_are_drawn_and_not_fixed`, `::a_channels_nak_delay_becomes_a_static_detector_at_the_ratio`, and `crates/driver/src/publication_image.rs::an_image_asks_for_gaps_at_the_delay_its_channel_named` for the wiring that makes a parameter reach the image at all. |
 
 ## The client's view of the ring, and of a message
 
@@ -984,13 +984,13 @@ all on the client's side. Each names the test that covers it.
   and, for the receiver's own semantics, `crates/cnc/src/broadcast.rs::a_lap_resyncs_forwards_and_is_counted`.
 - **One term per poll.** `Image::poll` fixes the partition at its entry and
   stops at that term's end, advancing into the next term on the *next* call —
-  which is what `aeron_image_poll` does (`aeron-client/src/main/c/aeron_image.c:266-273`)
+  which is what `aeron_image_poll` does (`aeron-client/src/main/c/aeron_image.c:270-277`)
   and what a caller that throttles by counting fragments per poll depends on.
   Covered by `crates/driver/src/conductor.rs::a_poll_reads_one_term_at_a_time`.
 - **An abandoned message is counted.** The fragment assembler drops a message
   whose fragments do not line up, as the reference does, and keeps a count of
   them (`FragmentAssembler::abandoned`) where the reference counts nothing
-  (`aeron-client/src/main/c/aeron_fragment_assembler.c:170-181`). ADR-0003: a
+  (`aeron-client/src/main/c/aeron_fragment_assembler.c:176-187`). ADR-0003: a
   skipped input is a counted one. Covered by the assembler's own tests in
   `crates/client/src/fragment_assembler.rs`.
 - **A message is assembled by session.** The assembler keeps one builder per
@@ -1006,7 +1006,7 @@ all on the client's side. Each names the test that covers it.
 - **`rejectImage` writes its correlation header, and waits.** The C client
   claims a command record and fills in everything after the header, leaving the
   client id and the correlation id as whatever the ring held there, and returns
-  `0` rather than an id (`aeron-client/src/main/c/aeron_client_conductor.c:3627-3654`)
+  `0` rather than an id (`aeron-client/src/main/c/aeron_client_conductor.c:3712-3739`)
   — so its driver answers a correlation nobody sent and its caller has nothing
   to match. The Java client writes both and returns the correlation id
   (`DriverProxy.rejectImage`, `aeron-client/src/main/java/io/aeron/DriverProxy.java:510-532`),
@@ -1024,7 +1024,7 @@ all on the client's side. Each names the test that covers it.
   subscription and gives it the `Image` itself
   (`Aeron.addSubscription(…, availableImageHandler, unavailableImageHandler)`,
   `aeron-client/src/main/java/io/aeron/Aeron.java:417`;
-  `aeron_async_add_subscription`, `aeron-client/src/main/c/aeronc.h:606-611`),
+  `aeron_async_add_subscription`, `aeron-client/src/main/c/aeronc.h:609-614`),
   from inside its own duty cycle — and forbids calling back into the client
   there (`AvailableImageHandler.java:21-28`). `Client::image_events` queues
   `ImageEvent`s instead, carrying the two ids the protocol used rather than the
@@ -1034,7 +1034,7 @@ all on the client's side. Each names the test that covers it.
 - **A subscription exists before its ready response does.** Both references
   register one first — Java puts it into its map and only then awaits
   (`ClientConductor.java:749-750`), and C creates it inside the ready handler
-  (`aeron-client/src/main/c/aeron_client_conductor.c:625-652`) — so an image
+  (`aeron-client/src/main/c/aeron_client_conductor.c:659-686`) — so an image
   that arrives alongside the ready response has something to attach to. This
   build does the same, and writes the channel-status counter id the response
   carries onto the subscription when it lands rather than carrying it back
@@ -1048,8 +1048,8 @@ One thing in this area is **not** a divergence and is written down anyway,
 because the correct value is one edit away: the source address of a publication
 error from an **IPC** rejection is byte-reversed. The reference assigns
 `INADDR_LOOPBACK` straight into `sin_addr.s_addr`, with no `htonl`
-(`aeron-driver/src/main/c/aeron_ipc_publication.c:231-236`), so the four bytes
-it copies out at `aeron_driver_conductor.c:2303` are the little-endian image of
+(`aeron-driver/src/main/c/aeron_ipc_publication.c:236-241`), so the four bytes
+it copies out at `aeron_driver_conductor.c:2366` are the little-endian image of
 `0x7f000001` — `1.0.0.127` to a reader, which is exactly what the reference's
 own Java client reports (`PublicationErrorFrameFlyweight.sourceAddress`,
 `aeron-client/src/main/java/io/aeron/command/PublicationErrorFrameFlyweight.java:286-317`).
@@ -1092,7 +1092,7 @@ that appear nowhere in the reference: `to.conductor.buffer.length`,
 `to.clients.buffer.length`, `counters.values.buffer.length`,
 `socket.so.rcvbuf`, `socket.so.sndbuf` and `flow.control.gtag`. They are now
 the reference's names (`aeron-driver/src/main/c/aeron_driver_context.h:208-219`,
-`:253`; `aeron-driver/src/main/java/io/aeron/driver/Configuration.java:182/198/216/322/993`),
+`:254`; `aeron-driver/src/main/java/io/aeron/driver/Configuration.java:183/198/216/322/993`),
 which for `flow.control.group.tag`
 means Java's rather than the one C's context header comments, since C reads no
 property there at all. A deployment's existing configuration therefore works
@@ -1115,7 +1115,7 @@ it cannot parse, and this refuses.
 
 A second divergence is in the idle strategies. The reference's caller gives the
 native resource agent `"1ms"` only while its strategy is **unnamed**
-(`aeron_driver_context.c:1205-1207`), so naming `sleep-ns` and no arguments
+(`aeron_driver_context.c:1235-1237`), so naming `sleep-ns` and no arguments
 sleeps one nanosecond there (`aeron_agent.c:56-59`); that condition is kept.
 What is not: the reference ignores `AERON_DRIVER_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY_INIT_ARGS`
 whenever the name is unset, and this honours it, because a caller who wrote
@@ -1123,8 +1123,8 @@ arguments asked for them. Pinned by
 `::arguments_without_a_name_are_honoured_rather_than_overwritten` and
 `::naming_the_native_resource_agents_strategy_drops_the_slots_own_arguments`.
 
-`aeron.send.to.status.poll.ratio` is read **and acted on** (`aeronmd.h:257`,
-the reference's sending-to-polling ratio, `aeron_driver_context.c:199` for its
+`aeron.send.to.status.poll.ratio` is read **and acted on** (`aeronmd.h:265`,
+the reference's sending-to-polling ratio, `aeron_driver_context.c:200` for its
 six and `:806-811` for where it is read). The decision is the reference's
 (`aeron_driver_sender.c:149-152`): a pass reads the control sockets when the
 send sent nothing, or when `ratio` passes that did send have gone by, or when
@@ -1142,15 +1142,17 @@ interop suite's, which runs against this sender on every CI run.
 `aeron.receiver.io.vector.capacity` and `aeron.sender.io.vector.capacity` are
 read, which they were not: this driver answered sixteen to both whatever the
 configuration said, because each side carried its own `const RECEIVE_SLOTS`.
-The reference's defaults are four each (`aeron_driver_context.c:240-241`,
-`:523-524`) and both are clamped to `1..=AERON_DRIVER_{RECEIVER,SENDER}_IO_VECTOR_LENGTH_MAX`,
-sixteen (`aeron_driver_context.h:55`, `:59`; `aeron_driver_context.c:3348-3371`).
-The receiver's capacity **is** the `vlen` its poll reads with — it is what
-`aeron_driver_receiver.c:47` stores and `:127` passes. The sender's is not:
-`aeron_driver_sender.c:154` builds a `struct mmsghdr mmsghdr[1]` and `:170`
-hands the poller `vlen = 1`, so the reference's sender is always on
-`aeron_udp_channel_transport_recvmsg` rather than `..._recvmmsg`
-(`media/aeron_udp_channel_transport.c:551-554`) however many buffers the
+The reference's defaults are four each (`aeron_driver_context.c:242-243`,
+`:528-529`) and both are clamped to `1..=AERON_DRIVER_{RECEIVER,SENDER}_IO_VECTOR_LENGTH_MAX`,
+sixty-four since 1.54.2 — it was sixteen (`aeron_driver_context.h:55`, `:59`;
+`aeron_driver_context.c:3449-3472`).
+The receiver's capacity **is** the number its buffers are sized to
+(`aeron_driver_receiver.c:39`); since 1.54.2 each socket is polled for
+`socket.poll.limit` turns (`media/aeron_udp_transport_poller.c:216`). The
+sender's is not: `aeron_driver_sender.c:60` builds its control read on
+`control_msgvec[0]` with `msg_iovlen = 1` (`:64`), so the reference's sender is
+always on `aeron_udp_channel_transport_recvmsg` rather than `..._recvmmsg`
+(`media/aeron_udp_channel_transport.c:425` against `:570`) however many buffers the
 capacity sized for it — the capacity sizes a pool whose first entry is the only
 one a poll fills, and a datagram that arrives while another is being dispatched
 waits one pass for the next poll.
@@ -1173,15 +1175,15 @@ value it does not spell.
 `aeron.threading.mode` is read, and all four of its values are served —
 dedicated, shared-network, shared and invoker
 (`aeron_config_parse_threading_mode`, `aeron_driver_context.c:45-71`, applied
-at `:447`; the runner set each one builds is `aeron_driver.c:1003-1122`). The
+at `:447`; the runner set each one builds is `aeron_driver.c:1043-1162`). The
 shape is **`aeronmd`'s**, which is the process this driver stands in for: slot
 0 — the conductor under the first two modes, all four pieces under the last
-two (`:723-755`) — runs on the process's own thread, because `aeronmd` starts
+two (`:753-785`) — runs on the process's own thread, because `aeronmd` starts
 its driver with `manual_main_loop` true (`aeronmd.c:153`) and drives it itself
 (`:165-168`). So `INVOKER` here is a working driver rather than the `EINVAL`
-`aeron_driver.c:1225-1230` is the other side of, and `SHARED` and `INVOKER`
+`aeron_driver.c:1380-1385` is the other side of, and `SHARED` and `INVOKER`
 run the same runner, which is what the reference's `switch` does with them
-(`:1003-1022`). `aeron.thread.naming` gives the threads the reference's two
+(`:1043-1062`). `aeron.thread.naming` gives the threads the reference's two
 sets of names (`aeron_driver_context.h:37-48`), with the process's own thread
 renamed only under `new` — also what `aeronmd` does (`:160-163`).
 `tests/integration/driver_process_contract.rs::every_threading_mode_runs_the_references_threads`
@@ -1190,11 +1192,11 @@ pins each mode's thread set off `/proc`, and
 
 `aeron.counters.free.to.reuse.timeout` follows the same rule and is one more
 name whose environment variable is not the property name in capitals
-(`AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT`, `aeronmd.h:525`).
+(`AERON_COUNTERS_FREE_TO_REUSE_TIMEOUT`, `aeronmd.h:542`).
 
 One setting has a bound the reference does not: `aeron.timer.interval` is
 capped at one hour. The reference parses up to `INT64_MAX` and then adds the
-period to a nanosecond clock (`aeron_driver_conductor.c:3379`), which a period
+period to a nanosecond clock (`aeron_driver_conductor.c:3476`), which a period
 near `INT64_MAX` turns into a wrapped deadline — a driver that looks healthy and
 spins a core. deepmsg computes its deadlines with saturating arithmetic *and*
 refuses the value, because a tier period above an hour is a typo rather than a
@@ -1252,7 +1254,7 @@ somebody did not offer.
 The archive is configured by the reference's own property names, and there are
 **45** of them — `grep -ohE '"aeron\.archive\.[a-zA-Z.]+"' Archive.java
 client/AeronArchive.java | sort -u` over `aeron-archive/src/main/java/io/aeron/archive/`,
-the server's own (`Archive.java:295-663`) and the ones it shares with the client
+the server's own (`Archive.java:301-669`) and the ones it shares with the client
 it embeds (`client/AeronArchive.java:2674-2848`). A name the reference does not
 have is **accepted and ignored**, because that is what the reference does with
 one: it reads `System.getProperty(name, default)` per name and validates no list.
@@ -1273,7 +1275,7 @@ The five are the deviations worth naming. **Two of them are the reference's
 own doing**, which is why they are not defects here:
 `aeron.archive.max.catalog.entries` has **no reader in the reference either** —
 `Archive.maxCatalogEntries()` is defined (`:849`, `:3337`) and never called, and
-its `Catalog` is constructed without it (`Archive.java:1504-1511`) — and
+its `Catalog` is constructed without it (`Archive.java:1572-1579`) — and
 `aeron.archive.client.name` is read by the **client** (`AeronArchive.java:3025`),
 where this build takes the name from `AERON_ARCHIVE_CLIENT_NAME` instead (a
 recorded deviation on that side, `crates/archive/src/client/context.rs`). The
@@ -1288,16 +1290,16 @@ its two companions with it: `…recording.events.channel` and
 `…recording.events.stream.id` were "accepted, not honoured" only because the
 switch that reads them was refused. The refusal that remains is the reference's
 own and is narrower: publishing events without naming a channel
-(`Archive.java:1240-1245`), pinned by
+(`Archive.java:1306-1311`), pinned by
 `crates/archive/src/server/config.rs::events_without_a_channel_are_refused_with_the_references_words`.
 
 ★ **The catalog's file sync level left that list in P2-12**, and it left behind a
 rule worth naming here because it is the reference's own trap:
 `aeron.archive.catalog.file.sync.level` defaults to the **static** `0`
 (`CATALOG_FILE_SYNC_LEVEL_DEFAULT` is `FILE_SYNC_LEVEL_DEFAULT`,
-`Archive.java:388`, `:369`), *not* to the file level that was configured, and a
+`Archive.java:394`, `:375`), *not* to the file level that was configured, and a
 catalog **below** the recording files' is an error rather than a warning
-(`Archive.java:1202-1205`, the reference's words verbatim). So
+(`Archive.java:1268-1271`, the reference's words verbatim). So
 `aeron.archive.file.sync.level=2` on its own is **refused** — the pair has to be
 raised together. Pinned by
 `crates/archive/src/server/config.rs::a_catalog_below_the_recording_files_is_refused_with_the_references_words`,
@@ -1327,13 +1329,13 @@ by reflection, so a deployment's own `IdleStrategy` on the classpath works there
 and is refused here.
 
 ★ **The two agents' own names left the list with it**: the recorder's
-(`Archive.java:406`) and the replayer's (`:412`). They were accepted and ignored
+(`Archive.java:435`) and the replayer's (`:441`). They were accepted and ignored
 for the reason the threads that would idle did not exist — under `SHARED` neither
 agent has a runner of its own, `SharedModeArchiveConductor.onStart` driving each
 through an `AgentInvoker` (`:40-44`), which has no idle strategy at all.
 `DEDICATED` gives each its own thread (P2-9a), and each idles with its own name
 or, when that names nothing, with the archive's — the reference's fallback
-(`Archive.java:1423-1440`), judged in
+(`Archive.java:1491-1508`), judged in
 `crates/archive/src/server/config.rs::an_agents_idle_strategy_falls_back_to_the_archives_own`.
 A name this build has no strategy for is refused wherever it was written, with
 the property named in the refusal.
@@ -1359,8 +1361,8 @@ fixed before them.
 | Session id | a plain monotonic `i64` from **1**; `-1` for a redirect/backup session. No leadership term is packed into it | `SessionManager.java:247`, `ClusterSession.java:109-112` | `session_manager.rs::should_redirect_a_connect_request_on_a_follower` and `::should_hand_an_accepted_connect_request_to_the_authenticator` |
 | Application message on ingress and in the log | SBE header (8) + `SessionMessageHeader` block (**24**) + payload; `SESSION_HEADER_LENGTH = 32`; one frame, aligned to 32 | `AeronCluster.java:99-100`, `IngressAdapter.java:87-101`, `LogPublisher.java:115-144` | `cluster_session.rs::a_client_connects_opens_a_session_sends_a_message_and_closes` (the log advances by **96** bytes for a 5-byte message: 32 data header + 37 message, aligned) |
 | Session counter | type **241**; key = `clusterId` (4, LE) + `sessionId` (8, LE); label `cluster-session: <sessionInfo> - clusterId=<n>`; value = the session id, reference id = the response publication's registration id | `ClusterSession.java:502-524` | `cluster_session.rs::a_session_id_is_a_plain_long_and_the_counter_key_is_cluster_then_id`; the label text is in the same test |
-| Ingress channel URI | the configured channel, `endpoint=<member ingress endpoint>` when it names none, `rejoin=false`, `reliable-stream=true`; a follower never subscribes to a multicast ingress; an IPC subscription exists only for a **leader** with `aeron.cluster.ingress.ipc.allowed=true` | `ConsensusModuleAgent.java:3387-3415` | `agent::tests::ingress_endpoints_are_id_equals_endpoint_separated_by_commas`, `::an_ipc_response_channel_becomes_the_egress_channel_unless_ipc_ingress_is_allowed`; the end-to-end path is the session integration test |
-| Response channel refinement | `aeron.cluster.egress.channel`'s parameters are put onto a client's response channel; an `aeron:ipc` response channel is replaced **whole** by the egress channel unless IPC ingress is allowed | `ConsensusModuleAgent.java:3459-3475` | `agent::tests::the_egress_channels_parameters_are_put_onto_a_udp_response_channel` and the two tests beside it |
+| Ingress channel URI | the configured channel, `endpoint=<member ingress endpoint>` when it names none, `rejoin=false`, `reliable-stream=true`; a follower never subscribes to a multicast ingress; an IPC subscription exists only for a **leader** with `aeron.cluster.ingress.ipc.allowed=true` | `ConsensusModuleAgent.java:3419-3447` | `agent::tests::ingress_endpoints_are_id_equals_endpoint_separated_by_commas`, `::an_ipc_response_channel_becomes_the_egress_channel_unless_ipc_ingress_is_allowed`; the end-to-end path is the session integration test |
+| Response channel refinement | `aeron.cluster.egress.channel`'s parameters are put onto a client's response channel; an `aeron:ipc` response channel is replaced **whole** by the egress channel unless IPC ingress is allowed | `ConsensusModuleAgent.java:3491-3507` | `agent::tests::the_egress_channels_parameters_are_put_onto_a_udp_response_channel` and the two tests beside it |
 | Connect request (client) | SBE header (8) + `SessionConnectRequest` (template **3**, block **16**): `correlationId`, `responseStreamId` = the egress stream id (**102** by default), `version` = the client-to-module protocol semantic version **0.3.0**, `responseChannel` = the egress channel with its endpoint resolved, `encodedCredentials`, `clientInfo` = `name=<clientName> version=<compat version> commit=<build token>` | `AeronCluster.java:2452-2471`, `:1209-1229`; `AeronCounters.java:1633-1636` | `async_connect::tests::the_connect_request_carries_the_references_fields` |
 | Connect after a redirect (client) | The redirect's table replaces the member table and the request is offered to **the leader the redirect names**; another member is asked again only when that leader's own publication failed permanently. Deliberate divergence: the reference re-examines every member and takes the first publication that is connected (`AC:2419-2450`). What keeps the reference from looping is `updateMembers` carrying the named leader's pending `registrationId` (`AC:2561`), which its `asyncGetPublication` then polls (`AC:2629-2647`) — deepmsg carries it too; without that, and with members sorted by id instead of hash order, the follower that redirected is chosen every round until `messageTimeout` | `AeronCluster.java:2419-2450`, `:2543-2570`, `:2561`, `:2629-2647` | `async_connect::tests::a_redirect_is_answered_by_the_leader_it_names` |
 | Session message (client) | SBE header (8) + `SessionMessageHeader` block (**24**) = **32** bytes on ingress and on egress, the payload after it; the header is written once and only `leadershipTermId` is rewritten on a leader change; offered as two parts (header, payload) | `AeronCluster.java:99-100`, `:259-262`, `:451-458`, `:687` | `cluster::tests::an_offer_carries_the_session_header_before_the_payload` |
@@ -1392,13 +1394,13 @@ the acceptance test plays the service with a raw client.
 | Contract | Value | Reference source | Pinned by |
 |---|---|---|---|
 | `JoinLog` (40) | `logPosition`, `maxLogPosition`, `memberId`, `logSessionId`, `logStreamId`, `isStartup`, `role`, `logChannel`, `isStandby` (optional since v16) | `ServiceProxy.java:54-101` | `cluster_service.rs` (the fake service decodes it and acks the position) |
-| `ServiceAck` (33) and "reached" | `logPosition`, `timestamp`, `ackId`, `relevantId`, `serviceId`; **every** service's queue head must match `(ackId, logPosition)` exactly, and a mismatch is `ack out of sequence` | `ServiceAck.java:59-79`, `ConsensusModuleAgent.java:1801-1838` | `service_control/ack.rs::every_queue_must_hold_the_exact_head` |
+| `ServiceAck` (33) and "reached" | `logPosition`, `timestamp`, `ackId`, `relevantId`, `serviceId`; **every** service's queue head must match `(ackId, logPosition)` exactly, and a mismatch is `ack out of sequence` | `ServiceAck.java:59-79`, `ConsensusModuleAgent.java:1817-1854` | `service_control/ack.rs::every_queue_must_hold_the_exact_head` |
 | Service message in the log | cluster session id = `(serviceId << 56) \| sessionId`; top seven bits are the service id (`serviceIdFromLogMessage`); a message **from** a service uses the service id itself as the session id | `PendingServiceMessageTracker.java:279-299` | `service_control/tracker.rs::the_service_id_packings_are_the_references` |
 | Queued service message | the whole `SessionMessageHeader` frame (32 bytes + payload); the session id is rewritten at offset 16 and the **timestamp field at offset 24 is reused as the log append position**, `i64::MAX` before it has one | `PendingServiceMessageTracker.java:87-105`, `:207-268` | `pending_service_message_tracker.rs` (the seven reference cases read the bytes directly) |
 | Tracker queue | an `ExpandableRingBuffer`: 8-byte frame header, 8-byte alignment, a padding frame before a message that would wrap, and a fixed capacity's `append` returning `false` | `org.agrona.ExpandableRingBuffer` (2.6.1) | `common::collections::ring` tests against `ring-ops.txt` (printed by the jar) |
 | Pending capacity in a snapshot | `pendingMessageCapacity` is the ring's **used bytes** (`size()`), not its allocated capacity | `ConsensusModuleSnapshotTaker.java:150` | `pending_service_message_tracker.rs::snapshot_*` (load then verify) |
-| Timer supplier | `aeron.cluster.timer.service.supplier` is a **byte contract**: the two class names are honoured, anything else is refused with `invalid TimerServiceSupplier: …` | `ConsensusModule.java:935-954`, `:4589-4607` | `timer::tests::an_unknown_supplier_name_is_refused_with_the_reference_words` |
-| Wheel tick | `nextPow2(clock.timeUnit().convert(aeron.cluster.wheel.tick.resolution, NANOSECONDS))` — 8 ms on the millisecond clock, 8_388_608 ns on a nanosecond one | `ConsensusModule.java:4594-4600` | `timer::tests::the_default_tick_is_eight_milliseconds_for_the_millisecond_clock` and the nanosecond case |
+| Timer supplier | `aeron.cluster.timer.service.supplier` is a **byte contract**: the two class names are honoured, anything else is refused with `invalid TimerServiceSupplier: …` | `ConsensusModule.java:942-961`, `:4653-4671` | `timer::tests::an_unknown_supplier_name_is_refused_with_the_reference_words` |
+| Wheel tick | `nextPow2(clock.timeUnit().convert(aeron.cluster.wheel.tick.resolution, NANOSECONDS))` — 8 ms on the millisecond clock, 8_388_608 ns on a nanosecond one | `ConsensusModule.java:4658-4664` | `timer::tests::the_default_tick_is_eight_milliseconds_for_the_millisecond_clock` and the nanosecond case |
 | Snapshot timer record order | the wheel writes in `Long2LongHashMap.entrySet().iterator()` order; the heap writes its array in level order — **the two differ for the same timers** | `WheelTimerService.java:118-131`, `PriorityHeapTimerService.java:179-187` | `tests/timer_snapshot_order.rs` (both orders, and the inequality) |
 | Entry-iterator order | descending slot order with one wrap, not `forEachLong`'s ascending order | `org.agrona.collections.Long2LongHashMap$AbstractIterator` (2.6.1) | `common/tests/agrona_entry_order.rs` against `agrona-entry-order.tsv` (printed by the jar) |
 | `POLL_LIMIT` | 20; a wheel `poll` can return **more** than 20 (it loops while the tick time is behind), a heap `poll` cannot | `TimerService.java:57`, `WheelTimerService.java:57-74` | `priority_heap_timer_service.rs::poll_should_stop_after_poll_limit_is_reached`; the wheel's loop is `timer/wheel.rs::the_service_poll_walks_the_ticks_in_order_within_one_call` |
@@ -1406,15 +1408,15 @@ the acceptance test plays the service with a raw client.
 ## The service container's process and its businesses (P3-2c)
 
 `deepmsg-clustered-service-container` is the reference's
-`ClusteredServiceContainer.main` (`ClusteredServiceContainer.java:97-112`): a
+`ClusteredServiceContainer.main` (`ClusteredServiceContainer.java:100-115`): a
 properties-driven process that joins a consensus module over the control
 channel above and runs one business.
 
 | Contract | Value | Reference source | Pinned by |
 |---|---|---|---|
-| Business selection | `deepmsg.cluster.service` names one compiled-in business — `echo`, `basic-auction`, `noop`. An absent name, or one the registry does not know, is a refused start that lists the three. **This name is this build's**; the reference loads a Java class. | `ClusteredServiceContainer.java:673-687` (the shape being replaced) | `crates/cluster/service/tests/container_binary.rs` |
-| A Java class name | `aeron.cluster.service.class.name` is refused **by name**; this build has no class loader | `ClusteredServiceContainer.java:253` | `container_binary.rs::a_java_class_name_is_refused_by_name` |
-| Container thread name | `aeron-cl-cs-<serviceId>` under `aeron.thread.naming=new`, `clustered-service-<clusterId>-<serviceId>` under `classic` (the default, `CommonContext.java:547`); the same value is the Aeron client name | `ClusteredServiceContainer.java:113`, `:926-930`, `:942`, `:1042` | `config::tests::an_empty_service_name_is_the_computed_one_under_both_namings` |
+| Business selection | `deepmsg.cluster.service` names one compiled-in business — `echo`, `basic-auction`, `noop`. An absent name, or one the registry does not know, is a refused start that lists the three. **This name is this build's**; the reference loads a Java class. | `ClusteredServiceContainer.java:700-714` (the shape being replaced) | `crates/cluster/service/tests/container_binary.rs` |
+| A Java class name | `aeron.cluster.service.class.name` is refused **by name**; this build has no class loader | `ClusteredServiceContainer.java:269` | `container_binary.rs::a_java_class_name_is_refused_by_name` |
+| Container thread name | `aeron-cl-cs-<serviceId>` under `aeron.thread.naming=new`, `clustered-service-<clusterId>-<serviceId>` under `classic` (the default, `CommonContext.java:554`); the same value is the Aeron client name | `ClusteredServiceContainer.java:116`, `:926-930`, `:949`, `:1082` | `config::tests::an_empty_service_name_is_the_computed_one_under_both_namings` |
 | `echo`'s messages | a client message is echoed to its session; the 27-byte `Echo as Service IPC ingress` is offered back **into the cluster** (`cluster.offer`), and the service message that returns (`session == null`) is echoed to **every** session | `TestNode.java:669-690`, `StubClusteredService.java:82-104`, `ClusterTests.java:40` | `cluster_lc4a_service_messages.rs` (all three arms: the round trip, exactly once) |
 | `echo`'s timer commands | a 16-byte message: `cmd: i32 @0` (1 = schedule, 2 = cancel), `correlationId: i64 @4`, `delayMillis: i32 @12`; a fired timer echoes its 8-byte correlation id to the session that scheduled it. **This shape is this build's** — the reference drives timers through its test harness, not through a business. | — | `cluster_lc4a_smoke.rs` (the timer scenario, all three arms) |
 
@@ -1499,21 +1501,21 @@ Five deviations worth naming, because none of them is the interface's shape:
 
 | Contract | Value | Reference source | Pinned by |
 |---|---|---|---|
-| Snapshot record order | `SnapshotMarker` BEGIN (100) → `ConsensusModule` (105) ×1 → `ClusterSession` (103) ×N → `Timer` (104) ×N → per service `PendingMessageTracker` (107) + its queued messages → `SnapshotMarker` END | `ConsensusModuleAgent.java:3221-3253`, `ConsensusModuleSnapshotTaker.java:50-160` | `tests/snapshot_taker.rs`; the ordering is documented record by record in `snapshot/taker.rs` |
-| Marker fields | `typeId = 1`, `logPosition`, `leadershipTermId`, `index = 0`, `mark`, `timeUnit`, `appVersion`; 48 bytes | `SnapshotTaker.java:139-177` | `snapshot_taker.rs::the_snapshot_markers_carry_the_type_and_position` |
+| Snapshot record order | `SnapshotMarker` BEGIN (100) → `ConsensusModule` (105) ×1 → `ClusterSession` (103) ×N → `Timer` (104) ×N → per service `PendingMessageTracker` (107) + its queued messages → `SnapshotMarker` END | `ConsensusModuleAgent.java:3248-3280`, `ConsensusModuleSnapshotTaker.java:50-160` | `tests/snapshot_taker.rs`; the ordering is documented record by record in `snapshot/taker.rs` |
+| Marker fields | `typeId = 1`, `logPosition`, `leadershipTermId`, `index = 0`, `mark`, `timeUnit`, `appVersion`; 48 bytes | `SnapshotTaker.java:161-199` | `snapshot_taker.rs::the_snapshot_markers_carry_the_type_and_position` |
 | Session record | id, correlation id, opened log position, **`timeOfLastActivity` always `-1`**, close reason, response stream id, response channel (varAscii); claim when it fits `maxPayloadLength`, offer otherwise | `ConsensusModuleSnapshotTaker.java:85-113, :162-174` | `snapshot_taker.rs` (the two path tests decode all seven fields) |
 | Snapshot's session order | the id-sorted committed list, `OPEN` and `CLOSING` only — not a map | `SessionManager.java:69, :1107-1119` | `snapshot_taker.rs::a_snapshot_only_writes_open_and_closing_sessions` |
 | Tracker record | `nextServiceSessionId` **corrected to `logServiceSessionId + 1` for an empty ring**, `logServiceSessionId`, `pendingMessageCapacity = ring used bytes`, `serviceId`; then each queued message verbatim in FIFO order | `ConsensusModuleSnapshotTaker.java:135-160, :176-193` | `snapshot_taker.rs::snapshot_pending_service_message_tracker*` |
 | `ClusterMembers` (106) | never written; decoded and ignored | `ConsensusModuleSnapshotAdapter.java:179-181` | `snapshot/adapter.rs` (the arm is a comment and `CONTINUE`) |
-| Snapshot recording channel | `aeron.cluster.snapshot.channel` + `\|session-id=<publication session>`, stream 107, `LOCAL` source, auto-stop | `ClusteredServiceContainer.java:319-337`, `ConsensusModule.java:568-573`, `ConsensusModuleAgent.java:3156-3163` | `tests/integration/cluster_snapshot.rs` |
-| `recording.log` snapshot entries | services in **descending** service id, then the module with `serviceId = -1` | `ConsensusModuleAgent.java:3177-3185` | `cluster_snapshot.rs` (the plan holds the snapshot and its recording) |
-| Replay channel | `aeron.cluster.replay.channel` (default `aeron:ipc`) stream 103; the subscription names `\|session-id=<low 32 bits of the replay id>` | `ClusteredServiceContainer.java:259-277`, `LogReplay.java:50-55` | `cluster_snapshot.rs` (the snapshot loads over it) |
+| Snapshot recording channel | `aeron.cluster.snapshot.channel` + `\|session-id=<publication session>`, stream 107, `LOCAL` source, auto-stop | `ClusteredServiceContainer.java:335-353`, `ConsensusModule.java:575-580`, `ConsensusModuleAgent.java:3180-3187` | `tests/integration/cluster_snapshot.rs` |
+| `recording.log` snapshot entries | services in **descending** service id, then the module with `serviceId = -1` | `ConsensusModuleAgent.java:3198-3206` | `cluster_snapshot.rs` (the plan holds the snapshot and its recording) |
+| Replay channel | `aeron.cluster.replay.channel` (default `aeron:ipc`) stream 103; the subscription names `\|session-id=<low 32 bits of the replay id>` | `ClusteredServiceContainer.java:275-293`, `LogReplay.java:50-55` | `cluster_snapshot.rs` (the snapshot loads over it) |
 | Log replay bounds | `[logPosition, appendPosition)`; the image's join position must equal the start; done when the adapter position reaches the stop and the state is not `SNAPSHOT` | `LogReplay.java:39-60, :114-118` | `cluster_snapshot.rs::a_node_replays_the_log_tail_written_after_its_snapshot` (the tail's session open moves the next session id) |
 | Startup session handling | sessions recovered from a snapshot are `closing(TIMEOUT)` at the end of the **startup** election (`isLeaderStartup`) | `Election.java:1914`, `SessionManager.java:932-946` | `cluster_snapshot.rs` (the recovered session closes; the next id comes from the snapshot) |
 
 ## What a consensus module reads from its local archive
 
-`ConsensusModuleAgent.pollArchiveEvents` (`ConsensusModuleAgent.java:2061-2140`)
+`ConsensusModuleAgent.pollArchiveEvents` (`ConsensusModuleAgent.java:2077-2156`)
 reads the archive's recording-signal channel **every turn**, whether or not a
 replication is running, and does three more things with what it finds: an
 `ERROR` control response is a failed catchup replay, a replay that is no longer
@@ -1570,7 +1572,7 @@ eighteen commands, the same output strings, and the same exit statuses
 The counters the container owns, completed by P3-8: **218**
 `Cluster container max cycle time in ns` and **219** `Cluster container
 work cycle time exceeded count: threshold=<duration>`, keyed by
-`clusterId` + `serviceId` (`ClusteredServiceContainer.java:969-984`);
+`clusterId` + `serviceId` (`ClusteredServiceContainer.java:1003-1018`);
 `aeron.cluster.service.cycle.threshold` (100 ms default) is their budget.
 
 The thread names, and where they are set:
@@ -1603,7 +1605,7 @@ agent).
 
 | Contract | Value | Reference source | Pinned by |
 |---|---|---|---|
-| Property names | the seven `aeron.cluster.backup.*` names are `Honoured`, as are `aeron.cluster.consensus.endpoints` and the two `aeron.cluster.replication.progress.*` names (the backup is their only consumer) | `ClusterBackup.java:326-590`; `ConsensusModule.java:969-986` | `names.rs`; `property_names.rs` |
+| Property names | the seven `aeron.cluster.backup.*` names are `Honoured`, as are `aeron.cluster.consensus.endpoints` and the two `aeron.cluster.replication.progress.*` names (the backup is their only consumer) | `ClusterBackup.java:326-590`; `ConsensusModule.java:983-1000` | `names.rs`; `property_names.rs` |
 | `cluster.backup.initial.replay.start` | `BEGINNING` (the default) or `LATEST_SNAPSHOT`. **Not** in the eighty-name table: the reference spells it without the `aeron.cluster.` prefix (`ClusterBackup.java:561-566`), so it is named here instead | `ClusterBackup.java:555-578` | `backup::context`'s `ReplayStart` tests; `cluster_backup_cases::should_backup_cluster_with_from_latest_snapshot_log_position` |
 | Defaults | catchup channel's six parameters, interval 1 h, response timeout 5 s, progress timeout 10 s, cool-down 30 s, source type `ANY` | `ClusterBackup.java:344-408` | `backup::context` |
 | Mark file | `ClusterComponentType.BACKUP`, the `.lnk` beside its parent directory, the active error buffer, `signalReady` last | `ClusterBackup.java:679-917` | `backup::context`'s conclude tests |

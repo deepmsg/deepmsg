@@ -28,7 +28,7 @@
 //! between a driver that ignores a stream and one that ignores it *once*: a
 //! stream with a subscription but a session nobody named would otherwise be
 //! re-examined for every packet of that session, for ever
-//! (`:376-383`, "mark as no interest to prevent repeated hash lookups").
+//! (`:381-388`, "mark as no interest to prevent repeated hash lookups").
 
 /// What is known about one session of a stream
 /// (`AERON_DATA_PACKET_DISPATCHER_IMAGE_*`,
@@ -68,7 +68,7 @@ pub enum Interest {
 ///
 /// Three answers rather than two, because "an image already serves this
 /// session" is not the same as "nothing wants it": the first still has work to
-/// do (`aeron_data_packet_dispatcher.c:499-502`), and that work is a
+/// do (`aeron_data_packet_dispatcher.c:504-507`), and that work is a
 /// **connection**.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupInterest {
@@ -88,7 +88,7 @@ pub enum SetupInterest {
 }
 
 /// One stream's interest, keyed by stream id
-/// (`aeron_data_packet_dispatcher_stream_interest_t`, `:44-58`).
+/// (`aeron_data_packet_dispatcher_stream_interest_t`, `:49-63`).
 #[derive(Clone, Debug, Default)]
 struct StreamInterest {
     /// Whether a subscription named no session, so every session on this stream
@@ -103,7 +103,7 @@ struct StreamInterest {
 }
 
 impl StreamInterest {
-    /// Whether a session is wanted at all (`stream_interest_for_session`, `:112-118`).
+    /// Whether a session is wanted at all (`stream_interest_for_session`, `:117-123`).
     fn wants(&self, session_id: i32) -> bool {
         self.is_all_sessions || self.subscribed.contains(&session_id)
     }
@@ -133,12 +133,12 @@ impl StreamInterest {
 }
 
 /// The streams a receive endpoint is reading
-/// (`aeron_data_packet_dispatcher_t`, `:20-28`).
+/// (`aeron_data_packet_dispatcher_t`, `:25-33`).
 #[derive(Debug)]
 pub struct DataPacketDispatcher {
     streams: Vec<(i32, StreamInterest)>,
     /// How many sessions one stream may have
-    /// (`stream.session.limit`, `:44`), which the reference checks before it
+    /// (`stream.session.limit`, `:49`), which the reference checks before it
     /// creates an image.
     stream_session_limit: usize,
 }
@@ -166,7 +166,7 @@ impl DataPacketDispatcher {
     /// before it re-sends a periodic ask. One that holds none has nobody to ask
     /// for: a `control-mode=response` subscription registers its stream in the
     /// endpoint's *response* refcount instead (`aeron_receive_channel_endpoint_incref_to_response_stream`,
-    /// `media/aeron_receive_channel_endpoint.c:746-756`), so the ask it makes
+    /// `media/aeron_receive_channel_endpoint.c:751-761`), so the ask it makes
     /// when its endpoint is created is the only one it ever makes.
     pub fn should_elicit_setup_message(&self) -> bool {
         0 != self.stream_count()
@@ -200,7 +200,7 @@ impl DataPacketDispatcher {
         out
     }
 
-    /// A subscription arrived (`add_subscription`, `:175-204`).
+    /// A subscription arrived (`add_subscription`, `:180-209`).
     ///
     /// A stream that already exists and was *not* reading every session becomes
     /// one that is — and the tombstones it wrote are dropped, because they said
@@ -228,7 +228,7 @@ impl DataPacketDispatcher {
     }
 
     /// A subscription that named a session arrived
-    /// (`add_subscription_by_session`, `:207-243`).
+    /// (`add_subscription_by_session`, `:212-248`).
     pub fn add_subscription_by_session(&mut self, stream_id: i32, session_id: i32) {
         let interest = match self.streams.iter_mut().find(|(id, _)| *id == stream_id) {
             Some((_, interest)) => interest,
@@ -249,7 +249,7 @@ impl DataPacketDispatcher {
     }
 
     /// A subscription for the whole stream went away
-    /// (`remove_subscription`, `:246-275`).
+    /// (`remove_subscription`, `:251-280`).
     pub fn remove_subscription(&mut self, stream_id: i32) {
         let Some(index) = self.streams.iter().position(|(id, _)| *id == stream_id) else {
             return;
@@ -273,7 +273,7 @@ impl DataPacketDispatcher {
     }
 
     /// A subscription for one session went away
-    /// (`remove_subscription_by_session`, `:277-300`).
+    /// (`remove_subscription_by_session`, `:282-305`).
     pub fn remove_subscription_by_session(&mut self, stream_id: i32, session_id: i32) {
         let Some(index) = self.streams.iter().position(|(id, _)| *id == stream_id) else {
             return;
@@ -295,7 +295,7 @@ impl DataPacketDispatcher {
     }
 
     /// An image was created: it takes this session's packets from now on
-    /// (`add_publication_image`, `:305-322`).
+    /// (`add_publication_image`, `:310-327`).
     pub fn add_image(&mut self, stream_id: i32, session_id: i32, registration_id: i64) {
         let Some((_, interest)) = self.streams.iter_mut().find(|(id, _)| *id == stream_id) else {
             return;
@@ -306,7 +306,7 @@ impl DataPacketDispatcher {
         interest.images.push((session_id, registration_id));
     }
 
-    /// An image went away (`remove_publication_image`, `:324-357`).
+    /// An image went away (`remove_publication_image`, `:329-362`).
     ///
     /// The cooldown is the point: an image that ended *without* an end of
     /// stream is one the far end may re-create, and a driver that immediately
@@ -335,7 +335,7 @@ impl DataPacketDispatcher {
     }
 
     /// What a data packet for this (stream, session) wants
-    /// (`on_data`, `:385-431`).
+    /// (`on_data`, `:390-436`).
     pub fn on_data(&mut self, stream_id: i32, session_id: i32, is_end_of_stream: bool) -> Interest {
         let Some((_, interest)) = self.streams.iter_mut().find(|(id, _)| *id == stream_id) else {
             return Interest::None;
@@ -361,11 +361,11 @@ impl DataPacketDispatcher {
     }
 
     /// A `SETUP` arrived for this (stream, session)
-    /// (`on_setup`, `:475-540`).
+    /// (`on_setup`, `:480-545`).
     ///
     /// An image already serving the session is **not** the end of the answer:
     /// the reference adds a connection for the destination the `SETUP` came in
-    /// on (`aeron_publication_image_add_connection_if_unknown`, `:499-502`),
+    /// on (`aeron_publication_image_add_connection_if_unknown`, `:504-507`),
     /// and that is the only way a session two publications share — two
     /// destinations, one session — ever gets answered on the second one.
     ///
@@ -399,7 +399,7 @@ impl DataPacketDispatcher {
     }
 
     /// Mark that a `SETUP` was asked for and record it
-    /// (`mark_image_pending_setup`, `:120-147`): returns whether the caller
+    /// (`mark_image_pending_setup`, `:125-152`): returns whether the caller
     /// should send the status message, which is only when the state moved.
     pub fn elicit_setup_from_source(&mut self, stream_id: i32, session_id: i32) -> bool {
         let Some((_, interest)) = self.streams.iter_mut().find(|(id, _)| *id == stream_id) else {
@@ -428,7 +428,7 @@ impl DataPacketDispatcher {
     }
 
     /// Forget a pending setup once the image exists or the ask timed out
-    /// (`remove_pending_setup`, `:661-680`).
+    /// (`remove_pending_setup`, `:666-685`).
     pub fn remove_pending_setup(&mut self, stream_id: i32, session_id: i32) {
         let Some((_, interest)) = self.streams.iter_mut().find(|(id, _)| *id == stream_id) else {
             return;
@@ -447,7 +447,7 @@ impl DataPacketDispatcher {
     /// The conductor sends this when an image leaves for `LINGER` and the
     /// subscription that read it rejoins
     /// (`aeron_driver_conductor_image_transition_to_linger`,
-    /// `aeron_driver_conductor.c:1642-1675`). Without it the cool-down
+    /// `aeron_driver_conductor.c:1683-1716`). Without it the cool-down
     /// [`Self::remove_image`] leaves behind is **permanent**: a `SETUP` in
     /// that state creates nothing (`:503-506`) and a frame in that state
     /// elicits nothing (`:410-413`), so a publisher that is still sending is
@@ -564,7 +564,7 @@ mod tests {
 
     /// The "once" is a lease, not a promise: a session that never answers is
     /// given up on and the next frame from it asks again
-    /// (`aeron_driver_receiver.c:215-227`, the branch that drops a
+    /// (`aeron_driver_receiver.c:184-196`, the branch that drops a
     /// non-periodic pending setup).
     ///
     /// Without this the state said `PendingSetup` for ever, so a sender that
