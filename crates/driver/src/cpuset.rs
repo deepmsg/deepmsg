@@ -70,7 +70,8 @@ pub enum CpusetError {
         /// How many CPUs the cpuset has.
         count: usize,
     },
-    /// The topology checks complained and `cpuset.warnings.as.errors` is on
+    /// The topology checks complained and
+    /// `thread.affinity.fail.on.validation.errors` is on
     /// (`aeron_driver.c:1190-1194`).
     WarningsAsErrors(usize),
 }
@@ -97,7 +98,7 @@ impl std::fmt::Display for CpusetError {
                 "{role} affinity {affinity} must be less than cpuset count {count}"
             ),
             Self::WarningsAsErrors(count) => {
-                write!(f, "cpuset warnings as errors, {count} warnings")
+                write!(f, "thread affinity validation errors, {count} warnings")
             }
             Self::NotFound(mount) => write!(
                 f,
@@ -281,7 +282,7 @@ pub struct CpuAssignment {
     pub native_resource_agent: Option<i32>,
 }
 
-/// What `aeron_driver_apply_cpuset_affinity` decides
+/// What `aeron_driver_apply_thread_affinity_use_cpuset_offsets` decides
 /// (`aeron-driver/src/main/c/aeron_driver.c:1138-1209`).
 ///
 /// The per-agent affinities and the cpuset are two things, and reading them as
@@ -310,7 +311,7 @@ pub struct CpuAssignment {
 /// With it on, in the reference's order: read the cpuset, run the three topology
 /// checks (their warnings go to **stderr**, which is where the reference's
 /// `fprintf(output, ...)` points when `aeronmd` passes `stderr`, `:1160-1178`),
-/// refuse if `cpuset.warnings.as.errors` is set and there were any, and finally
+/// refuse if `thread.affinity.fail.on.validation.errors` is set and there were any, and finally
 /// turn each slot's position into a CPU id.
 ///
 /// # Errors
@@ -318,7 +319,7 @@ pub struct CpuAssignment {
 /// [`CpusetError`] for a cgroup that cannot be read, an affinity position the
 /// cpuset does not have, and the warnings-as-errors refusal.
 pub fn apply(config: &crate::config::DriverConfig) -> Result<CpuAssignment, CpusetError> {
-    if !config.cpuset_affinity {
+    if !config.thread_affinity_use_cpuset_offsets {
         return Ok(CpuAssignment {
             conductor: at(config.conductor_cpu_affinity),
             receiver: at(config.receiver_cpu_affinity),
@@ -350,7 +351,7 @@ pub fn apply(config: &crate::config::DriverConfig) -> Result<CpuAssignment, Cpus
         eprintln!("{warning}");
     }
 
-    if config.cpuset_warnings_as_errors && !warnings.is_empty() {
+    if config.thread_affinity_fail_on_validation_errors && !warnings.is_empty() {
         return Err(CpusetError::WarningsAsErrors(warnings.len()));
     }
 
@@ -566,7 +567,7 @@ mod tests {
     fn a_driver_that_did_not_ask_for_affinity_reads_nothing() {
         let config = crate::config::DriverConfig::default();
 
-        assert!(!config.cpuset_affinity, "the default");
+        assert!(!config.thread_affinity_use_cpuset_offsets, "the default");
         assert_eq!(
             Ok(CpuAssignment::default()),
             apply(&config),

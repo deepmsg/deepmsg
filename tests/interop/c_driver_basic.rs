@@ -2,7 +2,7 @@
 //! actually prove.
 //!
 //! Run with `cargo test -p deepmsg-tests --features interop` (or `just
-//! interop`), with the Aeron 1.53.2 checkout present — `docs/reference.md`
+//! interop`), with the Aeron 1.54.2 checkout present — `docs/reference.md`
 //! describes the layout and `DEEPMSG_REF_AERONMD` overrides the path.
 //!
 //! When no driver can be found the tests print a `SKIPPED` line and pass. That
@@ -32,8 +32,8 @@ const SYSTEM_COUNTER_TYPE_ID: i32 = 0;
 
 /// What the driver stores in that counter: `aeron_semantic_version_compose` of
 /// its own major/minor/patch (`aeron-driver/src/main/c/aeron_driver.c:936-937`),
-/// i.e. `1.53.2` packed the same way the CnC version is.
-const VERSION_COUNTER_VALUE: i64 = ((1 << 16) | (53 << 8) | 2) as i64;
+/// i.e. `1.54.2` packed the same way the CnC version is.
+const VERSION_COUNTER_VALUE: i64 = ((1 << 16) | (54 << 8) | 2) as i64;
 
 fn now_ms() -> i64 {
     let elapsed = SystemTime::now()
@@ -186,7 +186,7 @@ fn a_counter_the_driver_wrote_matches_a_number_computed_only_from_the_reference_
     // statement these tests make.
     assert_eq!(
         VERSION_COUNTER_VALUE, version.value,
-        "counter {VERSION_COUNTER_ID} should read 1.53.2 packed, label {:?}",
+        "counter {VERSION_COUNTER_ID} should read 1.54.2 packed, label {:?}",
         version.label
     );
 

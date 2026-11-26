@@ -186,6 +186,9 @@ pub struct UdpChannel {
     pub socket_sndbuf_length: usize,
     /// `so-rcvbuf=`, in bytes; zero likewise.
     pub socket_rcvbuf_length: usize,
+    /// `so-tos=`, the socket's traffic class; `-1` (`AERON_NULL_VALUE`) when
+    /// the channel names none.
+    pub socket_tos: i32,
     /// `rcv-wnd=`, in bytes; zero means the subscription default.
     pub receiver_window_length: usize,
     /// The `endpoint=` text as it was written, which is what a **re-resolution**
@@ -455,6 +458,7 @@ impl UdpChannel {
                 is_multicast: true,
                 socket_sndbuf_length: read_size(uri, "so-sndbuf")?,
                 socket_rcvbuf_length: read_size(uri, "so-rcvbuf")?,
+                socket_tos: read_socket_tos(uri)?,
                 receiver_window_length: read_size(uri, "rcv-wnd")?,
                 endpoint_name: endpoint.map(str::to_owned),
                 control_name: control.map(str::to_owned),
@@ -522,6 +526,7 @@ impl UdpChannel {
             is_multicast: false,
             socket_sndbuf_length: read_size(uri, "so-sndbuf")?,
             socket_rcvbuf_length: read_size(uri, "so-rcvbuf")?,
+            socket_tos: read_socket_tos(uri)?,
             receiver_window_length: read_size(uri, "rcv-wnd")?,
             endpoint_name: endpoint.map(str::to_owned),
             control_name: control.map(str::to_owned),
@@ -571,11 +576,12 @@ pub const IPC_PREFIX: &str = "aeron:ipc";
 /// its MTU, its window, its socket buffers, its response correlation — and a
 /// destination is a place inside such a channel, not a channel of its own. A
 /// destination that named one would be asking for a setting nothing would read.
-pub const INVALID_DESTINATION_KEYS: [&str; 5] = [
+pub const INVALID_DESTINATION_KEYS: [&str; 6] = [
     "mtu",
     "rcv-wnd",
     "so-rcvbuf",
     "so-sndbuf",
+    "so-tos",
     "response-correlation-id",
 ];
 
@@ -811,6 +817,28 @@ fn read_size(uri: &ChannelUri<'_>, key: &str) -> Result<usize, UdpChannelError> 
         }),
         None => Ok(0),
     }
+}
+
+/// `so-tos=` (`aeron_udp_channel.c:410-427`): `0..=255`, or `-1` for a channel
+/// that names none. The reference's out-of-range answer is `EINVAL`, which
+/// reaches a client as the generic error — hence [`UdpChannelError::Resolution`]
+/// rather than the invalid-channel code.
+fn read_socket_tos(uri: &ChannelUri<'_>) -> Result<i32, UdpChannelError> {
+    let Some(text) = uri.value("so-tos") else {
+        return Ok(-1);
+    };
+
+    let value = text
+        .parse::<i32>()
+        .map_err(|_| UdpChannelError::Resolution(format!("so-tos must be a number: {text}")))?;
+
+    if !(0..=255).contains(&value) {
+        return Err(UdpChannelError::Resolution(format!(
+            "so-tos must be between 0 and 255 inclusive: {value}"
+        )));
+    }
+
+    Ok(value)
 }
 
 /// Refuse the parameters of the features this slice does not carry, rather
@@ -2873,6 +2901,34 @@ mod tests {
             "the wildcard follows the endpoint's family"
         );
         assert_eq!("UDP-[::]:0-[::1]:10123", channel.canonical_form);
+    }
+
+    #[test]
+    fn so_tos_is_read_bounded_and_is_not_a_destination_parameter() {
+        assert_eq!(-1, resolve("aeron:udp?endpoint=127.0.0.1:1").socket_tos);
+        assert_eq!(
+            0,
+            resolve("aeron:udp?endpoint=127.0.0.1:1|so-tos=0").socket_tos
+        );
+        assert_eq!(
+            255,
+            resolve("aeron:udp?endpoint=127.0.0.1:1|so-tos=255").socket_tos
+        );
+
+        for bad in ["-1", "256", "best-effort"] {
+            let uri = format!("aeron:udp?endpoint=127.0.0.1:1|so-tos={bad}");
+            assert!(
+                matches!(refuse(&uri), UdpChannelError::Resolution(_)),
+                "{bad} is the reference's EINVAL"
+            );
+        }
+
+        let destination = b"aeron:udp?endpoint=127.0.0.1:2|so-tos=1";
+        let uri = ChannelUri::parse(destination).expect("a URI");
+        assert!(matches!(
+            validate_destination_uri_params(&uri, destination),
+            Err(UdpChannelError::InvalidChannel(_))
+        ));
     }
 
     #[test]

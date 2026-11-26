@@ -73,6 +73,44 @@ pub fn validate_channel_buffer_length(
     })
 }
 
+/// `aeron_driver_conductor_validate_channel_socket_tos`
+/// (`aeron_driver_conductor.c:569-605`): a channel that names a `so-tos=` is
+/// asking for the socket the endpoint already has, and a traffic class that
+/// disagrees is a request that cannot be honoured.
+///
+/// `-1` (`AERON_NULL_VALUE`) on the arriving channel is agreement — it names
+/// nothing and takes the socket's; `-1` on the endpoint means the socket is on
+/// the OS default, which is its own message.
+///
+/// # Errors
+///
+/// The reference's message, verbatim: a client reads it.
+pub fn validate_channel_socket_tos(
+    named: i32,
+    existing: i32,
+    channel: &[u8],
+    existing_channel: &[u8],
+) -> Result<(), String> {
+    if named == -1 || named == existing {
+        return Ok(());
+    }
+
+    let channel = String::from_utf8_lossy(channel);
+    let existing_channel = String::from_utf8_lossy(existing_channel);
+
+    Err(if existing == -1 {
+        format!(
+            "so-tos={named} does not match existing value of OS default: \
+             existingChannel={existing_channel} channel={channel}"
+        )
+    } else {
+        format!(
+            "so-tos={named} does not match existing value of {existing}: \
+             existingChannel={existing_channel} channel={channel}"
+        )
+    })
+}
+
 /// `aeron_driver_conductor_validate_initial_window_for_rcvbuf`
 /// (`aeron_driver_conductor.c:464-526`).
 ///
@@ -349,6 +387,37 @@ mod tests {
         assert_eq!(
             Ok(()),
             validate_channel_buffer_length("so-sndbuf", 131_072, 131_072, CHANNEL, EXISTING)
+        );
+    }
+
+    #[test]
+    fn a_channel_that_named_a_different_tos_is_refused_by_name() {
+        assert_eq!(
+            Ok(()),
+            validate_channel_socket_tos(-1, 42, CHANNEL, EXISTING),
+            "naming no so-tos is agreement"
+        );
+        assert_eq!(
+            Ok(()),
+            validate_channel_socket_tos(42, 42, CHANNEL, EXISTING)
+        );
+
+        let refused = validate_channel_socket_tos(42, -1, CHANNEL, EXISTING)
+            .expect_err("a mismatch against the OS default");
+        assert_eq!(
+            "so-tos=42 does not match existing value of OS default: \
+             existingChannel=aeron:udp?endpoint=localhost:9999|so-sndbuf=131072 \
+             channel=aeron:udp?endpoint=localhost:9999|so-sndbuf=65536",
+            refused
+        );
+
+        let refused = validate_channel_socket_tos(42, 7, CHANNEL, EXISTING)
+            .expect_err("a mismatch against a value");
+        assert_eq!(
+            "so-tos=42 does not match existing value of 7: \
+             existingChannel=aeron:udp?endpoint=localhost:9999|so-sndbuf=131072 \
+             channel=aeron:udp?endpoint=localhost:9999|so-sndbuf=65536",
+            refused
         );
     }
 

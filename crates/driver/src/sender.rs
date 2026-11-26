@@ -496,6 +496,7 @@ impl Sender {
         status_message_timeout_ns: i64,
         send_to_sm_poll_ratio: u8,
         timer_interval_ns: i64,
+        poller_iteration_threshold: usize,
     ) -> io::Result<Self> {
         let SenderParts { proxy, agent } = Self::split(
             cnc,
@@ -509,6 +510,7 @@ impl Sender {
             status_message_timeout_ns,
             send_to_sm_poll_ratio,
             timer_interval_ns,
+            poller_iteration_threshold,
             &crate::media::TransportBindings::Default,
         )?;
 
@@ -546,6 +548,7 @@ impl Sender {
         status_message_timeout_ns: i64,
         send_to_sm_poll_ratio: u8,
         timer_interval_ns: i64,
+        poller_iteration_threshold: usize,
         bindings: &crate::media::TransportBindings,
     ) -> io::Result<SenderParts> {
         let (command_tx, command_rx) = mpsc::channel::<SenderCommand>();
@@ -573,7 +576,7 @@ impl Sender {
                 status_message_timeout_ns,
                 send_to_sm_poll_ratio,
                 timer_interval_ns,
-                bindings.poller(crate::media::Affinity::Sender),
+                bindings.poller(crate::media::Affinity::Sender, poller_iteration_threshold),
                 deepmsg_core::clock::monotonic_nano_time(),
                 event_tx,
                 command_rx,
@@ -2243,6 +2246,7 @@ mod tests {
             crate::config::RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT,
             crate::config::SEND_TO_STATUS_POLL_RATIO_DEFAULT,
             crate::config::TIMER_INTERVAL_NS_DEFAULT,
+            crate::config::UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD_DEFAULT,
         )
         .expect("a sender");
 

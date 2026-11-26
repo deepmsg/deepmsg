@@ -609,11 +609,11 @@ impl TransportBindings {
 
     /// A poller for the thread `affinity` names (`poller_init_func`,
     /// `:91-94`).
-    pub fn poller(&self, affinity: Affinity) -> MediaPoller {
+    pub fn poller(&self, affinity: Affinity, iteration_threshold: usize) -> MediaPoller {
         match self {
             Self::Default => {
                 let _ = affinity;
-                MediaPoller::Kernel(TransportPoller::new())
+                MediaPoller::Kernel(TransportPoller::new(iteration_threshold))
             }
             // One per agent thread, and the two behave differently: see
             // [`ThreadQueues::pump`]. The reference passes the same affinity to

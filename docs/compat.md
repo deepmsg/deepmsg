@@ -868,6 +868,20 @@ The upstream report is `analysis/fix/upstream-issue-live-replication-tags-minus-
 — the two spellings disagree upstream as well, and a live merge into a Java
 archive on a C driver fails there for the same reason.
 
+## The traffic class a channel names (`so-tos`)
+
+`so-tos=` (added in Aeron 1.54.0) is the socket's traffic class: `0..=255` or
+absent (`-1`, `AERON_NULL_VALUE`, meaning the driver's `aeron.socket.tos`, and
+that in turn meaning the OS default). A value outside the range is the
+reference's `EINVAL`, which reaches a client as the generic error. A
+**destination** URI may not carry it — it is a property of the channel's
+socket, like the buffer lengths — and a channel joining an existing endpoint
+must agree with the traffic class that socket already has, with the
+reference's `existingChannel=… channel=…` words otherwise
+(`aeron_udp_channel.c:410-427`, `aeron_driver_conductor.c:569-605`). Pinned by
+`crates/driver/src/udp_channel.rs::tests::so_tos_is_read_bounded_and_is_not_a_destination_parameter`
+and `crates/driver/src/channel_validation.rs::tests::a_channel_that_named_a_different_tos_is_refused_by_name`.
+
 ## The UDP data plane (P1-4)
 
 The network channel is now served, both ways: a publication on
@@ -1084,6 +1098,16 @@ means Java's rather than the one C's context header comments, since C reads no
 property there at all. A deployment's existing configuration therefore works
 unchanged, which is the point; the names are pinned by
 `crates/driver/src/config.rs::tests::the_settings_named_after_an_environment_variable_answer_to_their_property`.
+
+The 1.54.2 baseline renamed the cpuset pair and added four settings:
+`aeron.driver.cpuset.affinity` → `aeron.thread.affinity.use.cpuset.offsets`,
+`aeron.driver.cpuset.warnings.as.errors` →
+`aeron.thread.affinity.fail.on.validation.errors`, plus
+`aeron.socket.tos`, `aeron.receiver.poll.to.slow.work.ratio`,
+`aeron.udp.channel.transport.poller.iteration.threshold` and
+`aeron.udp.channel.transport.poller.socket.poll.limit`. The old cpuset names
+are not read, as in the reference; the new names are pinned by
+`crates/driver/src/config.rs::tests::the_thread_affinity_socket_and_poller_settings_answer_to_their_reference_names`.
 
 The table is `crates/driver/src/config.rs`, and its tests pin every name; the
 one divergence is recorded there too — the reference warns and clamps a value

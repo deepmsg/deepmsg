@@ -100,6 +100,9 @@ pub struct SendChannelEndpointEntry {
     pub socket_rcvbuf: usize,
     /// The `SO_SNDBUF`, likewise.
     pub socket_sndbuf: usize,
+    /// The traffic class the socket was opened with, or `-1` for the OS
+    /// default.
+    pub socket_tos: i32,
     /// The port the wildcard port manager is holding for this endpoint, and
     /// zero when it holds none
     /// (`aeron_send_channel_endpoint.managed_port`).
@@ -589,6 +592,7 @@ impl SendChannelEndpoints {
             time_of_last_activity_ns: now_ns,
             socket_rcvbuf,
             socket_sndbuf,
+            socket_tos: params.socket_tos,
             managed_port: endpoint.managed_port(),
             local_sockaddr_counter_id,
             num_destinations_counter_id,
@@ -829,6 +833,14 @@ fn validate_against_endpoint(
         )
         .map_err(EndpointError::ChannelValidation)?;
     }
+
+    channel_validation::validate_channel_socket_tos(
+        channel.socket_tos,
+        entry.socket_tos,
+        &channel.original_uri,
+        &entry.channel.original_uri,
+    )
+    .map_err(EndpointError::ChannelValidation)?;
 
     Ok(())
 }
@@ -1640,6 +1652,7 @@ mod tests {
             time_of_last_activity_ns: 1_000,
             socket_rcvbuf: 0,
             socket_sndbuf: 0,
+            socket_tos: -1,
             managed_port: 0,
             local_sockaddr_counter_id: deepmsg_cnc::layout::NULL_COUNTER_ID,
             num_destinations_counter_id: deepmsg_cnc::layout::NULL_COUNTER_ID,

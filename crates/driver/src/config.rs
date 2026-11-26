@@ -112,6 +112,24 @@ pub const SOCKET_SO_SNDBUF_DEFAULT: i32 = 0;
 /// with `ttl=`.
 pub const SOCKET_MULTICAST_TTL_DEFAULT: u8 = 0;
 
+/// `AERON_SOCKET_TOS_DEFAULT` (`aeron_driver_context.c:194`): `-1`, the null
+/// value — a socket with no traffic class of its own.
+pub const SOCKET_TOS_DEFAULT: i32 = -1;
+
+/// `AERON_RECEIVER_POLL_TO_SLOW_WORK_RATIO_DEFAULT`
+/// (`aeron_driver_context.c:201`): ten data polls to one slow tick.
+pub const RECEIVER_POLL_TO_SLOW_WORK_RATIO_DEFAULT: usize = 10;
+
+/// `AERON_UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD_DEFAULT`
+/// (`aeron_driver_context.c:252`): at or below five transports the poller
+/// reads each one directly.
+pub const UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD_DEFAULT: usize = 5;
+
+/// `AERON_UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT_DEFAULT`
+/// (`aeron_driver_context.c:253`): a readable socket is polled at most four
+/// times in one pass.
+pub const UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT_DEFAULT: usize = 4;
+
 /// `AERON_NAK_MULTICAST_GROUP_SIZE_DEFAULT`
 /// (`aeron_driver_context.c:220`): how many receivers a group is assumed to
 /// have, which is what a NAK's backoff is drawn against.
@@ -764,6 +782,25 @@ pub struct DriverConfig {
     /// leaves behind, so the two are one case and the socket keeps the
     /// kernel's own limit (`aeron_send_channel_endpoint.c:129`).
     pub socket_multicast_ttl: u8,
+    /// `aeron.socket.tos` (`AERON_SOCKET_TOS`, `aeronmd.h:257`): the traffic
+    /// class a socket with no `so-tos=` of its own gets. `-1` is the null
+    /// value, which leaves the kernel's default.
+    pub socket_tos: i32,
+    /// `aeron.receiver.poll.to.slow.work.ratio`
+    /// (`AERON_RECEIVER_POLL_TO_SLOW_WORK_RATIO`, `aeronmd.h:274`): after this
+    /// many data polls the receiver runs its slow tick work (status messages,
+    /// NAKs, RTTMs, pending setups, re-resolution).
+    pub receiver_poll_to_slow_work_ratio: usize,
+    /// `aeron.udp.channel.transport.poller.iteration.threshold`
+    /// (`AERON_UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD`,
+    /// `aeronmd.h:765`): the transport count at or below which the receiver
+    /// reads each socket directly instead of asking epoll.
+    pub udp_channel_transport_poller_iteration_threshold: usize,
+    /// `aeron.udp.channel.transport.poller.socket.poll.limit`
+    /// (`AERON_UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT`,
+    /// `aeronmd.h:774`): how many times one readable socket is polled in a
+    /// pass, `1..=16`.
+    pub udp_channel_transport_poller_socket_poll_limit: usize,
     /// Which strategy a multicast or multi-destination channel gets when it
     /// names no `fc=`
     /// (`aeron.multicast.flowcontrol.supplier`,
@@ -1065,16 +1102,17 @@ pub struct DriverConfig {
     /// The DPDK media's own settings, used when [`Self::media`] is
     /// [`MediaSelection::Dpdk`] and ignored otherwise (`design.md` §4.9).
     pub dpdk: DpdkSettings,
-    /// `aeron.driver.cpuset.affinity` (`AERON_DRIVER_CPUSET_AFFINITY`,
-    /// `aeronmd.h:969`): whether the driver pins its agents to the CPUs its
-    /// cgroup allows (`aeron_driver.c:1138-1209`). **Off by default**, which is
-    /// what makes that whole path an operator's choice.
-    pub cpuset_affinity: bool,
-    /// `aeron.driver.cpuset.warnings.as.errors`
-    /// (`AERON_DRIVER_CPUSET_WARNINGS_AS_ERRORS`, `aeronmd.h:973`): whether a
-    /// cpuset the topology checks complain about stops the driver instead of
-    /// being printed (`aeron_driver.c:1190-1194`).
-    pub cpuset_warnings_as_errors: bool,
+    /// `aeron.thread.affinity.use.cpuset.offsets`
+    /// (`AERON_THREAD_AFFINITY_USE_CPUSET_OFFSETS`, `aeronmd.h:1003`): whether
+    /// the per-agent affinity numbers are offsets into the effective cgroup
+    /// cpuset rather than CPU ids (`aeron_driver.c:1214-1230`). **Off by
+    /// default** — the numbers stand as written.
+    pub thread_affinity_use_cpuset_offsets: bool,
+    /// `aeron.thread.affinity.fail.on.validation.errors`
+    /// (`AERON_THREAD_AFFINITY_FAIL_ON_VALIDATION_ERRORS`, `aeronmd.h:1007`):
+    /// whether a topology complaint stops the driver instead of being printed
+    /// (`aeron_driver.c:1337-1360`).
+    pub thread_affinity_fail_on_validation_errors: bool,
     /// `aeron.conductor.cpu.affinity` (`AERON_CONDUCTOR_CPU_AFFINITY`,
     /// `aeronmd.h:953`): which CPU **of the cpuset** the conductor takes, by
     /// position — and `-1` to leave it alone
@@ -1145,6 +1183,12 @@ impl Default for DriverConfig {
             receiver_io_vector_capacity: RECEIVER_IO_VECTOR_CAPACITY_DEFAULT,
             sender_io_vector_capacity: SENDER_IO_VECTOR_CAPACITY_DEFAULT,
             socket_multicast_ttl: SOCKET_MULTICAST_TTL_DEFAULT,
+            socket_tos: SOCKET_TOS_DEFAULT,
+            receiver_poll_to_slow_work_ratio: RECEIVER_POLL_TO_SLOW_WORK_RATIO_DEFAULT,
+            udp_channel_transport_poller_iteration_threshold:
+                UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD_DEFAULT,
+            udp_channel_transport_poller_socket_poll_limit:
+                UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT_DEFAULT,
             receiver_group_consideration: RECEIVER_GROUP_CONSIDERATION_DEFAULT,
             receiver_group_tag: RECEIVER_GROUP_TAG_DEFAULT,
             image_liveness_timeout_ns: IMAGE_LIVENESS_TIMEOUT_NS_DEFAULT,
@@ -1200,8 +1244,8 @@ impl Default for DriverConfig {
             transport_bindings: crate::media::TransportBindings::Default,
             media: MediaSelection::Default,
             dpdk: DpdkSettings::default(),
-            cpuset_affinity: false,
-            cpuset_warnings_as_errors: false,
+            thread_affinity_use_cpuset_offsets: false,
+            thread_affinity_fail_on_validation_errors: false,
             conductor_cpu_affinity: CPU_AFFINITY_DEFAULT,
             receiver_cpu_affinity: CPU_AFFINITY_DEFAULT,
             sender_cpu_affinity: CPU_AFFINITY_DEFAULT,
@@ -1448,12 +1492,13 @@ impl DriverConfig {
         if let Some(value) = get(&Setting::ERROR_BUFFER_LENGTH) {
             config.layout.error_log_length = parse_size64(&Setting::ERROR_BUFFER_LENGTH, &value)?;
         }
-        if let Some(value) = get(&Setting::DRIVER_CPUSET_AFFINITY) {
-            config.cpuset_affinity = parse_bool(&Setting::DRIVER_CPUSET_AFFINITY, &value)?;
+        if let Some(value) = get(&Setting::THREAD_AFFINITY_USE_CPUSET_OFFSETS) {
+            config.thread_affinity_use_cpuset_offsets =
+                parse_bool(&Setting::THREAD_AFFINITY_USE_CPUSET_OFFSETS, &value)?;
         }
-        if let Some(value) = get(&Setting::DRIVER_CPUSET_WARNINGS_AS_ERRORS) {
-            config.cpuset_warnings_as_errors =
-                parse_bool(&Setting::DRIVER_CPUSET_WARNINGS_AS_ERRORS, &value)?;
+        if let Some(value) = get(&Setting::THREAD_AFFINITY_FAIL_ON_VALIDATION_ERRORS) {
+            config.thread_affinity_fail_on_validation_errors =
+                parse_bool(&Setting::THREAD_AFFINITY_FAIL_ON_VALIDATION_ERRORS, &value)?;
         }
         for (setting, field) in [
             (
@@ -1726,6 +1771,40 @@ impl DriverConfig {
                 255,
             )?)
             .unwrap_or(SOCKET_MULTICAST_TTL_DEFAULT);
+        }
+        if let Some(value) = get(&Setting::SOCKET_TOS) {
+            // The reference's parse has `-1` as the default and `0..=255` as
+            // the accepted explicit range; we accept the null value explicitly
+            // too, which is what a caller writing it means.
+            config.socket_tos = if value.trim() == "-1" {
+                SOCKET_TOS_DEFAULT
+            } else {
+                parse_bounded_size32(&Setting::SOCKET_TOS, &value, 0, 255)?
+            };
+        }
+        if let Some(value) = get(&Setting::RECEIVER_POLL_TO_SLOW_WORK_RATIO) {
+            config.receiver_poll_to_slow_work_ratio = parse_bounded_usize(
+                &Setting::RECEIVER_POLL_TO_SLOW_WORK_RATIO,
+                &value,
+                1,
+                u64::try_from(i32::MAX).unwrap_or(u64::MAX),
+            )?;
+        }
+        if let Some(value) = get(&Setting::UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD) {
+            config.udp_channel_transport_poller_iteration_threshold = parse_bounded_usize(
+                &Setting::UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD,
+                &value,
+                0,
+                u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+            )?;
+        }
+        if let Some(value) = get(&Setting::UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT) {
+            config.udp_channel_transport_poller_socket_poll_limit = parse_bounded_usize(
+                &Setting::UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT,
+                &value,
+                1,
+                16,
+            )?;
         }
         if let Some(value) = get(&Setting::NAK_MULTICAST_GROUP_SIZE) {
             // Bounded where the reference bounds it (`:938-943`, one to
@@ -2441,6 +2520,28 @@ impl Setting {
         property: "socket.multicast.ttl",
         env: "AERON_SOCKET_MULTICAST_TTL",
     };
+    /// `aeron.socket.tos` (`aeronmd.h:257`, read at `:782-788`).
+    const SOCKET_TOS: Self = Self {
+        property: "socket.tos",
+        env: "AERON_SOCKET_TOS",
+    };
+    /// `aeron.receiver.poll.to.slow.work.ratio` (`aeronmd.h:274`).
+    const RECEIVER_POLL_TO_SLOW_WORK_RATIO: Self = Self {
+        property: "receiver.poll.to.slow.work.ratio",
+        env: "AERON_RECEIVER_POLL_TO_SLOW_WORK_RATIO",
+    };
+    /// `aeron.udp.channel.transport.poller.iteration.threshold`
+    /// (`aeronmd.h:765`).
+    const UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD: Self = Self {
+        property: "udp.channel.transport.poller.iteration.threshold",
+        env: "AERON_UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD",
+    };
+    /// `aeron.udp.channel.transport.poller.socket.poll.limit`
+    /// (`aeronmd.h:774`).
+    const UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT: Self = Self {
+        property: "udp.channel.transport.poller.socket.poll.limit",
+        env: "AERON_UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT",
+    };
     /// `aeron.nak.multicast.group.size` (`aeronmd.h:645`, read at `:938-943`).
     const NAK_MULTICAST_GROUP_SIZE: Self = Self {
         property: "nak.multicast.group.size",
@@ -2546,15 +2647,15 @@ impl Setting {
         property: "driver.connect",
         env: "AERON_DRIVER_CONNECT",
     };
-    /// `aeron.driver.cpuset.affinity` (`aeronmd.h:969`).
-    const DRIVER_CPUSET_AFFINITY: Self = Self {
-        property: "driver.cpuset.affinity",
-        env: "AERON_DRIVER_CPUSET_AFFINITY",
+    /// `aeron.thread.affinity.use.cpuset.offsets` (`aeronmd.h:1003`).
+    const THREAD_AFFINITY_USE_CPUSET_OFFSETS: Self = Self {
+        property: "thread.affinity.use.cpuset.offsets",
+        env: "AERON_THREAD_AFFINITY_USE_CPUSET_OFFSETS",
     };
-    /// `aeron.driver.cpuset.warnings.as.errors` (`aeronmd.h:973`).
-    const DRIVER_CPUSET_WARNINGS_AS_ERRORS: Self = Self {
-        property: "driver.cpuset.warnings.as.errors",
-        env: "AERON_DRIVER_CPUSET_WARNINGS_AS_ERRORS",
+    /// `aeron.thread.affinity.fail.on.validation.errors` (`aeronmd.h:1007`).
+    const THREAD_AFFINITY_FAIL_ON_VALIDATION_ERRORS: Self = Self {
+        property: "thread.affinity.fail.on.validation.errors",
+        env: "AERON_THREAD_AFFINITY_FAIL_ON_VALIDATION_ERRORS",
     };
     /// `aeron.conductor.cpu.affinity` (`aeronmd.h:953`).
     const CONDUCTOR_CPU_AFFINITY: Self = Self {
@@ -5709,6 +5810,55 @@ mod tests {
             Some(-1),
             config.receiver_group_tag,
             "and `-1` is a tag, unlike naming nothing"
+        );
+    }
+
+    #[test]
+    fn the_thread_affinity_socket_and_poller_settings_answer_to_their_reference_names() {
+        let defaults = DriverConfig::default();
+        assert!(!defaults.thread_affinity_use_cpuset_offsets);
+        assert!(!defaults.thread_affinity_fail_on_validation_errors);
+        assert_eq!(-1, defaults.socket_tos);
+        assert_eq!(10, defaults.receiver_poll_to_slow_work_ratio);
+        assert_eq!(5, defaults.udp_channel_transport_poller_iteration_threshold);
+        assert_eq!(4, defaults.udp_channel_transport_poller_socket_poll_limit);
+
+        let config = resolve(&[
+            ("aeron.dir", "/tmp/aeron-test"),
+            ("aeron.thread.affinity.use.cpuset.offsets", "true"),
+            ("aeron.thread.affinity.fail.on.validation.errors", "true"),
+            ("aeron.socket.tos", "42"),
+            ("aeron.receiver.poll.to.slow.work.ratio", "7"),
+            (
+                "aeron.udp.channel.transport.poller.iteration.threshold",
+                "9",
+            ),
+            ("aeron.udp.channel.transport.poller.socket.poll.limit", "12"),
+        ])
+        .expect("a config");
+
+        assert!(config.thread_affinity_use_cpuset_offsets);
+        assert!(config.thread_affinity_fail_on_validation_errors);
+        assert_eq!(42, config.socket_tos);
+        assert_eq!(7, config.receiver_poll_to_slow_work_ratio);
+        assert_eq!(9, config.udp_channel_transport_poller_iteration_threshold);
+        assert_eq!(12, config.udp_channel_transport_poller_socket_poll_limit);
+
+        assert!(
+            resolve(&[
+                ("aeron.dir", "/tmp/aeron-test"),
+                ("aeron.udp.channel.transport.poller.socket.poll.limit", "17"),
+            ])
+            .is_err(),
+            "the reference's socket poll limit is 1..=16"
+        );
+        assert!(
+            resolve(&[
+                ("aeron.dir", "/tmp/aeron-test"),
+                ("aeron.socket.tos", "256")
+            ])
+            .is_err(),
+            "the reference refuses a traffic class above 255"
         );
     }
 

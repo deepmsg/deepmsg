@@ -75,6 +75,9 @@ pub struct ReceiveChannelEndpointEntry {
     pub socket_rcvbuf: usize,
     /// The `SO_SNDBUF`, likewise.
     pub socket_sndbuf: usize,
+    /// The traffic class the socket was opened with, or `-1` for the OS
+    /// default.
+    pub socket_tos: i32,
     /// How many destinations the endpoint has (`destinations.length`,
     /// `aeron_driver_conductor.c:2184`): one for a channel that named an
     /// endpoint, none for a `control-mode=manual` one (`:2099-2114`), and it
@@ -457,6 +460,7 @@ impl ReceiveChannelEndpoints {
             receiver_released: false,
             socket_rcvbuf,
             socket_sndbuf,
+            socket_tos: params.socket_tos,
             destination_count,
         });
 
@@ -565,6 +569,11 @@ impl ReceiveChannelEndpoints {
             } else {
                 usize::try_from(config.socket_so_sndbuf).unwrap_or(0)
             },
+            socket_tos: if channel.socket_tos != -1 {
+                channel.socket_tos
+            } else {
+                config.socket_tos
+            },
             multicast_if_index: channel.interface_index,
             ttl: if channel.multicast_ttl != 0 {
                 channel.multicast_ttl
@@ -661,6 +670,14 @@ fn validate_against_endpoint(
         )
         .map_err(ReceiveEndpointErrorKind::ChannelValidation)?;
     }
+
+    channel_validation::validate_channel_socket_tos(
+        channel.socket_tos,
+        entry.socket_tos,
+        &channel.original_uri,
+        &entry.channel.original_uri,
+    )
+    .map_err(ReceiveEndpointErrorKind::ChannelValidation)?;
 
     Ok(())
 }

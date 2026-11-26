@@ -455,18 +455,19 @@ impl DatagramSocket {
         Ok(())
     }
 
-    /// `SO_REUSEPORT` (`aeron_udp_channel_transport.c:176-182`).
-    ///
-    /// The reference sets this beside `SO_REUSEADDR` and only on a multicast
-    /// socket, where several subscribers to one group share the port —
-    /// `SO_REUSEADDR` alone lets a second socket *bind*, and `SO_REUSEPORT` is
-    /// what makes the kernel spread the group's datagrams across all of them.
+    /// The socket's traffic class (`aeron_udp_channel_transport.c:145-158`):
+    /// `IP_TOS` for IPv4 and `IPV6_TCLASS` for IPv6.
     ///
     /// # Errors
     ///
     /// The error from `setsockopt(2)`.
-    pub fn set_reuse_port(&self) -> io::Result<()> {
-        self.set_option(libc::SOL_SOCKET, libc::SO_REUSEPORT, &1i32)
+    pub fn set_tos(&self, value: i32) -> io::Result<()> {
+        let (level, name) = match self.family() {
+            AddressFamily::Inet => (libc::IPPROTO_IP, libc::IP_TOS),
+            AddressFamily::Inet6 => (libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
+        };
+
+        self.set_option(level, name, &value)
     }
 
     /// Join a multicast group on an interface
@@ -827,6 +828,15 @@ impl DatagramSocket {
                     1
                 }
             } else {
+                // 1.54.2 resets the capacity before every read: a previous
+                // IPv4 source leaves `msg_namelen` at `sockaddr_in`'s 16 bytes,
+                // and an IPv6 datagram read into that would be truncated —
+                // mixed-family traffic seeing corrupt addresses.
+                for message in &mut receive.messages[..count] {
+                    message.msg_hdr.msg_namelen =
+                        std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                }
+
                 libc::recvmmsg(
                     self.fd,
                     receive.messages.as_mut_ptr(),

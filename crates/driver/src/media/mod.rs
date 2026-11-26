@@ -58,12 +58,15 @@ pub use udp_transport::UdpTransport;
 /// The knobs a transport is opened with
 /// (`aeron_udp_channel_transport_params_t`,
 /// `aeron-driver/src/main/c/media/aeron_udp_channel_transport.h:39-47`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransportParams {
     /// `SO_RCVBUF`, in bytes; zero leaves the kernel's default.
     pub socket_rcvbuf: usize,
     /// `SO_SNDBUF`, in bytes; zero leaves the kernel's default.
     pub socket_sndbuf: usize,
+    /// The traffic class (`IP_TOS` on IPv4, `IPV6_TCLASS` on IPv6), or `-1`
+    /// when the channel and the driver both name none.
+    pub socket_tos: i32,
     /// The channel's interface index, which the IPv6 multicast options take in
     /// place of an address (`aeron_udp_channel_transport.c:213-227`, `:230-235`).
     pub multicast_if_index: u32,
@@ -95,6 +98,20 @@ pub struct TransportParams {
     /// `endpoint=…` channel fills the remote pair and leaves these at zero.
     /// Both are "the control address the channel named", so both are asked.
     pub control: Option<SocketAddr>,
+}
+
+impl Default for TransportParams {
+    fn default() -> Self {
+        Self {
+            socket_rcvbuf: 0,
+            socket_sndbuf: 0,
+            // `-1` is `AERON_NULL_VALUE`: no traffic class, not best-effort.
+            socket_tos: -1,
+            multicast_if_index: 0,
+            ttl: 0,
+            control: None,
+        }
+    }
 }
 
 /// What the endpoints, the publications and the images are allowed to ask of

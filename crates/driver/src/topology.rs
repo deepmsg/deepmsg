@@ -5,7 +5,7 @@
 //! expects. The reference's answer is to **say so**: three checks that read
 //! `/sys/devices/system/cpu` and print a warning per problem
 //! (`aeron-driver/src/main/c/aeron_topology.c:467-620`), whose count
-//! `aeron.driver.cpuset.warnings.as.errors` can turn into a refusal to start.
+//! `aeron.thread.affinity.fail.on.validation.errors` can turn into a refusal to start.
 //!
 //! The three, and what each one is looking at:
 //!

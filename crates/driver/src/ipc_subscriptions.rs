@@ -2856,6 +2856,48 @@ mod tests {
     }
 
     #[test]
+    fn a_udp_response_setup_with_a_different_session_is_refused() {
+        // `io.aeron.ResponseChannelsTest::shouldErrorCompletingUdpResponseSubscriptionSetupOnSessionMismatch`.
+        let mut subscriptions = IpcSubscriptions::new();
+        let mut response = link(1001, Some(42), true);
+        response.registration_id = 9;
+        response.endpoint_id = Some(3);
+        subscriptions.links.push(response);
+
+        let receiver = ReceiverProxy::for_test();
+        let (code, message) = subscriptions
+            .on_response_setup(9, 555, &receiver)
+            .expect("42 is not 555");
+
+        assert_eq!(deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR, code);
+        assert!(
+            message.contains("does not match `session-id=555`"),
+            "the reference's words: {message}"
+        );
+        let link = &subscriptions.links()[0];
+        assert_eq!(None, link.session_id, "the named session is dropped");
+        assert_eq!(SetupStatus::Error, link.setup_status);
+        assert!(link.is_response, "the link never became a reader");
+    }
+
+    #[test]
+    fn a_udp_response_setup_with_the_named_session_completes() {
+        let mut subscriptions = IpcSubscriptions::new();
+        let mut response = link(1001, Some(42), true);
+        response.registration_id = 9;
+        response.endpoint_id = Some(3);
+        subscriptions.links.push(response);
+
+        let receiver = ReceiverProxy::for_test();
+        assert_eq!(None, subscriptions.on_response_setup(9, 42, &receiver));
+
+        let link = &subscriptions.links()[0];
+        assert_eq!(Some(42), link.session_id);
+        assert_eq!(SetupStatus::Complete, link.setup_status);
+        assert!(!link.is_response);
+    }
+
+    #[test]
     fn a_chain_that_reaches_no_subscription_is_not_an_error() {
         // An ordinary publication names no correlation id, and a response
         // publication whose request publication has gone names one that is not

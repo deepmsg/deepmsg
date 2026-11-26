@@ -605,6 +605,7 @@ mod tests {
         let params = TransportParams {
             socket_rcvbuf: so_rcvbuf,
             socket_sndbuf: so_rcvbuf,
+            socket_tos: -1,
             multicast_if_index: 0,
             ttl: 0,
             control: None,

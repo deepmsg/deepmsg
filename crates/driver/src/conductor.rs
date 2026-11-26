@@ -982,6 +982,7 @@ impl Conductor {
             config.status_message_timeout_ns,
             config.send_to_sm_poll_ratio,
             config.timer_interval_ns,
+            config.udp_channel_transport_poller_iteration_threshold,
             &config.transport_bindings,
         )
         .map_err(ConductorError::Sender)?;
@@ -1007,6 +1008,9 @@ impl Conductor {
             config.receiver_cycle_threshold_ns,
             config.re_resolution_check_interval_ns,
             config.timer_interval_ns,
+            config.udp_channel_transport_poller_iteration_threshold,
+            config.udp_channel_transport_poller_socket_poll_limit,
+            config.receiver_poll_to_slow_work_ratio,
             &config.transport_bindings,
         )
         .map_err(ConductorError::Sender)?;

@@ -434,6 +434,16 @@ pub struct ReceiverProxy {
 }
 
 impl ReceiverProxy {
+    /// A proxy with no thread behind it, for the tests that only need the
+    /// conductor side of a command send.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (commands, _) = mpsc::channel();
+        let (_, events) = mpsc::channel();
+
+        Self { commands, events }
+    }
+
     /// Ask the receiver to take an endpoint.
     ///
     /// # Errors
@@ -750,6 +760,9 @@ impl Receiver {
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
         timer_interval_ns: i64,
+        poller_iteration_threshold: usize,
+        socket_poll_limit: usize,
+        poll_to_slow_work_ratio: usize,
     ) -> io::Result<Self> {
         // A test-only constructor: it puts the loss report beside the CnC file
         // it was handed, which is where a driver puts it too.
@@ -773,6 +786,9 @@ impl Receiver {
             cycle_threshold_ns,
             re_resolution_interval_ns,
             timer_interval_ns,
+            poller_iteration_threshold,
+            socket_poll_limit,
+            poll_to_slow_work_ratio,
             &crate::media::TransportBindings::Default,
         )?;
 
@@ -810,6 +826,9 @@ impl Receiver {
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
         timer_interval_ns: i64,
+        poller_iteration_threshold: usize,
+        socket_poll_limit: usize,
+        poll_to_slow_work_ratio: usize,
         bindings: &crate::media::TransportBindings,
     ) -> io::Result<ReceiverParts> {
         let (command_tx, command_rx) = mpsc::channel::<ReceiverCommand>();
@@ -837,7 +856,9 @@ impl Receiver {
                 cycle_threshold_ns,
                 re_resolution_interval_ns,
                 timer_interval_ns,
-                bindings.poller(crate::media::Affinity::Receiver),
+                socket_poll_limit,
+                poll_to_slow_work_ratio,
+                bindings.poller(crate::media::Affinity::Receiver, poller_iteration_threshold),
                 deepmsg_core::clock::monotonic_nano_time(),
                 event_tx,
                 command_rx,
@@ -955,6 +976,16 @@ pub(crate) struct ReceiverThread {
     /// on the path whose whole measured cost is under a microsecond.
     descriptors: Vec<crate::sys::socket::Descriptor>,
     last_cycle_ns: i64,
+    /// `aeron.udp.channel.transport.poller.socket.poll.limit`: how many times
+    /// one readable socket is polled in a pass.
+    socket_poll_limit: usize,
+    /// `aeron.receiver.poll.to.slow.work.ratio`: data polls between slow ticks.
+    poll_to_slow_work_ratio: usize,
+    /// Data polls since the last slow tick.
+    duty_cycle_counter: usize,
+    /// When the next slow tick is due regardless of the ratio, as the
+    /// status-message timeout bounds it.
+    slow_work_deadline_ns: i64,
     /// The commands the conductor sends, which this drains one pass at a time.
     commands: Inbox<ReceiverCommand>,
 }
@@ -972,6 +1003,8 @@ impl ReceiverThread {
         cycle_threshold_ns: i64,
         re_resolution_interval_ns: i64,
         timer_interval_ns: i64,
+        socket_poll_limit: usize,
+        poll_to_slow_work_ratio: usize,
         poller: crate::media::poller::MediaPoller,
         now_ns: i64,
         events: Outbox<ReceiverEvent>,
@@ -1008,6 +1041,11 @@ impl ReceiverThread {
             transports: Vec::new(),
             descriptors: Vec::new(),
             last_cycle_ns: deepmsg_core::clock::monotonic_nano_time(),
+            socket_poll_limit,
+            poll_to_slow_work_ratio,
+            duty_cycle_counter: 0,
+            // The reference starts at zero so the first pass is a slow tick.
+            slow_work_deadline_ns: 0,
         }
     }
 
@@ -1435,6 +1473,14 @@ impl ReceiverThread {
         let system = System::new(&self.counters, &regions);
         let now_ns = deepmsg_core::clock::monotonic_nano_time();
 
+        // The reference's duty-cycle gate (`aeron_driver_receiver.c:263-268`):
+        // data is polled every pass, the slow work (status messages, NAKs,
+        // RTTMs, pending setups, re-resolution) every ratio passes or when
+        // the status-message timeout says it has waited long enough.
+        self.duty_cycle_counter += 1;
+        let slow_tick = self.duty_cycle_counter >= self.poll_to_slow_work_ratio
+            || now_ns >= self.slow_work_deadline_ns;
+
         // The answers to control-name re-resolutions first, so that a
         // destination that has just moved answers there this pass.
         let mut re_resolved = Self::apply_resolution_changes(
@@ -1446,7 +1492,10 @@ impl ReceiverThread {
 
         // And the question, on its own deadline (`aeron_driver_receiver.c:254-258`):
         // a zero interval is a driver that never asks.
-        if self.re_resolution_interval_ns > 0 && now_ns > self.re_resolution_deadline_ns {
+        if slow_tick
+            && self.re_resolution_interval_ns > 0
+            && now_ns > self.re_resolution_deadline_ns
+        {
             self.re_resolution_deadline_ns = now_ns + self.re_resolution_interval_ns;
             re_resolved += Self::check_for_re_resolution(&mut self.endpoints, &self.events, now_ns);
         }
@@ -1467,6 +1516,7 @@ impl ReceiverThread {
             // times the destination count — 676,000 a second at 501K against
             // the 500,000 arriving.
             &mut self.buffers[..DATAGRAMS_PER_POLL],
+            self.socket_poll_limit,
             &mut self.datagrams,
             &mut self.poller,
             &mut self.readable,
@@ -1480,23 +1530,28 @@ impl ReceiverThread {
             now_ns,
         );
 
-        work += Self::send_status_messages(
-            &mut self.endpoints,
-            &mut self.images,
-            &system,
-            &self.counters,
-            &regions,
-            &self.loss_report,
-            &mut self.loss_report_cursor,
-            now_ns,
-        );
+        if slow_tick {
+            work += Self::send_status_messages(
+                &mut self.endpoints,
+                &mut self.images,
+                &system,
+                &self.counters,
+                &regions,
+                &self.loss_report,
+                &mut self.loss_report_cursor,
+                now_ns,
+            );
 
-        work += Self::send_pending_setups(
-            &mut self.pending_setups,
-            &mut self.endpoints,
-            &system,
-            now_ns,
-        );
+            work += Self::send_pending_setups(
+                &mut self.pending_setups,
+                &mut self.endpoints,
+                &system,
+                now_ns,
+            );
+
+            self.duty_cycle_counter = 0;
+            self.slow_work_deadline_ns = now_ns + self.status_message_timeout_ns;
+        }
 
         // The pair the reference runs on its timer rather than per pass. See
         // [`Timer`] for what the gate does and does not change.
@@ -1621,6 +1676,7 @@ impl ReceiverThread {
         endpoints: &mut [(u64, Box<ReceiveChannelEndpoint>)],
         images: &mut [PublicationImage],
         buffers: &mut [Vec<u8>],
+        socket_poll_limit: usize,
         datagrams: &mut Datagrams,
         poller: &mut crate::media::poller::MediaPoller,
         readable: &mut Vec<usize>,
@@ -1699,11 +1755,14 @@ impl ReceiverThread {
             // not through the first one. The position below is only the cursor
             // for this pass — what is passed on is the destination's own
             // handle, because that is what an image keeps.
-            {
-                let Some(destination) = endpoint.destination_id(destination_index) else {
-                    continue;
-                };
+            let Some(destination) = endpoint.destination_id(destination_index) else {
+                continue;
+            };
 
+            // `aeron.udp.channel.transport.poller.socket.poll.limit`: a
+            // readable socket is polled again while it has data, up to the
+            // limit (1..=16).
+            for _ in 0..socket_poll_limit {
                 let received = match endpoint.receive_from(destination, buffers, datagrams) {
                     Ok(received) => received,
                     Err(error) => {
@@ -1711,12 +1770,12 @@ impl ReceiverThread {
                             error_code: deepmsg_cnc::command::ERROR_CODE_GENERIC_ERROR,
                             description: format!("could not receive on a channel: {error}"),
                         });
-                        continue;
+                        break;
                     }
                 };
 
                 if received == 0 {
-                    continue;
+                    break;
                 }
 
                 // What this transport has received, which is the one counter a
@@ -2415,6 +2474,9 @@ mod tests {
             100_000_000,
             0,
             crate::config::TIMER_INTERVAL_NS_DEFAULT,
+            crate::config::UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD_DEFAULT,
+            crate::config::UDP_CHANNEL_TRANSPORT_POLLER_SOCKET_POLL_LIMIT_DEFAULT,
+            crate::config::RECEIVER_POLL_TO_SLOW_WORK_RATIO_DEFAULT,
         )
         .expect("a receiver");
 

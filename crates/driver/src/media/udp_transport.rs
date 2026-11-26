@@ -121,10 +121,12 @@ impl UdpTransport {
         let receive = recv_socket.as_ref().unwrap_or(&socket);
 
         if is_multicast {
-            // `:166-182`: both options, on the *receiving* descriptor, so that
+            // `:166-182`: `SO_REUSEADDR` on the *receiving* descriptor, so that
             // several subscribers to one group can share the port.
+            // `SO_REUSEPORT` is deliberately **not** set on Linux: 1.54.2
+            // stopped doing so (`aeron_udp_channel_transport.c:168-190`), and
+            // `SO_REUSEADDR` is what multicast sharing needs.
             receive.set_reuse_address()?;
-            receive.set_reuse_port()?;
 
             // `:190-205`, `:257-272`: a group this socket did not join is not
             // this socket's to hear.
@@ -153,8 +155,8 @@ impl UdpTransport {
         } else {
             // `:147-154`: a unicast transport binds and nothing else, and it is
             // the bind whose failure the reference composes from the descriptor
-            // and the address. **No reuse options**: the `SO_REUSEADDR` /
-            // `SO_REUSEPORT` pair at `:168-190` is inside the *multicast* branch
+            // and the address. **No reuse options**: `SO_REUSEADDR` at
+            // `:168-190` is inside the *multicast* branch
             // — the `else` of `if (!is_multicast)`, whose first act is that
             // bind. Setting them here as well looks like the same behaviour and
             // is not: a receive destination naming an address another socket of
@@ -176,6 +178,14 @@ impl UdpTransport {
         if params.socket_sndbuf > 0 {
             // `:336-344`: on the one that sends.
             socket.set_send_buffer(params.socket_sndbuf)?;
+        }
+
+        if params.socket_tos >= 0 {
+            // `:145-158`: both descriptors, like the buffer lengths above.
+            socket.set_tos(params.socket_tos)?;
+            if let Some(recv_socket) = &recv_socket {
+                recv_socket.set_tos(params.socket_tos)?;
+            }
         }
 
         // `:356-366`: both descriptors, which for a unicast transport are the
@@ -456,6 +466,7 @@ mod tests {
             &TransportParams {
                 socket_rcvbuf: 1 << 20,
                 socket_sndbuf: 1 << 20,
+                socket_tos: -1,
                 multicast_if_index: 0,
                 ttl: 4,
                 control: None,
@@ -573,8 +584,7 @@ mod tests {
         let interface = Some(SocketAddr::new(interface(), 0));
 
         // Two subscribers on one group and one port. That they can both bind
-        // at all is the `SO_REUSEADDR`/`SO_REUSEPORT` pair, and that both hear
-        // it is what they are for.
+        // at all is `SO_REUSEADDR`, and that both hear it is what it is for.
         let mut first = joined(data);
         let mut second = joined(data);
 
