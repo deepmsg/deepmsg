@@ -27,7 +27,7 @@
 //!
 //! The strip list is a list of twenty-three calls, and the quickest way to be
 //! wrong about it is to reason about which ones matter. It was read off the
-//! reference instead: `aeron-archive-1.53.2.jar` is built in the sibling
+//! reference instead: `aeron-archive-1.54.2.jar` is built in the sibling
 //! checkout, `strippedChannelBuilder` is reachable by reflection, and the
 //! outputs are in the test at the bottom of this file.
 //!
@@ -9400,7 +9400,7 @@ mod tests {
 
     /// The strip list, read off the reference's own `strippedChannelBuilder` by
     /// reflection rather than reasoned about — every expected value below is
-    /// what `aeron-archive-1.53.2.jar` printed.
+    /// what `aeron-archive-1.54.2.jar` printed.
     ///
     /// `term-length`, `mtu` and `sparse` are the interesting ones: a client
     /// that asked for them does **not** get them back, because the archive sets

@@ -272,13 +272,14 @@ fn allocate_counters(
     let errors = allocate(
         client,
         CLUSTER_BACKUP_ERROR_COUNT_TYPE_ID,
-        // The same two literals the consensus module's own versioned counter
-        // carries (`agent/mod.rs::allocate_counters`): the reference's
-        // `ClusterBackupVersion.VERSION` and `GIT_SHA`.
+        // The same version the consensus module's own counter carries
+        // (`agent/mod.rs::allocate_counters`): the reference's
+        // `ClusterBackupVersion.VERSION` and `GIT_SHA`; the commit is this
+        // build's own token rather than a reference sha.
         counters::versioned_cluster_counter(
             "ClusterBackup Errors",
             cluster_id,
-            "1.53.2",
+            counters::VERSION,
             "deepmsg",
         )?,
     )?;

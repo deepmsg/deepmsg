@@ -216,7 +216,7 @@ pub fn validate_mtu_for_sndbuf(
 /// # Errors
 ///
 /// The reference's composition, verbatim. Its shape was read off a live
-/// 1.53.2 driver — `tests/interop/` runs both drivers through this fault and
+/// 1.54.2 driver — `tests/interop/` runs both drivers through this fault and
 /// compares — because the file names, the line numbers and the OS's wording
 /// are all things a careful reading gets almost right.
 pub fn validate_sender_mtu_length(

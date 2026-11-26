@@ -170,7 +170,7 @@ const LABELS: [&str; COUNT] = [
     "Flow control under runs",
     "Flow control over runs",
     "Invalid packets",
-    "Errors: version=1.53.2 commit=deepmsg-0.1.0",
+    "Errors: version=1.54.2 commit=deepmsg-0.1.0",
     "Short sends",
     "Failed attempts to free log buffers",
     "Sender flow control limits, i.e. back-pressure events",
@@ -189,7 +189,7 @@ const LABELS: [&str; COUNT] = [
     "Receiver work cycle exceeded threshold count",
     "NameResolver max time in ns",
     "NameResolver exceeded threshold count",
-    "Aeron software: version=1.53.2 commit=deepmsg-0.1.0",
+    "Aeron software: version=1.54.2 commit=deepmsg-0.1.0",
     "Bytes currently mapped",
     "Retransmitted bytes",
     "Retransmit Pool Overflow count",
@@ -408,7 +408,7 @@ pub fn allocate_all(
     // The three values the reference sets once its agents exist
     // (`aeron-driver.c:936-949`); this driver has one agent and sets them at the
     // same point in startup.
-    let aeron_version = version::semantic_version_compose(1, 53, 2);
+    let aeron_version = version::semantic_version_compose(1, 54, 2);
     let control_protocol_version = version::semantic_version_compose(1, 0, 0);
     for (counter_id, value) in [
         (34, i64::from(aeron_version)),
@@ -802,9 +802,9 @@ mod tests {
         .expect("a fresh file");
 
         assert_eq!(
-            Some(79_106),
+            Some(79_362),
             value(&regions, 34),
-            "1.53.2 packed is the Aeron software counter"
+            "1.54.2 packed is the Aeron software counter"
         );
         assert_eq!(
             Some(65_536),

@@ -5,7 +5,7 @@ host. It has no specification — the bytes are the contract — so everything
 below cites the reference line it was read from, and the constants in
 `crates/cnc/src/layout.rs` assert their relationships at compile time.
 
-Baseline: Aeron **1.53.2**, commit `664f58e705`.
+Baseline: Aeron **1.54.2**, commit `481d4271ad`.
 
 ## Metadata region — 128 bytes
 

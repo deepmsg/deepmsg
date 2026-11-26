@@ -17,7 +17,7 @@ offence. Take that literally.
 
 ## Procedure
 
-1. **Find the authority.** Resolve it in the 1.53.2 checkout with the
+1. **Find the authority.** Resolve it in the 1.54.2 checkout with the
    `verify-citation` skill. The `Reference source` cell accepts only two kinds
    of value:
 

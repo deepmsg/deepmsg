@@ -1,6 +1,6 @@
 # Compatibility matrix
 
-deepmsg targets byte-level compatibility with Aeron **1.53.2** (ADR-0001).
+deepmsg targets byte-level compatibility with Aeron **1.54.2** (ADR-0001).
 Every row below is a testable contract; a row counts as verified only when
 the interop suite (`tests/interop`, feature `interop`) or a golden byte test
 covers it.
@@ -74,9 +74,9 @@ the one thing no case can reach.
 Two of the forty-six system counter labels name the build that wrote the file:
 `Errors: version=… commit=…` (id 15) and `Aeron software: …` (id 34)
 (`aeron-driver/src/main/c/aeron_system_counters.c:46,60`). The reference writes
-`AERON_VERSION_TXT` and its git sha. deepmsg writes `version=1.53.2` — the
+`AERON_VERSION_TXT` and its git sha. deepmsg writes `version=1.54.2` — the
 version whose contracts it implements, and the same version its value field
-packs as `79106` — and `commit=deepmsg-<crate version>`.
+packs as `79362` — and `commit=deepmsg-<crate version>`.
 
 That is a recorded divergence rather than a copy, and it is deliberate: a git
 sha is a fact about a build, the reference's own label changes from build to
@@ -89,7 +89,7 @@ It is also the one divergence here with a **known cost**, and the cost is
 worth stating plainly: `io.aeron.driver.SystemCountersTest::verifySystemCounters`
 asserts every label starts with the Java `SystemCounterDescriptor`'s, and the
 `Errors` descriptor carries the Java build's own `MediaDriverVersion.GIT_SHA` —
-`664f58e705+guilty` for this checkout, dirty marker included. The reference's C
+`481d4271ad+guilty` for this checkout, dirty marker included. The reference's C
 driver passes that assertion because both halves were built from the same tree,
 not because the string is a contract a driver can implement; satisfying it means
 writing down an environment fact. The test therefore stops there for this
@@ -846,7 +846,7 @@ swapped:
 | **this driver** | served — as no tag |
 
 Pinned by `tests/interop/null_tag_channel.rs::the_null_tag_channel_is_one_the_reference_refuses_and_this_driver_serves`
-— the two verdicts read against a real 1.53.2 C driver in the same test, which
+— the two verdicts read against a real 1.54.2 C driver in the same test, which
 is the only place the divergence can be read as one — and, in this build alone,
 by `crates/driver/src/udp_channel.rs::a_null_tag_is_no_tag` and
 `::any_other_negative_tag_is_refused` (only the null value is read this way),
@@ -897,7 +897,7 @@ be falsified.
 | **The two flow-control supplier settings name a strategy, not a symbol to load** | `AERON_MULTICAST_FLOWCONTROL_SUPPLIER` and `AERON_UNICAST_FLOWCONTROL_SUPPLIER` are read and the four names the reference's own table holds are served, **under both the symbol and the short name each entry carries** — `aeron_unicast_flow_control_strategy_supplier`/`unicast_max`, `aeron_max_multicast_flow_control_strategy_supplier`/`multicast_max`, `aeron_min_flow_control_strategy_supplier`/`multicast_min`, `aeron_tagged_flow_control_strategy_supplier`/`multicast_tagged` (`aeron_flow_control.c:43-64`, whose scan takes either, and `aeronmd.h:303-306` for the short ones). The reference `dlsym`s the name, so a *custom* supplier compiles into a driver that loads it; this build has no dynamic loading (ADR-0002) and **refuses** a name it does not know, which is also what the reference does for one its table does not hold (its context init fails and the driver does not start). `crates/driver/src/config.rs::a_flow_control_supplier_is_named_by_its_the_references_symbol`, `crates/driver/src/flowcontrol.rs::Supplier::from_name`. |
 | **A reader is told an image is gone as it leaves DRAINING for LINGER — except when the image was revoked** | The normal path is the reference's: `aeron_driver_conductor_image_transition_to_linger` tells every linked subscription the image is unavailable, and unlinks as it tells (`aeron_driver_conductor.c:1683-1716`), so a reader stops polling a stream that has stopped rather than a linger window later. It was not always: this build used to announce only at release, and `NameReResolutionTest.shouldReResolveMdcDynamicControlOnNotConnected` is what found it — its `while (subscription.isConnected())` after a publication closes waited out the whole linger window and hit the test's own deadline. The two places announce the same message (`crates/driver/src/conductor.rs::announce_image_unavailable`), and the transition is carried from the receiver thread as `ReceiverEvent::ImageLingering` because this build's image state machine runs there rather than on the conductor (`crates/driver/src/publication_image.rs::take_linger_notice`). A **revoked** image is the exception, and stays this build's own divergence: it reaches LINGER without a linger to announce on — its heartbeats already said `REVOKED` and it walks to DONE without waiting (`crates/driver/src/publication_image.rs::a_revoked_image_walks_to_done_without_waiting`) — so it is announced when it is released. The reader sees the same two things, an unavailable image whose `Image.isPublicationRevoked` is true; what differs for a revoked one is that it is told a pass or two later and that the log buffer is freed without a linger. `PublicationRevokeTest`. |
 | **A multicast channel is served without `IP_MULTICAST_LOOP` ever being touched and without a leave-group call** | Both are what the reference does as well — they were looked for and are not there: `IP_MULTICAST_LOOP` appears **nowhere** in the tree, and a group is left by closing the socket rather than by `IP_DROP_MEMBERSHIP` (`aeron-driver/src/main/c/media/aeron_udp_channel_transport.c:408-423`). The kernel's own default of on is what both builds send with, and a group is left when its socket goes. `crates/driver/src/media/udp_transport.rs::two_subscribers_to_one_group_both_hear_what_is_sent_to_it`. |
-| **The two `AERON_LOSS_DETECTOR_NAK_*` names multicast is usually described by are not implemented** | They are **dead macros** in 1.53.2: `AERON_LOSS_DETECTOR_NAK_UNICAST_DELAY_NS` and `AERON_LOSS_DETECTOR_NAK_MULTICAST_MAX_BACKOFF_NS` are definitions with no reader anywhere in the tree (`aeron-driver/src/main/c/aeron_loss_detector.h:61`, `:76`), and both say 60 — sixty milliseconds and sixty million. What a driver actually reads is the context's own pair, where the backoff is **ten** milliseconds and the unicast delay is **one** (`aeron-driver/src/main/c/aeron_driver_context.c:222-225`). This build's constant is that live value, not the macro's: `crates/driver/src/loss_detector.rs::a_channels_nak_delay_becomes_a_static_detector_at_the_ratio` pins the unicast pair, and `::a_groups_delays_are_drawn_and_not_fixed` the multicast scale. |
+| **The two `AERON_LOSS_DETECTOR_NAK_*` names multicast is usually described by are not implemented** | They are **dead macros** in 1.54.2: `AERON_LOSS_DETECTOR_NAK_UNICAST_DELAY_NS` and `AERON_LOSS_DETECTOR_NAK_MULTICAST_MAX_BACKOFF_NS` are definitions with no reader anywhere in the tree (`aeron-driver/src/main/c/aeron_loss_detector.h:61`, `:76`), and both say 60 — sixty milliseconds and sixty million. What a driver actually reads is the context's own pair, where the backoff is **ten** milliseconds and the unicast delay is **one** (`aeron-driver/src/main/c/aeron_driver_context.c:224-225`). This build's constant is that live value, not the macro's: `crates/driver/src/loss_detector.rs::a_channels_nak_delay_becomes_a_static_detector_at_the_ratio` pins the unicast pair, and `::a_groups_delays_are_drawn_and_not_fixed` the multicast scale. |
 | **A `ttl=0` and a channel that named no `ttl` at all are one value** | `aeron_uri_multicast_ttl` answers zero for both (`aeron-client/src/main/c/uri/aeron_uri.c:329-340`) and an endpoint reads zero as "take the driver's default" (`aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:122`), so a channel that writes `ttl=0` meaning "this datagram never leaves the host" gets the driver's hop limit instead. The reference does exactly this; the divergence is only that a reader would not expect it from a parameter that can be written. `crates/driver/src/udp_channel.rs::the_hop_limit_is_read_the_way_strtoull_reads_it`. |
 | **`recvmmsg` is called without a timeout** | The reference passes a zero `timespec`, which the kernel reads as "return after the first datagram" — one syscall per datagram of a burst. This passes `NULL` on a non-blocking socket, which returns everything queued. Same datagrams, fewer syscalls (`aeron_udp_channel_transport.c:581`, `:618`). |
 | **A frame is copied into a scratch buffer before it is sent** | The reference hands `sendmmsg` an iovec pointing into the mapped term. `deepmsg_core::buffer` refuses to mint a `&[u8]` over memory another thread is writing — a false immutability promise is licence for the optimiser to hoist loads — and a syscall taking `&[u8]` is exactly that borrow. `crates/driver/src/network_publication.rs`'s module note. |
@@ -1109,6 +1109,14 @@ The 1.54.2 baseline renamed the cpuset pair and added four settings:
 are not read, as in the reference; the new names are pinned by
 `crates/driver/src/config.rs::tests::the_thread_affinity_socket_and_poller_settings_answer_to_their_reference_names`.
 
+One cap in the same area is kept from 1.53.2 rather than adopted from 1.54.2.
+The reference capped the cpuset at `AERON_TOPOLOGY_MAX_CPU_ID` (8192,
+`aeron_topology.c:30` at 1.53.2); 1.54.2 sizes each table from the highest CPU
+id it is given and has no cap (`aeron_topology.c:183-201`). This build keeps
+the cap — a table at that size is 64 MiB per axis — and refuses a larger
+cpuset instead of allocating one, which is a machine no deployment here has.
+`crates/driver/src/topology.rs::a_cpuset_larger_than_the_tables_is_refused`.
+
 The table is `crates/driver/src/config.rs`, and its tests pin every name; the
 one divergence is recorded there too — the reference warns and clamps a value
 it cannot parse, and this refuses.
@@ -1163,7 +1171,9 @@ and `::the_settings_named_after_an_environment_variable_answer_to_their_property
 the one-datagram control read by
 `crates/driver/src/sys/socket.rs::tests::a_batch_of_one_takes_one_datagram_however_many_are_queued`.
 Both are bounded settings like the rest, so the reference clamps and this
-refuses (`1..=16`), which is the divergence recorded above.
+refuses (`1..=64` since 1.54.2; it was `1..=16`), which is the divergence
+recorded above. `crates/driver/src/config.rs::tests::the_two_io_vector_capacities_answer_to_the_references_names`
+is the test that holds the boundary.
 
 One divergence remains, and it is in the configuration rather than the sender:
 the reference parses `1..=INT32_MAX` and then casts through a `uint8_t`, so

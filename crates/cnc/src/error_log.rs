@@ -529,7 +529,7 @@ mod tests {
 
     #[test]
     fn the_composition_matches_what_the_reference_records() {
-        // Read off a live 1.53.2 driver with `ErrorStat`: an unknown command
+        // Read off a live 1.54.2 driver with `ErrorStat`: an unknown command
         // type is recorded as two lines, the code's own description and then
         // the recording site, and ends with a newline
         // (`aeron_error.c:346-395`).
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn a_positive_code_is_described_by_the_os_and_not_by_the_table() {
-        // Read off a live 1.53.2 driver, which recorded this for a sender
+        // Read off a live 1.54.2 driver, which recorded this for a sender
         // whose MTU did not fit the receiver's window: the receiving side
         // raises `AERON_SET_ERR(EINVAL, …)`, and a **positive** code takes
         // `aeron_err_set`'s other branch — `strerror_r`, not the protocol

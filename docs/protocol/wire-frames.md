@@ -1,7 +1,7 @@
 # The wire: UDP frames
 
 The datagrams a media driver puts on a socket, byte for byte, as Aeron
-**1.53.2** defines them. The authority is
+**1.54.2** defines them. The authority is
 `aeron-client/src/main/c/protocol/aeron_udp_protocol.h` — hand-written C
 structs under `#pragma pack(4)`, **not** SBE, and not generated: the codec in
 `crates/driver/src/protocol.rs` mirrors that header field for field, with a

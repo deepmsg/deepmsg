@@ -159,7 +159,7 @@ fn aeron_stat_lists_the_counters_this_driver_published() {
     assert!(
         label_of(&counters, 34)
             .expect("the Aeron software counter")
-            .starts_with("Aeron software: version=1.53.2 commit=deepmsg-"),
+            .starts_with("Aeron software: version=1.54.2 commit=deepmsg-"),
         "{:?}",
         label_of(&counters, 34)
     );

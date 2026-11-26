@@ -843,7 +843,7 @@ mod tests {
             "-Daeron.archive.control.channel=aeron:udp?endpoint=localhost:8010",
             "-Daeron.dir=/dev/shm/aeron-gavin",
             "-cp",
-            "/home/gavin/trader/aeron/aeron-all/build/libs/aeron-all-1.53.2.jar",
+            "/home/gavin/trader/aeron/aeron-all/build/libs/aeron-all-1.54.2.jar",
             "io.aeron.archive.ArchivingMediaDriver",
         ]
         .iter()

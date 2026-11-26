@@ -281,7 +281,9 @@ fn counter_value(agent: &ConsensusModuleAgent, type_id: i32) -> Option<i64> {
 /// The fifteen counters a consensus module allocates, with the spec P3-1c's
 /// encoders build for them.
 fn expected_counters() -> Vec<(i32, CounterSpec)> {
-    let version = "1.53.2";
+    // `ConsensusModuleVersion.VERSION` at the reference tag — a literal on
+    // purpose, so this test fails if the build's constant drifts.
+    let version = "1.54.2";
     let commit = "deepmsg";
     vec![
         (

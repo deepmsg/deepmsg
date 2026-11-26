@@ -9,7 +9,7 @@
 /// CnC semantic version targeted by this build: `0.2.0`.
 ///
 /// Source of truth: `aeron-client/src/main/c/aeron_cnc_file_descriptor.h:26`
-/// (`AERON_CNC_VERSION`) in the Aeron 1.53.2 reference checkout.
+/// (`AERON_CNC_VERSION`) in the Aeron 1.54.2 reference checkout.
 pub const CNC_SEMANTIC_VERSION: (u8, u8, u8) = (0, 2, 0);
 
 /// Compose a semantic version into the packed representation used in the CnC
@@ -44,11 +44,11 @@ pub const CNC_VERSION: i32 = semantic_version_compose(
 ///
 /// It is the `version=` half of the two system counter labels that carry a
 /// build identity (`aeron-driver/src/main/c/aeron_system_counters.c:46,60`), and
-/// it matches the packed value those counters hold — `1.53.2` as `79106`. The
+/// it matches the packed value those counters hold — `1.54.2` as `79362`. The
 /// reference writes its own `AERON_VERSION_TXT` there; this is the honest
 /// equivalent: the version we are compatible with, which is a claim about the
 /// contracts rather than about our source tree.
-pub const COMPAT_VERSION_TEXT: &str = "1.53.2";
+pub const COMPAT_VERSION_TEXT: &str = "1.54.2";
 
 /// Who wrote a file, in one token: `deepmsg-<crate version>`.
 ///

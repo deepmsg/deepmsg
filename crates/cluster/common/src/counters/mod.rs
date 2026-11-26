@@ -44,6 +44,15 @@ pub const SERVICE_ID_SUFFIX: &str = " serviceId=";
 /// (`ClusterSession.addSessionCounter`, `ClusterSession.java:517-520`).
 pub const SESSION_LABEL_PREFIX: &str = "cluster-session: ";
 
+/// What a versioned cluster counter calls this build.
+///
+/// The reference has one generated class per component —
+/// `ConsensusModuleVersion`, `ClusterBackupVersion` and
+/// `ClusteredServiceContainerVersion` — but all three take their `VERSION`
+/// from the same release tag, so one constant here is the authority and a
+/// baseline bump has a single place to move.
+pub const VERSION: &str = "1.54.2";
+
 // ---------------------------------------------------------------------------
 // Type ids — `AeronCounters.java:860-1106`.
 //

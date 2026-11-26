@@ -5485,7 +5485,7 @@ mod tests {
         let observer = cnc.counters().expect("the counter regions");
         assert_eq!(46, observer.for_each(|_| {}).allocated);
         assert_eq!(
-            Some(79_106),
+            Some(79_362),
             observer.value(34),
             "the Aeron version this build implements"
         );

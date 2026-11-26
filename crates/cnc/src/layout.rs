@@ -7,7 +7,7 @@
 //! possible enforcement of "every byte-level claim cites a reference source":
 //! the claim becomes executable and a drift becomes a build failure.
 //!
-//! All values are from Aeron 1.53.2 (commit `664f58e705`).
+//! All values are from Aeron 1.54.2 (commit `481d4271ad`).
 
 /// Cache line size, and a **byte contract rather than an optimisation
 /// target**.

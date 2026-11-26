@@ -32,8 +32,10 @@ use crate::error::ContainerError;
 /// How long a counter allocation may take before the driver is called silent.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// What this build calls itself in the versioned counter labels.
-pub const VERSION: &str = "1.53.2";
+/// What this build calls itself in the versioned counter labels. It is the
+/// cluster's one version constant — the CM, the backup and this container all
+/// take it from the same reference tag.
+pub const VERSION: &str = counters::VERSION;
 
 /// The commit marker the consensus module's counters carry, for the same reason.
 pub const COMMIT_HASH: &str = "deepmsg";

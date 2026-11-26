@@ -8,7 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [features]
-# Tests that require the reference C driver from the Aeron 1.53.2 checkout
+# Tests that require the reference C driver from the Aeron 1.54.2 checkout
 # (see docs/reference.md for the expected sibling-directory layout).
 interop = []
 # Tests in which *this* build's driver runs on the DPDK media, which is a

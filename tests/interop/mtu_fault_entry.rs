@@ -110,7 +110,7 @@ fn both_drivers_record_the_same_entry_for_an_mtu_the_window_cannot_carry() {
         entry_for(reference.aeron_dir()).expect("the reference records the refusal")
     };
 
-    // The reference's own entry, spelled out — read off a live 1.53.2 driver
+    // The reference's own entry, spelled out — read off a live 1.54.2 driver
     // and pinned here so that a change to *either* side shows up as a failure
     // of this test rather than as agreement between two wrong numbers.
     assert_eq!(

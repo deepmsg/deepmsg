@@ -4600,7 +4600,12 @@ fn allocate_counters(
     let error = allocate(
         client,
         CLUSTER_CONSENSUS_MODULE_ERROR_COUNT_TYPE_ID,
-        counters::versioned_cluster_counter("Cluster Errors", cluster_id, "1.53.2", "deepmsg")?,
+        counters::versioned_cluster_counter(
+            "Cluster Errors",
+            cluster_id,
+            counters::VERSION,
+            "deepmsg",
+        )?,
     )?;
 
     let module_state = allocate(
@@ -5546,7 +5551,7 @@ struct AgentServiceHandler<'a> {
     /// after the poll because it needs the archive and the recording log.
     deferred_termination: Option<i64>,
     /// A `QUITTING` ack: `closeAndTerminate()`, after the poll. Nothing in
-    /// 1.53.2 sets `QUITTING` (`ConsensusModule.java:171`), so this branch is
+    /// 1.54.2 sets `QUITTING` (`ConsensusModule.java:171`), so this branch is
     /// transcribed and unreachable, as in the reference.
     deferred_close: bool,
 }

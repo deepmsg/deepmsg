@@ -4,12 +4,12 @@
 
 | Path | What it is | Used for |
 |---|---|---|
-| `../aeron` | Aeron 1.53.2 (C client + driver sources, Java archive + cluster) | source of truth for every byte-level decision |
+| `../aeron` | Aeron 1.54.2 (C client + driver sources, Java archive + cluster) | source of truth for every byte-level decision |
 | `../aeron-rs` | UnitedTraders pure-Rust client (CnC 0.0.16 era, compat ceiling ~1.44) | prior art; also a catalogue of pitfalls to avoid |
 | `../aeron-deepmsg` | our fork of the same Aeron (`github.com/deepmsg/aeron`), branch `deepmsg-tests` | the C and Java *this* suite runs — see below |
 
-`../aeron` is **frozen** at `664f58e705`: it is the tree things are *built* against, and
-the headers, `libaeron` and `aeron-all-1.53.2.jar` come from it. The two **test-side
+`../aeron` is **frozen** at `481d4271ad`: it is the tree things are *built* against, and
+the headers, `libaeron` and `aeron-all-1.54.2.jar` come from it. The two **test-side
 holds** the archive suite is run with are a local modification of it rather than a fork
 of it, and their authoritative copy is the fork's branch
 `fix/the-drop-wait-races-the-flood` — which is what `deepmsg-tests` is based on.
@@ -18,7 +18,7 @@ of it, and their authoritative copy is the fork's branch
 
 Three of the probes the interop suite runs are **C** programs linked against the
 reference's own `libaeron`, three are **Java** programs compiled against
-`aeron-all-1.53.2.jar`, and four are the generators that produce the committed
+`aeron-all-1.54.2.jar`, and four are the generators that produce the committed
 fixtures under `tests/fixtures/`. None of them is in this repository: this is a Rust
 workspace, and a `.c` or `.java` file in it would be a file no gate here compiles.
 
@@ -48,7 +48,7 @@ driver process, so it needs a built `aeronmd`:
     ../aeron/cppbuild/Release/binaries/aeronmd
 
 `DEEPMSG_REF_AERONMD` overrides that path. The harness refuses a binary whose
-`-v` output does not name Aeron 1.53.2 at `664f58e705`, which turns "the wrong
+`-v` output does not name Aeron 1.54.2 at `481d4271ad`, which turns "the wrong
 driver is on `PATH`" into a clear message rather than a confusing decode
 failure deep inside a test.
 

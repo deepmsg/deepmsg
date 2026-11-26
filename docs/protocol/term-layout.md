@@ -5,7 +5,7 @@ descriptor a producer writes into the terms. It is the second file the driver
 and its clients share, after the CnC file, and like that one it has no
 specification — the bytes are the contract.
 
-Baseline: Aeron **1.53.2**, commit `664f58e705`. The authority for the
+Baseline: Aeron **1.54.2**, commit `481d4271ad`. The authority for the
 metadata struct is `aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h:42-88`,
 for the file's length `:105-111`, and for the frame descriptor
 `aeron-client/src/main/c/protocol/aeron_udp_protocol.h:23-62`. The

@@ -2,7 +2,7 @@
 //! datagram.
 //!
 //! Mirrors `aeron-client/src/main/c/protocol/aeron_udp_protocol.h`, and the
-//! layout written here is **Aeron 1.53.2's** — the version this driver is
+//! layout written here is **Aeron 1.54.2's** — the version this driver is
 //! byte-compatible with. A later reference that moves a field moves the wire,
 //! and this module moves with it.
 //!

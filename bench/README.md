@@ -183,6 +183,13 @@ fingerprint because it is part of what the machine was, and neither batch reads
 anything out of it: a batch touches the harness (two patches) and the fork, and
 leaves the reference alone.
 
+The `:line` citations under `crates/bench` that name `LoadTestRig.java`,
+`EchoNode.java`, `PersistedHistogram.java` and their kin are **not** Aeron
+citations: they are against the `aeron-io/benchmarks` harness, pinned at
+`1b11bfc` in `lib/checkouts.sh`, and they do not move when the Aeron baseline
+does. This track stays at Aeron 1.53.2 so its numbers remain comparable to the
+ones already taken; the build itself moved to 1.54.2.
+
 ## The rules every cell keeps
 
 Four, all of them paid for once already (`lib/cell.sh`):

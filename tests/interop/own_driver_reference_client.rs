@@ -211,7 +211,7 @@ fn the_reference_client_publishes_to_our_driver_and_reads_it_back() {
     // driver wrote into the log's metadata template and sent in
     // `ON_AVAILABLE_IMAGE` — three places that have to agree for this line to
     // be well formed at all. The digits are taken rather than the whole field:
-    // the installed sample's format string is not the one in the 1.53.2 source
+    // the installed sample's format string is not the one in the 1.54.2 source
     // (`from session 123(14@0)` against `from session 123 (14 bytes)`), which
     // is itself worth knowing — the reference's sample binaries are built from
     // whatever revision last built them, and `docs/reference.md` says so.

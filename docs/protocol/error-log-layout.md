@@ -34,7 +34,7 @@ composition `AERON_SET_ERR` left in the thread's error buffer (`aeron_err_set`,
   `(22) Invalid argument`, where the table's nearest answer would be wrong in
   the one place a reader looks.
 - `<line>` is the line bearing the `AERON_SET_ERR` itself — the macro name's
-  line, not a closing paren. Pinned empirically against a live 1.53.2 driver:
+  line, not a closing paren. Pinned empirically against a live 1.54.2 driver:
   unknown commands report `aeron_driver_conductor.c:3316`, malformed ones
   `:3308`, and the storage warning `aeron_driver_context.c:1414`.
 - The composition ends in `\n`, and a long one is cut at byte 8186:
