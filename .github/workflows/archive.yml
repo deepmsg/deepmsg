@@ -30,9 +30,11 @@ name: archive
 # recorded set says which ones are not:
 #
 # The reference is checked out at its **released tag**, with none of the local
-# test-side fixes a development machine carries. Measured on the development
-# machine by holding those fixes out (`analysis/archive/deepmsg-p2-9d-plan-ci.md`
-# §4): **302 passed, 4 failed**, and the four are the same four the fixes are for —
+# test-side fixes a development machine carries. On **1.53.2** the measured set
+# was `analysis/archive/deepmsg-p2-9d-plan-ci.md` §4: **302 passed, 4 failed**.
+# On **1.54.2** (2026-11-26) the same pristine tree is **317/317 passed**,
+# including all four, so `RECORDED` is empty and the four below are history.
+# The 1.53.2 four were the same four the fixes were for —
 # the persistent-subscription suite's drop waits race the flood that is meant to
 # over-run them, on a driver whose over-run gate follows the subscriber's *read*
 # position (`aeron_publication_image.c:983`):
@@ -59,8 +61,9 @@ name: archive
 # again), and this build's client does that now too. Pinned by
 # `tests/integration/connect_window.rs`.
 #
-# The four below are the reference's own, and they are shown exactly as they are;
+# On 1.53.2 the four below were the reference's own, shown exactly as they were;
 # the report is `analysis/fix/upstream-issue-drop-wait-races-the-flood.md`.
+# None of them fails on 1.54.2.
 #
 # ★ **The three after them are the reference's test racing itself**, in the same
 # file. `shouldCloseCleanlyInDifferentStates` first drives a persistent
@@ -83,15 +86,13 @@ name: archive
 # the job. If one of them ever fails with anything *other* than that timeout,
 # that is a different failure and this note does not cover it.
 #
-# ★ What that is **not** is a list of failures to ignore. The job asserts that the
-# failing set is **exactly** the recorded four, plus whatever of the three
-# flaky ones happened to lose their race: a failure outside both sets fails the
-# job, and so does one of the four starting to pass, because that would mean the
-# baseline moved and the note above is now wrong. A flaky one that does fail is
-# held to its message — `timed out waiting for 'reaches close state` — so a
-# different failure of the same case is still red. That is what the four buy: a
-# check that is green when nothing has changed and red when anything has, not a
-# check nobody reads.
+# ★ What that is **not** is a list of failures to ignore. On 1.53.2 the job
+# asserted that the failing set was **exactly** the recorded four, plus whatever
+# of the three flaky ones happened to lose their race. On 1.54.2 the recorded
+# set is empty, so **any** failure is this build's; the three flaky cases are
+# still allowed to lose their race, and a different failure of one of them is
+# still red. That is what the ledger buys: a check that is green when nothing
+# has changed and red when anything has, not a check nobody reads.
 
 on:
   pull_request:
@@ -217,22 +218,19 @@ jobs:
             archive-suite-table.md
           if-no-files-found: ignore
 
-      # ★ The baseline, pinned. The four are the reference's own drop-wait races
-      # (the header names them and `analysis/fix/upstream-issue-drop-wait-races-the-flood.md`
-      # is the report); anything outside them is this build's.
+      # ★ The baseline, pinned. On 1.54.2 the four drop-wait races that were
+      # red on 1.53.2 all pass (317/317, 2026-11-26); the set is empty until a
+      # case is observed red again. Anything outside it — or outside FLAKY — is
+      # this build's.
       - name: The failing set is the recorded one
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          # Red on every run, on the reference's released tag.
-          RECORDED = {
-              # The reference's own drop-wait races.
-              "AeronArchivePersistentSubscriptionTest.canFallbackToReplayAfterStartingFromLive",
-              "AeronArchivePersistentSubscriptionTest.cannotFallbackToReplayWhenRecordingHasBeenRemoved",
-              "AeronArchivePersistentSubscriptionTest.shouldDropFromLiveBackToReplayThenJoinLiveAgain",
-              "PersistentSubscriptionWrapperTest.shouldCycleThroughMultipleLiveReplayTransitions",
-          }
+          # Empty on 1.54.2. The four cases removed here were the reference's
+          # own drop-wait races; see
+          # `analysis/fix/upstream-issue-drop-wait-races-the-flood.md`.
+          RECORDED = set()
 
           # May fail, and may pass: the reference's test racing its own
           # observation (see the note above). Recorded rather than left to
