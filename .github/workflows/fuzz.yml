@@ -7,11 +7,21 @@ name: fuzz
 #   frozen crash bytes, and that every target compiles.
 # - `smoke`: nightly, on a schedule or by hand. One minute per target under
 #   libFuzzer + the sanitizer; a crash fails the job and uploads its artifact.
+#
+# The smoke's corpus survives from one night to the next through the Actions
+# cache: libFuzzer only keeps inputs that add coverage, so a cached corpus
+# lets the next sixty seconds explore past what has already been found
+# instead of re-finding it. The key carries the run id and attempt (a rerun
+# reuses the run id and cannot overwrite an existing cache), and the restore
+# prefix takes the most recent one. The job logs the corpus size before and
+# after every run; no `cmin` is applied yet, so those lines are the reading
+# for the two-week size observation.
 
 on:
   pull_request:
     paths:
       - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -48,8 +58,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
+      - name: Restore the corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fuzz-corpus-
       - name: Seed the corpora
         run: ./fuzz/corpus_seed/seed_from_fixtures.sh
+      - name: Corpus size before
+        run: |
+          du -sh fuzz/corpus || echo "fuzz/corpus: 0 (nothing restored)"
+          du -sb fuzz/corpus || true
       - name: Every target, sixty seconds
         run: |
           cd fuzz
@@ -57,8 +78,24 @@ jobs:
             echo "::group::$target"
             cargo +nightly fuzz run "$target" "corpus/$target" -- \
               -max_total_time=60 -timeout=2 -rss_limit_mb=2048 || exit 1
+            echo "$target: $(du -sh "corpus/$target" | cut -f1) / $(du -sb "corpus/$target" | cut -f1) bytes"
             echo "::endgroup::"
           done
+      - name: Save the corpus
+        # A crash must not throw away the inputs the earlier targets found;
+        # and a cache failure is not a fuzz failure, so the job stays green.
+        if: always() && hashFiles('fuzz/corpus/**') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Corpus size after
+        if: always()
+        run: |
+          du -sh fuzz/corpus || true
+          du -sb fuzz/corpus || true
+          du -sh fuzz/corpus/* 2>/dev/null | sort -h || true
       - name: Keep what crashed
         if: failure()
         uses: actions/upload-artifact@v4

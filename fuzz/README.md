@@ -69,6 +69,10 @@ directory. Two tiers:
     # nightly smoke: every target for 60 s
     ../just fuzz-smoke
 
+The scheduled smoke keeps `fuzz/corpus/` in the Actions cache between nights
+(`.github/workflows/fuzz.yml`), so each run starts from what the previous one
+found; the job prints the corpus size before and after each target.
+
 `fuzz/Cargo.lock` is committed; the path dependencies are the root crates, so
 there is no second copy of anything.
 
