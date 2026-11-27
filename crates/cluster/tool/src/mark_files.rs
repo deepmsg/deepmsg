@@ -247,7 +247,7 @@ pub fn header_line(mark_file: &ClusterMarkFile) -> String {
     )
 }
 
-/// `CommonContext.printErrorLog` (`CommonContext.java:1227-1257`).
+/// `CommonContext.printErrorLog` (`CommonContext.java:1274-1304`).
 pub fn print_error_log(out: &mut dyn Write, reader: &ErrorLogReader<'_>) -> io::Result<()> {
     if !reader.has_entries() {
         write!(out, "\n0 distinct errors observed\n")?;

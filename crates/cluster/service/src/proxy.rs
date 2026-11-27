@@ -808,7 +808,7 @@ mod tests {
         assert_eq!(u16_at(bytes, 0), SESSION_MESSAGE_HEADER_BLOCK_LENGTH);
         assert_eq!(u16_at(bytes, 2), 1, "SessionMessageHeader's template id");
         assert_eq!(u16_at(bytes, 4), 111, "schema 111");
-        assert_eq!(u16_at(bytes, 6), 17, "schema version");
+        assert_eq!(u16_at(bytes, 6), 18, "schema version");
         assert_eq!(i64_at(bytes, 8), 7);
         assert_eq!(i64_at(bytes, 16), 42);
         assert_eq!(i64_at(bytes, 24), 99);

@@ -4,7 +4,7 @@
 //! # What is judged here
 //!
 //! `shouldReplayOverConfiguredChannel` — the reference's case
-//! (`…_persistent_subscription_test.cpp:1997`), which is a table of fourteen:
+//! (`…_persistent_subscription_test.cpp:1999`), which is a table of fourteen:
 //! six replay channels of the ordinary shapes, and eight that carry
 //! `control-mode=response`. Every cell is the same run:
 //!
@@ -17,8 +17,8 @@
 //!
 //! A replay channel that says `control-mode=response` is asked for over a
 //! publication the **client** makes on the archive's control request channel
-//! (`:1602-1657`), and is addressed by a **replay token** the archive hands out
-//! (`:1729-1817`). Those four states, the publication, the proxy over it and the
+//! (`:1604-1659`), and is addressed by a **replay token** the archive hands out
+//! (`:1731-1819`). Those four states, the publication, the proxy over it and the
 //! token are what this commit adds; the six ordinary cells are here because the
 //! same run has to keep working for them.
 //!
@@ -26,9 +26,9 @@
 //!
 //! Three of them:
 //!
-//! * cells 13 and 14 (`:1993-1994`) — both control channels on IPC, the answer
+//! * cells 13 and 14 (`:1995-1996`) — both control channels on IPC, the answer
 //!   and the replay over `aeron:ipc?control-mode=response`;
-//! * cell 7 (`:1987`) — the archive listening for control requests on the
+//! * cell 7 (`:1989`) — the archive listening for control requests on the
 //!   **fixed** UDP endpoint `localhost:8010`, the client answered on a UDP
 //!   response channel of its own, and the replay coming back on a third.
 //!
@@ -44,7 +44,7 @@
 //!   `session-id=4`, `endpoint=localhost:5006`, `endpoint=localhost:0` — which
 //!   is the same fact the reference's own classification encodes: for a
 //!   response channel the endpoint and the session are the archive's to name,
-//!   not the caller's (`:1037-1040`).
+//!   not the caller's (`:1039-1042`).
 //!
 //! ★ Fixed ports are why cell 7 is one test of its own rather than six: this
 //! build's fixture starts one archiving media driver **per test** and `cargo
@@ -76,12 +76,12 @@ use deepmsg_tests::temp::TempDir;
 
 /// The stream that is recorded: the subscription's live stream has to be this
 /// one, because a descriptor whose stream differs from the configured live
-/// stream is refused (`:1204`).
+/// stream is refused (`:1270`).
 const LIVE_CHANNEL: &str = "aeron:ipc?alias=ps-configured-live";
 const LIVE_STREAM_ID: i32 = 4228;
 
 /// The reference's own response-channel replay channel for the IPC cells
-/// (`…_persistent_subscription_test.cpp:1993-1994`).
+/// (`…_persistent_subscription_test.cpp:1995-1996`).
 ///
 /// Its stream id is `-11` there too — **negative on purpose**, and the same
 /// stream id every one of the reference's response-channel cells uses. Nothing
@@ -92,12 +92,12 @@ const RESPONSE_REPLAY_STREAM_ID: i32 = -11;
 
 /// The reference's IPC cells put **both** control channels on IPC, with the
 /// answer coming back over a `control-mode=response` channel
-/// (`:1993-1994`).
+/// (`:1995-1996`).
 const CONTROL_REQUEST_IPC: &str = "aeron:ipc";
 const CONTROL_RESPONSE_IPC: &str = "aeron:ipc?control-mode=response";
 
 /// The reference's UDP cells (`…_persistent_subscription_test.cpp:53-54`,
-/// `:1987-1992`): the archive listens for control requests on a **fixed**
+/// `:1989-1994`): the archive listens for control requests on a **fixed**
 /// endpoint, the client asks to be answered on a response channel of its own,
 /// and the replay comes back over a third one.
 ///
@@ -238,7 +238,7 @@ impl Source {
 
 /// The reference's cell 13: the replay comes back over an IPC **response
 /// channel**, and the request that asks for it goes out over a publication this
-/// client made (`…_persistent_subscription_test.cpp:1993`).
+/// client made (`…_persistent_subscription_test.cpp:1995`).
 #[test]
 fn a_replay_over_an_ipc_response_channel() {
     replay_over_configured_channel(
@@ -251,7 +251,7 @@ fn a_replay_over_an_ipc_response_channel() {
 }
 
 /// The same, with the replay channel naming a session
-/// (`…_persistent_subscription_test.cpp:1994`) — which for a response channel is
+/// (`…_persistent_subscription_test.cpp:1996`) — which for a response channel is
 /// a parameter the archive's answer overrides, not a channel to subscript to by
 /// hand.
 #[test]
@@ -267,7 +267,7 @@ fn a_replay_over_an_ipc_response_channel_that_names_a_session() {
 
 /// The reference's cells 7–12: the same response-channel machinery, with the
 /// archive's control channel on UDP and the replay coming back on a UDP
-/// response channel (`…_persistent_subscription_test.cpp:1987-1992`).
+/// response channel (`…_persistent_subscription_test.cpp:1989-1994`).
 ///
 /// One test and not six because the endpoint is fixed: these cells exist to
 /// exercise the **transport**, and a fixture that renamed the port per cell

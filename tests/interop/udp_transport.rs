@@ -88,7 +88,7 @@ fn counters_of(cnc: &deepmsg_cnc::CncFile) -> String {
             descriptor.counter_id, descriptor.label
         ));
         // The system counters a UDP publication moves, by their reference
-        // names (`aeron-driver/src/main/c/aeron_system_counters.c:24-71`).
+        // names (`aeron-driver/src/main/c/aeron_system_counters.c:29-76`).
         let named = match descriptor.counter_id {
             0 => "bytes sent",
             1 => "bytes received",
@@ -340,7 +340,7 @@ fn a_withheld_frame_is_retransmitted_until_the_reference_subscriber_has_it() {
     // One data frame in every four is withheld. The count is over frames and
     // the slot is the reference's, so the SETUP and heartbeat frames that go
     // the same way are counted with the data frames
-    // (`media/aeron_send_channel_endpoint.c:391-403`, which is also where the
+    // (`media/aeron_send_channel_endpoint.c:384-396`, which is also where the
     // reference's own generator is consulted).
     let Some(mut own) = OwnDriver::start_with(
         "udp-our-lossy-publisher",
@@ -984,7 +984,7 @@ fn two_of_our_clients_talk_over_udp_and_both_channels_report_active() {
 /// buffer is.
 ///
 /// The reference answers both of its paths with `publication->log_file_name`
-/// (`aeron_driver_conductor.c:4195-4196` is the shared one — the link path,
+/// (`aeron_driver_conductor.c:4292-4293` is the shared one — the link path,
 /// reached by a second caller rather than by a new publication). Answering with
 /// nothing is not a smaller thing to say: `ON_PUBLICATION_READY`'s tail *is* the
 /// name, so a client given an empty one has no buffer to map and cannot offer
@@ -1027,11 +1027,11 @@ fn a_second_publication_on_a_channel_is_answered_with_the_buffer_they_share() {
 
     // Two handles on **one** publication, which is what the reference's reply
     // carries two ids for (`aeron_publication_buffers_ready_t`,
-    // `aeron_driver_conductor.c:2387-2388`): the `correlation_id` of the add
+    // `aeron_driver_conductor.c:2450-2451`): the `correlation_id` of the add
     // being answered — the handle a client removes by, and the one the C client
-    // keeps as `resource->registration_id` (`aeron_client_conductor.c:332`) —
+    // keeps as `resource->registration_id` (`aeron_client_conductor.c:366`) —
     // and the publication's own `registration_id`, which is what the *log
-    // buffer* is keyed by (`:385`) and what every client on the channel shares.
+    // buffer* is keyed by (`:419`) and what every client on the channel shares.
     assert_ne!(
         first, second,
         "each add is its own handle, though both are one publication"
@@ -1086,7 +1086,7 @@ fn a_second_publication_on_a_channel_is_answered_with_the_buffer_they_share() {
 /// The arrangement is three subscriptions on one image — one that keeps up and
 /// one that stalls — because **"behind" is relative to the fastest reader**
 /// (`untethered_window_limit = (max_sub_pos - window) + window / 4`,
-/// `aeron_publication_image.c:1199-1215`), so a lone subscriber is never put
+/// `aeron_publication_image.c:1204-1220`), so a lone subscriber is never put
 /// aside however slowly it reads. One reader that keeps up is what makes the
 /// other late at all.
 ///
@@ -1101,7 +1101,7 @@ fn a_second_publication_on_a_channel_is_answered_with_the_buffer_they_share() {
 /// `aeron_driver_conductor.c:334-346` — probed against a live reference driver,
 /// which answers with the same `option conflicts with existing subscription:
 /// rejoin=false` this build does), and every position takes the value the image
-/// was created with (`aeron_publication_image.c:279`). An earlier version of
+/// was created with (`aeron_publication_image.c:284`). An earlier version of
 /// this test had the two readers differ on it, and passed only because this
 /// build did not check.
 struct Untethered {
@@ -1123,7 +1123,7 @@ impl Untethered {
     fn stall(rejoin: bool, port_offset: u16, name: &str) -> Option<Self> {
         // The three stage timeouts are the driver's, not the channel's — and that
         // is not a shortcut: the image reads them from the **endpoint's** URI
-        // (`aeron_publication_image.c:243`, `aeron_driver_uri_subscription_params`,
+        // (`aeron_publication_image.c:248`, `aeron_driver_uri_subscription_params`,
         // which starts from the context's defaults), so a subscription that names
         // them on a channel another subscription already created an endpoint for
         // is naming them at nobody. Configuring the driver is what the image
@@ -1136,7 +1136,7 @@ impl Untethered {
                 "-Daeron.untethered.resting.timeout=200ms",
                 // The window the machine measures a reader's lag against — three
                 // quarters of it before a reader is late
-                // (`aeron_publication_image.c:1180-1181`). The 128 KiB default takes
+                // (`aeron_publication_image.c:1185-1186`). The 128 KiB default takes
                 // a hundred-odd round trips through the reference driver to fill;
                 // eight kibibytes is the same test with one.
                 "-Daeron.rcv.initial.window.length=8k",
@@ -1600,7 +1600,7 @@ fn counter_like(cnc: &deepmsg_cnc::CncFile, needle: &str) -> Option<(i32, i32, i
 /// `rcv-naks-sent` is how a client sees whether its own stream is being asked to
 /// retransmit, and it is a counter of the image beside `rcv-hwm` and `rcv-pos`:
 /// the reference allocates all three together and hands each the subscribing
-/// client's id (`aeron_driver_conductor.c:6650`, `:6665`, `:6680-6683`). A
+/// client's id (`aeron_driver_conductor.c:6743`, `:6758`, `:6773-6776`). A
 /// counter born without an owner is one a tool that groups counters by owner —
 /// or reclaims them when a client goes — files under the driver rather than
 /// under the client that reads it.
@@ -1776,7 +1776,7 @@ fn a_receiver_that_restarts_is_answered_with_a_setup() {
     // that restarts has to be answered *and* has to go on reading from where
     // the stream is — an image whose position counters start at zero is owed
     // everything from the beginning, and the beginning is not there any more
-    // (`aeron_publication_image.c:391-392`).
+    // (`aeron_publication_image.c:396-397`).
     assert!(
         !after_restart.is_empty(),
         "a subscriber that restarted asked for a `SETUP` and then read nothing.\n\
@@ -1898,7 +1898,7 @@ fn reference_message_number(payload: &[u8]) -> Option<i64> {
 ///
 /// An image is born at the position its `SETUP` describes, and the reference
 /// seeds its two position counters with that position the moment it builds one
-/// (`aeron_publication_image.c:391-392`). A receiver whose counters start at
+/// (`aeron_publication_image.c:396-397`). A receiver whose counters start at
 /// zero is owed everything from the beginning of a stream that has been reused
 /// many times over, and a subscription that links to an image begins reading at
 /// `rcv-pos` (`aeron_publication_image.h:376-396`) — so a late subscriber
@@ -2068,7 +2068,7 @@ fn a_late_subscriber_meets_a_reference_publisher_where_the_stream_is() {
         matches!(rcv_pos, Some(position) if position > 0)
             && matches!(sub_pos, Some(position) if position > 0),
         "an image built from a `SETUP` naming a position must take that position, not zero \
-         (`aeron_publication_image.c:391-392`).\n{evidence}"
+         (`aeron_publication_image.c:396-397`).\n{evidence}"
     );
 }
 

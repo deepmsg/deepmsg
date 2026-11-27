@@ -5,7 +5,7 @@ Two artifacts, because they have two lifetimes:
 
 * **the ledger** (`reference-java-cases.tsv`) — the denominator, pinned. It is
   the set of case names the reference's *Java* archive suite runs at
-  `664f58e705`, and it exists so that "we ran the whole suite" is a fact about
+  `481d4271ad`, and it exists so that "we ran the whole suite" is a fact about
   a name set rather than a count (review E-3, the same lesson the C suite's
   `reference-cases.tsv` already carries). It is committed.
 * **the result** — one row per case per run, with the outcome and the

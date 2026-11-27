@@ -29,7 +29,7 @@
 //! 1. **The destination is what binds.** A manual channel has no socket until a
 //!    destination arrives; if the destination binds anywhere but the address
 //!    its URI names — `remote_data`, the same field the reference's receive
-//!    port manager is handed (`media/aeron_receive_destination.c:55-63`) —
+//!    port manager is handed (`media/aeron_receive_destination.c:60-68`) —
 //!    then the publisher's frames land nowhere and not one message arrives.
 //! 2. **A session can come into being on a destination's socket.** The `SETUP`
 //!    that describes the stream arrives on the destination's transport, not on
@@ -40,7 +40,7 @@
 //! worth stating because the obvious answer is wrong. The destination names no
 //! `control=`, so `has_explicit_control` is false and the receiver sends
 //! **nothing** when the destination is added
-//! (`aeron_receive_channel_endpoint.c:1136-1156`, which is a no-op without it).
+//! (`aeron_receive_channel_endpoint.c:1141-1161`, which is a no-op without it).
 //! No `SEND_SETUP` is ever sent — the first frame on the wire is the
 //! publisher's own, because a publication with no initial connection sends a
 //! `SETUP` to its endpoint address on a timer
@@ -67,7 +67,7 @@ use deepmsg_tests::samples;
 const STREAM_ID: i32 = 4104;
 
 /// The channel a destination can be added to at all
-/// (`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:147-151`).
+/// (`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:153-157`).
 ///
 /// It names no `endpoint`, as the reference's own MDS test does not
 /// (`aeron-driver/src/test/c/aeron_c_multi_destination_test.cpp:32`): there is
@@ -565,7 +565,7 @@ fn our_publications_destinations_reach_two_reference_subscribers() {
     // `SETUP → :28502` on its own, then the first `DATA` to both destinations,
     // and only *then* a `SEND_SETUP` from :28503 — the second subscriber
     // eliciting a `SETUP` for a session it is receiving data for and knows
-    // nothing about (`aeron_data_packet_dispatcher.c:616-659`).
+    // nothing about (`aeron_data_packet_dispatcher.c:621-664`).
     //
     // That is the protocol working, not a defect: a destination added to a
     // publication that is already connected joins **mid-stream**, through the
@@ -895,7 +895,7 @@ fn aeron_stat_text(stat_binary: &Path, dir: &Path) -> Result<String, String> {
 /// send socket was bound, as another program reads it.
 ///
 /// The label is `snd-local-sockaddr: <channel status id> <ip:port>`
-/// (`aeron_position.c:295-297`).
+/// (`aeron_position.c:300-302`).
 fn send_local_sockaddr(stat_binary: &Path, dir: &Path) -> Result<String, String> {
     let text = aeron_stat_text(stat_binary, dir)?;
 
@@ -1099,7 +1099,7 @@ fn await_mdc_num_dest(
 /// The publication **binds** the control address (`control=localhost:C`) and
 /// has no destination at all until something talks to it; the subscriber binds
 /// its own endpoint `P` and sends its control messages *to C*
-/// (`aeron_udp_channel.c:465-487`: a channel that names a `control=` sends its
+/// (`aeron_udp_channel.c:486-508`: a channel that names a `control=` sends its
 /// control frames there). So the subscriber speaks first — the same shape as a
 /// destination with an explicit control address — and the publication learns
 /// where to send data from the **source** of what arrived

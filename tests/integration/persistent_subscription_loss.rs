@@ -3,14 +3,14 @@
 //! # What is judged here
 //!
 //! `shouldCatchupLiveGapDuringAttemptSwitchWithReplayLoss` — the reference's case
-//! (`…_persistent_subscription_resilience_test.cpp:2946`) — which is the one the
+//! (`…_persistent_subscription_resilience_test.cpp:2949`) — which is the one the
 //! fourth commit **measured** as unreachable from this build's own tests.
 //!
 //! The machine has two ways through `ATTEMPT_SWITCH`, and until now every case
 //! this slice wrote took the short one. When the live stream is **idle** at the
 //! moment the subscription joins it, the live image's position and the replay's
-//! are equal and the switch is immediate (`:2072-2074`); the two catch-up
-//! handlers that align a live stream already **ahead** (`:2002-2058`) never run.
+//! are equal and the switch is immediate (`:2075-2077`); the two catch-up
+//! handlers that align a live stream already **ahead** (`:2005-2061`) never run.
 //! The fourth commit said so from the other side: mutating the live probe's
 //! `ABORT` to `Continue` left all four of its cells green, which is what a test
 //! that never reaches the code under it looks like.
@@ -29,7 +29,7 @@
 //! assertion is not "it became live", which the short path also gives, but "a
 //! difference was measured", which only the alignment can say. The reference's
 //! own case asserts the same thing for the same reason
-//! (`:3004-3007`, and its comment on why the snapshot is taken inside the
+//! (`:3007-3010`, and its comment on why the snapshot is taken inside the
 //! callback rather than read after: the value is reset when the catch-up
 //! finishes).
 //!
@@ -93,13 +93,13 @@ const REPLAY_CHANNEL: &str = "aeron:udp?endpoint=localhost:0";
 const REPLAY_STREAM_ID: i32 = 4239;
 
 /// What the recording holds before the subscription exists — the reference's
-/// five (`:2960`).
+/// five (`:3144`).
 const REPLAYED: usize = 5;
 
 /// The **most** this case will write to the live stream while the switch is
 /// happening, and an upper bound rather than a count: the loop stops when the
 /// subscription goes live, which in practice is after twenty or so. The
-/// reference writes a fixed fifty and then waits (`:2996-3002`); see the note on
+/// reference writes a fixed fifty and then waits (`:3180-3186`); see the note on
 /// the loop for why that shape cannot be deterministic here.
 const AT_MOST_PUBLISHED_DURING_REPLAY: usize = 200;
 
@@ -110,7 +110,7 @@ const MESSAGE_LENGTH: usize = 1024;
 
 /// The rule the driver is started with: one replay frame in every two.
 ///
-/// The reference asks for 50% (`configure_drop_rate(0.5)`, `:2983`), which is
+/// The reference asks for 50% (`configure_drop_rate(0.5)`, `:2986`), which is
 /// the same share; this build spells a rate as a count (`docs/compat.md`).
 const LOSS_RULE: &str = "-Ddeepmsg.debug.receive.data.loss.stream.id=4239";
 const LOSS_RATE: &str = "-Ddeepmsg.debug.receive.data.loss.every=2";
@@ -154,7 +154,7 @@ impl SubscriptionListener for SharedJoins {
         // the subscription by the test instead. The reference snapshots it inside
         // this callback because it then polls `join_difference()` after an
         // unbounded wait, by which time the catch-up has finished and the value
-        // has been reset (`:3005-3007`); here the test reads it the instant
+        // has been reset (`:3189-3191`); here the test reads it the instant
         // `is_live()` holds, which is the same moment, and a listener cannot see
         // the subscription anyway.
         self.0.borrow_mut().live_joined += 1;

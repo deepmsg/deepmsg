@@ -7,8 +7,8 @@
 //! of milliseconds inside `fallocate` is a conductor that has stopped draining
 //! commands, publishing positions and answering clients. The reference puts
 //! that work on a **native resource agent** thread and has the conductor poll
-//! for the result (`aeron-driver/src/main/c/aeron_driver_native_resource_agent.c:426-466`,
-//! polled from `aeron_driver_conductor.c:4042-4067`), which is what this is.
+//! for the result (`aeron-driver/src/main/c/aeron_driver_native_resource_agent.c:431-471`,
+//! polled from `aeron_driver_conductor.c:4139-4164`), which is what this is.
 //!
 //! # Shape
 //!
@@ -34,8 +34,8 @@
 //! the counters are allocated (the conductor, which owns the allocator) and
 //! **run** here: its own clock turns on this thread's duty cycle, its `start`
 //! resolves the bootstrap neighbours here, and a channel's names are resolved
-//! here, as agent commands (`aeron_driver_native_resource_agent.c:253-270` for
-//! the cycle, `:361-392` for the two commands, `:224-251` for `start`).
+//! here, as agent commands (`aeron_driver_native_resource_agent.c:258-275` for
+//! the cycle, `:366-397` for the two commands, `:229-256` for `start`).
 //!
 //! # What it does not do
 //!
@@ -72,10 +72,10 @@ enum Request {
     },
     /// Finish parsing a channel: every name in it goes through the resolver
     /// (`aeron_driver_native_resource_agent_on_parse_udp_channel`,
-    /// `:381-392`, and behind it `aeron_udp_channel_finish_parse`).
+    /// `:386-397`, and behind it `aeron_udp_channel_finish_parse`).
     ParseChannel {
         /// The URI as the client wrote it, which is what the parse is handed
-        /// and what its error messages name (`aeron_udp_channel.c:346-381`).
+        /// and what its error messages name (`aeron_udp_channel.c:347-382`).
         original_uri: Vec<u8>,
         /// What a name that does not answer means for this caller: a channel
         /// is refused, a send destination is kept (`:5332-5343`).
@@ -97,7 +97,7 @@ enum Request {
     /// microseconds inside the driver's construction.
     AttachResolver(AgentResolver),
     /// Resolve one `host:port` again, for a name that has gone stale
-    /// (`aeron_driver_native_resource_agent_on_resolve_address`, `:361-379`).
+    /// (`aeron_driver_native_resource_agent_on_resolve_address`, `:366-384`).
     ResolveAddress {
         /// The name and port as the channel wrote them.
         text: String,
@@ -113,7 +113,7 @@ enum Request {
 /// `aeron_driver_native_resource_agent_command_result_t` (`:120-150`): the
 /// agent fills the payload and then **publishes** it, and the conductor's
 /// command state machine reads it once per duty cycle and stays `RUNNING`
-/// until it is there (`aeron_driver_conductor.c:4113-4121`).
+/// until it is there (`aeron_driver_conductor.c:4210-4218`).
 ///
 /// The publish is what the reference's `AERON_SET_RELEASE` on `state` is for,
 /// and [`OnceLock`] is this build's spelling of it: `set` happens once, under a
@@ -127,7 +127,7 @@ pub type ResolutionCell<T> = Arc<OnceLock<Result<T, UdpChannelError>>>;
 /// The address is the send destination's, and `None` for everything else: a
 /// destination that names a host which does not answer is kept with the address
 /// the reference calls `AF_UNSPEC`, and that `Option` is where it lives
-/// (`aeron_driver_conductor_execute_add_send_destination`, `:5337-5343`).
+/// (`aeron_driver_conductor_execute_add_send_destination`, `:5434-5440`).
 #[derive(Clone, Debug)]
 pub struct ParsedChannel {
     pub channel: UdpChannel,
@@ -139,7 +139,7 @@ pub struct ParsedChannel {
 /// Built where the counters are, and handed over rather than built here,
 /// because a resolver takes counters out of the allocator and **the allocator
 /// has one owner** — the conductor. The reference builds it from the context
-/// inside the agent's own init (`aeron_driver_native_resource_agent.c:280-310`);
+/// inside the agent's own init (`aeron_driver_native_resource_agent.c:285-315`);
 /// this build cannot copy that arrangement without giving two threads
 /// allocators that can hand out the same id twice.
 pub struct AgentResolver {
@@ -188,8 +188,8 @@ impl AgentResolver {
 
 /// The space check that stands in front of every log buffer this agent
 /// creates — the reference's `aeron_driver_context_run_storage_checks`
-/// (`aeron_driver_context.c:1354-1377`), which its own agent runs at the
-/// head of its map command (`aeron_driver_native_resource_agent.c:432`).
+/// (`aeron_driver_context.c:1398-1421`), which its own agent runs at the
+/// head of its map command (`aeron_driver_native_resource_agent.c:437`).
 ///
 /// A filesystem that cannot hold the log about to be made answers before
 /// the file is touched, so the client hears `STORAGE_SPACE` from a check
@@ -197,7 +197,7 @@ impl AgentResolver {
 pub struct StorageChecks {
     /// Whether the check runs at all (`perform.storage.checks`). Off means
     /// the reference's "always plenty" probe (`aeron_usable_fs_space_disabled`,
-    /// `aeron_fileutil.c:1203`).
+    /// `aeron_fileutil.c:1202`).
     enabled: bool,
     /// The level at which the check stops refusing and starts warning
     /// (`low.file.store.warning.threshold`, `aeron_driver_context.h:207`).
@@ -208,7 +208,7 @@ pub struct StorageChecks {
 }
 
 /// A filesystem that could hold the log about to be made, but only just
-/// (`aeron_driver_context.c:1368-1377`).
+/// (`aeron_driver_context.c:1412-1421`).
 ///
 /// The reference records this straight into the distinct error log on its
 /// agent thread and carries on — the create proceeds. Here the
@@ -261,12 +261,12 @@ impl StorageChecks {
         // `ENOSPC`, because that is the errno the reference's own composition
         // turns into `STORAGE_SPACE` — its pre-check raises the negative
         // protocol code and its kernel raises the errno, and both arrive at
-        // the client as the same code (`aeron_driver_conductor.c:2326-2341`).
+        // the client as the same code (`aeron_driver_conductor.c:2389-2404`).
         if usable < length as u64 {
             return (Some(io::Error::from_raw_os_error(libc::ENOSPC)), None);
         }
 
-        // The second half (`:1368-1377`): at or below the threshold the
+        // The second half (`:1412-1421`): at or below the threshold the
         // reference records a warning and **returns zero**, which is why the
         // warning is not a refusal and the create that follows still happens.
         let warning = (usable <= self.warning_threshold).then_some(StorageWarning {
@@ -309,7 +309,7 @@ pub enum Completion {
 ///
 /// The reference's agent writes these straight into the shared error log
 /// (`aeron_driver_distinct_error_log_record`, and its resolver's own failures at
-/// `aeron_driver_name_resolver.c:214-216`, `:718-723`). That log is a
+/// `aeron_driver_name_resolver.c:214-216`, `:719-724`). That log is a
 /// process-local structure here with the conductor as its only writer — the
 /// same arrangement the storage warnings already use — so an agent fault is
 /// handed over rather than recorded.
@@ -443,7 +443,7 @@ impl NativeResourceAgent {
     /// from then on.
     ///
     /// The reference has **one** native resource agent and the resolver lives
-    /// on it (`aeron_driver_native_resource_agent.c:224-270`), and so does this
+    /// on it (`aeron_driver_native_resource_agent.c:229-275`), and so does this
     /// build: the three that were one per kind of log buffer were collapsed
     /// into this one, and the resolver came with them.
     ///
@@ -596,7 +596,7 @@ impl NativeResourceAgent {
 
     /// Every storage warning raised since the last call — filesystems that
     /// could hold their log buffer but only just
-    /// (`aeron_driver_context.c:1368-1377`). These do not fail anything: the
+    /// (`aeron_driver_context.c:1412-1421`). These do not fail anything: the
     /// create they accompanied went ahead, and the warning is for the
     /// driver's error log.
     pub fn poll_warnings(&self) -> Vec<StorageWarning> {
@@ -648,7 +648,7 @@ impl crate::driver::Agent for AgentLoop {
 /// One pass over the queue, not a loop until it empties: a file that cannot be
 /// removed will not remove itself on the second try within the same pass, and
 /// the reference's own drain makes one attempt each
-/// (`aeron_driver_native_resource_agent.c:205-222`).
+/// (`aeron_driver_native_resource_agent.c:210-227`).
 fn retry_frees(pending: &mut VecDeque<PathBuf>, mut on_failure: impl FnMut()) {
     let mut attempts = pending.len();
 
@@ -685,7 +685,7 @@ pub(crate) struct AgentLoop {
     resolver: Option<AgentResolver>,
     counters: Option<CounterManager>,
     /// Log buffers whose file could not be removed, waiting to be tried again
-    /// (`aeron_driver_native_resource_agent.c:213-220`: the reference keeps the
+    /// (`aeron_driver_native_resource_agent.c:218-225`: the reference keeps the
     /// same queue and re-adds to its tail).
     ///
     /// The **path**, not the `LogFile`: [`LogFile::remove`] drops the mapping
@@ -727,7 +727,7 @@ impl AgentLoop {
     /// gone — which is the reference's `running` flag cleared. `Some(work)` is
     /// what the idle strategy is given.
     /// Count a log buffer whose file could not be removed
-    /// (`AERON_SYSTEM_COUNTER_FREE_FAILS`, `aeron_system_counters.c:43`).
+    /// (`AERON_SYSTEM_COUNTER_FREE_FAILS`, `aeron_system_counters.c:48`).
     ///
     /// The counter regions are reached the way the resolver's own counters are
     /// (`:871-880`): through the resolver's file, which is where they live. The
@@ -755,14 +755,14 @@ impl AgentLoop {
         {
             // Log buffers whose removal failed on an earlier pass get their
             // next attempt here, before this pass's new work
-            // (`aeron_driver_native_resource_agent.c:213-220`: the reference
+            // (`aeron_driver_native_resource_agent.c:218-225`: the reference
             // drains the same queue at the top of its pass).
             let mut pending = std::mem::take(&mut self.pending_frees);
             retry_frees(&mut pending, || self.count_free_failure());
             self.pending_frees = pending;
 
             // The resolver's own clock, on this thread's duty cycle
-            // (`aeron_driver_native_resource_agent.c:253-270`): a driver nobody
+            // (`aeron_driver_native_resource_agent.c:258-275`): a driver nobody
             // is talking to still has to answer when someone does, and its
             // gossip runs on its own intervals.
             let now_ms = deepmsg_core::clock::epoch_nano_time() / NANOS_PER_MILLI;
@@ -798,7 +798,7 @@ impl AgentLoop {
                         // neighbours, and a nameserver that will not answer
                         // would otherwise stop the conductor before it has
                         // published a heartbeat
-                        // (`aeron_driver_native_resource_agent.c:224-251`).
+                        // (`aeron_driver_native_resource_agent.c:229-256`).
                         // A failure is recorded and the driver runs on, which
                         // is what the reference's agent does with it — a driver
                         // whose resolver is not the one it was configured with
@@ -830,7 +830,7 @@ impl AgentLoop {
 
             // What the resolver itself could not do, on its way to the
             // driver's error log (`aeron_name_resolver_log_and_clear_error`,
-            // `aeron_driver_name_resolver.c:718-723`): the reference's resolver
+            // `aeron_driver_name_resolver.c:719-724`): the reference's resolver
             // writes into that log directly, and this one hands the entries
             // over because the log is the conductor's.
             if let Some(AgentResolver { resolver, .. }) = self.resolver.as_mut() {
@@ -998,14 +998,14 @@ impl AgentLoop {
             } => {
                 // The space question first, the file second: a refusal
                 // here never touches the filesystem, which is the point
-                // of asking before allocating (`aeron_driver_context.c:1354-1377`).
+                // of asking before allocating (`aeron_driver_context.c:1398-1421`).
                 let (refusal, warning) = checks.assess(term_length, page_size);
                 let completion = match refusal {
                     Some(error) => Completion::MapFailed { path, error },
                     None => {
                         // A warning is not a refusal: the reference
                         // records it before it maps and carries on
-                        // (`:1374` inside the check, the create after the
+                        // (`:1418` inside the check, the create after the
                         // `return 0`). Dropped rather than fatal if the
                         // conductor is gone — the completion below is
                         // what says the loop is over, and it says it.
@@ -1030,7 +1030,7 @@ impl AgentLoop {
                 // The mapping goes either way — `LogFile::remove` drops it
                 // first — so what a failure leaves behind is the **file**, and
                 // that is what goes on the queue to be tried again
-                // (`aeron_driver_native_resource_agent.c:405-412`).
+                // (`aeron_driver_native_resource_agent.c:410-417`).
                 if log.remove().is_err() {
                     self.count_free_failure();
                     self.pending_frees.push_back(path.clone());
@@ -1062,7 +1062,7 @@ impl AgentLoop {
 }
 
 /// The entry a resolver that would not start leaves in the error log
-/// (`aeron_driver_native_resource_agent.c:233-251`): the reference records
+/// (`aeron_driver_native_resource_agent.c:238-256`): the reference records
 /// either what the failure said or, when it said nothing, the words the agent
 /// composes itself — under the negated generic code, because
 /// `AERON_ERROR_CODE_GENERIC_ERROR` is what its `AERON_SET_ERR` was given.
@@ -1314,7 +1314,7 @@ mod tests {
 
     /// A removal that fails is not dropped on the floor: the file goes on the
     /// queue, which is what the reference does with the log buffer
-    /// (`aeron_driver_native_resource_agent.c:405-412`).
+    /// (`aeron_driver_native_resource_agent.c:410-417`).
     #[test]
     fn a_free_that_fails_is_kept_for_another_try() {
         // `queues` is held, not dropped: it owns the completion receiver, and a
@@ -1417,10 +1417,10 @@ mod tests {
     #[test]
     fn a_log_buffer_is_refused_when_the_filesystem_cannot_be_asked() {
         // The reference's `aeron_usable_fs_space` answers zero when the
-        // filesystem cannot be asked (`aeron_fileutil.c:952-961`), and a
+        // filesystem cannot be asked (`aeron_fileutil.c:951-960`), and a
         // check that cannot ask refuses — with the `ENOSPC` the error
         // composition turns into `STORAGE_SPACE`
-        // (`aeron_driver_conductor.c:2326-2341`).
+        // (`aeron_driver_conductor.c:2389-2404`).
         let dir = TempDir::new();
         let agent = NativeResourceAgent::start(StorageChecks::new(
             true,
@@ -1445,7 +1445,7 @@ mod tests {
         );
         // A filesystem with nothing left is below any threshold too, and the
         // refusal is what answers: the reference returns before the warning's
-        // question is ever asked (`aeron_driver_context.c:1360-1366`).
+        // question is ever asked (`aeron_driver_context.c:1404-1410`).
         assert!(agent.poll_warnings().is_empty());
 
         agent.stop();
@@ -1453,7 +1453,7 @@ mod tests {
 
     #[test]
     fn a_nearly_full_filesystem_warns_and_the_log_buffer_still_lands() {
-        // The reference's second half (`aeron_driver_context.c:1368-1377`):
+        // The reference's second half (`aeron_driver_context.c:1412-1421`):
         // at or below the threshold it records a warning in the distinct
         // error log and returns zero, so the create it was asked about
         // happens anyway. A threshold no filesystem can exceed stands in for

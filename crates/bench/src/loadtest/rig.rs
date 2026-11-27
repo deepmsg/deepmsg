@@ -261,7 +261,7 @@ where
         Ok(status)
     }
 
-    /// `LoadTestRig.send` (`:191-311`).
+    /// `LoadTestRig.send` (`:192-312`).
     ///
     /// Returns how many messages went out and how many came back; it does not
     /// judge them, because the caller knows how many there should have been.

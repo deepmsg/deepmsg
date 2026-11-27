@@ -45,17 +45,17 @@
 //! # The switch is positions, not transports
 //!
 //! ★ `activeTransportCount() >= 2` — the gate the reference's **replay merge**
-//! uses (`aeron_archive_replay_merge.c:831`) — is **not** part of this machine
+//! uses (`aeron_archive_replay_merge.c:853`) — is **not** part of this machine
 //! and must not be ported into it. Here, "has the replay caught up?" is answered
 //! by asking the archive for `max_recorded_position` and comparing it with the
-//! replay image's position (`:683-698`), with a quarter of the recording's term
+//! replay image's position (`:705-720`), with a quarter of the recording's term
 //! buffer as the margin (`:1157-1159`). Two mechanisms for two jobs, and the
 //! merge's is the one that needs a transport count.
 //!
 //! # Where the answers come from
 //!
 //! This machine never reads the control channel. The **async client** does, and
-//! this object is its listener (`:994-999`, `:831-860`): every control response
+//! this object is its listener (`:994-999`, `:853-882`): every control response
 //! and every recording descriptor arrives at [`Ops`] and is filed by
 //! correlation id. That is why there is an [`Rc`] here — the listener is owned
 //! by the async client, and this object has to read what it wrote — and why
@@ -88,7 +88,7 @@ use crate::client::proxy::{ArchiveProxy, NULL_VALUE, ReplayParams};
 const ALL_AND_FOLLOW: i64 = -1;
 
 /// `SESSION_ID_KEY` on a replay channel — the session the replay publication
-/// will have, written in once the archive has named it (`:1448-1471`).
+/// will have, written in once the archive has named it (`:1452-1475`).
 const SESSION_ID_KEY: &str = "session-id";
 
 /// The media of a channel that stays inside this process (`media` in a URI).
@@ -105,7 +105,7 @@ const TERM_LENGTH_KEY: &str = "term-length";
 const SPIES_SIMULATE_CONNECTION_KEY: &str = "spies-simulate-connection";
 
 /// The channel a response-channel replay's request publication is made on
-/// (`:1610-1621`).
+/// (`:1614-1625`).
 ///
 /// **Its own function because it is the one part of those four states that is
 /// arithmetic rather than waiting**, and because what it does to the control
@@ -118,7 +118,7 @@ const SPIES_SIMULATE_CONNECTION_KEY: &str = "spies-simulate-connection";
 ///
 /// [`UriError`] when the control request channel is not a channel at all — the
 /// one failure the reference can have here too, since it builds this string from
-/// the context's own setting (`:1613`).
+/// the context's own setting (`:1617`).
 fn request_publication_channel(
     control_channel: &str,
     term_buffer_length: i32,
@@ -137,8 +137,8 @@ fn request_publication_channel(
     Ok(uri.build())
 }
 
-/// The four the request publication's channel has **taken off** it (`:1614`,
-/// `:1616-1618`).
+/// The four the request publication's channel has **taken off** it (`:1618`,
+/// `:1620-1622`).
 ///
 /// The reference writes each with a null value, and a null value in a
 /// `aeron_uri_string_builder` is not an empty one: it **removes** the key
@@ -246,7 +246,7 @@ impl State {
 ///
 /// Every method has a default: the reference's listener is a struct of function
 /// pointers of which any may be null, and `shouldNotRequireEventListener`
-/// (`…_persistent_subscription_test.cpp:2878`) is the case that says so.
+/// (`…_persistent_subscription_test.cpp:2880`) is the case that says so.
 pub trait SubscriptionListener {
     /// The recording has been caught up with and the live stream is being read.
     fn on_live_joined(&mut self) {}
@@ -560,7 +560,7 @@ pub struct PersistentSubscription {
     /// Whether the replay subscription has been seen **with an image on it**.
     ///
     /// The reference holds the image itself and asks it whether it is closed
-    /// (`aeron_image_is_closed`, `aeron_image.c:732-745`), which is what tells
+    /// (`aeron_image_is_closed`, `aeron_image.c:736-749`), which is what tells
     /// "the image I was reading has been taken away" apart from "no image has
     /// appeared yet". A subscription here is a registration id and its images are
     /// looked up per turn, so what is kept is the one thing that lookup cannot
@@ -570,7 +570,7 @@ pub struct PersistentSubscription {
     ///
     /// Cleared with the subscription it belongs to
     /// ([`Self::clean_up_replay_subscription`]), as the reference clears
-    /// `replay_image` in its own cleanup (`:745-752`).
+    /// `replay_image` in its own cleanup (`:749-756`).
     replay_image_seen: bool,
     /// The `ADD_SUBSCRIPTION` in flight, whose registration id the driver will
     /// answer under (`:1494`).
@@ -2591,7 +2591,7 @@ mod tests {
                 ReplayChannelType::ResponseChannel,
             ),
             // A manual channel's endpoint is not one the driver replaces
-            // (`aeron_subscription.c:660-672`), so it is not a dynamic port —
+            // (`aeron_subscription.c:648-660`), so it is not a dynamic port —
             // and the reference's test asks only for `:0`, which this is not.
             (
                 "aeron:udp?endpoint=localhost:10",

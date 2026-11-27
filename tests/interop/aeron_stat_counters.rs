@@ -159,7 +159,7 @@ fn aeron_stat_lists_the_counters_this_driver_published() {
     assert!(
         label_of(&counters, 34)
             .expect("the Aeron software counter")
-            .starts_with("Aeron software: version=1.53.2 commit=deepmsg-"),
+            .starts_with("Aeron software: version=1.54.2 commit=deepmsg-"),
         "{:?}",
         label_of(&counters, 34)
     );
@@ -176,7 +176,7 @@ fn aeron_stat_shows_a_client_heartbeat_after_a_client_registers() {
 
     // The client exists to the driver from its first resource command, and
     // that command is what allocates the counter this test looks for
-    // (`aeron_driver_conductor.c:982-1035`).
+    // (`aeron_driver_conductor.c:1023-1076`).
     let mut add_counter = Vec::new();
     add_counter.extend_from_slice(&7i64.to_le_bytes()); // client_id
     add_counter.extend_from_slice(&99i64.to_le_bytes()); // correlation_id

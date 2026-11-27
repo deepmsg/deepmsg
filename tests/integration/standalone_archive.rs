@@ -27,7 +27,7 @@
 //! The aeron directory comes from [`OwnDriver`], which owns it and deletes it on
 //! the way out; this test only borrows it. The archive's own directory is this
 //! test's to place, because the archive is the one that makes it
-//! (`Archive.java:1275-1282`, `IoUtil.ensureDirectoryExists`).
+//! (`Archive.java:1341-1348`, `IoUtil.ensureDirectoryExists`).
 
 use std::time::Instant;
 
@@ -104,7 +104,7 @@ fn a_standalone_archive_serves_a_connect_over_a_drivers_cnc() {
 /// one. What it would have been is still in the segment files, and
 /// `Catalog.refreshAndFixDescriptor` (`:1066-1097`) reads them — the reference
 /// runs that over **every** descriptor as it loads the catalog
-/// (`Catalog.java:228-231`).
+/// (`Catalog.java:231-234`).
 ///
 /// This build's repair is a method on purpose — a reader like `ArchiveTool
 /// describe` has no business writing to somebody's catalog because it looked at

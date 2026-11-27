@@ -25,7 +25,7 @@
 //! * **Free space.** Before a log buffer is created, the filesystem it will
 //!   land on is asked whether it has room — the reference's
 //!   `aeron_usable_fs_space`, a `statvfs` asking `f_frsize * f_bavail`
-//!   (`aeron-client/src/main/c/util/aeron_fileutil.c:952-961`).
+//!   (`aeron-client/src/main/c/util/aeron_fileutil.c:951-960`).
 //! * **The interfaces this host has.** A channel's `interface=` parameter names
 //!   one, by address or by name, and the kernel is the only thing that knows
 //!   which addresses are local and what their indices are
@@ -190,7 +190,7 @@ pub fn current_thread_affinity() -> io::Result<Vec<i32>> {
 }
 
 /// How long the loss report file is: the configured length rounded up to the
-/// file page size (`aeron-driver/src/main/c/aeron_driver.c:329-330`).
+/// file page size (`aeron-driver/src/main/c/aeron_driver.c:346-347`).
 ///
 /// The alignment is the reference's and it is why a driver configured with the
 /// default megabyte gets exactly that: 1 MiB is already a multiple of every
@@ -344,7 +344,7 @@ pub fn default_socket_buffers() -> io::Result<SocketBufferLengths> {
 /// `path` — or zero, when the filesystem cannot be asked.
 ///
 /// This is the reference's `aeron_usable_fs_space`
-/// (`aeron-client/src/main/c/util/aeron_fileutil.c:952-961`): `statvfs`'s
+/// (`aeron-client/src/main/c/util/aeron_fileutil.c:951-960`): `statvfs`'s
 /// `f_frsize * f_bavail`, with a failure reading as zero. A caller comparing
 /// the answer against a log buffer's length treats that as "no space",
 /// which is the safe side to fail on.

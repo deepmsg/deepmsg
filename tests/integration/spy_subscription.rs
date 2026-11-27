@@ -93,7 +93,7 @@ fn drain(client: &mut Client, subscription: i64, received: &mut i64) {
 /// What is **not** required is that they all finish, and that is a fact about
 /// the driver rather than a weaker assertion. What joins a network
 /// publication's set of readers is a spy
-/// (`aeron_driver_conductor.c:4904-4911`); a wire subscriber is not in it, so
+/// (`aeron_driver_conductor.c:5001-5008`); a wire subscriber is not in it, so
 /// the limit and the cleaning run behind the slowest *spy*
 /// (`aeron_network_publication.c:960-980`, `:985`). A spy reads the log buffer
 /// in memory and a subscriber reads the same bytes off a socket, so a spy that

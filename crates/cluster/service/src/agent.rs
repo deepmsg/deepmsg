@@ -69,7 +69,7 @@ pub const NULL_POSITION: i64 = -1;
 
 /// `AeronArchive.Configuration.localControlStreamId()`'s default, which the
 /// container's mark file names as `archiveStreamId`
-/// (`ClusteredServiceContainer.java:2094`).
+/// (`ClusteredServiceContainer.java:2157`).
 pub const ARCHIVE_CONTROL_STREAM_ID: i32 = 10;
 
 /// The handle a caller (a test, or P3-2c's `SIGTERM` hook) stops the container
@@ -106,7 +106,7 @@ pub struct ClusteredServiceAgent<S: ClusteredService> {
     owns_client: bool,
     /// The local archive, connected the first time a snapshot is taken or
     /// loaded. **A deviation from the reference**, which connects and closes one
-    /// per operation (`CSA:938`, `:990`): this build's `Archive` has no
+    /// per operation (`CSA:938`, `:992`): this build's `Archive` has no
     /// `Drop`, so a per-operation connect would leak the control subscription
     /// and publication in the client. Holding one keeps the number of control
     /// sessions at one. Recorded in the plan (§7, D1).
@@ -141,7 +141,7 @@ pub struct ClusteredServiceAgent<S: ClusteredService> {
 
 impl<S: ClusteredService> ClusteredServiceAgent<S> {
     /// `ClusteredServiceContainer` construction plus `CSA.onStart`
-    /// (`CSA:197-206`, `:765-815`).
+    /// (`CSA:197-206`, `:794-844`).
     ///
     /// # Errors
     ///
@@ -163,7 +163,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
         owns_client: bool,
     ) -> Result<Self, ContainerError> {
         // The thread the agent runs on carries the service name
-        // (`ClusteredServiceContainer.java:929-930`); the binary set it too,
+        // (`ClusteredServiceContainer.java:958-959`); the binary set it too,
         // and an in-process container gets the same name from here.
         deepmsg_driver::sys::set_current_thread_name(&config.service_name).map_err(|error| {
             ContainerError::Cluster(format!("could not name the container's thread: {error}"))
@@ -221,7 +221,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
             config.cycle_threshold_ns,
         )?;
         // `onStart`'s `dutyCycleTracker.update(nanoClock.nanoTime())`
-        // (`ClusteredServiceAgent.java:205`): the first cycle measures from
+        // (`ClusteredServiceAgent.java:206`): the first cycle measures from
         // here, not from zero.
         duty_cycle.start(deepmsg_core::clock::monotonic_nano_time());
 
@@ -589,13 +589,14 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
         &mut self,
         log_position: i64,
         leadership_term_id: i64,
+        term_base_log_position: i64,
     ) -> Result<(), ContainerError> {
         let mut recording_id = NULL_POSITION;
         let mut failure = None;
 
         self.snapshot_duration
             .on_snapshot_begin(deepmsg_core::clock::monotonic_nano_time());
-        match self.take_snapshot(log_position, leadership_term_id) {
+        match self.take_snapshot(log_position, leadership_term_id, term_base_log_position) {
             Ok(id) => recording_id = id,
             Err(error) => failure = Some(error),
         }
@@ -627,6 +628,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
         &mut self,
         log_position: i64,
         leadership_term_id: i64,
+        term_base_log_position: i64,
     ) -> Result<i64, ContainerError> {
         let Self {
             client,
@@ -687,6 +689,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
             SnapshotAction {
                 log_position,
                 leadership_term_id,
+                term_base_log_position,
             },
         )?;
 
@@ -810,7 +813,11 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
         self.cluster_time = new_cluster_time;
 
         if let Some(action) = snapshot_action {
-            self.execute_snapshot_action(action.log_position, action.leadership_term_id)?;
+            self.execute_snapshot_action(
+                action.log_position,
+                action.leadership_term_id,
+                action.term_base_log_position,
+            )?;
         }
 
         if read == 0 && self.log_adapter.is_done() {
@@ -1244,7 +1251,7 @@ impl<S: ClusteredService> ClusteredServiceAgent<S> {
 }
 
 /// The log's handler: one method per `BoundedLogAdapter.onMessage` arm
-/// (`BoundedLogAdapter.java:136-260`), all with the same disjoint borrows.
+/// (`BoundedLogAdapter.java:151-275`), all with the same disjoint borrows.
 struct EventHandler<'a, S: ClusteredService> {
     service: &'a mut S,
     client: &'a mut Client,
@@ -1269,6 +1276,7 @@ struct EventHandler<'a, S: ClusteredService> {
 struct SnapshotAction {
     log_position: i64,
     leadership_term_id: i64,
+    term_base_log_position: i64,
 }
 
 impl<S: ClusteredService> EventHandler<'_, S> {
@@ -1438,6 +1446,7 @@ impl<S: ClusteredService> LogHandler for EventHandler<'_, S> {
             LogMessage::ClusterAction {
                 leadership_term_id,
                 log_position,
+                term_base_log_position,
                 timestamp,
                 action,
                 flags,
@@ -1449,6 +1458,7 @@ impl<S: ClusteredService> LogHandler for EventHandler<'_, S> {
                     *self.snapshot_action = Some(SnapshotAction {
                         log_position,
                         leadership_term_id,
+                        term_base_log_position,
                     });
                 }
                 Ok(())
@@ -1543,7 +1553,7 @@ fn ensure_archive<'a>(
     Ok(archive.as_mut().expect("connected above"))
 }
 
-/// The agent as the loader's listener (`CSA.addSession`, `:628-652`): a session
+/// The agent as the loader's listener (`CSA.addSession`, `:630-654`): a session
 /// is rebuilt with no egress publication, because the join that follows decides
 /// the role and connects it there.
 struct SessionLoadHandler<'a> {
@@ -1601,11 +1611,19 @@ fn snapshot_state(
     };
     let mut taker = ServiceSnapshotTaker::new(&mut sink, time_unit, app_version);
 
-    taker.mark_begin(action.log_position, action.leadership_term_id)?;
+    taker.mark_begin(
+        action.leadership_term_id,
+        action.term_base_log_position,
+        action.log_position,
+    )?;
     for session in sessions.iter() {
         taker.snapshot_session(session)?;
     }
-    taker.mark_end(action.log_position, action.leadership_term_id)
+    taker.mark_end(
+        action.leadership_term_id,
+        action.term_base_log_position,
+        action.log_position,
+    )
 }
 
 /// The snapshot publication and the idle that drives the client between

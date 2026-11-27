@@ -12,8 +12,9 @@ is SBE — the UDP wire protocol, the CnC file, the counter files and the
 cluster's `recording.log` are hand-written formats.
 
 The tool that produces the reference's own codecs is
-`uk.co.real-logic:sbe-tool`, pinned at 1.40.2 in the reference's
-`gradle/libs.versions.toml`, driven by an XSD-validated `JavaExec` task. It
+`uk.co.real-logic:sbe-tool`, pinned at 1.42.0 in the reference's
+`gradle/libs.versions.toml` for Aeron 1.54.2, driven by an XSD-validated
+`JavaExec` task. It
 ships generators for Java, C, C++, C#, Go and **Rust**, all in the same jar.
 Whether that Rust target existed was the open question this ADR had to
 answer; it does, and everything below was measured rather than assumed.
@@ -54,8 +55,13 @@ rather than that two generators disagree.
 
 ## Decision
 
-Use the reference's own `sbe-tool` 1.40.2, with `agrona` 2.6.1 on the
+Use the reference's own `sbe-tool` 1.42.0, with `agrona` 2.7.1 on the
 classpath, and `sbe.target.language=Rust`.
+
+The pin moved from 1.40.2/2.6.1 with the Aeron 1.54.2 baseline (2026-11-26).
+A/B generation showed the 1.42.0 Rust target changed only the cluster codecs
+whose schema changed (schema 18's two fields); the archive and mark crates are
+byte-identical.
 
 - **One crate per schema**, filed under names of ours:
   `deepmsg-codec-archive`, `deepmsg-codec-archive-mark`,
@@ -82,7 +88,7 @@ classpath, and `sbe.target.language=Rust`.
 - Generated sources are checked in. `build.rs` keeps validating schema
   presence and emitting rerun triggers; it does not generate. Regeneration
   is the explicit `just gen`, which:
-  - locates the tool and pins its version (1.40.2 / 2.6.1),
+  - locates the tool and pins its version (1.42.0 / 2.7.1),
   - **fails if the generator prints `[Error]`**,
   - runs `cargo fmt` over the result.
 - Schemas are validated against the FIX `sbe.xsd`, copied verbatim into

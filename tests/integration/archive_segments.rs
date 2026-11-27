@@ -11,7 +11,7 @@
 //!
 //! Every C case asserts the **catalog**: a truncate moves a recording's stop,
 //! and the descriptor is read back to see that it did. What the reference does
-//! to the *file* is `eraseRemainingSegment` (`ArchiveConductor.java:2535-2575`),
+//! to the *file* is `eraseRemainingSegment` (`ArchiveConductor.java:2570-2610`),
 //! and this build does it in `segment::erase_tail`: the file is cut at the stop
 //! and the cut byte is written back at `segmentLength - 1`, which on a file
 //! system extends the file out again with zeros in between. So the segment the
@@ -21,7 +21,7 @@
 //! Both halves of that are load-bearing and neither is visible in a descriptor.
 //! Not erasing leaves the frames the recording no longer claims readable in a
 //! file it still claims, and *truncating* instead of padding leaves a file whose
-//! length is not `segmentLength` — which `attachSegments` refuses (`:1591-1596`),
+//! length is not `segmentLength` — which `attachSegments` refuses (`:1598-1603`),
 //! so the segment can never be attached again. The C harness records a few
 //! kilobytes into 128 MiB segments, so its truncate is to position 0 and no
 //! segment is cut at all.
@@ -81,10 +81,10 @@ use deepmsg_tests::ports::port;
 /// The connect's correlation id, which its answer echoes.
 const CONNECT_CORRELATION_ID: i64 = 0x5ed1_0005;
 
-/// The archive's segment file length (`Archive.java:342`).
+/// The archive's segment file length (`Archive.java:348`).
 ///
 /// 64 KiB, the **power-of-two minimum** the archive accepts
-/// (`Archive.java:1486-1489`) — the smallest segment a recording can be made to
+/// (`Archive.java:1554-1557`) — the smallest segment a recording can be made to
 /// span several of, which is what every test here needs.
 const SEGMENT_FILE_LENGTH: i64 = 64 * 1024;
 
@@ -115,13 +115,13 @@ const MARK: usize = MESSAGE_COUNT / 2;
 /// is still in flight.
 const LONG_MESSAGE_COUNT: usize = 512;
 
-/// The block size a replay reads with (`:372-374`).
+/// The block size a replay reads with (`:378-380`).
 const FILE_IO_MAX_LENGTH: i32 = 4096;
 
 /// The type id of the counter the delete-guard test's replay is bounded by.
 ///
 /// Any id would do — it is a counter nothing but these tests reads — and it is
-/// the C suite's own choice (`aeron_archive_test.cpp:3515`) for the bounded
+/// the C suite's own choice (`aeron_archive_test.cpp:3582`) for the bounded
 /// replay that has one.
 const LIMIT_COUNTER_TYPE_ID: i32 = 10002;
 
@@ -172,7 +172,7 @@ fn detached_channel() -> String {
 ///
 /// **The other two are one setting, not two.** A recording's segment length is
 /// `max(aeron.archive.segment.file.length, termBufferLength)`
-/// (`ArchiveConductor.java:2006`, `conductor::segment_file_length`), because a
+/// (`ArchiveConductor.java:2028`, `conductor::segment_file_length`), because a
 /// segment has to be able to hold one term — so the archive's 64 KiB is
 /// **ignored** while the driver's term is its own default of 16 MiB, and a
 /// recording of a few segments' worth lands in a single file. `max(64k, 64k)` is
@@ -662,7 +662,7 @@ fn a_replay_that_would_read_past_a_delete_in_flight_is_refused() {
 /// The state is made by hand — the `.rec` renamed to `.del`, which is what a
 /// delete that died between the two leaves — and the file that goes is the one
 /// the listing named, not the one on disk: `findDetachedSegments` builds the
-/// `.rec` name whatever is there (`ArchiveConductor.java:1715-1738`), which is
+/// `.rec` name whatever is there (`ArchiveConductor.java:1722-1745`), which is
 /// what makes the fallback reachable at all.
 #[test]
 fn a_delete_of_detached_segments_finishes_one_that_was_half_rolled() {

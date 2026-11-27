@@ -13,7 +13,7 @@
 //!
 //! One datagram per `sendmsg`, batched into one syscall: the reference's
 //! `aeron_udp_channel_transport_sendv`
-//! (`aeron_udp_channel_transport.c:701-752`) sends up to sixteen datagrams
+//! (`aeron_udp_channel_transport.c:728-779`) sends up to sixteen datagrams
 //! this way and reports how many the kernel took, which is what lets the
 //! sender's position advance by exactly what left the machine.
 //!
@@ -32,9 +32,9 @@ use super::AddressFamily;
 
 /// The most datagrams one batched call may carry, which is the reference's
 /// `AERON_DRIVER_SENDER_IO_VECTOR_LENGTH_MAX` and
-/// `AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX` — both sixteen
-/// (`aeron-driver/src/main/c/aeron_driver_context.h:55-59`).
-pub const MAX_BATCH: usize = 16;
+/// `AERON_DRIVER_RECEIVER_IO_VECTOR_LENGTH_MAX` — both sixty-four since 1.54.2
+/// (`aeron-driver/src/main/c/aeron_driver_context.h:55-59`); they were 16.
+pub const MAX_BATCH: usize = 64;
 
 /// Where a received datagram came from and how long it was.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,7 +245,7 @@ const IPV6_JOIN_GROUP: libc::c_int = libc::IPV6_ADD_MEMBERSHIP;
 
 /// `IPV6_MULTICAST_ALL` (option 29 on Linux), which `libc` has no name for on
 /// glibc: the reference guards it with `#if defined(IPV6_MULTICAST_ALL)` for
-/// the same reason (`aeron_udp_channel_transport.c:190-205`) and treats
+/// the same reason (`aeron_udp_channel_transport.c:204-219`) and treats
 /// `ENOPROTOOPT` as "this kernel is older than 4.20", which is what
 /// [`DatagramSocket::set_multicast_all_disabled`] does.
 ///
@@ -321,7 +321,7 @@ impl DatagramSocket {
     }
 
     /// Bind the socket to a local address
-    /// (`aeron_udp_channel_transport.c:147-154`).
+    /// (`aeron_udp_channel_transport.c:161-168`).
     ///
     /// # Errors
     ///
@@ -351,7 +351,7 @@ impl DatagramSocket {
     }
 
     /// Connect the socket, so that sends need no address and the kernel
-    /// filters what arrives (`:316-324`).
+    /// filters what arrives (`:330-338`).
     ///
     /// # Errors
     ///
@@ -376,7 +376,7 @@ impl DatagramSocket {
         Ok(())
     }
 
-    /// `SO_REUSEADDR` (`aeron_udp_channel_transport.c:166-174`).
+    /// `SO_REUSEADDR` (`aeron_udp_channel_transport.c:180-188`).
     ///
     /// # Errors
     ///
@@ -404,7 +404,7 @@ impl DatagramSocket {
         Ok(())
     }
 
-    /// `SO_RCVBUF` (`:326-334`).
+    /// `SO_RCVBUF` (`:340-348`).
     ///
     /// # Errors
     ///
@@ -413,7 +413,7 @@ impl DatagramSocket {
         self.set_byte_option(libc::SO_RCVBUF, bytes)
     }
 
-    /// `SO_SNDBUF` (`:336-344`).
+    /// `SO_SNDBUF` (`:350-358`).
     ///
     /// # Errors
     ///
@@ -423,7 +423,7 @@ impl DatagramSocket {
     }
 
     /// `IP_TTL`, which is what a unicast sender's `ttl=` sets (the reference
-    /// sets `IP_MULTICAST_TTL`, `:304-312`, because only multicast honours it —
+    /// sets `IP_MULTICAST_TTL`, `:318-326`, because only multicast honours it —
     /// the unicast option is the same idea for the unicast path).
     ///
     /// # Errors
@@ -455,22 +455,23 @@ impl DatagramSocket {
         Ok(())
     }
 
-    /// `SO_REUSEPORT` (`aeron_udp_channel_transport.c:176-182`).
-    ///
-    /// The reference sets this beside `SO_REUSEADDR` and only on a multicast
-    /// socket, where several subscribers to one group share the port —
-    /// `SO_REUSEADDR` alone lets a second socket *bind*, and `SO_REUSEPORT` is
-    /// what makes the kernel spread the group's datagrams across all of them.
+    /// The socket's traffic class (`aeron_udp_channel_transport.c:145-158`):
+    /// `IP_TOS` for IPv4 and `IPV6_TCLASS` for IPv6.
     ///
     /// # Errors
     ///
     /// The error from `setsockopt(2)`.
-    pub fn set_reuse_port(&self) -> io::Result<()> {
-        self.set_option(libc::SOL_SOCKET, libc::SO_REUSEPORT, &1i32)
+    pub fn set_tos(&self, value: i32) -> io::Result<()> {
+        let (level, name) = match self.family() {
+            AddressFamily::Inet => (libc::IPPROTO_IP, libc::IP_TOS),
+            AddressFamily::Inet6 => (libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
+        };
+
+        self.set_option(level, name, &value)
     }
 
     /// Join a multicast group on an interface
-    /// (`aeron_udp_channel_transport.c:213-227`, `:275-293`).
+    /// (`aeron_udp_channel_transport.c:227-241`, `:289-307`).
     ///
     /// The families name the interface differently, which is the kernel's
     /// doing and not the reference's: IPv4 takes the interface's *address*,
@@ -512,8 +513,8 @@ impl DatagramSocket {
     }
 
     /// `IP_MULTICAST_IF` / `IPV6_MULTICAST_IF`: the interface this socket's
-    /// multicast **sends** leave by (`aeron_udp_channel_transport.c:230-235`,
-    /// `:295-302`).
+    /// multicast **sends** leave by (`aeron_udp_channel_transport.c:244-249`,
+    /// `:309-316`).
     ///
     /// Both families set it on the sending descriptor rather than on the one
     /// that joins, which is why a multicast transport may hold two.
@@ -540,10 +541,10 @@ impl DatagramSocket {
     }
 
     /// `IP_MULTICAST_TTL` / `IPV6_MULTICAST_HOPS`
-    /// (`aeron_udp_channel_transport.c:240-248`, `:304-312`).
+    /// (`aeron_udp_channel_transport.c:254-262`, `:318-326`).
     ///
     /// One byte, because that is what the reference hands the kernel
-    /// (`sizeof(params->ttl)`, `:308`) — the option reads an `int` or a
+    /// (`sizeof(params->ttl)`, `:322`) — the option reads an `int` or a
     /// single octet and the reference chose the octet.
     ///
     /// # Errors
@@ -560,7 +561,7 @@ impl DatagramSocket {
     }
 
     /// Turn off delivery of groups this socket did not join
-    /// (`aeron_udp_channel_transport.c:190-205`, `:257-272`).
+    /// (`aeron_udp_channel_transport.c:204-219`, `:289-304`).
     ///
     /// Not an error when the kernel has never heard of the option: the
     /// reference clears the error and carries on, and so does this.
@@ -583,7 +584,7 @@ impl DatagramSocket {
     }
 
     /// Put the socket in non-blocking mode, which is how the data plane polls
-    /// (`aeron_udp_channel_transport.c:356-366`).
+    /// (`aeron_udp_channel_transport.c:370-380`).
     ///
     /// # Errors
     ///
@@ -607,7 +608,7 @@ impl DatagramSocket {
     }
 
     /// Send one datagram to a connected socket's peer
-    /// (`aeron_udp_channel_transport_send_connected`, `:646-665`).
+    /// (`aeron_udp_channel_transport_send_connected`, `:673-692`).
     ///
     /// # Errors
     ///
@@ -633,7 +634,7 @@ impl DatagramSocket {
     }
 
     /// Send up to [`MAX_BATCH`] datagrams, one per buffer, in one syscall
-    /// (`aeron_udp_channel_transport_sendv`, `:701-752`).
+    /// (`aeron_udp_channel_transport_sendv`, `:728-779`).
     ///
     /// `address` is the destination for an unconnected socket; a connected
     /// socket takes `None` and the kernel uses the address it was connected to.
@@ -646,7 +647,7 @@ impl DatagramSocket {
     /// The error from `sendmmsg(2)`, with `WouldBlock` and `ConnectionRefused`
     /// left for the caller to read as "nothing sent this time" — which is what
     /// the reference does with `EAGAIN`, `EWOULDBLOCK`, `ECONNREFUSED` and
-    /// `EINTR` (`:728-731`).
+    /// `EINTR` (`:755-758`).
     pub fn send_batch(&self, address: Option<SocketAddr>, buffers: &[&[u8]]) -> io::Result<usize> {
         let count = buffers.len().min(MAX_BATCH);
         if count == 0 {
@@ -668,7 +669,7 @@ impl DatagramSocket {
 
         for (index, buffer) in buffers.iter().take(count).enumerate() {
             // One datagram per message, each with its own iovec — the shape the
-            // reference builds (`:713-723`).
+            // reference builds (`:740-750`).
             io_vectors[index] = libc::iovec {
                 iov_base: buffer.as_ptr().cast_mut().cast(),
                 iov_len: buffer.len(),
@@ -713,7 +714,7 @@ impl DatagramSocket {
     }
 
     /// Receive up to `buffers.len()` datagrams into them, in one syscall
-    /// (`aeron_udp_channel_transport_recvmmsg`, `:549-644`).
+    /// (`aeron_udp_channel_transport_recvmmsg`, `:570-665`).
     ///
     /// The buffer lengths are the maximum datagram size, so a filled buffer is
     /// a whole datagram — UDP does not truncate silently into a smaller
@@ -723,7 +724,7 @@ impl DatagramSocket {
     /// # Errors
     ///
     /// The error from `recvmmsg(2)`, with `WouldBlock` left for the caller to
-    /// read as "nothing arrived this time" (`:584-587`).
+    /// read as "nothing arrived this time" (`:605-608`).
     pub fn receive_batch(
         &mut self,
         buffers: &mut [Vec<u8>],
@@ -769,7 +770,7 @@ impl DatagramSocket {
 
         // No timeout: the socket is non-blocking, so this returns everything
         // that was queued, up to `count`. The reference passes a zero
-        // `timespec` here instead (`:560`, `:577`), which the kernel reads as
+        // `timespec` here instead (`:581`, `:598`), which the kernel reads as
         // "return after the first datagram" — the same datagrams, one syscall
         // per burst instead of one per datagram.
         //
@@ -782,7 +783,7 @@ impl DatagramSocket {
         // `recvfrom` is what the **Java** driver's data path lands on — its
         // `DataTransportPoller` reads one datagram per transport per poll into
         // a preallocated buffer (`media/DataTransportPoller.java:222-225`,
-        // `media/UdpChannelTransport.java:450-471`), and the JDK maps
+        // `media/UdpChannelTransport.java:461-482`), and the JDK maps
         // `DatagramChannel.receive` to it — and it is the cheapest of the
         // three by a wide margin on an empty queue, which is what 98.5% of
         // this driver's polls are: measured on one socket, 889 instructions per
@@ -827,6 +828,15 @@ impl DatagramSocket {
                     1
                 }
             } else {
+                // 1.54.2 resets the capacity before every read: a previous
+                // IPv4 source leaves `msg_namelen` at `sockaddr_in`'s 16 bytes,
+                // and an IPv6 datagram read into that would be truncated —
+                // mixed-family traffic seeing corrupt addresses.
+                for message in &mut receive.messages[..count] {
+                    message.msg_hdr.msg_namelen =
+                        std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                }
+
                 libc::recvmmsg(
                     self.fd,
                     receive.messages.as_mut_ptr(),
@@ -876,7 +886,7 @@ impl DatagramSocket {
 
     /// `getsockname(2)`, which is where a channel's local address comes from
     /// when the kernel chose the port
-    /// (`aeron_udp_channel_transport_bind_addr_and_port`, `:917-930`).
+    /// (`aeron_udp_channel_transport_bind_addr_and_port`, `:944-957`).
     ///
     /// # Errors
     ///
@@ -1250,7 +1260,7 @@ mod tests {
     fn a_batch_of_one_takes_one_datagram_however_many_are_queued() {
         // The length of the slice is the `vlen`, and the sender's control read
         // is a slice of one: `aeron_driver_sender.c:154` builds a
-        // `struct mmsghdr mmsghdr[1]` and `:170` passes `vlen = 1`, so a burst
+        // `struct mmsghdr mmsghdr[1]` and `:147` passes `vlen = 1`, so a burst
         // of control frames takes as many polls as it has frames. This is what
         // makes that true on this side.
         let mut receiver = DatagramSocket::open(AddressFamily::Inet).expect("a socket");
@@ -1402,7 +1412,7 @@ impl DatagramSocket {
 pub struct Poller {
     fd: libc::c_int,
     /// One `epoll_event` per registered descriptor is what the reference
-    /// allocates (`:150-160`); here the events buffer is filled by
+    /// allocates (`:169-179`); here the events buffer is filled by
     /// [`Poller::ready`] into the caller's list.
     _private: (),
 }
@@ -1470,10 +1480,10 @@ impl Poller {
     /// has, and asking for more events than that is asking the kernel to fill
     /// a buffer nobody is waiting for.
     ///
-    /// The timeout is **zero** — the reference's own (`:208`) — so a pass never
+    /// The timeout is **zero** — the reference's own (`:235`) — so a pass never
     /// waits: whatever is there now is what this pass reads, and the next pass
     /// asks again. `EINTR` and `EAGAIN` are "nothing this pass" rather than
-    /// errors, which is also the reference's reading of them (`:211-216`).
+    /// errors, which is also the reference's reading of them (`:238-243`).
     ///
     /// # Returns
     ///

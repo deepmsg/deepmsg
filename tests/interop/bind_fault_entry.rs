@@ -28,10 +28,10 @@ const STREAM_ID: i32 = 1001;
 /// process's own masked out.
 const EXPECTED: &str = "(98) Address already in use\n\
      [aeron_bind, aeron_socket.c:93] failed to bind(<fd>, 127.0.0.1:10099)\n\
-     [aeron_udp_channel_transport_init, aeron_udp_channel_transport.c:151] unicast bind, affinity=1\n\
-     [aeron_receive_destination_create, aeron_receive_destination.c:78] uri = aeron:udp?endpoint=127.0.0.1:10099\n\
-     [aeron_driver_conductor_get_or_add_receive_channel_endpoint, aeron_driver_conductor.c:2110] correlation_id=2\n\
-     [aeron_driver_conductor_execute_add_network_subscription, aeron_driver_conductor.c:5043] \n";
+     [aeron_udp_channel_transport_init, aeron_udp_channel_transport.c:165] unicast bind, affinity=1\n\
+     [aeron_receive_destination_create, aeron_receive_destination.c:84] uri = aeron:udp?endpoint=127.0.0.1:10099\n\
+     [aeron_driver_conductor_get_or_add_receive_channel_endpoint, aeron_driver_conductor.c:2161] correlation_id=2\n\
+     [aeron_driver_conductor_execute_add_network_subscription, aeron_driver_conductor.c:5140] \n";
 
 fn masked(text: &str) -> String {
     let Some(at) = text.find("failed to bind(") else {

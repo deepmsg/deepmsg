@@ -130,9 +130,9 @@ impl<'a, Access> CountersReader<'a, Access> {
     ///
     /// How a client finds its own heartbeat counter: the driver allocates it
     /// with type `11` and the client's id as the registration
-    /// (`aeron-driver/src/main/c/aeron_driver_conductor.c:994-1006`), and the
+    /// (`aeron-driver/src/main/c/aeron_driver_conductor.c:1035-1047`), and the
     /// reference finds it the same way
-    /// (`aeron-client/src/main/c/aeron_client_conductor.c:1337-1340`).
+    /// (`aeron-client/src/main/c/aeron_client_conductor.c:1383-1386`).
     pub fn find_by_type_and_registration(&self, type_id: i32, registration_id: i64) -> Option<i32> {
         let mut found = None;
         self.for_each(|counter| {
@@ -185,7 +185,7 @@ impl<'a, Access> CountersReader<'a, Access> {
     /// The question a client asks about a counter it cached an id for, and the
     /// one the reference asks in constant time
     /// (`aeron_counter_heartbeat_timestamp_is_active`,
-    /// `aeron-client/src/main/c/aeron_client_conductor.c:1234-1249`): the state
+    /// `aeron-client/src/main/c/aeron_client_conductor.c:1264-1279`): the state
     /// of the slot the id names, its type, and its registration, and nothing
     /// else. It has to be asked again on every use, because the driver reuses
     /// ids — an id that was ours can be somebody else's counter by now.
@@ -240,7 +240,7 @@ impl<'a, Access> CountersReader<'a, Access> {
     /// of them mean anything (`aeron_counters_manager.c:309`, and the layout
     /// structs at `aeron_counters_manager.h:37-70` for what each type means).
     /// The client's own heartbeat lookup compares the first eight bytes — the
-    /// registration id — to its client id (`aeron_client_conductor.c:1208-1232`).
+    /// registration id — to its client id (`aeron_client_conductor.c:1238-1262`).
     ///
     /// A fixed-width array rather than a slice because there is nothing to
     /// trim: a caller that wants eight bytes takes eight, and nothing allocates
@@ -310,7 +310,7 @@ impl<'a, Access> CountersReader<'a, Access> {
 /// `client_id`, with the client id as its registration id. A client writes it
 /// to stay alive: the driver reaps a client — and destroys every subscription
 /// it owns — once the counter's age exceeds `aeron.client.liveness.timeout`
-/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:1038-1055`).
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:1079-1096`).
 pub const CLIENT_HEARTBEAT_TYPE_ID: i32 = 11;
 
 /// `AERON_COUNTER_LOCAL_SOCKADDR_TYPE_ID`
@@ -340,7 +340,7 @@ pub const CHANNEL_ENDPOINT_STATUS_ACTIVE: i64 = 1;
 /// channel-status counter the address belongs to, the length of the address,
 /// and the address as text. A reader finds the address by the id and reads the
 /// text beside it, which is what `aeron_local_sockaddr_find_addrs` does from
-/// the C client (`aeron-client/src/main/c/status/aeron_local_sockaddr.c:95-131`)
+/// the C client (`aeron-client/src/main/c/status/aeron_local_sockaddr.c:99-135`)
 /// and `LocalSocketAddressStatus.findAddress` from Java.
 ///
 /// Decoding is checked rather than trusting: the address field's length is the
@@ -384,10 +384,10 @@ impl<'a> CountersReader<'a, ReadWrite> {
     /// A client writes its heartbeat counter directly rather than sending a
     /// `CLIENT_KEEPALIVE` command — that is what the reference does, in
     /// `aeron_client_conductor_check_liveness`
-    /// (`aeron-client/src/main/c/aeron_client_conductor.c:1305-1375`; the write
-    /// is the `aeron_counter_set_release` at `:1373`), and the driver would
+    /// (`aeron-client/src/main/c/aeron_client_conductor.c:1355-1425`; the write
+    /// is the `aeron_counter_set_release` at `:1421`), and the driver would
     /// ignore the command anyway for a client it has not yet seen
-    /// (`aeron_driver_conductor.c:5271-5278`).
+    /// (`aeron_driver_conductor.c:5368-5375`).
     pub fn set_value(&self, counter_id: i32, value: i64) -> Option<()> {
         if counter_id < 0 || counter_id > self.max_counter_id {
             return None;
@@ -776,7 +776,7 @@ mod tests {
         // readers disagree about it and the disagreement is the reference's
         // own: enumeration stops at the first unused record
         // (`aeron_counters_manager.c:284-321`), while the by-id check reads the
-        // slot the caller names (`aeron_client_conductor.c:1234-1249`). A
+        // slot the caller names (`aeron_client_conductor.c:1264-1279`). A
         // client's heartbeat check has an id already and must not be at the
         // mercy of a gap below it.
         allocate(

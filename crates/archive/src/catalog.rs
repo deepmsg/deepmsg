@@ -5,7 +5,7 @@
 //! by a `RecordingDescriptor` and whatever padding the alignment wants, so the
 //! only way to walk the file is from one record to the next — which is exactly
 //! what opening one does, rebuilding the index from scratch every time
-//! (`Catalog.java:228-230`).
+//! (`Catalog.java:231-233`).
 //!
 //! # No SBE message header anywhere
 //!
@@ -19,7 +19,7 @@
 //!
 //! # What the reference's catalog needs from P2-2c
 //!
-//! Its `refreshAndFixDescriptor` (`:1066-1097`) repairs a record whose
+//! Its `refreshAndFixDescriptor` (`:1069-1100`) repairs a record whose
 //! `stopPosition` is null by reading the recording's **segment files** and
 //! checksumming across a page boundary. That is a different file's business and
 //! belongs with segments, so it is not here: this module opens, appends, reads
@@ -51,7 +51,7 @@ use crate::checksum::Checksum;
 use crate::mark::NULL_VALUE;
 use crate::mark_file::{MAJOR_VERSION, SEMANTIC_VERSION};
 
-/// `Archive.FILENAME_CATALOG` (`Archive.java:284`).
+/// `Archive.FILENAME_CATALOG` (`Archive.java:290`).
 pub const FILENAME: &str = "archive.catalog";
 
 /// The catalog header's block length, which is also where the first record
@@ -59,7 +59,7 @@ pub const FILENAME: &str = "archive.catalog";
 pub const HEADER_LENGTH: usize = HEADER_BLOCK_LENGTH as usize;
 
 /// One record's header: `RecordingDescriptorHeaderDecoder.BLOCK_LENGTH`
-/// (`Catalog.java:113`).
+/// (`Catalog.java:115`).
 pub const DESCRIPTOR_HEADER_LENGTH: usize = DESCRIPTOR_HEADER_BLOCK_LENGTH as usize;
 
 /// Where the descriptor block holds a recording's **start** position, in bytes
@@ -71,22 +71,22 @@ pub const START_POSITION_OFFSET: usize = 40;
 /// `stopPosition` is "encodedOffset: 48").
 pub const STOP_POSITION_OFFSET: usize = 48;
 
-/// `Catalog.DEFAULT_CAPACITY` (`Catalog.java:118`).
+/// `Catalog.DEFAULT_CAPACITY` (`Catalog.java:120`).
 pub const DEFAULT_CAPACITY: usize = 1024 * 1024;
 
 /// `Catalog.MIN_CAPACITY`: a file that cannot hold its own header is not a
-/// catalog (`:119`).
+/// catalog (`:121`).
 pub const MIN_CAPACITY: usize = HEADER_LENGTH;
 
-/// `Catalog.MAX_CATALOG_LENGTH` (`:117`) — the length field is an `int32`.
+/// `Catalog.MAX_CATALOG_LENGTH` (`:119`) — the length field is an `int32`.
 pub const MAX_CAPACITY: usize = i32::MAX as usize;
 
-/// `Catalog.PAGE_SIZE` (`:110`), which is the granularity a grown catalog is
+/// `Catalog.PAGE_SIZE` (`:112`), which is the granularity a grown catalog is
 /// rounded up to.
 pub const PAGE_SIZE: usize = 4096;
 
 /// The alignment a **new** catalog's records are laid out on
-/// (`Catalog.java:216` sets `CACHE_LINE_LENGTH`).
+/// (`Catalog.java:219` sets `CACHE_LINE_LENGTH`).
 ///
 /// Not `Catalog.DEFAULT_ALIGNMENT` (1024), which is the value old catalogs were
 /// written with and is only ever *read* — the alignment is a field in the
@@ -94,7 +94,7 @@ pub const PAGE_SIZE: usize = 4096;
 pub const NEW_ALIGNMENT: usize = 64;
 
 /// The alignment an old catalog's records were laid out on
-/// (`Catalog.DEFAULT_ALIGNMENT`, `:116`).
+/// (`Catalog.DEFAULT_ALIGNMENT`, `:118`).
 pub const LEGACY_ALIGNMENT: usize = 1024;
 
 /// Why a catalog could not be opened, or a record could not be written.
@@ -104,7 +104,7 @@ pub enum CatalogError {
     Io(io::Error),
     /// The file's version is another major's: the reference refuses it by the
     /// same rule and with the same words as the mark file
-    /// (`Catalog.java:203-208`).
+    /// (`Catalog.java:206-211`).
     Version {
         /// The file's path.
         path: PathBuf,
@@ -246,7 +246,7 @@ pub struct Recording {
 /// answer is the only part of it that is a contract.
 ///
 /// It is **not** written to the file. Opening a catalog rebuilds it by walking
-/// the records (`Catalog.java:228-230`), which is why a catalog that has been
+/// the records (`Catalog.java:231-233`), which is why a catalog that has been
 /// appended to by another process is not something an open index can be trusted
 /// about.
 #[derive(Debug, Default)]
@@ -286,7 +286,7 @@ impl CatalogIndex {
     }
 
     /// The recordings it knows, newest first: the direction `Catalog.findLast`
-    /// scans in (`Catalog.java:551-559`, where the index is walked `i -= 2` from
+    /// scans in (`Catalog.java:554-562`, where the index is walked `i -= 2` from
     /// its last position). Not `pub` — it is [`Catalog::find_last`]'s step, and
     /// nothing outside this module walks a catalog backwards.
     fn newest_first(&self) -> impl Iterator<Item = i64> + '_ {
@@ -305,7 +305,7 @@ impl CatalogIndex {
     }
 
     /// Move every record that lives **after** `offset` along by `shift`
-    /// (`Catalog.fixupIndexForShifterRecordings`, `:837-860`).
+    /// (`Catalog.fixupIndexForShifterRecordings`, `:840-863`).
     ///
     /// Substituting one record for a longer one moves everything behind it, and
     /// the offsets in this index are absolute — so the entries that point past
@@ -321,7 +321,7 @@ impl CatalogIndex {
     }
 
     /// Forget one, which is what marking its record INVALID does
-    /// (`Catalog.java:783`).
+    /// (`Catalog.java:786`).
     fn remove(&mut self, recording_id: i64) -> Option<usize> {
         self.entries
             .binary_search_by_key(&recording_id, |(id, _)| *id)
@@ -339,7 +339,7 @@ pub struct Catalog {
     next_offset: usize,
     index: CatalogIndex,
     /// Above zero the catalog is forced after every change, above one its
-    /// metadata as well (`Catalog.java:161-162`) — the same two lines
+    /// metadata as well (`Catalog.java:164-165`) — the same two lines
     /// `RecordingWriter.java:88-89` sets for the segments, and the same two
     /// [`crate::segment::SegmentWriter`] sets from the file's own level.
     force_writes: bool,
@@ -348,13 +348,13 @@ pub struct Catalog {
     /// the one the mapping came from: [`MappedFile`] keeps only the path,
     /// because a mapping outlives its descriptor. The reference's
     /// `catalogChannel` is the channel its mapping came from and stays open for
-    /// as long as the catalog does (`Catalog.java:195`), so the shape is the
+    /// as long as the catalog does (`Catalog.java:198`), so the shape is the
     /// reference's rather than a consequence of ours — and it is why an `fsync`
     /// here reaches pages this process wrote through `mmap`.
     ///
     /// ★ **Open at every level**, because the close-time force is not a level's
     /// business (`:1257`, [`Catalog::close`]). The reference's `null` case is
-    /// its **read-only** constructor (`:254-257`), which this build has no
+    /// its **read-only** constructor (`:257-260`), which this build has no
     /// counterpart for: every catalog here is opened read-write.
     catalog_channel: File,
     /// How many forces have been made, which is what a test can see of a promise
@@ -371,9 +371,9 @@ pub struct Catalog {
     #[cfg(test)]
     forces: std::cell::Cell<usize>,
     /// The archive directory, for the one force the reference makes on it — a
-    /// catalog that has just been **created** (`Catalog.java:226`), so that the
+    /// catalog that has just been **created** (`Catalog.java:229`), so that the
     /// new file's directory entry is durable. `None` at level 0, which is
-    /// `channelForDirectorySync`'s own answer (`Archive.java:3917-3931`): there
+    /// `channelForDirectorySync`'s own answer (`Archive.java:4105-4119`): there
     /// is a catalog file to force at every level, and a directory entry only
     /// when something is being forced.
     archive_dir_channel: Option<File>,
@@ -392,8 +392,8 @@ impl Catalog {
     /// [`CatalogError::Capacity`] for a capacity the format cannot hold, and
     /// the file system's own errors.
     /// `file_sync_level` is `aeron.archive.catalog.file.sync.level`
-    /// (`Archive.java:380`, default 0): above zero every change is forced to
-    /// disk, above one the metadata as well (`Catalog.java:161-162`).
+    /// (`Archive.java:386`, default 0): above zero every change is forced to
+    /// disk, above one the metadata as well (`Catalog.java:164-165`).
     pub fn create(
         directory: &Path,
         capacity: usize,
@@ -426,7 +426,7 @@ impl Catalog {
         catalog.write_header()?;
 
         // The reference forces the **directory** here, and this is the only
-        // place it does (`Catalog.java:226`): the catalog has just been created,
+        // place it does (`Catalog.java:229`): the catalog has just been created,
         // so what is new is the directory entry. The file's own bytes are not
         // forced here — their first force is the first recording's.
         catalog.force_archive_directory()?;
@@ -506,14 +506,14 @@ impl Catalog {
     /// The two answers differ because the reference asks two questions. "Is
     /// there a catalog file to force?" is answered yes at every level — its
     /// channel is the mapping's own, and the close-time force uses it whatever
-    /// the level says (`:195`, `:1257`). "Is there a directory entry to force?"
+    /// the level says (`:198`, `:1257`). "Is there a directory entry to force?"
     /// is answered by the level, because the directory channel is opened for
-    /// that force alone (`channelForDirectorySync`, `Archive.java:3917-3931`).
+    /// that force alone (`channelForDirectorySync`, `Archive.java:4105-4119`).
     ///
     /// Their failures differ for the same reason: the catalog's channel is
     /// opened where the mapping is opened and a failure there is the mapping's
-    /// failure (a `throw`, `:191-196`), while the directory's is **swallowed**
-    /// and answered with `null` (`:3925-3927`) — a directory that will not open
+    /// failure (a `throw`, `:197-202`), while the directory's is **swallowed**
+    /// and answered with `null` (`:4113-4115`) — a directory that will not open
     /// is a directory entry that will not be forced, not an archive that will
     /// not start.
     fn force_channels(
@@ -546,7 +546,7 @@ impl Catalog {
     }
 
     /// Force the catalog one last time, on the way out
-    /// (`Catalog.unmapAndCloseChannel`, `:1252-1259`).
+    /// (`Catalog.unmapAndCloseChannel`, `:1255-1262`).
     ///
     /// ★ **Both of the reference's arguments here are literal** —
     /// `fsync(catalogChannel, true, true)` — so this force happens at **every**
@@ -554,7 +554,7 @@ impl Catalog {
     /// did. It is the one force the level does not govern, and the reason the
     /// catalog's channel is opened at all at level 0.
     ///
-    /// A failure is an error like every other force's (`:1115` rethrows), which
+    /// A failure is an error like every other force's (`:1177` rethrows), which
     /// is why this is a method rather than something `Drop` does: a drop cannot
     /// say what went wrong.
     ///
@@ -571,7 +571,7 @@ impl Catalog {
     }
 
     /// The one force the reference makes on the archive directory, after a
-    /// catalog has been created (`Catalog.java:226`).
+    /// catalog has been created (`Catalog.java:229`).
     fn force_archive_directory(&self) -> Result<(), CatalogError> {
         match &self.archive_dir_channel {
             Some(channel) => self.force(channel),
@@ -584,7 +584,7 @@ impl Catalog {
     /// [`crate::segment::SegmentWriter`] already uses for the segments.
     ///
     /// **A force that fails is an error, not a warning.** The reference
-    /// rethrows it unchecked (`Catalog.java:1115`), so a catalog that could not
+    /// rethrows it unchecked (`Catalog.java:1118`), so a catalog that could not
     /// be made durable is something the caller is told about rather than
     /// something it is not.
     fn force(&self, channel: &File) -> Result<(), CatalogError> {
@@ -652,19 +652,19 @@ impl Catalog {
     }
 
     /// Whether this catalog holds a recording (`Catalog.hasRecording`,
-    /// `Catalog.java:495-498`).
+    /// `Catalog.java:498-501`).
     ///
     /// The reference's test is `recordingId >= 0 && recordingDescriptorOffset
     /// (recordingId) > 0`, and the index is the same question asked of a map:
     /// [`CatalogIndex::offset_of`] answers `None` for an id no record carries,
     /// and a record that was retired is taken out of the index
-    /// (`Catalog.changeState`, `:779-790`), which is what makes `> 0` false for
+    /// (`Catalog.changeState`, `:782-793`), which is what makes `> 0` false for
     /// it there.
     ///
     /// This is the guard every request that names a recording passes through on
     /// its way to [`Catalog::recording`], and the reason it is a separate
     /// question: the refusal it produces carries the reference's own words
-    /// (`ArchiveConductor.hasRecording`, `ArchiveConductor.java:1950-1960`).
+    /// (`ArchiveConductor.hasRecording`, `ArchiveConductor.java:1957-1967`).
     #[must_use]
     pub fn has_recording(&self, recording_id: i64) -> bool {
         recording_id >= 0 && self.recording_offset(recording_id).is_some()
@@ -672,12 +672,12 @@ impl Catalog {
 
     /// The **newest** recording at or after `min_recording_id` whose session,
     /// stream and original channel match (`Catalog.findLast`,
-    /// `Catalog.java:544-578`).
+    /// `Catalog.java:547-581`).
     ///
     /// `None` is the reference's `NULL_RECORD_ID`, which is what a
     /// `FindLastMatchingRecordingRequest` answers a client with when nothing
     /// matches — the "not found" is an `OK` carrying `-1`, not a refusal
-    /// (`ArchiveConductor.java:742-761`).
+    /// (`ArchiveConductor.java:741-760`).
     ///
     /// # The scan
     ///
@@ -721,7 +721,7 @@ impl Catalog {
     /// The id is the catalog's to allocate, not the caller's: it is
     /// `nextRecordingId` and the field is advanced by one in the same breath —
     /// `Catalog.addNewRecording` takes the id it was handed and writes
-    /// `recordingId + 1` back into the header (`:421-426`).
+    /// `recordingId + 1` back into the header (`:424-429`).
     ///
     /// # Errors
     ///
@@ -767,13 +767,13 @@ impl Catalog {
     /// past it ([`crate::segment::compute_stop_position`]).
     ///
     /// The stop **timestamp** is `now_ms`, which is the reference's choice too:
-    /// it writes `epochClock.time()` when it repairs (`Catalog.java:1093-1095`),
+    /// it writes `epochClock.time()` when it repairs (`Catalog.java:1096-1098`),
     /// because the time the recording actually stopped is not knowable from the
     /// files. A caller that wants a different answer has a different question.
     ///
     /// This is a **method** rather than something [`Catalog::open`] does, which
     /// is the one place this diverges from the reference: its constructor
-    /// repairs as it opens (`:228-231`). A constructor that writes is a
+    /// repairs as it opens (`:231-234`). A constructor that writes is a
     /// constructor whose caller cannot choose, and a reader — `ArchiveTool
     /// describe` is one — has no business repairing somebody's catalog because it
     /// looked at it.
@@ -876,7 +876,7 @@ impl Catalog {
     /// stays that way until it ends — which is what makes "has it stopped?" a
     /// question a reader can ask of the file itself. The checksum the reference
     /// recomputes here is the one this build writes as zero, because an archive
-    /// with no checksum provider computes zero (`:911-921`).
+    /// with no checksum provider computes zero (`:914-924`).
     ///
     /// # Errors
     ///
@@ -897,7 +897,7 @@ impl Catalog {
     }
 
     /// Move a recording's **start**, which is what a detach is
-    /// (`Catalog.startPosition(id, position)`, `:758-767`).
+    /// (`Catalog.startPosition(id, position)`, `:757-766`).
     ///
     /// The whole of "detached" is this field: the segment files below it stay
     /// where they are, and what makes them *detached* is that the recording no
@@ -905,7 +905,7 @@ impl Catalog {
     /// question asked of a file name.
     ///
     /// The reference writes this one with `putLong` where its `stopPosition`
-    /// uses `putLongVolatile` (`:764` against `:643`) — an asymmetry about
+    /// uses `putLongVolatile` (`:767` against `:646`) — an asymmetry about
     /// which of the two a reader is allowed to see half-written. Both are a
     /// release store here, which is the ordering Rust names and the one a
     /// reader taking the record afterwards needs.
@@ -920,7 +920,7 @@ impl Catalog {
     }
 
     /// Move a recording's **stop**, which is what a truncate is
-    /// (`ArchiveConductor.truncateRecording`, `:1213`).
+    /// (`ArchiveConductor.truncateRecording`, `:1216`).
     ///
     /// A truncate writes this field **first** and deletes files afterwards, so
     /// between the two a recording whose files are still there already claims to
@@ -959,7 +959,7 @@ impl Catalog {
 
     /// Record that a recording has been **extended**: the row goes back to
     /// being one that has not stopped, and remembers which control session and
-    /// request did it (`Catalog.extendRecording`, `:648-662`).
+    /// request did it (`Catalog.extendRecording`, `:651-665`).
     ///
     /// Five fields, and the two that matter to a reader are the pair of stop
     /// ones: an extended recording has not stopped any more, so both go back to
@@ -970,7 +970,7 @@ impl Catalog {
     ///
     /// The checksum the reference recomputes is the one this build writes as
     /// zero: an archive with no checksum provider computes zero
-    /// (`:911-921`), and the field lives in the record **header**, which this
+    /// (`:914-924`), and the field lives in the record **header**, which this
     /// window does not reach.
     ///
     /// # Errors
@@ -1015,7 +1015,7 @@ impl Catalog {
     }
 
     /// Write a recording's record again, in place, with a record that may be a
-    /// **different length** (`Catalog.replaceRecording`, `:664-745`).
+    /// **different length** (`Catalog.replaceRecording`, `:667-748`).
     ///
     /// One caller: `updateChannel`, which reads a descriptor, substitutes one
     /// field pair, and writes the whole thing back
@@ -1174,7 +1174,7 @@ impl Catalog {
             })?;
 
         // ★ Inside the branch that found the row, which is where the reference
-        // has it (`Catalog.java:791`): a state change that matched nothing wrote
+        // has it (`Catalog.java:794`): a state change that matched nothing wrote
         // nothing, and a force for a write that did not happen is the one thing
         // this rule is not.
         self.force_catalog()?;
@@ -1195,7 +1195,7 @@ impl Catalog {
     /// [`CatalogError::Full`] when even the maximum capacity cannot hold the
     /// record — the reference has two messages for that, one for a catalog
     /// already at its maximum and one for a record too big for what is left
-    /// (`:858-865`), and they are the same refusal to a caller.
+    /// (`:861-868`), and they are the same refusal to a caller.
     fn grow(&mut self, needed: usize) -> Result<(), CatalogError> {
         let target = self.next_offset + needed;
 
@@ -1383,7 +1383,7 @@ impl Catalog {
     ///
     /// This is the only way to know what a catalog holds: the index is not in
     /// the file, and the walk is what opening one does
-    /// (`Catalog.java:960-975`, inside `buildIndex`). Only a `VALID` record
+    /// (`Catalog.java:963-978`, inside `buildIndex`). Only a `VALID` record
     /// goes into it — the others are records that were retired and are still in
     /// the file, which is why the walk reads the state at all.
     fn build_index(&mut self) -> Result<(), CatalogError> {
@@ -1416,7 +1416,7 @@ impl Catalog {
         }
 
         self.index = index;
-        // `Catalog.java:968`: the walk ends where the last record does, and
+        // `Catalog.java:971`: the walk ends where the last record does, and
         // that is where the **next** `addRecording` writes. Without this an
         // archive that reopens a non-empty catalog appends over its first
         // record and leaves the tail un-walkable — which is what the next
@@ -1497,7 +1497,7 @@ impl fmt::Debug for Catalog {
             .field("next_recording_id", &self.next_recording_id)
             .field("entries", &self.index.len())
             // The reference's own summary carries these two (`Catalog.toString`,
-            // `:1398-1399`), and they are the first thing a person asks when a
+            // `:1501-1502`), and they are the first thing a person asks when a
             // catalog is not being forced: what level did it get?
             .field("force_writes", &self.force_writes)
             .field("force_metadata", &self.force_metadata)
@@ -1510,7 +1510,7 @@ impl fmt::Debug for Catalog {
 ///
 /// `length` is the descriptor's bytes **including that padding**, which is what
 /// the schema's own description says (`schemas/aeron-archive-codecs.xml:336`)
-/// and what the reference writes (`Catalog.java:420`: `frameLength -
+/// and what the reference writes (`Catalog.java:423`: `frameLength -
 /// DESCRIPTOR_HEADER_LENGTH`).
 fn encode_record(recording: &Recording, alignment: usize) -> Result<Vec<u8>, CatalogError> {
     // Room for the descriptor as the schema can make it: the fields the block
@@ -1560,7 +1560,7 @@ fn encode_record(recording: &Recording, alignment: usize) -> Result<Vec<u8>, Cat
             .state(RecordingState::VALID)
             // The checksum is over the descriptor, and only when the archive
             // was configured with a provider: `Catalog.computeRecordingDescriptorChecksum`
-            // returns zero when there is none (`:911-921`), which is what this
+            // returns zero when there is none (`:914-924`), which is what this
             // writes. P2-2c is where the providers live.
             .checksum(0);
     }
@@ -1671,7 +1671,7 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// `Catalog.originalChannelContains` (`Catalog.java:585-625`): whether the
+/// `Catalog.originalChannelContains` (`Catalog.java:588-628`): whether the
 /// recording's **original** channel has `fragment` in it, anywhere.
 ///
 /// An empty fragment is in every channel, which is the reference's first test
@@ -1744,7 +1744,7 @@ mod tests {
     }
 
     /// The level picks the two flags and the **directory** descriptor, and `> 1`
-    /// is not `== 2` (`Catalog.java:161-162` reads `> 0` and `> 1`, so a level of
+    /// is not `== 2` (`Catalog.java:164-165` reads `> 0` and `> 1`, so a level of
     /// three is a level of two).
     ///
     /// The catalog's own descriptor is not in this table because it is not a
@@ -1767,7 +1767,7 @@ mod tests {
                 directory,
                 catalog.archive_dir_channel.is_some(),
                 "level {level}: the directory's descriptor is `channelForDirectorySync`'s \
-                 own answer (`Archive.java:3917-3931`)"
+                 own answer (`Archive.java:4105-4119`)"
             );
         }
     }
@@ -1780,7 +1780,7 @@ mod tests {
     ///
     /// The first half is the criterion that makes "nothing changed by default"
     /// an assertion rather than an absence of evidence: 0 is the reference's own
-    /// default (`Archive.java:388`, `:369`), so before this slice a deployment
+    /// default (`Archive.java:394`, `:375`), so before this slice a deployment
     /// got exactly this whether it asked or not.
     ///
     /// ★ Reading the two halves apart is the point of the test: "no force" and
@@ -1831,35 +1831,35 @@ mod tests {
         assert_eq!(
             1,
             catalog.forces(),
-            "creating a catalog forces the **directory**, once (`Catalog.java:226`)"
+            "creating a catalog forces the **directory**, once (`Catalog.java:229`)"
         );
 
         let id = catalog.add_recording(&recording(0)).expect("added");
-        assert_eq!(2, catalog.forces(), "a new recording (`:426`)");
+        assert_eq!(2, catalog.forces(), "a new recording (`:429`)");
 
         catalog.recording_stopped(id, 4096, NOW).expect("stopped");
-        assert_eq!(3, catalog.forces(), "a stop (`:634`)");
+        assert_eq!(3, catalog.forces(), "a stop (`:637`)");
 
         catalog.start_position(id, 128).expect("start moved");
-        assert_eq!(4, catalog.forces(), "a start position (`:766`)");
+        assert_eq!(4, catalog.forces(), "a start position (`:769`)");
 
         catalog.stop_position(id, 8192).expect("stop moved");
-        assert_eq!(5, catalog.forces(), "a stop position (`:645`)");
+        assert_eq!(5, catalog.forces(), "a stop position (`:648`)");
 
         catalog.extend_recording(id, 1, 2, 3).expect("extended");
-        assert_eq!(6, catalog.forces(), "an extend (`:661`)");
+        assert_eq!(6, catalog.forces(), "an extend (`:664`)");
 
         let mut replacement = recording(1);
         replacement.recording_id = id;
         catalog.replace_recording(&replacement).expect("replaced");
-        assert_eq!(7, catalog.forces(), "a replace (`:745`)");
+        assert_eq!(7, catalog.forces(), "a replace (`:744`)");
 
         assert!(
             catalog
                 .change_state(id, RecordingState::DELETED)
                 .expect("state")
         );
-        assert_eq!(8, catalog.forces(), "a state change (`:791`)");
+        assert_eq!(8, catalog.forces(), "a state change (`:794`)");
 
         catalog.close().expect("close");
         assert_eq!(
@@ -1871,7 +1871,7 @@ mod tests {
 
     /// The other half of "the force follows the write": a change that matched
     /// nothing wrote nothing, and the reference's own site for the state change
-    /// is **inside** the branch that found the row (`Catalog.java:791`).
+    /// is **inside** the branch that found the row (`Catalog.java:794`).
     #[test]
     fn a_change_that_matched_nothing_is_not_forced() {
         let dir = TempDir::new();
@@ -1899,7 +1899,7 @@ mod tests {
     /// It cannot here — `grow` reopens and remaps but never renames, so the
     /// descriptor a force goes through still names the same inode — and this is
     /// what says so rather than leaving it to be reasoned about. The reference
-    /// has the same reopen and, there too, no force beside it (`:872-873`).
+    /// has the same reopen and, there too, no force beside it (`:875-876`).
     #[test]
     fn a_force_still_works_after_the_catalog_has_grown() {
         let dir = TempDir::new();
@@ -2106,7 +2106,7 @@ mod tests {
     }
 
     /// A recording added **after a reopen** goes after the records the walk
-    /// found, not over them (`Catalog.java:968`: `buildIndex` leaves
+    /// found, not over them (`Catalog.java:971`: `buildIndex` leaves
     /// `nextRecordingDescriptorOffset` at the end of the walk).
     ///
     /// The failure without that line is not a lost recording but a catalog the
@@ -2609,7 +2609,7 @@ mod tests {
 
         // A floor above the older two picks the same one; a floor above all
         // three ends the scan where the reference's `break` is
-        // (`Catalog.java:556-559`).
+        // (`Catalog.java:559-562`).
         assert_eq!(
             Some(newest),
             catalog
@@ -2637,7 +2637,7 @@ mod tests {
 
     /// A record that is no longer in the index is not found, whatever it
     /// matches: `findLast` walks the index, and a retired record is out of it
-    /// (`Catalog.changeState`, `Catalog.java:779-790`).
+    /// (`Catalog.changeState`, `Catalog.java:782-793`).
     #[test]
     fn a_retired_recording_is_not_found() {
         let dir = TempDir::new();
@@ -2655,7 +2655,7 @@ mod tests {
     }
 
     /// A recording is written with no stop position and is given one when it
-    /// stops (`Catalog.recordingStopped`, `Catalog.java:627-638`).
+    /// stops (`Catalog.recordingStopped`, `Catalog.java:630-641`).
     ///
     /// The write is two fields **in place** — the record is not rewritten and
     /// its neighbours are not touched — so what is asserted is that the two
@@ -2703,8 +2703,8 @@ mod tests {
 
     /// A recording's two ends can be moved on their own, which is the whole of
     /// what a detach and a truncate are
-    /// (`Catalog.startPosition(id, position)`, `Catalog.java:758-767`, and
-    /// `stopPosition(id, position)`, `:637-646`).
+    /// (`Catalog.startPosition(id, position)`, `Catalog.java:761-770`, and
+    /// `stopPosition(id, position)`, `:640-649`).
     ///
     /// Neither write touches anything else in the row — that is the assertion
     /// worth making here, because both are fields *inside* a variable-length
@@ -2760,12 +2760,12 @@ mod tests {
 
     /// Substituting a **longer** record moves everything behind it, and the
     /// ones that moved are still themselves
-    /// (`Catalog.replaceRecording`, `Catalog.java:664-745`).
+    /// (`Catalog.replaceRecording`, `Catalog.java:667-748`).
     ///
     /// One caller substitutes a channel, and a channel is a string — so the
     /// record it writes is as likely to be longer as shorter. A catalog is
     /// packed, so a longer record pushes the tail along, and the offsets in the
-    /// index are absolute, so they have to be told (`:824-838`). What could go
+    /// index are absolute, so they have to be told (`:827-841`). What could go
     /// wrong is silent: a tail moved without the index moved with it reads back
     /// as a **different recording's** bytes.
     #[test]
@@ -2833,7 +2833,7 @@ mod tests {
     }
 
     /// And a **shorter** one leaves its slack as zeros rather than as the bytes
-    /// of the record it replaced (`Catalog.java:820-823`).
+    /// of the record it replaced (`Catalog.java:823-826`).
     #[test]
     fn a_record_that_shrinks_leaves_zeros_behind_it() {
         let dir = TempDir::new();
@@ -2862,7 +2862,7 @@ mod tests {
 
     /// An extended recording is one that has not stopped again, and its row
     /// remembers which session and request extended it
-    /// (`Catalog.extendRecording`, `Catalog.java:648-662`).
+    /// (`Catalog.extendRecording`, `Catalog.java:651-665`).
     #[test]
     fn an_extended_recording_has_not_stopped_any_more() {
         let dir = TempDir::new();

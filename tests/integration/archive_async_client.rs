@@ -2,8 +2,8 @@
 //!
 //! # These are the reference's cases
 //!
-//! `testAeronArchiveAsyncClient` (`…_async_client_test.cpp:501`) and
-//! `shouldAllowToStopReplay` (`:630`), ported. The two things that make this
+//! `testAeronArchiveAsyncClient` (`…_async_client_test.cpp:503`) and
+//! `shouldAllowToStopReplay` (`:632`), ported. The two things that make this
 //! client different from the synchronous one are what the criteria are about:
 //!
 //! * **answers arrive as callbacks**, so every assertion here is made against
@@ -15,11 +15,11 @@
 //! # What the reference asserts that this does not, and why
 //!
 //! * The replay's **data** is read back through an image
-//!   (`…_async_client_test.cpp:611-627`). That is the archive replaying, which
+//!   (`…_async_client_test.cpp:613-629`). That is the archive replaying, which
 //!   P2-S4 and P2-C2 already judge end to end; what belongs to this client is
 //!   that the request goes out and `OK` comes back with the replay session id in
 //!   it, which is asserted here.
-//! * `shouldCloseItselfIfErrorIsTerminal` (`:696`) needs an archive that sends a
+//! * `shouldCloseItselfIfErrorIsTerminal` (`:699`) needs an archive that sends a
 //!   message this client cannot read. Nothing in the archive's own protocol does
 //!   that, so the reference reaches for a seam this build does not have yet;
 //!   see the commit that lands this file.
@@ -158,7 +158,7 @@ fn rig(
 /// (`…_async_client.c:154-168`), so the context has to know where the driver is.
 /// The reference's own test does the same thing one way further up — it hands
 /// the archive context an `aeron` it has already built
-/// (`…_async_client_test.cpp:510-511`), and this build's equivalent of "an
+/// (`…_async_client_test.cpp:512-513`), and this build's equivalent of "an
 /// aeron the caller built" is the directory it was built from.
 fn context(aeron_dir: &Path) -> ArchiveContext {
     ArchiveContext::resolve(&[
@@ -355,7 +355,7 @@ fn the_async_client_answers_every_kind_of_request_and_stops_its_replay() {
     );
 }
 
-/// **The healing** (`…_async_client_test.cpp:583-604`): the archive is killed
+/// **The healing** (`…_async_client_test.cpp:585-606`): the archive is killed
 /// and another one started over the same directory, and the client reconnects
 /// and works.
 ///
@@ -455,7 +455,7 @@ fn the_async_client_reconnects_after_the_archive_is_restarted() {
 ///
 /// **A client of its own** because the async client under test owns the one it
 /// connects with: the reference's own test makes a second synchronous client for
-/// exactly this (`…_async_client_test.cpp:566-567`), and an archive serving two
+/// exactly this (`…_async_client_test.cpp:568-569`), and an archive serving two
 /// control sessions at once is what an archive is for.
 fn record(aeron_dir: &std::path::Path) -> (i64, i64) {
     let mut client = Client::connect(aeron_dir).expect("connect to our driver");

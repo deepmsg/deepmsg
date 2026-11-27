@@ -1343,7 +1343,7 @@ impl TestCluster {
     /// node, then starts the node **alone**.
     ///
     /// The recovery-state counter lives only from the module's startup until
-    /// every service has acked (`ConsensusModuleAgent.java:3505-3520`), so a
+    /// every service has acked (`ConsensusModuleAgent.java:3537-3552`), so a
     /// test that reads a snapshot's recording id out of it has to do that while
     /// the services are still down.
     pub fn restart_node_without_containers(&mut self, member: i32) {
@@ -1733,7 +1733,7 @@ impl TestCluster {
                 config,
                 LaunchComponents {
                     // The reference's `ClusterTests.errorHandler`
-                    // (`ClusterTest.java:565`): a WARN is printed by the agent
+                    // (`ClusterTest.java:570`): a WARN is printed by the agent
                     // and goes no further, an ERROR is a failure — and here a
                     // failure is what a case's waits panic with.
                     error_handler: Some(Box::new(move |error: &deepmsg_cluster::ClusterError| {
@@ -1796,7 +1796,7 @@ impl TestCluster {
     /// inside `await_services_ready` — the follower's join, or a new leader's
     /// first turn — and that loop leaves only when a service acks it: neither
     /// this build's nor the reference's has a deadline
-    /// (`ConsensusModuleAgent.java:1820-1836`). A container stopped first
+    /// (`ConsensusModuleAgent.java:1836-1852`). A container stopped first
     /// therefore strands the thread until the bounded join below fails, which is
     /// the red `cluster_lc3_matrix::the_matrix_survives_a_leader_that_dies`
     /// used to take.
@@ -1842,9 +1842,9 @@ impl TestCluster {
 
             // A JVM that exits before its archive conductor reaches `onClose`
             // leaves the mark file's last proof-of-life behind
-            // (`signalTerminated` is `ArchiveConductor.java:324`), and agrona
+            // (`signalTerminated` is `ArchiveConductor.java:323`), and agrona
             // calls such a file *active* for `LIVENESS_TIMEOUT_MS` — ten
-            // seconds (`Archive.java:673`). The next start over the same
+            // seconds (`Archive.java:702`). The next start over the same
             // directory is then refused with `IllegalStateException: active
             // mark file detected` (`MarkFile.java:693`), the JVM dies inside
             // `Archive$Context.conclude`, its media driver closes and writes
@@ -1872,7 +1872,7 @@ impl TestCluster {
                     // `do_work` is not in that turn**: the election's
                     // `await_services_ready` polls its acks in a loop with no
                     // deadline (the reference's does the same,
-                    // `ConsensusModuleAgent.java:1820-1836`), and a member
+                    // `ConsensusModuleAgent.java:1836-1852`), and a member
                     // that is joining a term while this fixture takes its
                     // service containers away never leaves it.
                     //
@@ -1905,7 +1905,7 @@ impl TestCluster {
                              flag is read between duty cycles, so this is a module blocked \
                              inside one — the join's `await_services_ready` waits for a service \
                              ack that has no deadline (the reference's loop is the same, \
-                             `ConsensusModuleAgent.java:1820-1836`), so a container stopped \
+                             `ConsensusModuleAgent.java:1836-1852`), so a container stopped \
                              first strands it for ever. This is a hang made into a failure; \
                              what the module and its driver last said follows.\n{state}"
                         );
@@ -2055,7 +2055,7 @@ impl TestCluster {
         args.push("-cp".to_owned());
         // The probes are on the node's classpath too: a Java node loads its
         // authenticator supplier **by class name** from a property
-        // (`ConsensusModule.java:807`), which is how a scenario gives a
+        // (`ConsensusModule.java:814`), which is how a scenario gives a
         // three-node cluster a challenge/response authenticator without a
         // custom node main.
         args.push(format!(

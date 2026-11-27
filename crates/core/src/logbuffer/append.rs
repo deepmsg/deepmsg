@@ -142,7 +142,7 @@ enum PayloadSource<'a, 'b> {
     /// `ClientSession.offer` take `DirectBufferVector[]`
     /// (`aeron-cluster/.../service/Cluster.java:332`,
     /// `ClientSession.java:96`), and the container puts its own session header
-    /// at the front of that array (`ClusteredServiceAgent.java:390-397`). The
+    /// at the front of that array (`ClusteredServiceAgent.java:391-398`). The
     /// leading slice is separate from `rest` so a caller whose header is
     /// resident never has to build an array of it and the payload's parts.
     ///
@@ -432,7 +432,7 @@ impl<'a> Appender<'a> {
     /// How many terms have been written since the log began.
     pub fn active_term_count(&self) -> Option<i32> {
         // Acquire, as `aeron_logbuffer_active_term_count` reads it
-        // (`aeron_logbuffer_descriptor.h:179-184`).
+        // (`aeron_logbuffer_descriptor.h:180-185`).
         self.metadata
             .load_i32_acquire(descriptor::ACTIVE_TERM_COUNT_OFFSET)
     }
@@ -441,7 +441,7 @@ impl<'a> Appender<'a> {
     ///
     /// Reads `active_term_count` **first**, then uses it to pick the counter —
     /// the order matters, because the count is what tells you which counter is
-    /// current (`aeron_logbuffer_descriptor.h:94-102`).
+    /// current (`aeron_logbuffer_descriptor.h:95-103`).
     pub fn current_tail(&self) -> Option<RawTail> {
         let term_count = self.active_term_count()?;
         let index = position::index_by_term_count(term_count);
@@ -600,7 +600,7 @@ impl<'a> Appender<'a> {
         if source.len() > self.max_payload_length {
             // Fragmented: the reservation is the whole message, computed with
             // the reference's own formula so the frames below land exactly
-            // where it says (`aeron_logbuffer_descriptor.h:326-334`).
+            // where it says (`aeron_logbuffer_descriptor.h:327-335`).
             let framed_length =
                 descriptor::compute_fragmented_length(source.len(), self.max_payload_length);
 
@@ -1598,8 +1598,8 @@ impl<'a> Appender<'a> {
     /// The work is [`descriptor::rotate_log`]'s: the reference keeps rotation
     /// on the metadata block rather than on a producer, because the driver's
     /// blocked-publisher unblocker rotates the same way
-    /// (`aeron_logbuffer_descriptor.h:194-216`,
-    /// `aeron_logbuffer_unblocker.c:46,55`).
+    /// (`aeron_logbuffer_descriptor.h:195-217`,
+    /// `aeron_logbuffer_unblocker.c:51,55`).
     pub fn rotate(&self, current_term_count: i32, current_term_id: i32) -> bool {
         descriptor::rotate_log(&self.metadata, current_term_count, current_term_id)
     }
@@ -1625,7 +1625,7 @@ impl<'a> Appender<'a> {
     ///
     /// Separate from any "apply defaults" because neither reference function
     /// does it: `aeron_logbuffer_metadata_init` documents that it leaves the
-    /// tails alone (`aeron_logbuffer_descriptor.h:235-239`), and a writer that
+    /// tails alone (`aeron_logbuffer_descriptor.h:236-240`), and a writer that
     /// publishes without this produces three zeroed tails — which read as term
     /// id 0 / offset 0 in every partition and are silently wrong for any other
     /// `initial_term_id`.

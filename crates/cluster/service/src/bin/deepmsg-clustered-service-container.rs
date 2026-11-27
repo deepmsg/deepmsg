@@ -1,6 +1,6 @@
 //! One service container process, the counterpart of
 //! `io.aeron.cluster.service.ClusteredServiceContainer.main`
-//! (`ClusteredServiceContainer.java:97-112`).
+//! (`ClusteredServiceContainer.java:100-115`).
 //!
 //! # Arguments
 //!
@@ -123,7 +123,7 @@ fn run() -> Result<(), String> {
         )
     })?;
 
-    // The reference's thread name (`:926-930`, `:942`): the agent's role name,
+    // The reference's thread name (`:955-959`, `:976`): the agent's role name,
     // on the thread the agent runs on. The kernel keeps fifteen bytes, which is
     // what `set_current_thread_name` leaves; P3-8 owns the naming-mode table and
     // the tests that read the whole name back.

@@ -13,9 +13,9 @@ header *is* the framing. Those facts only exist in a whole file.
 
 | | |
 |---|---|
-| Written by | `GenerateCatalog.java` (in the fork `aeron-deepmsg`, branch `deepmsg-tests`), from `aeron-all-1.53.2.jar` |
+| Written by | `GenerateCatalog.java` (in the fork `aeron-deepmsg`, branch `deepmsg-tests`), from `aeron-all-1.54.2.jar` |
 | Fixtures | `archive.catalog` (1 MiB, 3 recordings), `catalog.tsv` (66 readings) |
-| Captured | 2026-10-06 |
+| Captured | 2026-11-26 (re-run at 1.54.2; the bytes are identical to the 1.53.2 capture) |
 | Read by | `crates/archive/tests/catalog.rs` (no reference needed) and, next, `tests/interop/catalog_reference.rs` |
 
 ## The files
@@ -32,7 +32,7 @@ Two of the numbers are the ones a reader cannot compute: each record's
 
 ## Regenerating
 
-    JAR=../../aeron/aeron-all/build/libs/aeron-all-1.53.2.jar
+    JAR=../../aeron/aeron-all/build/libs/aeron-all-1.54.2.jar
     javac -proc:none -cp "$JAR" -d /tmp/catgen \
          "$AERON_DEEPMSG/deepmsg-tests/generators/catalog/GenerateCatalog.java"
     java --add-exports java.base/jdk.internal.misc=ALL-UNNAMED \
@@ -52,7 +52,7 @@ shows nothing, which is the cheapest check that the generator is deterministic.
 **Every recording is finished** — a real stop position and stop timestamp rather
 than `NULL_POSITION`. A record that is `VALID` with a null stop position is one
 the reference tries to *repair* on open, by reading the recording's **segment
-files** (`refreshAndFixDescriptor`, `Catalog.java:1066`), and this fixture has no
+files** (`refreshAndFixDescriptor`, `Catalog.java:1069`), and this fixture has no
 segments: it would fail for a reason that has nothing to do with the catalog's
 layout. What a catalog of *live* recordings looks like is the archive's question,
 not a format fixture's.
@@ -64,4 +64,4 @@ would land somewhere that is not a record. The frame lengths are 256, 192 and
 
 `GenerateCatalog.java` is in `package io.aeron.archive` for the same reason
 `GenerateMarkFile.java` is: the constructor that creates a catalog is
-package-private (`Catalog.java:152`), as is `addNewRecording` (`:407`).
+package-private (`Catalog.java:155`), as is `addNewRecording` (`:410`).

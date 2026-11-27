@@ -9,7 +9,7 @@
 //! response channel is a response channel it rewrites the **request** channel
 //! `aeron:ipc` into `aeron:ipc?response-correlation-id=<response subscription's
 //! registration id>`, and the driver pairs the two ends by that id
-//! (`aeron_driver_conductor.c:1714-1729`).
+//! (`aeron_driver_conductor.c:1755-1770`).
 //!
 //! So the request publication that has to reach the archive's plain `aeron:ipc`
 //! subscription carries one parameter a plain channel does not carry. If this

@@ -5,13 +5,13 @@
 //! and the way decides both how many threads there are and what they are named:
 //!
 //! * `DEDICATED` — the conductor, the recorder and the replayer are three
-//!   agents (`Archive.java:146-147`), and `DedicatedModeArchiveConductor.onStart`
+//!   agents (`Archive.java:148-149`), and `DedicatedModeArchiveConductor.onStart`
 //!   starts the last two on threads of their own
-//!   (`DedicatedModeArchiveConductor.java:54-55`).
+//!   (`DedicatedModeArchiveConductor.java:64-65`).
 //! * `SHARED` — one agent for all three, driven in one turn
 //!   (`SharedModeArchiveConductor.java:57-64`).
 //! * `INVOKER` — the same single agent, driven by the *caller*
-//!   (`Archive.java:149-153`: an `AgentInvoker` instead of an `AgentRunner`).
+//!   (`Archive.java:151-155`: an `AgentInvoker` instead of an `AgentRunner`).
 //!
 //! This module is the part of that which is not a thread yet: **which name each
 //! role's thread gets**. [`Role::name`] is the table, and [`spawn`] is the one
@@ -20,19 +20,19 @@
 //!
 //! # Two namings, and one collision
 //!
-//! `aeron.thread.naming` (`CommonContext.java:534`) picks between two spellings
-//! of the same four roles, and the default is `classic` (`:547`):
+//! `aeron.thread.naming` (`CommonContext.java:541`) picks between two spellings
+//! of the same four roles, and the default is `classic` (`:554`):
 //!
 //! | role | `classic` | `new` |
 //! |---|---|---|
-//! | conductor (`Archive.java:131`, `:126`) | `archive-conductor` | `aeron-ar-cnd` |
-//! | recorder (`:129`, `:124`) | `archive-recorder` | `aeron-ar-rec` |
-//! | replayer (`:130`, `:125`) | `archive-replayer` | `aeron-ar-rep` |
-//! | shared (`:132`, `:127`) | `archive-conductor` | `aeron-ar-shd` |
+//! | conductor (`Archive.java:133`, `:128`) | `archive-conductor` | `aeron-ar-cnd` |
+//! | recorder (`:131`, `:126`) | `archive-recorder` | `aeron-ar-rec` |
+//! | replayer (`:132`, `:127`) | `archive-replayer` | `aeron-ar-rep` |
+//! | shared (`:134`, `:129`) | `archive-conductor` | `aeron-ar-shd` |
 //!
 //! ★ **`Shared` and `Conductor` are the same name under `classic`** and differ
 //! under `new` (`AERON_ARCHIVE_SHARED_THREAD_NAME_CLASSIC` is literally
-//! `AERON_ARCHIVE_CONDUCTOR_THREAD_NAME_CLASSIC`, `Archive.java:132`), which is
+//! `AERON_ARCHIVE_CONDUCTOR_THREAD_NAME_CLASSIC`, `Archive.java:134`), which is
 //! why they are two roles here and not one: a table that folded them would be
 //! right in one naming and wrong in the other.
 //!
@@ -40,7 +40,7 @@
 //! calls `Thread.setName` with, from the runner's `roleName()`
 //! (`org.agrona.concurrent.AgentRunner`; the role names themselves are set in
 //! the agents' own constructors — `DedicatedModeArchiveConductor.java:39`,
-//! `SharedModeArchiveConductor.java:33`, `ArchiveConductor.java:2711`, `:2758`).
+//! `SharedModeArchiveConductor.java:33`, `ArchiveConductor.java:2746`, `:2793`).
 //!
 //! # Why these are not cut to fifteen bytes
 //!

@@ -9,7 +9,7 @@
 //! 4. **the business's own records, after END** — `service.on_take_snapshot` is
 //!    called once `snapshot_state` has returned
 //!
-//! `typeId` is **2**, the container's (`ClusteredServiceContainer.java:195`),
+//! `typeId` is **2**, the container's (`ClusteredServiceContainer.java:203`),
 //! not 1, the consensus module's: the two share `SnapshotMarker(100)`, and the
 //! type id is all that tells their snapshots apart.
 //!
@@ -49,7 +49,7 @@ use crate::error::ContainerError;
 use crate::role::TimeUnit;
 use crate::session::ContainerClientSession;
 
-/// `ClusteredServiceContainer.Configuration.SNAPSHOT_TYPE_ID` (`:195`).
+/// `ClusteredServiceContainer.Configuration.SNAPSHOT_TYPE_ID` (`:203`).
 pub const SNAPSHOT_TYPE_ID: i64 = 2;
 
 /// `ServiceSnapshotLoader.FRAGMENT_LIMIT` (`:31`).
@@ -124,10 +124,16 @@ impl<'a> ServiceSnapshotTaker<'a> {
     /// [`ContainerError::Cluster`] when the record is refused.
     pub fn mark_begin(
         &mut self,
-        log_position: i64,
         leadership_term_id: i64,
+        term_base_log_position: i64,
+        log_position: i64,
     ) -> Result<(), ContainerError> {
-        self.mark(SnapshotMark::BEGIN, log_position, leadership_term_id)
+        self.mark(
+            SnapshotMark::BEGIN,
+            leadership_term_id,
+            term_base_log_position,
+            log_position,
+        )
     }
 
     /// `SnapshotTaker.markEnd` (`:127-144`).
@@ -137,10 +143,16 @@ impl<'a> ServiceSnapshotTaker<'a> {
     /// As [`Self::mark_begin`].
     pub fn mark_end(
         &mut self,
-        log_position: i64,
         leadership_term_id: i64,
+        term_base_log_position: i64,
+        log_position: i64,
     ) -> Result<(), ContainerError> {
-        self.mark(SnapshotMark::END, log_position, leadership_term_id)
+        self.mark(
+            SnapshotMark::END,
+            leadership_term_id,
+            term_base_log_position,
+            log_position,
+        )
     }
 
     /// `snapshotSession` (`ServiceSnapshotTaker.java:37-72`): claim when the
@@ -188,8 +200,9 @@ impl<'a> ServiceSnapshotTaker<'a> {
     fn mark(
         &mut self,
         mark: SnapshotMark,
-        log_position: i64,
         leadership_term_id: i64,
+        term_base_log_position: i64,
+        log_position: i64,
     ) -> Result<(), ContainerError> {
         let length = MESSAGE_HEADER_LENGTH + usize::from(SNAPSHOT_MARKER_BLOCK_LENGTH);
         self.size_buffer(length);
@@ -208,7 +221,8 @@ impl<'a> ServiceSnapshotTaker<'a> {
                 .index(0)
                 .mark(mark)
                 .time_unit(self.time_unit.to_cluster_time_unit())
-                .app_version(self.app_version);
+                .app_version(self.app_version)
+                .term_base_log_position(term_base_log_position);
         }
 
         self.claim(length)
@@ -606,11 +620,11 @@ mod tests {
         let channel = "aeron:udp?endpoint=localhost:0";
         {
             let mut taker = ServiceSnapshotTaker::new(&mut sink, TimeUnit::Milliseconds, 7);
-            taker.mark_begin(1_024, 5).expect("BEGIN");
+            taker.mark_begin(5, 4_096, 1_024).expect("BEGIN");
             taker
                 .snapshot_session(&session(channel, &[1, 2, 3]))
                 .expect("session");
-            taker.mark_end(1_024, 5).expect("END");
+            taker.mark_end(5, 4_096, 1_024).expect("END");
         }
 
         let claims = sink.claims.borrow();
@@ -628,6 +642,7 @@ mod tests {
         assert_eq!(marker.mark(), SnapshotMark::BEGIN);
         assert_eq!(marker.log_position(), 1_024);
         assert_eq!(marker.leadership_term_id(), 5);
+        assert_eq!(marker.term_base_log_position(), Some(4_096));
         assert_eq!(marker.app_version(), Some(7));
 
         let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(&claims[1]), 0);
@@ -700,11 +715,11 @@ mod tests {
         let mut sink = RecordingSink::new(1024);
         {
             let mut taker = ServiceSnapshotTaker::new(&mut sink, TimeUnit::Milliseconds, 7);
-            taker.mark_begin(1_024, 5).expect("BEGIN");
+            taker.mark_begin(5, 4_096, 1_024).expect("BEGIN");
             taker
                 .snapshot_session(&session("aeron:udp?endpoint=localhost:0", &[1, 2, 3]))
                 .expect("session");
-            taker.mark_end(1_024, 5).expect("END");
+            taker.mark_end(5, 4_096, 1_024).expect("END");
         }
         core::mem::take(&mut *sink.claims.borrow_mut())
     }

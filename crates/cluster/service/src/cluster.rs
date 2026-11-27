@@ -43,7 +43,7 @@ use crate::session::{ContainerClientSession, SessionTable};
 /// How often the container's clock tick runs (`CSA.ONE_MILLISECOND_NS`).
 pub const CLOCK_TICK_INTERVAL_NS: i64 = 1_000_000;
 
-/// How often the mark file is stamped (`MARK_FILE_UPDATE_INTERVAL_NS`, `:200`).
+/// How often the mark file is stamped (`MARK_FILE_UPDATE_INTERVAL_NS`, `:208`).
 pub const MARK_FILE_UPDATE_INTERVAL_NS: i64 = 1_000_000_000;
 
 /// Which callback the container is inside, for `checkForValidInvocation`

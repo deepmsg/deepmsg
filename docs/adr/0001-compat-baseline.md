@@ -1,6 +1,6 @@
 # ADR-0001: Compatibility baseline is Aeron 1.53.2
 
-- Status: accepted (2026-09-25)
+- Status: accepted (2026-09-25), superseded by [ADR-0007](0007-compat-baseline-1.54.2.md) (2026-11-26)
 
 ## Context
 

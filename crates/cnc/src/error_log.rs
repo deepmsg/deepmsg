@@ -175,7 +175,7 @@ struct Observation {
 /// The reference's per-thread error buffer, as a value.
 ///
 /// `aeron_err_set` starts it, `aeron_err_append` adds a line to it
-/// (`util/aeron_error.c:337-378`), and the whole of it is what **both**
+/// (`util/aeron_error.c:357-398`), and the whole of it is what **both**
 /// consumers see: the `ON_ERROR` a client is handed and the entry the distinct
 /// error log records. They are one composition with two readers, which is why
 /// a client's `RegistrationException` message looks like a log entry.
@@ -227,7 +227,7 @@ impl ErrorReport {
 
     /// The code the reference would report: the errno `set` was handed, which
     /// is what `log_explicit_error` records and what `on_error` transforms for
-    /// a client (`aeron_driver_conductor.c:1215`, `:2334-2338`).
+    /// a client (`aeron_driver_conductor.c:1256`, `:2397-2401`).
     pub const fn code(&self) -> i32 {
         self.code
     }
@@ -282,7 +282,7 @@ pub enum RecordError {
 }
 
 /// The reference's description for a code a **driver** records
-/// (`aeron_error_code_str`, `aeron-client/src/main/c/util/aeron_error.c:190-309`).
+/// (`aeron_error_code_str`, `aeron-client/src/main/c/util/aeron_error.c:195-314`).
 ///
 /// This is the part of that table this build models: the reference has rows
 /// for its client-side codes (`AERON_CLIENT_ERROR_*`, `aeronc.h:32-35`) and
@@ -291,7 +291,7 @@ pub enum RecordError {
 ///
 /// Zero is not the default, because the reference's own switch puts
 /// `AERON_ERROR_CODE_UNUSED` on the same case as
-/// `AERON_ERROR_CODE_GENERIC_ERROR` (`:195-200`).
+/// `AERON_ERROR_CODE_GENERIC_ERROR` (`:200-205`).
 ///
 /// The code the reference *records* is often negated — its `AERON_SET_ERR`
 /// calls on the recording sites are given `-ERROR_CODE_*` — and this table is
@@ -319,13 +319,13 @@ pub fn error_code_description(code: i32) -> &'static str {
 /// How much of an error message the reference's per-thread buffer can hold
 /// before its composition is cut short: `AERON_ERROR_MAX_TOTAL_LENGTH` is
 /// 8192 (`aeron_error.h:26`), and the trailer `strcpy` lands six bytes from
-/// the end (`sizeof - (strlen("...\n") + 2)`, `aeron_error.c:348`), so
+/// the end (`sizeof - (strlen("...\n") + 2)`, `aeron_error.c:368`), so
 /// anything past byte 8186 is the trailer.
 const ERROR_MESSAGE_LIMIT: usize = 8192 - 6;
 
 /// Compose the description the reference records for an error set with
-/// `AERON_SET_ERR` (`aeron_err_set`, `aeron_error.c:351-375`, with the entry
-/// formatting at `:326-334`):
+/// `AERON_SET_ERR` (`aeron_err_set`, `aeron_error.c:371-395`, with the entry
+/// formatting at `:346-354`):
 ///
 /// ```text
 /// (<code>) <the code's description>
@@ -336,7 +336,7 @@ const ERROR_MESSAGE_LIMIT: usize = 8192 - 6;
 /// `__LINE__`, which the compiler resolves to the line bearing the macro
 /// name. The code appears as it was set, negated or not, and **which
 /// description follows it is decided by its sign** (`aeron_err_set`,
-/// `aeron_error.c:361-373`): a code at or below zero is described by
+/// `aeron_error.c:381-393`): a code at or below zero is described by
 /// [`error_code_description`], and a positive one — an errno, which is what
 /// `AERON_SET_ERR(EINVAL, …)` hands over — by the OS's own `strerror` text,
 /// through [`deepmsg_core::pal::error_string`].
@@ -344,7 +344,7 @@ const ERROR_MESSAGE_LIMIT: usize = 8192 - 6;
 /// That second branch went unmodelled until a recording site needed it, on the
 /// argument that no site here set a positive code. The argument was true and
 /// expired: a receiver refusing a sender's MTU records `(22) Invalid argument`
-/// (`media/aeron_receive_channel_endpoint.c:1022`), and a composition that
+/// (`media/aeron_receive_channel_endpoint.c:1027`), and a composition that
 /// printed `unknown error code` after the 22 would be wrong in the one place a
 /// reader looks.
 ///
@@ -418,7 +418,7 @@ impl DistinctErrorLog {
     /// [`RecordError::Unrecordable`] when the entry would not fit; nothing is
     /// written then. Counting the failure is the caller's business — the
     /// reference increments its errors counter even for an error it could not
-    /// record (`aeron_driver_conductor.c:1203-1210`) — which is why the error
+    /// record (`aeron_driver_conductor.c:1244-1251`) — which is why the error
     /// carries the description back rather than asking the caller to re-derive
     /// it.
     pub fn record(
@@ -529,25 +529,25 @@ mod tests {
 
     #[test]
     fn the_composition_matches_what_the_reference_records() {
-        // Read off a live 1.53.2 driver with `ErrorStat`: an unknown command
+        // Read off a live 1.54.2 driver with `ErrorStat`: an unknown command
         // type is recorded as two lines, the code's own description and then
         // the recording site, and ends with a newline
-        // (`aeron_error.c:326-375`).
+        // (`aeron_error.c:346-395`).
         assert_eq!(
             "(-6) unknown command type id\n\
-             [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3219] \
+             [aeron_driver_conductor_on_command, aeron_driver_conductor.c:3316] \
              command=153 unknown\n",
             compose_description(
                 -ERROR_CODE_UNKNOWN_COMMAND_TYPE_ID,
                 "aeron_driver_conductor_on_command",
                 "aeron_driver_conductor.c",
-                3219,
+                3316,
                 "command=153 unknown",
             )
         );
 
         // A *negative* code the table has no case for gets the reference's
-        // default (`aeron_error.c:307-309`).
+        // default (`aeron_error.c:327-329`).
         assert_eq!(
             "(-99) unknown error code\n[f, f.c:1] m\n",
             compose_description(-99, "f", "f.c", 1, "m")
@@ -556,22 +556,22 @@ mod tests {
 
     #[test]
     fn a_positive_code_is_described_by_the_os_and_not_by_the_table() {
-        // Read off a live 1.53.2 driver, which recorded this for a sender
+        // Read off a live 1.54.2 driver, which recorded this for a sender
         // whose MTU did not fit the receiver's window: the receiving side
         // raises `AERON_SET_ERR(EINVAL, …)`, and a **positive** code takes
         // `aeron_err_set`'s other branch — `strerror_r`, not the protocol
-        // table (`aeron_error.c:361-373`). That is why the entry says
+        // table (`aeron_error.c:381-393`). That is why the entry says
         // `Invalid argument` and not the table's row for 22 (which there is
         // not) and not the row for 1.
         assert_eq!(
             "(22) Invalid argument\n\
              [aeron_receiver_channel_endpoint_validate_sender_mtu_length, \
-             aeron_receive_channel_endpoint.c:1022] mtuLength=1408 > initialWindowLength=1376\n",
+             aeron_receive_channel_endpoint.c:1027] mtuLength=1408 > initialWindowLength=1376\n",
             compose_description(
                 22,
                 "aeron_receiver_channel_endpoint_validate_sender_mtu_length",
                 "aeron_receive_channel_endpoint.c",
-                1022,
+                1027,
                 "mtuLength=1408 > initialWindowLength=1376",
             )
         );
@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn an_appended_line_is_a_site_and_a_message_and_leaves_the_code_alone() {
-        // The shape `aeron_err_update_entry` writes (`:337-349`), and the two
+        // The shape `aeron_err_update_entry` writes (`:357-369`), and the two
         // things it does *not* do: it never touches the code, and an empty
         // message still gets its site line — the last line the reference
         // writes for a subscription that could not bind has nothing after the
@@ -605,13 +605,13 @@ mod tests {
         report.append(
             "aeron_receive_destination_create",
             "aeron_receive_destination.c",
-            78,
+            84,
             "uri = aeron:udp?endpoint=127.0.0.1:9999",
         );
         report.append(
             "aeron_driver_conductor_execute_add_network_subscription",
             "aeron_driver_conductor.c",
-            5043,
+            5140,
             "",
         );
 
@@ -619,10 +619,10 @@ mod tests {
         assert_eq!(
             "(98) Address already in use\n\
              [aeron_bind, aeron_socket.c:93] failed to bind(3, 127.0.0.1:9999)\n\
-             [aeron_receive_destination_create, aeron_receive_destination.c:78] \
+             [aeron_receive_destination_create, aeron_receive_destination.c:84] \
              uri = aeron:udp?endpoint=127.0.0.1:9999\n\
              [aeron_driver_conductor_execute_add_network_subscription, \
-             aeron_driver_conductor.c:5043] \n",
+             aeron_driver_conductor.c:5140] \n",
             report.text()
         );
     }
@@ -643,18 +643,18 @@ mod tests {
 
     #[test]
     fn the_code_descriptions_are_the_references_table() {
-        // `aeron_error_code_str` (`aeron_error.c:190-309`), the entries a
+        // `aeron_error_code_str` (`aeron_error.c:195-314`), the entries a
         // driver-recorded code can reach.
         assert_eq!("invalid channel", error_code_description(1));
         assert_eq!("unknown counter", error_code_description(5));
         assert_eq!("insufficient storage space", error_code_description(12));
         // The two rows the reference's switch shares, and past the driver's
-        // own range (`:195-200`, `:233-238`).
+        // own range (`:200-205`, `:238-243`).
         assert_eq!("generic error, see message", error_code_description(0));
         assert_eq!("generic error, see message", error_code_description(11));
         assert_eq!("image rejected", error_code_description(13));
         assert_eq!("publication revoked", error_code_description(14));
-        // And the default for a code with no row (`:307-309`).
+        // And the default for a code with no row (`:327-329`).
         assert_eq!("unknown error code", error_code_description(99));
     }
 
@@ -805,8 +805,8 @@ mod tests {
 
         assert_eq!(1, scan.entries);
         // The count of a first sighting is one: the entry is written with a
-        // zero count (`:136`) and the sighting is then counted against it
-        // (`:200`).
+        // zero count (`:141`) and the sighting is then counted against it
+        // (`:205`).
         assert_eq!(1, out[0].observation_count);
         assert_eq!(1_000, out[0].first_observation_timestamp_ms);
         assert_eq!(1_000, out[0].last_observation_timestamp_ms);
@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     fn the_same_text_under_another_code_is_its_own_entry() {
-        // The code is half the de-duplication key (`:84-85`), even though it
+        // The code is half the de-duplication key (`:89-90`), even though it
         // never reaches the region: a reader cannot tell the two entries
         // apart, and only the process can.
         let mut region = Region::zeroed(512);
@@ -860,7 +860,7 @@ mod tests {
     #[test]
     fn a_longer_text_containing_a_remembered_one_counts_against_it() {
         // The remembered text is a prefix of the new one — `strncmp` with the
-        // *stored* length (`:85`) — so a more specific failure of the same
+        // *stored* length (`:90`) — so a more specific failure of the same
         // thing still counts, and the region keeps the shorter text.
         let mut region = Region::zeroed(512);
         let mut log = DistinctErrorLog::new();

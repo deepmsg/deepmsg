@@ -179,7 +179,7 @@ pub struct AsyncArchiveClient {
     /// `context->aeron = NULL` again so that the *next* connect makes a fresh
     /// one — and the reason is the one case that matters: the archive is a
     /// process, and `testAeronArchiveAsyncClient` reconnects to it by **killing
-    /// it and starting another** (`…_async_client_test.cpp:583-590`). A client
+    /// it and starting another** (`…_async_client_test.cpp:585-592`). A client
     /// value that outlived that would be mapped onto a CnC file the new driver
     /// has replaced.
     client: Option<Client>,

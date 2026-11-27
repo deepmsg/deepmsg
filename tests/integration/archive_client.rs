@@ -202,11 +202,11 @@ fn a_context_that_never_retries_is_refused() {
 
 /// `shouldFailWithErrorIfAeronClientFailsToConnect` (`:3155-3169`), and the same
 /// refusal reached from the other side in `shouldFailIfClientNameIsTooLong`
-/// (`:4838-4846`).
+/// (`:5051-5059`).
 ///
 /// The name is 127 characters — `"super very long client name"` and a hundred
 /// `x`s — and the limit is the width of a counter's client-name field
-/// (`aeronc.h:885`).
+/// (`aeronc.h:888`).
 ///
 /// **The two reference cases are two layers of one rule**, which is why one
 /// criterion here answers both: the first is a *driver* refusing a name that
@@ -236,7 +236,7 @@ fn a_context_whose_client_name_is_too_wide_is_refused() {
 ///
 /// The reference's two instances of the name are `"abc"` and ninety-nine `x`s
 /// and a `$`: **100 characters**, the width of a counter's client-name field
-/// (`aeronc.h:885`), which the case sets and reads back unharmed.
+/// (`aeronc.h:888`), which the case sets and reads back unharmed.
 ///
 /// **What is asserted is the boundary, not a setter.** That case has a
 /// setter/getter pair to round-trip through, and this build has a public field —
@@ -345,7 +345,7 @@ fn a_size_reads_its_suffix_and_ignores_the_rest() {
 
 /// The driver's own MTU seeds the control MTU's default.
 ///
-/// `aeron_archive_context.c:92-97` reads `AERON_MTU_LENGTH` *first* and the
+/// `aeron_archive_context.c:91-96` reads `AERON_MTU_LENGTH` *first* and the
 /// archive's variable over it, so `AERON_MTU_LENGTH` alone changes the control
 /// channel too — and the archive's variable alone wins over it.
 #[test]
@@ -459,9 +459,9 @@ fn driver_and_client(test_name: &str) -> Option<(OwnDriver, Client)> {
 ///
 /// The reference's own version fabricates an `aeron_t` with
 /// `control_protocol_version = 0` rather than starting a driver
-/// (`aeron_archive_test.cpp:3177-3193`), because below 1.0.0
+/// (`aeron_archive_test.cpp:3194-3210`), because below 1.0.0
 /// `aeron_async_next_session_id` hands back a randomised int32 with no command
-/// sent at all (`aeron_client_conductor.c:2344-2371`). There is no such
+/// sent at all (`aeron_client_conductor.c:2394-2421`). There is no such
 /// shortcut here, so this asks a real driver — which is what production does.
 #[test]
 fn default_parameters_reach_both_control_channels() {
@@ -506,7 +506,7 @@ fn default_parameters_reach_both_control_channels() {
     );
 }
 
-/// `shouldNotApplyDefaultParameters…IfTheyAreSetExplicitly` (`:3231-3296`).
+/// `shouldNotApplyDefaultParameters…IfTheyAreSetExplicitly` (`:3297-3362`).
 ///
 /// Nothing that is already written is overwritten — not the term length
 /// spelled `64k`, not the MTU, not sparse-ness — and the parameters a channel
@@ -516,7 +516,7 @@ fn default_parameters_reach_both_control_channels() {
 /// **One thing is overwritten**, and it is the case's quiet half: the request
 /// channel above says `session-id=0`, and afterwards it names the minted
 /// session instead. A session id is not a default; it is the session's, and
-/// `put_int32` replaces it (`aeron_archive_context.c:399-400`).
+/// `put_int32` replaces it (`aeron_archive_context.c:403-404`).
 #[test]
 fn explicit_parameters_are_not_overwritten() {
     let Some((_own, mut client)) = driver_and_client("archive-client-explicit-parameters") else {
@@ -572,7 +572,7 @@ fn explicit_parameters_are_not_overwritten() {
     // It is not a hope about what the driver will say. A driver never answers
     // with an id inside its reserved range — `SessionIds::cursor` *skips* the
     // whole of it (`crates/driver/src/ipc_publications.rs:343-349`), and the
-    // range is `-1..=1000` by default (`config.rs:414`, `:421`) — so nought is
+    // range is `-1..=1000` by default (`config.rs:414`, `:425`) — so nought is
     // one of the ids it cannot give, whatever it seeded its cursor with.
     assert_ne!(
         Some("0"),
@@ -644,7 +644,7 @@ fn a_response_mode_context_names_no_session() {
 /// pointer**: the copy's channels say the same thing and are their own
 /// allocations, so writing to one cannot be seen through the other. The
 /// reference needs a function for this because its copy is a `memcpy` with
-/// three re-`strdup`s (`:229-267`); here [`Clone`] does it, and what the case
+/// three re-`strdup`s (`:228-266`); here [`Clone`] does it, and what the case
 /// is really pinning is that it stays a *deep* copy — a field changed from
 /// `String` to `Arc<str>` would satisfy `assert_eq!` and break this.
 ///
@@ -722,7 +722,7 @@ fn a_context_is_copied_not_shared() {
 ///
 /// That last part is the one place this deviates from the reference. It parses
 /// into a `ChannelUriStringBuilder` and prints its fields in a fixed order
-/// (`ChannelUriStringBuilder.java:2451-2512`), so a channel whose parameters
+/// (`ChannelUriStringBuilder.java:2505-2566`), so a channel whose parameters
 /// were written in another order comes back normalised; [`ChannelUri`] prints
 /// what it read, which makes this a round trip. Both are asserted below, because
 /// a caller that compares the result against what it passed in needs to know

@@ -40,12 +40,12 @@ citation at all, because it reads as if it were checked.
    C implementation (`docs/adr/0001`). Java is the authority only where no C
    exists — the archive server and the cluster.
 
-4. **Pin the version.** The baseline is 1.53.2, commit `664f58e705`. A path
+4. **Pin the version.** The baseline is 1.54.2, commit `481d4271ad`. A path
    that resolves today may not resolve after an upstream bump, so a citation
    meant to survive one should say which baseline it was written against.
 
 ## Known-bad paths
 
 [references/known-bad-paths.md](references/known-bad-paths.md) lists paths that
-look plausible but do not exist at 1.53.2, together with where they actually
+look plausible but do not exist at 1.54.2, together with where they actually
 live. Read it before trusting any path you did not resolve with `ls`.

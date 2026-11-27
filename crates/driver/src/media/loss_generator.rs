@@ -2,9 +2,9 @@
 //!
 //! The reference ships a family of them behind one vtable: a randomised one
 //! that drops a fraction of what it is shown
-//! (`media/aeron_random_loss_generator.c:33-62`), a fixed one that drops one
+//! (`media/aeron_random_loss_generator.c:38-67`), a fixed one that drops one
 //! term-and-offset region exactly once per frame
-//! (`media/aeron_fixed_loss_generator.c:33-95`), and a multi-gap one. What
+//! (`media/aeron_fixed_loss_generator.c:38-100`), and a multi-gap one. What
 //! they are for is testing loss recovery: loopback does not drop, so a test
 //! that waits for a real network to lose something waits forever, and the gap,
 //! the NAK, the retransmission and the de-duplication never become
@@ -16,13 +16,13 @@
 //! `control_loss_generator` (`media/aeron_send_channel_endpoint.h:73-74`,
 //! `media/aeron_receive_channel_endpoint.h:87-88`). The reference fills them
 //! from a supplier on the driver context, which the endpoint's own create
-//! calls (`media/aeron_send_channel_endpoint.c:237-240`,
-//! `media/aeron_receive_channel_endpoint.c:148-151`), so a driver that wants
+//! calls (`media/aeron_send_channel_endpoint.c:230-233`,
+//! `media/aeron_receive_channel_endpoint.c:153-156`), so a driver that wants
 //! loss is configured once and every endpoint made afterwards has it.
 //!
 //! This build has the **send endpoint's data slot**, which is where the
 //! reference consults its own generator too
-//! (`media/aeron_send_channel_endpoint.c:391-403`). The control slots — the
+//! (`media/aeron_send_channel_endpoint.c:384-396`). The control slots — the
 //! incoming NAKs, status messages and errors a *send* endpoint drops — and the
 //! receive side arrive with the features that need them.
 //!
@@ -34,8 +34,8 @@
 //! sixteen small messages produces one datagram, not sixteen. So "one in every
 //! n" counts datagrams here, and the reference's own send-side slot has the
 //! same coarseness — it looks at `iov[0]` and answers for the whole call
-//! (`:391-403`). Per-frame decisions live on the *receive* side, where each
-//! call carries exactly one frame (`media/aeron_receive_channel_endpoint.c:576-589`).
+//! (`:384-396`). Per-frame decisions live on the *receive* side, where each
+//! call carries exactly one frame (`media/aeron_receive_channel_endpoint.c:581-594`).
 //!
 //! # This is a test seam, not a feature
 //!
@@ -67,9 +67,9 @@ use std::time::{Duration, Instant};
 ///
 /// **Which one is asked depends on the frame type, not on the generator**
 /// (`media/aeron_receive_channel_endpoint.c`): a **`DATA`** frame goes to the
-/// *detailed* question (`:576-585`), and a **`SETUP`** or **`RTTM`** frame —
+/// *detailed* question (`:581-590`), and a **`SETUP`** or **`RTTM`** frame —
 /// neither of which carries a term offset a caller could name — goes to the
-/// simple one (`:618-620`, `:646-648`). Both slots may be null, and a null slot
+/// simple one (`:623-625`, `:651-653`). Both slots may be null, and a null slot
 /// means *no drop*: a generator that answers only the detailed question never
 /// drops a `SETUP`, and one that answers only the simple question never drops
 /// data. That is not an accident of the reference's vtable — it is what makes
@@ -78,7 +78,7 @@ use std::time::{Duration, Instant};
 /// default to `false`**.
 ///
 /// The send endpoint's data path asks the simple question
-/// (`media/aeron_send_channel_endpoint.c:391-403`), which is what this build's
+/// (`media/aeron_send_channel_endpoint.c:384-396`), which is what this build's
 /// [`EveryNthDatagram`] answers.
 ///
 /// The reference's third entry point, `close`, has no counterpart here: a
@@ -196,7 +196,7 @@ impl LossGenerator for EveryNthDatagram {
 /// What the driver's settings ask a **send** endpoint to withhold.
 ///
 /// The reference's send-side slot is filled by a supplier on its driver context
-/// (`media/aeron_send_channel_endpoint.c:237-240`), which a test builds in the
+/// (`media/aeron_send_channel_endpoint.c:230-233`), which a test builds in the
 /// same process; a driver here is a process of its own, so what it drops comes
 /// from its settings. The two rules are the two the tests need: a rate
 /// ([`EveryNthDatagram`]) and a **bounded blackout that starts after the

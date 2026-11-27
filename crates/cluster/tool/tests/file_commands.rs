@@ -30,7 +30,7 @@ fn now_ms() -> i64 {
 }
 
 /// A ready consensus-module mark file, in `directory`, with the six var-data
-/// strings the reference writes (`ConsensusModule.java:4564-4590`).
+/// strings the reference writes (`ConsensusModule.java:4628-4654`).
 fn consensus_module_mark_file(directory: &Path, aeron_dir: &str) -> ClusterMarkFile {
     let path = directory.join(mark::FILENAME);
     let file = ClusterMarkFile::create(

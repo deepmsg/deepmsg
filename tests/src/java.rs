@@ -1,7 +1,7 @@
 //! Running the reference's own Java tools.
 //!
 //! The archive server is Java-only — the C tree ships a client — so its tools
-//! are **classes in `aeron-all-1.53.2.jar`** rather than binaries beside
+//! are **classes in `aeron-all-1.54.2.jar`** rather than binaries beside
 //! `aeronmd`. `ArchiveTool` is the one P2 leans on: it is the reference's own
 //! reader of the two files an archive directory is made of, which makes it the
 //! only instrument that can say whether what this build writes is what the

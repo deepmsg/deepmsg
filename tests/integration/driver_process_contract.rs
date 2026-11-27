@@ -34,7 +34,7 @@
 //!    line fails every test at once.
 //! 4. **`TERMINATE_DRIVER` stops it promptly and cleanly.** The harness writes
 //!    that command from a process that never registered as a client
-//!    (`CommonContext.java:1140-1165`, token `null` and length 0) and then waits
+//!    (`CommonContext.java:1187-1212`, token `null` and length 0) and then waits
 //!    ten seconds (`CTestMediaDriver.java:593`) before falling back to
 //!    `destroyForcibly()` (`:599`). The fallback is not a failure — the exit
 //!    code is recorded and never asserted (`MediaDriverTestUtil.java:148`) —
@@ -117,13 +117,13 @@ const READ: &[(&str, &str)] = &[
     ("AERON_RECEIVER_IDLE_STRATEGY", "sleeping"),
     ("AERON_SHARED_IDLE_STRATEGY", "sleeping"),
     // The reference's own environment name for this slot has no underscore
-    // (`aeronmd.h:441`): `SHAREDNETWORK`, not `SHARED_NETWORK`.
+    // (`aeronmd.h:458`): `SHAREDNETWORK`, not `SHARED_NETWORK`.
     ("AERON_SHAREDNETWORK_IDLE_STRATEGY", "sleeping"),
     // The reference's own name for this slot carries a `driver.` infix
-    // (`aeronmd.h:497`) and that is the one this driver reads; the harness
+    // (`aeronmd.h:514`) and that is the one this driver reads; the harness
     // sends `AERON_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY`, which the reference's
     // own C driver ignores too (`CTestMediaDriver.java:248` against
-    // `aeronmd.h:497`) — see the ignored half.
+    // `aeronmd.h:514`) — see the ignored half.
     (
         "AERON_DRIVER_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY",
         "sleeping",
@@ -146,10 +146,10 @@ const READ: &[(&str, &str)] = &[
     ("AERON_NAME_RESOLVER_INIT_ARGS", "/nonexistent/resolver.csv"),
     ("AERON_RECEIVER_GROUP_TAG", "42"),
     // And the harness's spelling of the native resource agent's idle strategy,
-    // which neither driver reads (`aeronmd.h:497`).
+    // which neither driver reads (`aeronmd.h:514`).
     ("AERON_NATIVE_RESOURCE_AGENT_IDLE_STRATEGY", "sleeping"),
     // The four duty-cycle thresholds, which the driver puts in eight counter
-    // labels and counts against (`aeron_driver_conductor.c:889-935`). The
+    // labels and counts against (`aeron_driver_conductor.c:930-976`). The
     // harness sends them as **bare nanosecond counts**
     // (`CTestMediaDriver.java:294-297`), which is the spelling the receiver's
     // value below uses; the other three are durations, which is what a
@@ -168,7 +168,7 @@ const READ: &[(&str, &str)] = &[
     ("AERON_PUBLICATION_LINGER_TIMEOUT", "1s"),
     // Twenty seconds rather than the default fifteen, because this list also
     // sends a fifteen-second liveness window and the first rule of
-    // `aeron_driver_validate_unblock_timeout` (`aeron_driver_context.c:1514-1524`)
+    // `aeron_driver_validate_unblock_timeout` (`aeron_driver_context.c:1558-1568`)
     // is `publication_unblock_timeout_ns > client_liveness_timeout_ns`. Equal
     // values are a combination the reference refuses too — the default fifteen
     // against this list's liveness is exactly that, which is what made this
@@ -196,7 +196,7 @@ const READ: &[(&str, &str)] = &[
     ("AERON_UNTETHERED_WINDOW_LIMIT_TIMEOUT", "2s"),
     // The transport bindings, both halves. The harness does not send them —
     // only the C driver reads them, and only from the environment
-    // (`aeron_driver_context.c:1258-1270`) — but a deployment copying a C
+    // (`aeron_driver_context.c:1288-1300`) — but a deployment copying a C
     // configuration might, and `default` is the one name both drivers serve,
     // under either of its two spellings.
     ("AERON_UDP_CHANNEL_TRANSPORT_BINDINGS_MEDIA", "default"),
@@ -387,7 +387,7 @@ impl Fixture {
     /// took to go.
     ///
     /// This is `CommonContext.requestDriverTermination(directory, null, 0, 0)`
-    /// byte for byte (`CommonContext.java:1140-1165`): the command is written
+    /// byte for byte (`CommonContext.java:1187-1212`): the command is written
     /// straight into the CnC file by a process that has **registered nothing**
     /// — no client record, no heartbeat counter, no keepalive — which is the
     /// one thing a client-shaped helper would get wrong.
@@ -602,10 +602,10 @@ fn every_variable_the_reference_harness_can_send_is_accepted() {
 ///
 /// `io.aeron.driver.DriverLoggingSystemTest` is **not** the oracle for this: it
 /// is excluded from the harness's `test` task (`build.gradle:1145`) and run by a
-/// task of its own that points at no external driver (`:1148-1156`), because
+/// task of its own that points at no external driver (`:1195-1203`), because
 /// what it asserts is the content of a ring buffer the Java driver writes and a
-/// Java agent reads **in one JVM** (`driver/logging/DriverEventLogger.java:46`,
-/// `logging/CollectingEventLogReaderAgent.java:76-78`). `docs/compat.md` holds
+/// Java agent reads **in one JVM** (`driver/logging/DriverTracer.java:46`,
+/// `logging/CollectingEventLogReaderAgent.java:77-79`). `docs/compat.md` holds
 /// the divergence.
 #[test]
 fn the_event_log_names_are_accepted_and_make_no_log() {
@@ -665,7 +665,7 @@ fn the_event_log_names_are_accepted_and_make_no_log() {
 /// The settings whose value is **code** do not start a driver — and they do
 /// not start one in the reference either, where the library or the symbol that
 /// cannot be loaded fails its context init
-/// (`aeron_driver_context.c:539-546`, `:555-561`).
+/// (`aeron_driver_context.c:546-553`, `:572-578`).
 ///
 /// This is the one **exception** to the clause above: a name this driver has
 /// never heard of must not stop it, and these two are names it has heard of
@@ -690,7 +690,7 @@ fn the_settings_that_name_code_stop_the_driver_with_a_reason() {
         // reference compiles in has one (`outgoing_init_func` is `NULL` in all
         // three `_load` functions), so every name here is one its table cannot
         // resolve and its context init fails on
-        // (`aeron_driver_context.c:1274-1281`).
+        // (`aeron_driver_context.c:1304-1311`).
         (
             "AERON_UDP_CHANNEL_OUTGOING_INTERCEPTORS",
             "aeron_transport_security_channel_interceptor_load",
@@ -894,7 +894,7 @@ fn threads(pid: u32) -> Vec<String> {
 /// The process's own thread is in every set: it is slot 0
 /// (`aeron_driver.h:26`), which is the conductor under `DEDICATED` and
 /// `SHARED_NETWORK` and the four-piece composite under `SHARED` and `INVOKER`
-/// (`aeron_driver.c:1003-1064`). `aeronmd` drives that slot from its own thread
+/// (`aeron_driver.c:1043-1104`). `aeronmd` drives that slot from its own thread
 /// rather than giving it one (`aeronmd.c:153,165-168`), which is why the counts
 /// here are one less than the runner counts in the reference's `switch` — and
 /// why the process's name is one of them under the classic naming.
@@ -935,7 +935,7 @@ fn expected_threads(mode: &str, naming: &str) -> Vec<String> {
 ///
 /// Waiting, rather than reading once: the runners are started after the CnC
 /// file is published, which is the order the reference has too
-/// (`aeron_driver.c:972` signals the file ready, `:1206` starts the runners). A
+/// (`aeron_driver.c:1012` signals the file ready, `:1361` starts the runners). A
 /// client may reach a ready file a moment before the work behind it runs.
 fn await_threads(pid: u32, expected: &[String]) -> Vec<String> {
     let deadline = Instant::now() + READY_TIMEOUT;
@@ -961,8 +961,8 @@ fn await_threads(pid: u32, expected: &[String]) -> Vec<String> {
 /// `INVOKER` is in the list because in this process it is not a refusal:
 /// `aeronmd` starts its driver with `manual_main_loop` true (`aeronmd.c:153`),
 /// which is the condition the reference's `EINVAL` is the *other* side of
-/// (`aeron_driver.c:1225-1230`), and `SHARED` and `INVOKER` build the same
-/// runner there (`:1003-1022` is one `case` arm for both). So an `INVOKER`
+/// (`aeron_driver.c:1380-1385`), and `SHARED` and `INVOKER` build the same
+/// runner there (`:1043-1062` is one `case` arm for both). So an `INVOKER`
 /// driver process is a `SHARED` one, which is what this asserts.
 #[test]
 fn every_threading_mode_runs_the_references_threads() {

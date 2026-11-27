@@ -16,14 +16,14 @@
 //! named port zero is a channel whose real port is knowable from nowhere else,
 //! and both sides publish it in the `send-local-sockaddr` /
 //! `receive-local-sockaddr` counter their endpoint writes
-//! (`media/aeron_send_channel_endpoint.c:211-228`,
-//! `media/aeron_receive_destination.c:88-101`).
+//! (`media/aeron_send_channel_endpoint.c:204-221`,
+//! `media/aeron_receive_destination.c:94-107`).
 //!
 //! The reference hangs two of these on the driver context — one for each
 //! direction, each with its own range
-//! (`aeron_driver_context.c:428-437`, set from
+//! (`aeron_driver_context.c:431-440`, set from
 //! `AERON_SENDER_WILDCARD_PORT_RANGE` / `AERON_RECEIVER_WILDCARD_PORT_RANGE`,
-//! `:1058-1082`). This build keeps each beside the registry that owns the
+//! `:1088-1112`). This build keeps each beside the registry that owns the
 //! endpoints it hands ports to; see [`crate::send_endpoints`] and
 //! [`crate::receive_endpoints`].
 //!
@@ -31,7 +31,7 @@
 //!
 //! **Two numbers separated by a space**, `"20700 20701"` — not `low-high`.
 //! The reference parses it with two `strtoll` calls and no separator handling
-//! at all (`aeron_port_manager.c:176-211`): the first stops at the space, and
+//! at all (`aeron_port_manager.c:181-216`): the first stops at the space, and
 //! the second skips the leading whitespace itself. The Java side writes it the
 //! same way (`WildcardPortManagerSystemTest.java:68-69`,
 //! `.receiverWildcardPortRange("20700 20701")`), and the error a full range
@@ -48,7 +48,7 @@ use crate::udp_channel::UdpChannel;
 ///
 /// `0 0` — the default — is not "the range of nothing": it is the flag that
 /// says the **kernel** picks (`is_os_wildcard`,
-/// `aeron_wildcard_port_manager_set_range`, `aeron_port_manager.c:58-65`).
+/// `aeron_wildcard_port_manager_set_range`, `aeron_port_manager.c:63-70`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortRange {
     /// The low end, inclusive.
@@ -59,17 +59,17 @@ pub struct PortRange {
 
 impl PortRange {
     /// What a driver that named no range uses: let the kernel choose
-    /// (`AERON_DRIVER_*_WILDCARD_PORT_RANGE` unset, `aeron_port_manager.c:49-52`).
+    /// (`AERON_DRIVER_*_WILDCARD_PORT_RANGE` unset, `aeron_port_manager.c:54-57`).
     pub const OS_WILDCARD: Self = Self { low: 0, high: 0 };
 
     /// Whether the kernel, rather than the manager, picks the port
-    /// (`is_os_wildcard`, `:64`).
+    /// (`is_os_wildcard`, `:69`).
     pub const fn is_os_wildcard(&self) -> bool {
         self.low == 0 && self.high == 0
     }
 
     /// Read a range the way the reference does
-    /// (`aeron_parse_port_range`, `:176-211`).
+    /// (`aeron_parse_port_range`, `:181-216`).
     ///
     /// # Errors
     ///
@@ -126,11 +126,11 @@ fn split_number(text: &str) -> Option<(i64, &str)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortRangeError {
     /// The first number was missing, negative or above 65535
-    /// (`"failed to parse first part of port range"`, `:183-186`).
+    /// (`"failed to parse first part of port range"`, `:188-191`).
     FirstPart,
-    /// The second, likewise (`:195-198`).
+    /// The second, likewise (`:200-203`).
     SecondPart,
-    /// `"low port should be less than or equal to high port"` (`:202-206`).
+    /// `"low port should be less than or equal to high port"` (`:207-211`).
     LowAboveHigh,
 }
 
@@ -150,7 +150,7 @@ impl std::error::Error for PortRangeError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortError {
     /// Every port in the range is spoken for
-    /// (`"no available ports in range %" PRIu16 " %" PRIu16`, `:99-102`).
+    /// (`"no available ports in range %" PRIu16 " %" PRIu16`, `:105-108`).
     ///
     /// The words are the reference's, and they matter: a client that has run a
     /// driver out of ports reads them in its `RegistrationException`
@@ -251,7 +251,7 @@ impl WildcardPortManager {
     }
 
     /// The range in force, which is what a driver prints at start-up
-    /// (`aeron_driver.c:658-660`).
+    /// (`aeron_driver.c:682-684`).
     pub const fn range(&self) -> PortRange {
         PortRange {
             low: self.low_port,
@@ -261,7 +261,7 @@ impl WildcardPortManager {
 
     /// The port a channel's bind address should use, given the address the
     /// channel itself named
-    /// (`aeron_wildcard_port_manager_get_managed_port`, `:121-163`).
+    /// (`aeron_wildcard_port_manager_get_managed_port`, `:126-168`).
     ///
     /// Three cases, in the reference's order:
     ///
@@ -276,7 +276,7 @@ impl WildcardPortManager {
     ///
     /// The sender exception lives in the third case: a sender's zero is left
     /// alone unless the channel named a `control=`
-    /// (`!is_sender || udp_channel->has_explicit_control`, `:142`).
+    /// (`!is_sender || udp_channel->has_explicit_control`, `:147`).
     ///
     /// # Errors
     ///
@@ -307,7 +307,7 @@ impl WildcardPortManager {
     }
 
     /// Give a port back (`aeron_wildcard_port_manager_free_managed_port`,
-    /// `:165-174`).
+    /// `:182-191`).
     ///
     /// Port zero is not a port: a channel the kernel picked for holds nothing
     /// in the table, and saying so is the whole of this function.
@@ -327,7 +327,7 @@ impl WildcardPortManager {
     }
 
     /// The next free port, and take it
-    /// (`aeron_wildcard_port_manager_allocate_open_port`, `:93-119`).
+    /// (`aeron_wildcard_port_manager_allocate_open_port`, `:92-118`).
     fn allocate_open_port(&mut self) -> Result<u16, PortError> {
         let port = self.find_open_port().ok_or(PortError::NoAvailablePorts {
             low: self.low_port,

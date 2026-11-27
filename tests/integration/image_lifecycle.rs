@@ -338,7 +338,7 @@ fn an_images_state_is_readable_from_the_client() {
         .expect("the image");
 
     // The driver's answer to the channel, not the string this client wrote:
-    // an IPC image reports the constant (`aeron_driver_conductor.c:3612-3613`).
+    // an IPC image reports the constant (`aeron_driver_conductor.c:3709-3710`).
     assert_eq!("aeron:ipc", image.source_identity());
 
     assert_eq!(
@@ -565,7 +565,7 @@ fn a_run_of_frames_can_be_read_in_one_call() {
 /// The bound is a **start** position: a frame that begins at or after it is
 /// left in the term even though it has been written, which is what lets a
 /// cluster follower refuse to apply an entry the leader has not committed
-/// (`ConsensusModuleAgent.java:2523`).
+/// (`ConsensusModuleAgent.java:2549`).
 #[test]
 fn a_bounded_poll_stops_at_the_bound() {
     let Some((_own, mut client)) = own_driver_and_client("image-bounded-poll") else {

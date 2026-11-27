@@ -132,7 +132,7 @@ fn three_nodes_elect_commit_and_keep_committing_when_a_follower_dies() {
 
     // `P3-6b` gives each follower a log adapter, so its **commit** counter —
     // not just its recording — reaches what the leader committed: the same
-    // position on all three (`ConsensusModuleAgent.java:2526-2532`).
+    // position on all three (`ConsensusModuleAgent.java:2552-2558`).
     //
     // Two things this wait does that the first version of it did not:
     //

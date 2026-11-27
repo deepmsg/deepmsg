@@ -45,7 +45,7 @@ fn rows(template_id: u16) -> Option<Rows> {
         timer_event_codec::SBE_TEMPLATE_ID => &[(0, 24, 0)],
         session_open_event_codec::SBE_TEMPLATE_ID => &[(0, 36, 2)],
         session_close_event_codec::SBE_TEMPLATE_ID => &[(0, 28, 0)],
-        cluster_action_request_codec::SBE_TEMPLATE_ID => &[(0, 28, 0), (11, 32, 0)],
+        cluster_action_request_codec::SBE_TEMPLATE_ID => &[(0, 28, 0), (11, 32, 0), (18, 40, 0)],
         new_leadership_term_event_codec::SBE_TEMPLATE_ID => &[(0, 40, 0), (4, 48, 0)],
         membership_change_event_codec::SBE_TEMPLATE_ID => &[(0, 40, 1)],
         admin_request_codec::SBE_TEMPLATE_ID => &[(0, 28, 1)],
@@ -85,7 +85,7 @@ fn rows(template_id: u16) -> Option<Rows> {
         heartbeat_response_codec::SBE_TEMPLATE_ID => &[(0, 8, 0)],
         // A group, then two variable fields; consensus reads the fixed block only.
         standby_snapshot_codec::SBE_TEMPLATE_ID => &[(0, 16, 0)],
-        snapshot_marker_codec::SBE_TEMPLATE_ID => &[(0, 32, 0), (4, 40, 0)],
+        snapshot_marker_codec::SBE_TEMPLATE_ID => &[(0, 32, 0), (4, 40, 0), (18, 48, 0)],
         client_session_codec::SBE_TEMPLATE_ID => &[(0, 12, 2)],
         cluster_session_codec::SBE_TEMPLATE_ID => &[(0, 40, 1)],
         timer_codec::SBE_TEMPLATE_ID => &[(0, 16, 0)],

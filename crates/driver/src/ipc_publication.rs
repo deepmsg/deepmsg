@@ -68,12 +68,12 @@ pub struct IpcPublication {
     /// The largest frame, which is in the log buffer's metadata and is what a
     /// second publication on this channel has to agree about before it may
     /// share this one (`aeron_confirm_publication_match`,
-    /// `aeron_driver_conductor.c:1109-1136`).
+    /// `aeron_driver_conductor.c:1150-1177`).
     pub mtu_length: i32,
     /// `log2(term_length)`.
     pub bits_to_shift: u32,
     /// The term a resumed stream resumed in — the initial term id when the
-    /// stream did not resume (`aeron_ipc_publication.c:168`).
+    /// stream did not resume (`aeron_ipc_publication.c:173`).
     pub starting_term_id: i32,
     /// How far into it.
     pub starting_term_offset: i64,
@@ -85,7 +85,7 @@ pub struct IpcPublication {
     pub is_exclusive: bool,
     /// Which request this channel answers, resolved at creation. It is one of
     /// the four things two `ADD_PUBLICATION`s have to agree about before the
-    /// second may share the first (`aeron_driver_conductor.c:1770-1784`), and
+    /// second may share the first (`aeron_driver_conductor.c:1811-1825`), and
     /// it is the value the **first** one was created with.
     pub response_correlation_id: i64,
     /// The log buffer itself.
@@ -106,12 +106,12 @@ pub struct IpcPublication {
     pub untethered_linger_timeout_ns: i64,
     /// And the resting half.
     pub untethered_resting_timeout_ns: i64,
-    /// How long a rejection lasts (`aeron_ipc_publication.c:177`, which takes
+    /// How long a rejection lasts (`aeron_ipc_publication.c:182`, which takes
     /// it from `context->image_liveness_timeout_ns` — the same window an image
     /// waits before deciding a publication is gone, and the same setting that
     /// value comes from).
     pub liveness_timeout_ns: i64,
-    /// Where the limit may next jump to (`aeron_ipc_publication.h:172`).
+    /// Where the limit may next jump to (`aeron_ipc_publication.h:177`).
     trip_gain: i32,
     trip_limit: i64,
     /// How long the publisher's position may sit unmoved before its log is
@@ -274,7 +274,7 @@ impl IpcPublication {
     ///
     /// The metadata block is initialised here, after the mapping exists and
     /// before anything can read it — the reference does the same, one function
-    /// later than the create (`aeron_ipc_publication.c:107-142`) — and the term
+    /// later than the create (`aeron_ipc_publication.c:112-147`) — and the term
     /// tails are written *before* the metadata, because that is the order the
     /// reference's caller uses and nothing in the tails needs the metadata.
     ///
@@ -283,7 +283,7 @@ impl IpcPublication {
     /// from `socket_buffers`, which is what the kernel reports: two of the six
     /// socket-buffer fields are the machine's own receive and send buffer
     /// sizes, and the other four are zeroes on both sides of the comparison
-    /// (`aeron_ipc_publication.c:118-124`).
+    /// (`aeron_ipc_publication.c:123-129`).
     #[allow(clippy::too_many_arguments)] // one per source of a written field
     pub fn create(
         log: Box<LogFile>,
@@ -302,7 +302,7 @@ impl IpcPublication {
         // Every refusal below hands the mapping back rather than dropping it:
         // a log buffer this function could not make a publication of is a
         // *file* the caller has to remove, and dropping the mapping would
-        // leave it behind (`aeron_driver_conductor.c:3913-3916` frees the
+        // leave it behind (`aeron_driver_conductor.c:4010-4013` frees the
         // counters, and the command's own free removes the file).
         let Some(bits_to_shift) = position::bits_to_shift(params.term_length) else {
             return Err(log);
@@ -381,7 +381,7 @@ impl IpcPublication {
         // all start where the tails say the stream is — which for a resumed
         // stream is not zero: the reference takes all three from the producer
         // position over the raw tail, starting offset included
-        // (`aeron_ipc_publication.c:182-184`).
+        // (`aeron_ipc_publication.c:187-189`).
         #[allow(clippy::cast_possible_truncation)] // bounded by a term length
         let starting_term_offset = params
             .starting_position
@@ -424,7 +424,7 @@ impl IpcPublication {
             consumer_position: start_position,
             clean_position: start_position,
             // The reference seeds both from the consumer position it starts at
-            // (`aeron_ipc_publication.c:183-184`).
+            // (`aeron_ipc_publication.c:188-189`).
             last_consumer_position: start_position,
             time_of_last_consumer_position_change_ns: 0,
             refcount: 0,
@@ -438,7 +438,7 @@ impl IpcPublication {
 
     /// Whether a publication this driver already has can serve `params`, and
     /// why not when it cannot (`aeron_confirm_publication_match`,
-    /// `aeron_driver_conductor.c:1109-1177`).
+    /// `aeron_driver_conductor.c:1150-1218`).
     ///
     /// Only what the URI **named** is compared: a second client that says
     /// nothing about the MTU is served the existing publication whatever its
@@ -613,7 +613,7 @@ impl IpcPublication {
     }
 
     /// Whether a rejection arriving now would cut the readers off, or only
-    /// push the deadline out (`aeron_ipc_publication.c:252`, the
+    /// push the deadline out (`aeron_ipc_publication.c:257`, the
     /// `if (!publication->in_cool_down)` that guards all of the work).
     ///
     /// A rejected-but-not-yet-cooled publication is left exactly as it is: a
@@ -625,7 +625,7 @@ impl IpcPublication {
     }
 
     /// Refuse readers until `now_ns + liveness_timeout_ns`
-    /// (`aeron_ipc_publication.c:273-276`).
+    /// (`aeron_ipc_publication.c:278-281`).
     pub fn enter_cool_down(&mut self, now_ns: i64) {
         self.in_cool_down = true;
         self.cool_down_expire_time_ns = now_ns + self.liveness_timeout_ns;
@@ -633,7 +633,7 @@ impl IpcPublication {
 
     /// End the cool down if it has run out, and say whether it did
     /// (`aeron_ipc_publication_check_cooldown_status`,
-    /// `aeron_ipc_publication.c:468-479`).
+    /// `aeron_ipc_publication.c:492-503`).
     ///
     /// The caller links the subscriptions again — that is a conductor's act,
     /// and this publication cannot reach them. The comparison is the
@@ -650,7 +650,7 @@ impl IpcPublication {
     }
 
     /// Close the log's `is_connected` byte, the first thing a rejection does
-    /// (`aeron_ipc_publication.c:254`).
+    /// (`aeron_ipc_publication.c:259`).
     ///
     /// Written rather than recomputed from the readers, which is what
     /// [`Self::update_connected_status`] does and what the untethered machine
@@ -664,7 +664,7 @@ impl IpcPublication {
     }
 
     /// Give every reader's counter back and empty the set
-    /// (`aeron_ipc_publication.c:258-271`).
+    /// (`aeron_ipc_publication.c:263-276`).
     ///
     /// The counters belong to the publication's set and not to the subscription
     /// links that point at them, which is why the links are unlinked first and
@@ -685,7 +685,7 @@ impl IpcPublication {
 
     /// Whether the readers have fallen behind far enough that the log may be
     /// blocked (`aeron_ipc_publication_is_possibly_blocked`,
-    /// `aeron_ipc_publication.h:146-159`).
+    /// `aeron_ipc_publication.h:151-164`).
     ///
     /// Deliberately not an answer to "is a claim stalled in there": a consumer
     /// behind the producer, or a consumer whose expected term is not the active
@@ -707,7 +707,7 @@ impl IpcPublication {
     }
 
     /// Unblock the log for a publisher that has gone quiet
-    /// (`aeron_ipc_publication_check_for_blocked_publisher`, `:650-672`).
+    /// (`aeron_ipc_publication_check_for_blocked_publisher`, `:676-698`).
     ///
     /// Returns whether the log was unblocked.
     ///
@@ -739,11 +739,11 @@ impl IpcPublication {
     }
 
     /// Run the unblocker at `position`, and count it if it did anything
-    /// (`aeron_logbuffer_unblocker.c:19-66` through either of its two callers
+    /// (`aeron_logbuffer_unblocker.c:24-71` through either of its two callers
     /// here).
     ///
     /// The count goes to the **system** counter 19: the reference takes that one
-    /// address at creation (`aeron_ipc_publication.c:186-188`), so every
+    /// address at creation (`aeron_ipc_publication.c:191-193`), so every
     /// publication in the process increments the same counter.
     fn unblock_at(
         &self,
@@ -765,7 +765,7 @@ impl IpcPublication {
     }
 
     /// The timeout tier's turn for this publication
-    /// (`aeron_ipc_publication_on_time_event`, `:481-585`).
+    /// (`aeron_ipc_publication_on_time_event`, `:505-609`).
     ///
     /// The active arm's other duties — the untethered subscription sweep, the
     /// connected byte and the cool-down — run in [`IpcPublications::on_time_event`]
@@ -785,7 +785,7 @@ impl IpcPublication {
 
                 // An exclusive publication has one producer, which is
                 // responsible for its own log — the reference skips the check
-                // for it (`:543`).
+                // for it (`:567`).
                 if self.is_exclusive {
                     return false;
                 }
@@ -800,7 +800,7 @@ impl IpcPublication {
                     // Not drained, so a reader is stuck — and the publication is
                     // draining, which means the last client has let go and will
                     // never commit whatever is in the way. **No timeout gate and
-                    // no `is_exclusive` test** (`aeron_ipc_publication.c:579-585`):
+                    // no `is_exclusive` test** (`aeron_ipc_publication.c:605-611`):
                     // being here is the evidence. It is also why this arm
                     // retries on every time event rather than once — an unblock
                     // advances the log, so the next attempt is at a different
@@ -839,7 +839,7 @@ impl IpcPublication {
     }
 
     /// One fewer. `true` when that was the last link, which is when the
-    /// reference closes the publication (`aeron_ipc_publication.c:196-214`).
+    /// reference closes the publication (`aeron_ipc_publication.c:201-219`).
     pub fn decref(&mut self) -> bool {
         self.refcount -= 1;
         0 == self.refcount
@@ -861,7 +861,7 @@ impl IpcPublication {
     }
 
     /// How far the producer has written, read from the log's own tail
-    /// (`aeron_ipc_publication.h:162-173`).
+    /// (`aeron_ipc_publication.h:167-178`).
     pub fn publisher_position(&self) -> Option<i64> {
         let metadata = self.log.metadata()?;
         let term_count = metadata.load_i32_acquire(descriptor::ACTIVE_TERM_COUNT_OFFSET)?;
@@ -886,7 +886,7 @@ impl IpcPublication {
     /// The counter is allocated and seeded by the caller — the conductor, which
     /// also owns the position the subscriber joins at — because the reference
     /// allocates it in `link_subscribable` and only then calls this
-    /// (`aeron_driver_conductor.c:3547-3617`).
+    /// (`aeron_driver_conductor.c:3644-3714`).
     pub fn add_subscriber(&mut self, position: TetherablePosition) -> bool {
         let Some(metadata) = self.log.metadata() else {
             return false;
@@ -936,7 +936,7 @@ impl IpcPublication {
     }
 
     /// Where a subscriber joining right now should start reading
-    /// (`aeron_ipc_publication_join_position`, `aeron_ipc_publication.h:176-197`).
+    /// (`aeron_ipc_publication_join_position`, `aeron_ipc_publication.h:181-202`).
     ///
     /// The earliest position any current reader still needs, or the
     /// publication's own consumer position when there is none. Not the
@@ -954,7 +954,7 @@ impl IpcPublication {
 
     /// The untethered subscriptions' state machine, for a publication's own
     /// readers (`aeron_ipc_publication_check_untethered_subscriptions`,
-    /// `aeron-driver/src/main/c/aeron_ipc_publication.c:354-470`).
+    /// `aeron-driver/src/main/c/aeron_ipc_publication.c:359-475`).
     ///
     /// The same three states as an image's readers, judged against the same
     /// shape of limit, and differing in exactly three things — which is the
@@ -962,7 +962,7 @@ impl IpcPublication {
     /// mind:
     ///
     /// * the limit is measured against [`Self::consumer_position`], the
-    ///   **fastest** active reader (the reference's `:316`), where an image
+    ///   **fastest** active reader (the reference's `:321`), where an image
     ///   takes the maximum of its own readers' positions;
     /// * the window is the publication's own [`Self::term_window_length`] —
     ///   the `pub-wnd` the channel named — where an image uses the receiver
@@ -1081,7 +1081,7 @@ impl IpcPublication {
     }
 
     /// Write `pub-pos` and recompute `pub-lmt`
-    /// (`aeron_ipc_publication.c:278-328`).
+    /// (`aeron_ipc_publication.c:283-333`).
     ///
     /// Returns whether anything moved, which is the reference's `work_count`
     /// contribution to the conductor's pass.
@@ -1126,7 +1126,7 @@ impl IpcPublication {
 
             // The reference seeds the running maximum with the consumer
             // position before it takes a single reading
-            // (`aeron_ipc_publication.c:292`): the position is monotonic, and
+            // (`aeron_ipc_publication.c:297`): the position is monotonic, and
             // a reader that comes back below it — a rejoining subscription
             // still holding its join position — must not drag the limit
             // arithmetic backwards with it.
@@ -1160,7 +1160,7 @@ impl IpcPublication {
     }
 
     /// Zero the terms the readers have finished with, a chunk at a time
-    /// (`aeron_ipc_publication.c:328-350`).
+    /// (`aeron_ipc_publication.c:333-355`).
     ///
     /// Everything past the first eight bytes is zeroed first, and the
     /// frame-length word goes to zero last with a **release**. A reader that
@@ -1196,7 +1196,7 @@ impl IpcPublication {
     }
 
     /// Whether every active reader has read everything written
-    /// (`aeron_ipc_publication.h:202-222`).
+    /// (`aeron_ipc_publication.h:207-227`).
     ///
     /// A draining publication is readable until this is true, and the reference
     /// keeps accepting subscribers until then too
@@ -1218,7 +1218,7 @@ impl IpcPublication {
     }
 
     /// Whether a subscriber arriving now would be attached
-    /// (`aeron_ipc_publication.h:224-230`): an active publication, or a draining
+    /// (`aeron_ipc_publication.h:229-235`): an active publication, or a draining
     /// one that still has unread data — and never one that is refusing readers,
     /// whatever state it is in.
     pub fn is_accepting_subscriptions(
@@ -1379,7 +1379,7 @@ mod tests {
     /// positions the machine's limit is measured from.
     ///
     /// `consumer_position` is set by hand rather than by producing: the
-    /// machine reads the field the publication maintains (`:316`), and an
+    /// machine reads the field the publication maintains (`:321`), and an
     /// untethered test that had to fill a window first would be testing the
     /// limit's *maintenance* instead of its use.
     fn stalled_and_reading(
@@ -1520,7 +1520,7 @@ mod tests {
     fn the_logs_connected_byte_follows_a_reader_that_is_woken() {
         // Waking is the case the add and remove hooks cannot see: nothing is
         // added and nothing is removed, so the log's `is_connected` byte is
-        // either the reference's per-tier recomputation (`:533-534`) or it is
+        // either the reference's per-tier recomputation (`:557-558`) or it is
         // stale — and it is what a producer reads to tell "nobody is reading"
         // from "a slow reader".
         let dir = TempDir::new();
@@ -1839,7 +1839,7 @@ mod tests {
         // The untethered linger timeout is -1 in the configuration and 5 s in
         // the file: an unset value means "the window limit timeout", and that
         // substitution happens as the parameters are resolved
-        // (`aeron-driver/src/main/c/uri/aeron_driver_uri.c:414-427`).
+        // (`aeron-driver/src/main/c/uri/aeron_driver_uri.c:419-432`).
         assert_eq!(
             Some(5_000_000_000),
             metadata.load_i64_unaligned(descriptor::UNTETHERED_LINGER_TIMEOUT_NS_OFFSET),
@@ -1958,7 +1958,7 @@ mod tests {
         // The consumer, like cleanup, starts where the tails say the stream
         // is — the term the URI named *and* the offset into it — which is the
         // reference's producer position over the freshly initialised tails
-        // (`aeron_ipc_publication.c:182-184`). Dropping the offset would put
+        // (`aeron_ipc_publication.c:187-189`). Dropping the offset would put
         // the limit logic a term's head behind a stream that resumed midway.
         let bits = position::bits_to_shift(TERM_LENGTH).expect("a power of two");
         let expected = Position::new(19, 8192, bits, 17).raw();
@@ -2039,7 +2039,7 @@ mod tests {
     #[test]
     fn a_reader_below_the_consumer_position_cannot_drag_it_back() {
         // The running maximum is seeded with the consumer position
-        // (`aeron_ipc_publication.c:292`), so a subscription that reports a
+        // (`aeron_ipc_publication.c:297`), so a subscription that reports a
         // position the publication has already passed — which is what a
         // rejoining reader holds until it catches up — does not pull the
         // consumer position, and everything derived from it, backwards.
@@ -2222,7 +2222,7 @@ mod tests {
 
     /// The same unblock with the **system** counter in place, because that is
     /// the observable: counter 19 is one per process, not one per publication
-    /// (`aeron_ipc_publication.c:186-188`), so nothing about the publication
+    /// (`aeron_ipc_publication.c:191-193`), so nothing about the publication
     /// shows it was counted.
     #[test]
     fn unblocking_moves_the_system_counter() {
@@ -2369,7 +2369,7 @@ mod tests {
 
     /// And a draining publication that is already drained moves on rather than
     /// trying: the unblock is the `else` of the drained test
-    /// (`aeron_ipc_publication.c:556-585`).
+    /// (`aeron_ipc_publication.c:582-611`).
     #[test]
     fn a_drained_publication_does_not_look_for_anything_to_unblock() {
         let dir = TempDir::new();
@@ -2405,7 +2405,7 @@ mod tests {
         );
 
         // The comparison is the reference's strict `<` — a deadline of exactly
-        // now is not yet past (`aeron_ipc_publication.c:471`).
+        // now is not yet past (`aeron_ipc_publication.c:495`).
         assert!(!publication.cool_down_has_expired(expires - 1));
         assert!(!publication.cool_down_has_expired(expires));
 
@@ -2429,7 +2429,7 @@ mod tests {
         let mut publication = publication(&dir, &mut manager, &region_pair);
 
         // The reference's guard is `if (!publication->in_cool_down)`
-        // (`aeron_ipc_publication.c:252`): everything that takes the readers
+        // (`aeron_ipc_publication.c:257`): everything that takes the readers
         // away is skipped the second time, and this is what tells the caller
         // so.
         publication.enter_cool_down(1_000);

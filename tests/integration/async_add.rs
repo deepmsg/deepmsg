@@ -204,7 +204,7 @@ fn a_counter_only_moves_up() {
 ///
 /// The reference's cancel for one spells out what a caller gets: "if a counter
 /// gets created by the time cancellation happens, it will get removed"
-/// (`aeron_async_add_counter_cancel`, `aeronc.h:698-714`). So the counter is
+/// (`aeron_async_add_counter_cancel`, `aeronc.h:701-717`). So the counter is
 /// waited for here, and then the driver's own metadata region is what says it
 /// went — a `REMOVE_PUBLICATION` under the same registration id would have freed
 /// nothing.

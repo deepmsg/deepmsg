@@ -84,7 +84,7 @@ fn compile_probe() -> Option<PathBuf> {
 }
 
 /// A manual channel — the category a destination can be added to at all
-/// (`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:147-151`).
+/// (`aeron_udp_channel_is_multi_destination`, `media/aeron_udp_channel.h:153-157`).
 fn manual_channel(port: u16) -> String {
     format!("aeron:udp?endpoint=localhost:{port}|term-length=65536|control-mode=manual")
 }

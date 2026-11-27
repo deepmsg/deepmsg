@@ -48,8 +48,12 @@ use deepmsg_core::logbuffer::frame::DATA_HEADER_LENGTH;
 use crate::election::ConsensusSender;
 use crate::error::ClusterError;
 
-/// `ConsensusModule.Configuration.PROTOCOL_SEMANTIC_VERSION` — schema 111,
-/// version 17 (`MemoryOrder` 5.4). Sent in the two messages that carry it.
+/// The value this build sends in `CanvassPosition` and `RequestVote`.
+///
+/// The reference composes `ConsensusModule.Configuration.PROTOCOL_SEMANTIC_VERSION`
+/// as 1.0.0 (65536); this build has historically sent 17. That is a
+/// pre-existing divergence, not the SBE schema version (which is 18 since
+/// 1.54.2) and not changed by the schema bump.
 pub const PROTOCOL_SEMANTIC_VERSION: i32 = 17;
 
 /// `ConsensusPublisher.SEND_ATTEMPTS` (`:29`).

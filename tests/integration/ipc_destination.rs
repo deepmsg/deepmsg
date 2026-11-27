@@ -8,7 +8,7 @@
 //! identity, and reads it without a socket being opened for it.
 //!
 //! It is the mirror of `aeron-spy:` and shares its handler's shape
-//! (`aeron_driver_conductor.c:5617-5700` against `:5808-5870`). What is
+//! (`aeron_driver_conductor.c:5714-5797` against `:5905-5967`). What is
 //! different is what it reads: a spy names a *network* publication, and this
 //! names an IPC one.
 //!

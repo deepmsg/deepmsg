@@ -2,7 +2,7 @@
 //!
 //! Counterpart of `service/RecoveryState.java`. The counter exists only while
 //! a consensus module is recovering: the module allocates it before the
-//! container starts (`ConsensusModuleAgent.java:2865-2874`), the container
+//! container starts (`ConsensusModuleAgent.java:2888-2897`), the container
 //! reads it to learn which snapshot recordings to load (`ClusteredServiceContainer`
 //! `recoverState`, `CSA:765`), and it is removed when recovery finishes.
 //!

@@ -189,7 +189,7 @@ fn an_exclusive_publication_reports_a_window_too() {
 
     // Nobody is subscribed, so there is no room at all: the limit is set from
     // what the subscribers have read, and with none working the reference sets
-    // it to the consumer position (`aeron_ipc_publication.c:309-320`). A
+    // it to the consumer position (`aeron_ipc_publication.c:314-325`). A
     // publication nobody is reading is not one to write into.
     assert_eq!(
         Some(0),

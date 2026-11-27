@@ -2,11 +2,11 @@
 //! exists, and what happens to the directory afterwards.
 //!
 //! The reference's rule is one question asked in one place
-//! (`aeron-driver/src/main/c/aeron_driver.c:136-235`): **is somebody else
+//! (`aeron-driver/src/main/c/aeron_driver.c:153-252`): **is somebody else
 //! living here?** If the directory exists it maps whatever `cnc.dat` is in it
 //! and reads the to-driver ring's consumer heartbeat — the same liveness field
-//! a client reads, with the same timeout (`aeron_driver_context.c:1595-1643`).
-//! A heartbeat inside `aeron.driver.timeout` (10 s by default, `:217`) means a
+//! a client reads, with the same timeout (`aeron_driver_context.c:1639-1687`).
+//! A heartbeat inside `aeron.driver.timeout` (10 s by default, `:234`) means a
 //! live driver and the answer is `EBUSY`; anything else — no CnC file, a
 //! version this build cannot read, a heartbeat that stopped — means a dead
 //! one, and the directory is deleted rather than reused.
@@ -20,7 +20,7 @@
 //!
 //! Before a dead driver's directory is deleted, its error log is saved beside
 //! the directory as `<aeron_dir>-<datestamp>-error.log`, in the reference's
-//! format (`aeron_driver.c:83-132`, called at `:205-212`). That is the only
+//! format (`aeron_driver.c:83-132`, called at `:222-229`). That is the only
 //! chance to see why the previous driver died: the directory — and the CnC
 //! file the errors were recorded in — is about to go. The reference's
 //! delete-on-start branch does not read the old CnC at all, so neither does
@@ -38,7 +38,7 @@ use crate::config::DriverConfig;
 /// How long to wait between looks while another driver creates its CnC file.
 ///
 /// The reference sleeps a millisecond in the same loop (`aeron_micro_sleep(1000)`,
-/// `aeron-driver/src/main/c/aeron_driver_context.c:1610`).
+/// `aeron-driver/src/main/c/aeron_driver_context.c:1654`).
 pub const POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Subdirectory for IPC publication log buffers
@@ -231,7 +231,7 @@ pub fn prepare(config: &DriverConfig, now_ms: i64) -> Result<PreparedDir, DirErr
 /// one deletes its directory and then serves the file the other one is still
 /// writing — so the reference spins until the version appears or its timeout
 /// expires (`aeron_is_driver_active_with_cnc`'s `while (0 == cnc_version)`,
-/// `aeron-driver/src/main/c/aeron_driver_context.c:1603-1612`).
+/// `aeron-driver/src/main/c/aeron_driver_context.c:1647-1656`).
 ///
 /// The second step is a heartbeat check, and it is only meaningful for a file
 /// this build can read. That is why an *incompatible* file is not
@@ -254,7 +254,7 @@ fn check_for_a_live_driver(
 
     // The wait is a *duration*, so it is measured with a monotonic clock — not
     // with the epoch clock the judgement below uses. The reference measures it
-    // against `aeron_epoch_clock()` (`aeron_driver_context.c:1605`), which a
+    // against `aeron_epoch_clock()` (`aeron_driver_context.c:1649`), which a
     // clock step turns into a different window: a fresh VM correcting its time
     // can step it forward by seconds and make a driver give up on a peer that
     // is still creating its file, or backward and make the wait longer than
@@ -576,7 +576,7 @@ mod tests {
         // The other end of the same window: nobody published, so after the
         // window the directory is a dead one — which is the reference's
         // conclusion too ("CnC file is created but not initialised",
-        // `aeron_driver_context.c:1605-1609`), reached after the same wait.
+        // `aeron_driver_context.c:1649-1653`), reached after the same wait.
         let temp = TempDir::new();
         std::fs::create_dir_all(temp.path()).expect("mkdir");
         let _cnc = cnc_pending_publication(temp.path());
@@ -764,7 +764,7 @@ mod tests {
     #[test]
     fn a_driver_that_stopped_on_purpose_is_a_dead_driver() {
         // NULL_VALUE is what a clean shutdown writes
-        // (`aeron_driver_conductor.c:3493`), and it is a different answer from
+        // (`aeron_driver_conductor.c:3590`), and it is a different answer from
         // a timestamp, not an older one.
         let temp = TempDir::new();
         std::fs::create_dir_all(temp.path()).expect("mkdir");

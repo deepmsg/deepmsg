@@ -4,7 +4,7 @@
 //! its cgroup allows, and this is where that list comes from: cgroup **v2**
 //! keeps it in `<cgroup>/cpuset.cpus.effective` as a `cpulist` — `0-3,7`, the
 //! same spelling the kernel uses — and the reference reads it with
-//! `aeron_cpuset_cgroup_read_v2` (`aeron-driver/src/main/c/aeron_cpuset.c:353-420`).
+//! `aeron_cpuset_cgroup_read_v2` (`aeron-driver/src/main/c/aeron_cpuset.c:433-500`).
 //!
 //! Two things are worth knowing about the shape of it, because both are the
 //! reference's rather than this build's:
@@ -17,7 +17,7 @@
 //!
 //! The file itself is checked before it is read: a path that resolves outside
 //! `/sys/` and outside the temporary directory is refused
-//! (`aeron_cpuset_validate_path_root`, `:158-175`). The temporary directory is
+//! (`aeron_cpuset_validate_path_root`, `:163-180`). The temporary directory is
 //! in that list for the reference's own tests, which build a cgroup tree under
 //! `/tmp`, and it stays in this build's for the same reason.
 
@@ -61,7 +61,7 @@ pub enum CpusetError {
     /// No `cpuset.cpus.effective` anywhere up the cgroup path.
     NotFound(PathBuf),
     /// A slot asked for a position in the cpuset that it does not have
-    /// (`aeron_driver_context.c:3545-3550`).
+    /// (`aeron_driver_context.c:3647-3652`).
     AffinityOutOfRange {
         /// The role whose setting it was.
         role: &'static str,
@@ -70,8 +70,9 @@ pub enum CpusetError {
         /// How many CPUs the cpuset has.
         count: usize,
     },
-    /// The topology checks complained and `cpuset.warnings.as.errors` is on
-    /// (`aeron_driver.c:1190-1194`).
+    /// The topology checks complained and
+    /// `thread.affinity.fail.on.validation.errors` is on
+    /// (`aeron_driver.c:1301-1305`).
     WarningsAsErrors(usize),
 }
 
@@ -97,7 +98,7 @@ impl std::fmt::Display for CpusetError {
                 "{role} affinity {affinity} must be less than cpuset count {count}"
             ),
             Self::WarningsAsErrors(count) => {
-                write!(f, "cpuset warnings as errors, {count} warnings")
+                write!(f, "thread affinity validation errors, {count} warnings")
             }
             Self::NotFound(mount) => write!(
                 f,
@@ -126,7 +127,7 @@ impl Eq for CpusetError {}
 /// The spelling is the kernel's: a number is a CPU, `a-b` is a range, and
 /// commas separate. **A negative number is not a CPU** — it is how a range ends,
 /// because that is what the reference's `strtol` walk leaves to the sign
-/// (`aeron_cpuset.c:200-330`), and the arms below are that walk's: a comma with
+/// (`aeron_cpuset.c:205-335`), and the arms below are that walk's: a comma with
 /// no CPU before it is a leading comma, one with nothing after it is a trailing
 /// comma, a range end before its start is refused, and anything that is not a
 /// number, a comma or a newline is a non-numeric CPU.
@@ -254,7 +255,7 @@ pub fn cgroup_read_v2(proc_cgroup_file: &Path, mount_root: &Path) -> Result<Vec<
         }
 
         // Up one cgroup: the file may live in a parent, and the reference looks
-        // there rather than giving up (`:390-410`).
+        // there rather than giving up (`:470-490`).
         cgroup_path = match cgroup_path.rfind('/') {
             Some(index) => cgroup_path[..index].to_owned(),
             None => String::new(),
@@ -266,7 +267,7 @@ pub fn cgroup_read_v2(proc_cgroup_file: &Path, mount_root: &Path) -> Result<Vec<
 /// one that is left where the scheduler put it.
 ///
 /// The reference keeps the same four numbers in its context — an index into the
-/// cpuset that [`apply`] turns into a CPU id (`aeron_driver.c:1196-1207`) — and
+/// cpuset that [`apply`] turns into a CPU id (`aeron_driver.c:1308-1319`) — and
 /// every agent thread reads its own on start.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CpuAssignment {
@@ -281,7 +282,7 @@ pub struct CpuAssignment {
     pub native_resource_agent: Option<i32>,
 }
 
-/// What `aeron_driver_apply_cpuset_affinity` decides
+/// What `aeron_driver_apply_thread_affinity_use_cpuset_offsets` decides
 /// (`aeron-driver/src/main/c/aeron_driver.c:1138-1209`).
 ///
 /// The per-agent affinities and the cpuset are two things, and reading them as
@@ -291,14 +292,14 @@ pub struct CpuAssignment {
 /// (`aeronmd.c:139`), and that hook pins whichever agent is starting from
 /// `conductor`, `receiver`, `sender` or `native_resource_agent_cpu_affinity_no`
 /// with no cpuset condition anywhere in it
-/// (`aeron_driver_context.c:3406-3428`; the test it makes is `0 <= affinity`,
+/// (`aeron_driver_context.c:3507-3529`; the test it makes is `0 <= affinity`,
 /// `:3410`).
 ///
 /// The cpuset path is a **translation** of those numbers rather than an
 /// alternative to them. With `aeron.driver.cpuset.affinity` on it reads the
 /// cgroup's cpuset and rewrites each number in place — a position in the cpuset
 /// becomes the CPU id at that position
-/// (`aeron_driver_context.c:3560-3588`) — after which the same `on_start` hook
+/// (`aeron_driver_context.c:3662-3690`) — after which the same `on_start` hook
 /// applies them. With it off the function returns immediately
 /// (`aeron_driver.c:1138-1143`) and the numbers stand as they were written.
 ///
@@ -310,7 +311,7 @@ pub struct CpuAssignment {
 /// With it on, in the reference's order: read the cpuset, run the three topology
 /// checks (their warnings go to **stderr**, which is where the reference's
 /// `fprintf(output, ...)` points when `aeronmd` passes `stderr`, `:1160-1178`),
-/// refuse if `cpuset.warnings.as.errors` is set and there were any, and finally
+/// refuse if `thread.affinity.fail.on.validation.errors` is set and there were any, and finally
 /// turn each slot's position into a CPU id.
 ///
 /// # Errors
@@ -318,7 +319,7 @@ pub struct CpuAssignment {
 /// [`CpusetError`] for a cgroup that cannot be read, an affinity position the
 /// cpuset does not have, and the warnings-as-errors refusal.
 pub fn apply(config: &crate::config::DriverConfig) -> Result<CpuAssignment, CpusetError> {
-    if !config.cpuset_affinity {
+    if !config.thread_affinity_use_cpuset_offsets {
         return Ok(CpuAssignment {
             conductor: at(config.conductor_cpu_affinity),
             receiver: at(config.receiver_cpu_affinity),
@@ -350,7 +351,7 @@ pub fn apply(config: &crate::config::DriverConfig) -> Result<CpuAssignment, Cpus
         eprintln!("{warning}");
     }
 
-    if config.cpuset_warnings_as_errors && !warnings.is_empty() {
+    if config.thread_affinity_fail_on_validation_errors && !warnings.is_empty() {
         return Err(CpusetError::WarningsAsErrors(warnings.len()));
     }
 
@@ -376,7 +377,7 @@ fn at(affinity: i32) -> Option<i32> {
 
 /// One slot's position in the cpuset as a CPU id, or `None` for `-1` — the
 /// reference's own test and translation (`-1 < affinity`, then
-/// `cpus[(int)affinity]`, `aeron_driver_context.c:3551-3556`).
+/// `cpus[(int)affinity]`, `aeron_driver_context.c:3653-3658`).
 fn slot(role: &'static str, affinity: i32, cpus: &[i32]) -> Result<Option<i32>, CpusetError> {
     let Some(affinity) = at(affinity) else {
         return Ok(None);
@@ -397,7 +398,7 @@ fn slot(role: &'static str, affinity: i32, cpus: &[i32]) -> Result<Option<i32>, 
 /// The cgroup path this process is in, from `/proc/self/cgroup`'s v2 line.
 ///
 /// The line is `id:controllers:path` and the v2 one is the line with an empty
-/// controller list whose id is `0` (`aeron_cpuset.c:54-140`). The reference
+/// controller list whose id is `0` (`aeron_cpuset.c:59-145`). The reference
 /// reads only the **first** line; so does this, and a system whose first line
 /// is a v1 controller line has no v2 cgroup to report.
 fn read_cgroup_path(proc_cgroup_file: &Path) -> Result<String, CpusetError> {
@@ -418,7 +419,7 @@ fn read_cgroup_path(proc_cgroup_file: &Path) -> Result<String, CpusetError> {
 
 /// The path a cgroup file must resolve to: under `/sys/`, or under the
 /// temporary directory the reference's own tests build their fixtures in
-/// (`aeron_cpuset.c:158-175`).
+/// (`aeron_cpuset.c:163-180`).
 fn validate_path_root(path: &Path) -> Result<PathBuf, CpusetError> {
     let resolved = std::fs::canonicalize(path).map_err(CpusetError::Io)?;
 
@@ -496,7 +497,7 @@ mod tests {
         assert_eq!(2048, parse_cpulist("0-2047").expect("a range").len());
     }
 
-    /// `shouldNotParseCpulist` (`:187-217`), case for case — the arms are the
+    /// `shouldNotParseCpulist` (`:192-222`), case for case — the arms are the
     /// reference's, word for word.
     #[test]
     fn a_cpulist_that_is_wrong_is_refused_with_the_references_word() {
@@ -514,7 +515,7 @@ mod tests {
         }
     }
 
-    /// `shouldReadV2Cgroups` (`:80-111`): the process's own cgroup has the
+    /// `shouldReadV2Cgroups` (`:85-116`): the process's own cgroup has the
     /// file, and the list comes back sorted and expanded.
     #[test]
     fn the_effective_cpus_come_from_the_processes_own_cgroup() {
@@ -531,7 +532,7 @@ mod tests {
         assert_eq!(vec![5, 6, 7, 8, 9, 10], cpus);
     }
 
-    /// `shouldReadV2CgroupsInParent` (`:113-146`): the file is in a parent
+    /// `shouldReadV2CgroupsInParent` (`:118-151`): the file is in a parent
     /// cgroup, and the search walks up to it.
     #[test]
     fn the_search_walks_up_to_a_parent_cgroup() {
@@ -545,7 +546,7 @@ mod tests {
         assert_eq!(vec![5, 6, 7, 8, 9, 10], cpus);
     }
 
-    /// `shouldErrorIfNotFoundReadV2Cgroups` (`:148-165`): no cgroup up the path
+    /// `shouldErrorIfNotFoundReadV2Cgroups` (`:153-170`): no cgroup up the path
     /// has the file, and that is an error rather than an empty list.
     #[test]
     fn a_cgroup_tree_with_no_effective_cpus_is_an_error() {
@@ -566,7 +567,7 @@ mod tests {
     fn a_driver_that_did_not_ask_for_affinity_reads_nothing() {
         let config = crate::config::DriverConfig::default();
 
-        assert!(!config.cpuset_affinity, "the default");
+        assert!(!config.thread_affinity_use_cpuset_offsets, "the default");
         assert_eq!(
             Ok(CpuAssignment::default()),
             apply(&config),
@@ -576,7 +577,7 @@ mod tests {
 
     /// Off is not the same as unasked-for. The reference pins each agent from
     /// `*_cpu_affinity_no` whatever the cpuset says
-    /// (`aeron_driver_context.c:3406-3428`), and the cpuset on top of that only
+    /// (`aeron_driver_context.c:3507-3529`), and the cpuset on top of that only
     /// rewrites the numbers. Reading them only when the cpuset was on left
     /// every agent to the scheduler under a configuration that had named a CPU
     /// for each — which is the configuration the benchmark runs on.

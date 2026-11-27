@@ -78,7 +78,7 @@ fn a_single_member_module_starts_allocates_its_counters_and_reaches_steady_state
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
             .expect("the configuration settles");
     // This build has no class loader; the flag is the programmatic
-    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2193`).
     config.consensus_module_extension = true;
     let mut agent = ConsensusModuleAgent::launch(config).expect("the module launches");
 
@@ -170,7 +170,7 @@ fn a_single_member_module_starts_allocates_its_counters_and_reaches_steady_state
     // ---- a clean shutdown leaves an adoptable directory ------------------
     //
     // `signalTerminated` writes the activity timestamp as `-1`
-    // (`ClusterMarkFile.java:455-462`, file offset 16) and leaves the version
+    // (`ClusterMarkFile.java:470-477`, file offset 16) and leaves the version
     // alone. Read it back from the file the process left behind: that field is
     // what tells the next start the directory was left on purpose, and it is
     // what `ClusterMarkFile::adopt_existing` tests.
@@ -195,7 +195,7 @@ fn a_single_member_module_starts_allocates_its_counters_and_reaches_steady_state
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
             .expect("the configuration settles again");
     // This build has no class loader; the flag is the programmatic
-    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2193`).
     config.consensus_module_extension = true;
     let mut agent = ConsensusModuleAgent::launch(config).expect("the module restarts");
 
@@ -234,7 +234,7 @@ fn a_single_member_module_starts_allocates_its_counters_and_reaches_steady_state
 }
 
 /// The reference's first question every slow tick is whether its Aeron client
-/// is still there (`ConsensusModuleAgent.java:2386-2390`). A swallowed error
+/// is still there (`ConsensusModuleAgent.java:2403-2407`). A swallowed error
 /// here is a duty cycle that keeps working against a driver that has gone.
 #[test]
 fn a_closed_client_ends_the_duty_cycle() {
@@ -257,7 +257,7 @@ fn a_closed_client_ends_the_duty_cycle() {
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
             .expect("the configuration settles");
     // This build has no class loader; the flag is the programmatic
-    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2193`).
     config.consensus_module_extension = true;
     let mut agent = ConsensusModuleAgent::launch(config).expect("the module launches");
 
@@ -281,7 +281,9 @@ fn counter_value(agent: &ConsensusModuleAgent, type_id: i32) -> Option<i64> {
 /// The fifteen counters a consensus module allocates, with the spec P3-1c's
 /// encoders build for them.
 fn expected_counters() -> Vec<(i32, CounterSpec)> {
-    let version = "1.53.2";
+    // `ConsensusModuleVersion.VERSION` at the reference tag — a literal on
+    // purpose, so this test fails if the build's constant drifts.
+    let version = "1.54.2";
     let commit = "deepmsg";
     vec![
         (
@@ -380,7 +382,7 @@ fn the_mark_file_is_aligned_to_the_drivers_file_page_size() {
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
             .expect("the configuration settles");
     // This build has no class loader; the flag is the programmatic
-    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2193`).
     config.consensus_module_extension = true;
     let agent = ConsensusModuleAgent::launch(config).expect("the module launches");
 

@@ -62,7 +62,7 @@ pub const MAX_MESSAGE_LENGTH: i32 = 16 * 1024 * 1024;
 /// The fields a driver writes into a fresh log's metadata block.
 ///
 /// `aeron_logbuffer_metadata_init` takes these as thirty-odd positional
-/// arguments (`aeron_logbuffer_descriptor.h:240-317`); naming them is what
+/// arguments (`aeron_logbuffer_descriptor.h:241-318`); naming them is what
 /// makes a call site where two adjacent `i32`s are swapped *impossible* rather
 /// than merely unlikely — and the two socket-buffer triples are exactly that
 /// shape.
@@ -144,11 +144,11 @@ pub struct LogMetadataInit {
 
 /// Write every field a driver initialises on a fresh log's metadata block.
 ///
-/// Mirrors `aeron_logbuffer_metadata_init` (`aeron_logbuffer_descriptor.h:240-317`)
+/// Mirrors `aeron_logbuffer_metadata_init` (`aeron_logbuffer_descriptor.h:241-318`)
 /// field for field, in its order — including the two it deliberately does
 /// **not** touch: `term_tail_counters` and `active_term_count` belong to the
 /// code that creates the publication, not to the metadata template
-/// (`aeron_ipc_publication.c:75-103`).
+/// (`aeron_ipc_publication.c:80-108`).
 ///
 /// # Errors
 ///
@@ -235,7 +235,7 @@ pub fn initialise(
 }
 
 /// Write the template frame header a receiver copies for frames it has to
-/// invent — padding, heartbeats, gap fills (`aeron_logbuffer_descriptor.h:320-341`).
+/// invent — padding, heartbeats, gap fills (`aeron_logbuffer_descriptor.h:321-342`).
 ///
 /// `frame_length` is written as **zero**, which is what the reference writes:
 /// the template is a header, not a record, and a reader that trusted a length
@@ -298,7 +298,7 @@ pub fn fill_default_header(
 /// Rotate the log to the next term.
 ///
 /// Mirrors `aeron_logbuffer_rotate_log`
-/// (`aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h:194-216`)
+/// (`aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h:195-217`)
 /// and Java's `LogBufferDescriptor.rotateLog`
 /// (`aeron-client/src/main/java/io/aeron/logbuffer/LogBufferDescriptor.java:883-902`).
 ///
@@ -306,7 +306,7 @@ pub fn fill_default_header(
 /// has two callers: a producer's own rotation
 /// (`aeron_publication.c:168`, `ConcurrentPublication.java:763`) and the
 /// driver's blocked-publisher unblocker
-/// (`aeron_logbuffer_unblocker.c:46,55`, `LogBufferUnblocker.java:54,70`).
+/// (`aeron_logbuffer_unblocker.c:51,55`, `LogBufferUnblocker.java:54,70`).
 ///
 /// Two steps, in this order and for a reason:
 ///
@@ -336,7 +336,7 @@ pub fn rotate_log(
     // The reset retries while it is still ours to perform. Losing the
     // compare-exchange to another producer rotating the same term is not a
     // failure — it means the reset is done — and the reference loops for
-    // exactly that reason (`aeron_logbuffer_descriptor.h:197-211`).
+    // exactly that reason (`aeron_logbuffer_descriptor.h:198-212`).
     loop {
         let Some(raw) = metadata.load_i64_acquire(offset) else {
             return false;
@@ -362,7 +362,7 @@ pub fn rotate_log(
     // the four bytes after it are structure padding that nothing promises
     // to keep zero, and an 8-byte compare-exchange would take them into
     // both the comparison and the write
-    // (`aeron_logbuffer_descriptor.h:186-191`).
+    // (`aeron_logbuffer_descriptor.h:187-192`).
     metadata
         .compare_exchange_i32(
             ACTIVE_TERM_COUNT_OFFSET,
@@ -375,7 +375,7 @@ pub fn rotate_log(
 /// The term space one fragmented message occupies.
 ///
 /// Mirrors `aeron_logbuffer_compute_fragmented_length`
-/// (`aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h:326-334`):
+/// (`aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h:327-335`):
 /// every full frame costs `max_payload_length + 32` — **not** rounded up, which
 /// is only equivalent because the driver forces the MTU to a multiple of the
 /// frame alignment — and the last, possibly short, frame costs its aligned

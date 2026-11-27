@@ -66,7 +66,7 @@ impl ElectionRng {
     /// then nominated in the same millisecond, every ballot split three ways,
     /// and the election could not converge no matter how long it ran
     /// (`records/P3-6c.md`). The reference does not have that coupling — its
-    /// `Random` is one per module (`ConsensusModule.java:2131`) and a 48-bit
+    /// `Random` is one per module (`ConsensusModule.java:2166`) and a 48-bit
     /// LCG scrambles a nearby seed in its first step — so a stream per member
     /// that starts a millisecond apart is what it has, and what this has to.
     ///
@@ -103,22 +103,22 @@ const fn mix_seed(seed: u64) -> u64 {
 /// The groups, top to bottom: immutable-for-one-election, the five-tuple being
 /// reconciled, progress, in-flight work, deadlines.
 pub struct Election {
-    // ---- immutable for the life of one election (ctor, `:110-150`) ----
-    /// Whether the node is starting up, not re-electing (`:112`).
+    // ---- immutable for the life of one election (ctor, `:113-153`) ----
+    /// Whether the node is starting up, not re-electing (`:115`).
     is_node_startup: bool,
     /// `isExtendedCanvass`, seeded from `isNodeStartup` (`:124`).
     is_extended_canvass: bool,
-    /// The leader that shut down cleanly, or a null id (`:113`).
+    /// The leader that shut down cleanly, or a null id (`:116`).
     graceful_closed_leader_id: i32,
-    /// `:131` — also the initial `logLeadershipTermId` and `candidateTermId`.
+    /// `:134` — also the initial `logLeadershipTermId` and `candidateTermId`.
     initial_log_leadership_term_id: i64,
-    /// `:133`.
+    /// `:136`.
     initial_term_base_log_position: i64,
-    /// `:140` — one day in the past, so the first heartbeat check fires.
+    /// `:143` — one day in the past, so the first heartbeat check fires.
     initial_time_of_last_update_ns: i64,
-    /// `thisMember.id()` (`:135`).
+    /// `thisMember.id()` (`:138`).
     this_member_id: i32,
-    /// The eligible members, in the reference's array order (`:134`).
+    /// The eligible members, in the reference's array order (`:137`).
     ///
     /// Ids, not members: see the module note. Order matters — `CANVASS`
     /// publishes in it and the ballots are indexed by it.
@@ -126,32 +126,32 @@ pub struct Election {
     rng: ElectionRng,
 
     // ---- the five-tuple being reconciled (spec §1.2) ----
-    /// The term this member is in (`:136`).
+    /// The term this member is in (`:139`).
     leadership_term_id: i64,
-    /// The term of the last entry in the log (`:132`).
+    /// The term of the last entry in the log (`:135`).
     log_leadership_term_id: i64,
-    /// Applied position (`:127`).
+    /// Applied position (`:130`).
     log_position: i64,
-    /// Written position (`:128`).
+    /// Written position (`:131`).
     append_position: i64,
-    /// What the leader last told us is committed (`:130`).
+    /// What the leader last told us is committed (`:133`).
     notified_commit_position: i64,
 
     // ---- progress ----
     state: ElectionState,
-    /// `:144` — bumped before every vote we cast or request.
+    /// `:147` — bumped before every vote we cast or request.
     candidate_term_id: i64,
-    /// `:146` — `INIT` uses it to tell "first INIT" from "retry".
+    /// `:149` — `INIT` uses it to tell "first INIT" from "retry".
     is_first_init: bool,
-    /// `:145`.
+    /// `:148`.
     is_leader_startup: bool,
-    /// `leaderMember`, as an id; `-1`/null while none (`:144`).
+    /// `leaderMember`, as an id; `-1`/null while none (`:147`).
     leader_member_id: i32,
-    /// `:143` — determined when the log publication is created.
+    /// `:146` — determined when the log publication is created.
     log_session_id: i32,
-    /// `:142`.
+    /// `:145`.
     leader_recording_id: i64,
-    /// `:129` — where a follower must join; `-1` when not catching up.
+    /// `:132` — where a follower must join; `-1` when not catching up.
     catchup_join_position: i64,
     /// A live-log join found the publication **ahead** of this member's log:
     /// the next term that is accepted must take the catch-up path.
@@ -165,40 +165,40 @@ pub struct Election {
     /// at 96 bytes of startup entries against a log of zero on a loaded
     /// machine.
     force_catchup: bool,
-    /// `:138`.
-    replication_leadership_term_id: i64,
-    /// `:139`.
-    replication_stop_position: i64,
     /// `:141`.
+    replication_leadership_term_id: i64,
+    /// `:142`.
+    replication_stop_position: i64,
+    /// `:144`.
     replication_term_base_log_position: i64,
-    /// `:143`-adjacent: the last commit position we published (`:149`).
+    /// `:146`-adjacent: the last commit position we published (`:152`).
     last_published_commit_position: i64,
-    /// The last append position we published (`:150`).
+    /// The last append position we published (`:153`).
     last_published_append_position: i64,
 
     // ---- in-flight work, owned here, advanced through the host ----
-    /// The log subscription's registration id, or none (`:107`).
+    /// The log subscription's registration id, or none (`:110`).
     log_subscription_id: Option<i64>,
-    /// Our own tail replay, when replaying (`:108`).
+    /// Our own tail replay, when replaying (`:111`).
     log_replay: Option<LogReplay>,
-    /// An archive-to-archive replication, when catching up by copying (`:109`).
+    /// An archive-to-archive replication, when catching up by copying (`:112`).
     log_replication: Option<RecordingReplication>,
 
-    // ---- deadlines (`:85-92`, `:140`) ----
-    /// `:86`.
-    time_of_last_state_change_ns: i64,
-    /// `:87`.
-    time_of_last_update_ns: i64,
+    // ---- deadlines (`:87-94`, `:143`) ----
     /// `:88`.
+    time_of_last_state_change_ns: i64,
+    /// `:89`.
+    time_of_last_update_ns: i64,
+    /// `:90`.
     time_of_last_commit_position_update_ns: i64,
-    /// `:89` — when `NOMINATE` gives up waiting and asks for votes.
+    /// `:91` — when `NOMINATE` gives up waiting and asks for votes.
     nomination_deadline_ns: i64,
-    /// `:137` — how long a replication may stall before it is a `Timeout`.
+    /// `:140` — how long a replication may stall before it is a `Timeout`.
     replication_deadline_ns: i64,
     /// The replication position the last turn saw, for the progress clock
     /// (`RecordingReplication.poll`'s `progressDeadlineNs`).
     replication_progress_position: i64,
-    /// `RecordingReplication.progressDeadlineNs` (`:74`): how long the copy may
+    /// `RecordingReplication.progressDeadlineNs` (`:76`): how long the copy may
     /// go without moving before it is a failure.
     ///
     /// **Separate from [`Self::replication_deadline_ns`], and that separation
@@ -496,7 +496,7 @@ impl Election {
             }
             Some(replay) => {
                 // The replay is advanced by the host's own poll (the agent's
-                // `poll_log_replay`, `ConsensusModuleAgent.java:1845`); the
+                // `poll_log_replay`, `ConsensusModuleAgent.java:1861`); the
                 // election watches `isDone` (`Election.java:855-866`).
                 if replay.is_done() {
                     self.log_position = self.append_position;

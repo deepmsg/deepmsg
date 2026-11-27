@@ -345,7 +345,7 @@ fn a_single_member_consensus_module_does_not_allocate_in_steady_state() {
         ConsensusModuleConfig::from_properties(&properties(driver.aeron_dir(), cluster_dir.path()))
             .expect("the configuration parses");
     // This build has no class loader; the flag is the programmatic
-    // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+    // extension seam a zero-service cluster needs (`ConsensusModule.java:2193`).
     config.consensus_module_extension = true;
 
     let mut client = Client::connect(driver.aeron_dir()).expect("the test client connects");

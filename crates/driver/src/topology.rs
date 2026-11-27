@@ -4,36 +4,38 @@
 //! two dies or two L3 caches, will run — and run worse than its operator
 //! expects. The reference's answer is to **say so**: three checks that read
 //! `/sys/devices/system/cpu` and print a warning per problem
-//! (`aeron-driver/src/main/c/aeron_topology.c:467-620`), whose count
-//! `aeron.driver.cpuset.warnings.as.errors` can turn into a refusal to start.
+//! (`aeron-driver/src/main/c/aeron_topology.c:251-357`), whose count
+//! `aeron.thread.affinity.fail.on.validation.errors` can turn into a refusal to start.
 //!
 //! The three, and what each one is looking at:
 //!
 //! * **alignment** — a core whose sibling threads are not all in the cpuset.
 //!   `thread_siblings_list` gives a CPU's siblings, so a group with some
 //!   present and some missing is a core that has been split
-//!   (`check_alignment`, `:467`).
+//!   (`aeron_topology_check_alignment`, `:251`).
 //! * **L3 locality** — the cpuset reaching outside the L3 cache that its first
-//!   CPU shares (`cache/index3/shared_cpu_list`, `:512`).
+//!   CPU shares (`cache/index3/shared_cpu_list`, `aeron_topology_check_l3_locality`, `:296`).
 //! * **die locality** — the cpuset spanning more than one die
-//!   (`topology/die_id`, `:558`).
+//!   (`topology/die_id`, `aeron_topology_check_die_locality`, `:326`).
 //!
 //! Everything here is a **warning**: none of them fails on its own, and a check
 //! that cannot read what it needs is not a warning either — it is silence
-//! (`aeron_err_clear()` and carry on, `:539-545`). The only hard limit is the
-//! one the reference puts on the array sizes: more CPUs than
-//! [`MAX_CPU_ID`] is an error rather than a warning.
+//! (`aeron_topology_init` reads each table and ignores the reader's result,
+//! `:225-227`). The only hard limit is the one this build puts on the array
+//! sizes: more CPUs than [`MAX_CPU_ID`] is an error rather than a warning.
 
 use std::io;
 use std::path::Path;
 
 use crate::cpuset::{CpusetError, parse_cpulist};
 
-/// `AERON_TOPOLOGY_MAX_CPU_ID` (`aeron_topology.c:30`): how many CPUs the
-/// reference's lookup tables hold.
+/// How many CPUs this build's lookup tables hold. 1.53.2 capped the count at
+/// `AERON_TOPOLOGY_MAX_CPU_ID` (8192, `aeron_topology.c:30`) and refused a
+/// larger one; 1.54.2 sizes each table from the highest id it is given and has
+/// no such cap. The guard stays here — a table that size is 64 MiB per axis —
+/// and `docs/compat.md` records the difference.
 ///
-/// A count above it is refused rather than truncated, which is the reference's
-/// behaviour — and it compares the **count**, not the ids, which is its own
+/// It compares the **count**, not the ids, which is the 1.53.2 reference's own
 /// quirk and is kept as it is.
 pub const MAX_CPU_ID: usize = 8192;
 
@@ -84,8 +86,9 @@ pub struct CoreGroup {
 }
 
 /// Every core that has at least one CPU in `cpus`, in the order the CPUs are
-/// visited, each split into what the cpuset has and what it has not
-/// (`aeron_topology_read_core_groups`, `:152-290`).
+/// visited, each split into what the cpuset has and what it has not. The
+/// reference now builds one sibling table at init (`aeron_topology_read_siblings`,
+/// `:83-113`) and walks it in the alignment check (`:251-294`).
 ///
 /// # Errors
 ///
@@ -130,7 +133,7 @@ pub fn read_core_groups(root: &Path, cpus: &[i32]) -> Result<Vec<CoreGroup>, Top
 }
 
 /// A core split between the cpuset and the rest of the machine, one warning
-/// each (`:467-509`).
+/// each (`aeron_topology_check_alignment`, `:251-294`).
 ///
 /// A cpuset with fewer than two CPUs is never misaligned — there is no core to
 /// split — and answers no warnings.
@@ -165,7 +168,7 @@ pub fn check_alignment(root: &Path, cpus: &[i32]) -> Result<Vec<String>, Topolog
 }
 
 /// The cpuset reaching outside the L3 cache its first CPU is in, one warning
-/// (`:512-556`).
+/// (`aeron_topology_check_l3_locality`, `:296-324`).
 ///
 /// # Errors
 ///
@@ -192,7 +195,8 @@ pub fn check_l3_locality(root: &Path, cpus: &[i32]) -> Result<Vec<String>, Topol
     Ok(Vec::new())
 }
 
-/// The cpuset spanning more than one die, one warning (`:558-620`).
+/// The cpuset spanning more than one die, one warning
+/// (`aeron_topology_check_die_locality`, `:326-357`).
 ///
 /// The message carries the die ids it found — sorted, comma separated — which
 /// is the reference's own wording, and it is the one warning without the
@@ -236,8 +240,12 @@ pub fn check_die_locality(root: &Path, cpus: &[i32]) -> Result<Vec<String>, Topo
     )])
 }
 
-/// The CPUs in `cpus` as a `cpulist`, with runs collapsed into ranges
-/// (`aeron_topology_format_cpulist`, `:294-330`).
+/// The CPUs in `cpus` as a `cpulist`, with runs collapsed into ranges.
+///
+/// The reference had this helper at 1.53.2 (`aeron_topology_format_cpulist`);
+/// 1.54.2's alignment message names one missing sibling per line instead
+/// (`aeron_topology_check_alignment`, `:286-287`), so the collapse is this
+/// build's own formatting of the same values.
 pub fn format_cpulist(cpus: &[i32]) -> String {
     let mut text = String::new();
     let mut index = 0;
@@ -342,8 +350,8 @@ mod tests {
 
     /// The sibling list of each of the sixteen CPUs of the reference's fixture,
     /// which is its own vector entry for entry
-    /// (`TopologyTest::setupSiblings`, `aeron_topology_test.cpp:89-101` and the
-    /// sixteen pairs at `:139-142`): every CPU names the core it is on, so
+    /// (`TopologyTest::setupSiblings`, `aeron_topology_test.cpp:79-91` and the
+    /// sixteen pairs at `:141-144`): every CPU names the core it is on, so
     /// `cpu4` and `cpu5` both say `4-5`.
     fn write_siblings(dir: &TempDir) {
         for cpu in 0..16 {
@@ -355,7 +363,7 @@ mod tests {
         }
     }
 
-    /// `shouldCheckAlignment` (`:124-159`): the cpuset runs from CPU 5 to 10 and
+    /// The alignment case of `shouldCheckCgroupConfiguration` (`:141-182`): the cpuset runs from CPU 5 to 10 and
     /// the machine's cores are pairs, so the core holding 5 is split (4 is
     /// outside) and the one holding 10 is too (11 is outside).
     #[test]
@@ -379,8 +387,10 @@ mod tests {
         );
     }
 
-    /// `shouldCheckL3Locality` (`:161-194`): the cpuset's first CPU is in an L3
-    /// shared by 0-7, and CPUs 8 to 10 are outside it.
+    /// The L3 case of the reference's cgroup test
+    /// (`aeron_topology_test.cpp:153-190`, `shouldCheckCgroupConfiguration`):
+    /// the cpuset's first CPU is in an L3 shared by 0-7, and CPUs 8 to 10 are
+    /// outside it.
     #[test]
     fn a_cpuset_that_spans_two_l3_caches_is_reported_once() {
         let dir = TempDir::new();
@@ -399,7 +409,7 @@ mod tests {
         assert!(warnings[0].contains("cpuset spans multiple L3 cache domains"));
     }
 
-    /// `shouldCheckClusterLocality` (`:196-227`): the CPUs are on two dies, and
+    /// The die case of `shouldCheckCgroupConfiguration` (`:148-198`): the CPUs are on two dies, and
     /// the message carries the ids.
     #[test]
     fn a_cpuset_that_spans_two_dies_is_reported_once() {
@@ -466,8 +476,18 @@ mod tests {
         );
     }
 
-    /// The formatter collapses runs, which is what the alignment message
-    /// carries (`aeron_topology_format_cpulist`, `:294`).
+    /// The cpuset is refused before any table is allocated when its count is
+    /// past this build's tables; 1.54.2 has no such cap (`docs/compat.md`).
+    #[test]
+    fn a_cpuset_larger_than_the_tables_is_refused() {
+        let cpus: Vec<i32> = (0..=MAX_CPU_ID as i32).collect();
+        assert!(matches!(
+            read_core_groups(Path::new("/nonexistent"), &cpus),
+            Err(TopologyError::TooManyCpus(count)) if count == MAX_CPU_ID + 1
+        ));
+    }
+
+    /// The formatter collapses runs into ranges.
     #[test]
     fn a_cpu_list_collapses_runs_into_ranges() {
         assert_eq!("4", format_cpulist(&[4]));

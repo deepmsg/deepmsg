@@ -31,7 +31,7 @@
 //! images a reader would have to interleave: the driver joins publications that
 //! agree on session and stream, and
 //! `ReplayMerge.shouldStopAndRemoveReplay` reads exactly that count
-//! (`:569-574`) to decide the live transport is carrying the stream. Measured —
+//! (`:574-579`) to decide the live transport is carrying the stream. Measured —
 //! with two same-session publications on two destinations, the subscription
 //! holds one image whose `activeTransportCount` is 2.
 //!
@@ -118,7 +118,7 @@ fn live_channel() -> String {
 ///
 /// Its own endpoint, and its control frames go to the publication's control
 /// address — the shape a subscriber of a dynamic publication has
-/// (`aeron_udp_channel.c:465-487`).
+/// (`aeron_udp_channel.c:486-508`).
 fn recording_channel() -> String {
     format!(
         "aeron:udp?endpoint={}|control={}|term-length=64k",

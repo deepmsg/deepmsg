@@ -98,7 +98,7 @@ pub const REQUEST_BUFFER_LENGTH: usize = 8 * 1024;
 /// archive has named one, and what every optional field here is set to.
 pub const NULL_VALUE: i64 = -1;
 
-/// `AERON_NULL_COUNTER_ID` (`aeronc.h:896`), which `AERON_NULL_VALUE` happens
+/// `AERON_NULL_COUNTER_ID` (`aeronc.h:899`), which `AERON_NULL_VALUE` happens
 /// to equal — and which is the value that says a replay is **not** bounded.
 pub const NULL_COUNTER_ID: i32 = -1;
 
@@ -316,7 +316,7 @@ impl ArchiveProxy {
                 .response_stream_id(response_stream_id)
                 // The *protocol*'s version, not this build's: the archive
                 // compares its major against its own
-                // (`ArchiveConductor.java:483-488`).
+                // (`ArchiveConductor.java:482-487`).
                 .version(PROTOCOL_SEMANTIC_VERSION)
                 .response_channel(response_channel.as_bytes())
                 .encoded_credentials(credentials)
@@ -348,7 +348,7 @@ impl ArchiveProxy {
         self.offer_once(client, length)
     }
 
-    /// Answer a challenge: `ChallengeResponse` (`:203-227`).
+    /// Answer a challenge: `ChallengeResponse` (`:202-226`).
     ///
     /// The second half of a connect that was answered with a challenge rather
     /// than an acceptance.
@@ -377,7 +377,7 @@ impl ArchiveProxy {
         self.offer_once(client, length)
     }
 
-    /// Leave: `CloseSessionRequest` (`:229-245`).
+    /// Leave: `CloseSessionRequest` (`:228-244`).
     ///
     /// The only request with **no correlation id** — there is nothing left to
     /// correlate it with once the session is closing — and one of the four that
@@ -403,7 +403,7 @@ impl ArchiveProxy {
     // The twenty-eight that retry
     // -----------------------------------------------------------------------
 
-    /// Start a recording: `StartRecordingRequest2` (`:247-281`).
+    /// Start a recording: `StartRecordingRequest2` (`:246-280`).
     #[allow(clippy::too_many_arguments)]
     pub fn start_recording(
         &mut self,
@@ -436,7 +436,7 @@ impl ArchiveProxy {
         self.offer(client, length)
     }
 
-    /// Where a recording has got to: `RecordingPositionRequest` (`:283-304`).
+    /// Where a recording has got to: `RecordingPositionRequest` (`:282-303`).
     pub fn get_recording_position(
         &mut self,
         client: &Client,
@@ -462,7 +462,7 @@ impl ArchiveProxy {
         self.offer(client, length)
     }
 
-    /// Where a recording begins: `StartPositionRequest` (`:306-327`).
+    /// Where a recording begins: `StartPositionRequest` (`:305-326`).
     pub fn get_start_position(
         &mut self,
         client: &Client,
@@ -488,7 +488,7 @@ impl ArchiveProxy {
         self.offer(client, length)
     }
 
-    /// Where a recording ends: `StopPositionRequest` (`:329-350`).
+    /// Where a recording ends: `StopPositionRequest` (`:328-349`).
     pub fn get_stop_position(
         &mut self,
         client: &Client,
@@ -515,7 +515,7 @@ impl ArchiveProxy {
     }
 
     /// The furthest a recording ever reached: `MaxRecordedPositionRequest`
-    /// (`:352-373`).
+    /// (`:351-372`).
     ///
     /// Not the stop position: a recording still going has one of those too, and
     /// this is the one that does not move backwards.
@@ -545,7 +545,7 @@ impl ArchiveProxy {
     }
 
     /// Stop a recording by the channel and stream it was started with:
-    /// `StopRecordingRequest` (`:375-401`).
+    /// `StopRecordingRequest` (`:374-400`).
     pub fn stop_recording(
         &mut self,
         client: &Client,
@@ -574,7 +574,7 @@ impl ArchiveProxy {
     }
 
     /// Stop one recording subscription:
-    /// `StopRecordingSubscriptionRequest` (`:403-424`).
+    /// `StopRecordingSubscriptionRequest` (`:402-423`).
     pub fn stop_recording_subscription(
         &mut self,
         client: &Client,
@@ -600,7 +600,7 @@ impl ArchiveProxy {
         self.offer(client, length)
     }
 
-    /// Stop a recording by its id: `StopRecordingByIdentityRequest` (`:426-447`).
+    /// Stop a recording by its id: `StopRecordingByIdentityRequest` (`:425-446`).
     pub fn stop_recording_by_identity(
         &mut self,
         client: &Client,
@@ -627,7 +627,7 @@ impl ArchiveProxy {
     }
 
     /// The last recording matching a description:
-    /// `FindLastMatchingRecordingRequest` (`:449-479`).
+    /// `FindLastMatchingRecordingRequest` (`:448-478`).
     ///
     /// **Searches backwards**, which is what `min_recording_id` is for: the
     /// answer is the newest recording at or above that id.
@@ -663,7 +663,7 @@ impl ArchiveProxy {
         self.offer(client, length)
     }
 
-    /// One recording's descriptor: `ListRecordingRequest` (`:481-502`).
+    /// One recording's descriptor: `ListRecordingRequest` (`:480-501`).
     pub fn list_recording(
         &mut self,
         client: &Client,
@@ -689,7 +689,7 @@ impl ArchiveProxy {
         self.offer(client, length)
     }
 
-    /// A page of descriptors: `ListRecordingsRequest` (`:504-527`).
+    /// A page of descriptors: `ListRecordingsRequest` (`:503-526`).
     ///
     /// `from_recording_id` is a **cursor, not a page number** — the id the
     /// answer should start after — which is what lets a listing survive
@@ -722,7 +722,7 @@ impl ArchiveProxy {
     }
 
     /// A page of descriptors for one channel and stream:
-    /// `ListRecordingsForUriRequest` (`:529-559`).
+    /// `ListRecordingsForUriRequest` (`:528-558`).
     #[allow(clippy::too_many_arguments)]
     pub fn list_recordings_for_uri(
         &mut self,
@@ -1324,7 +1324,7 @@ impl ArchiveProxy {
             }
 
             // The reference runs the context's idle strategy here, which
-            // defaults to a backoff (`aeron_archive_context.c:420-430`). This
+            // defaults to a backoff (`aeron_archive_context.c:424-434`). This
             // context has no idle strategy yet — P2-C1 does not build one — so
             // the turn is yielded, which is what that strategy does first.
             //
@@ -1373,7 +1373,7 @@ fn is_retryable(error: &ProxyError) -> bool {
 }
 
 /// The reference's code for a failure, so a message says which
-/// (`aeronc.h:1072-1101`).
+/// (`aeronc.h:1075-1104`).
 ///
 /// Two of this build's states are one of the reference's: a term that ended
 /// under the producer and a term caught mid-rotation are the same thing to a
@@ -1410,7 +1410,7 @@ pub enum ProxyError {
 
 impl core::fmt::Display for ProxyError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // The reference's own text (`:1081`), which is the whole of it.
+        // The reference's own text (`:1084`), which is the whole of it.
         if let Self::TooManyRetries = self {
             return write!(f, "too many retries");
         }

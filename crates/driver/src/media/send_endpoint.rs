@@ -3,7 +3,7 @@
 //!
 //! Mirrors `aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c`. An
 //! endpoint is shared by every publication whose channel *canonicalises* to the
-//! same form (`aeron_driver_conductor.c:1961-2030`), which is why it exists as
+//! same form (`aeron_driver_conductor.c:2012-2081`), which is why it exists as
 //! a thing of its own: two publications to the same address are one socket, one
 //! channel-status counter and one place for the answers to arrive.
 //!
@@ -79,8 +79,8 @@ pub struct PublicationDispatch {
 
 /// The first three lines of what the reference records when a **send**
 /// endpoint cannot bind: `aeron_bind` set it, and two layers appended to it on
-/// the way up (`aeron_socket.c:93`, `aeron_udp_channel_transport.c:151`,
-/// `media/aeron_send_channel_endpoint.c:142`).
+/// the way up (`aeron_socket.c:93`, `aeron_udp_channel_transport.c:165`,
+/// `media/aeron_send_channel_endpoint.c:135`).
 ///
 /// The receive side's twin is `receive_endpoint.rs::bind_report`, and the two
 /// differ in exactly the ways the probe shows: the affinity is the **sender's**
@@ -104,14 +104,14 @@ fn bind_report(
     report.append(
         "aeron_udp_channel_transport_init",
         "aeron_udp_channel_transport.c",
-        151,
+        165,
         "unicast bind, affinity=0",
     );
 
     report.append(
         "aeron_send_channel_endpoint_create",
         "aeron_send_channel_endpoint.c",
-        142,
+        135,
         &format!("uri={}", String::from_utf8_lossy(&channel.original_uri)),
     );
 
@@ -134,7 +134,7 @@ pub struct SendChannelEndpoint {
     /// [`EndpointStatus`].
     channel_status_counter_id: i32,
     /// The `snd-local-sockaddr` counter, whose **key** is the address the
-    /// socket was actually bound to (`aeron_send_channel_endpoint.c:211-228`).
+    /// socket was actually bound to (`aeron_send_channel_endpoint.c:204-221`).
     ///
     /// The port is the reason it exists: a channel is allowed to name port
     /// zero, and then the port the kernel chose is readable from nowhere else.
@@ -147,11 +147,11 @@ pub struct SendChannelEndpoint {
     transport_counter_id: i32,
     /// The port the wildcard port manager gave this endpoint, and zero when it
     /// gave none (`aeron_wildcard_port_manager_get_managed_port`,
-    /// `aeron_port_manager.c:121-163`).
+    /// `aeron_port_manager.c:126-168`).
     ///
     /// Zero is the ordinary case: a channel that named a port keeps it, and a
     /// channel that named none keeps the kernel's — and the kernel's port is
-    /// not the manager's to take back (`free_managed_port`, `:170-173`). What
+    /// not the manager's to take back (`free_managed_port`, `:175-178`). What
     /// a non-zero port here means is that the manager is holding it for this
     /// endpoint, and that the endpoint owes it back when it is deleted.
     ///
@@ -182,7 +182,7 @@ pub struct SendChannelEndpoint {
     publications: Vec<PublicationDispatch>,
     /// `SO_RCVBUF` this endpoint asked for, zero meaning the driver's default
     /// — the value a later channel on the same canonical form has to agree
-    /// with (`aeron_driver_conductor.c:1936-1956`).
+    /// with (`aeron_driver_conductor.c:1977-1997`).
     pub socket_rcvbuf: usize,
     /// `SO_SNDBUF`, likewise.
     pub socket_sndbuf: usize,
@@ -192,13 +192,13 @@ impl SendChannelEndpoint {
     /// Create the endpoint: allocate its channel-status counter, open its
     /// socket, and leave the status `INITIALIZING`
     /// (`aeron_send_channel_endpoint_create`,
-    /// `aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:42-235`).
+    /// `aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:34-227`).
     ///
     /// The counter comes first, because the reference's create allocates it
     /// before the transport and a failure to allocate is a failure to create.
     /// The caller sets the status to `ACTIVE` once the endpoint is registered
     /// — the reference does it in the conductor, right after the create
-    /// (`aeron_driver_conductor.c:2013`), and a channel that is looked up
+    /// (`aeron_driver_conductor.c:2064`), and a channel that is looked up
     /// before that is a channel that is not there yet.
     ///
     /// # Errors
@@ -246,7 +246,7 @@ impl SendChannelEndpoint {
             (channel.has_explicit_endpoint && !channel.is_multi_destination() && connect_enabled)
                 .then_some(channel.remote_data);
 
-        // `aeron_send_channel_endpoint.c:115-135`: a multicast endpoint binds
+        // `aeron_send_channel_endpoint.c:107-127`: a multicast endpoint binds
         // the group's **control** twin — it is the group it joins and hears
         // NAKs on — and names `local_control` as the interface every multicast
         // send leaves by. A unicast endpoint binds its local side and the
@@ -257,7 +257,7 @@ impl SendChannelEndpoint {
             channel.local_control
         };
 
-        // `:112-120`: the port the channel named, or the one the manager hands
+        // `:104-112`: the port the channel named, or the one the manager hands
         // it, or the kernel's — asked **before** the socket is opened, because
         // this is where a driver that has run out of ports refuses the
         // publication rather than binding something nobody will find.
@@ -281,11 +281,11 @@ impl SendChannelEndpoint {
                 // And the port, which the manager is holding for an endpoint
                 // that will not exist either: the reference gives it back in
                 // the delete its `goto error` reaches
-                // (`media/aeron_send_channel_endpoint.c:229-232`, whose delete
+                // (`media/aeron_send_channel_endpoint.c:222-225`, whose delete
                 // frees the managed port at `:278-281`).
                 port_manager.free_managed_port(managed_port);
                 // A bind failure is the one the reference composes a chain
-                // for on this side too (`media/aeron_send_channel_endpoint.c:142`
+                // for on this side too (`media/aeron_send_channel_endpoint.c:135`
                 // and the two layers above it); anything else keeps its error.
                 let error = match error {
                     super::udp_transport::OpenError::Bind(failure) => {
@@ -463,24 +463,24 @@ impl SendChannelEndpoint {
 
     /// A status message arrived for one of this endpoint's publications, which
     /// is the whole of what "this endpoint has a connection" means
-    /// (`aeron_send_channel_endpoint.c:658`).
+    /// (`aeron_send_channel_endpoint.c:651`).
     pub const fn on_status_message(&mut self, now_ns: i64) {
         self.time_of_last_sm_ns = now_ns;
     }
 
     /// Whether this endpoint's channel has to be resolved again
-    /// (`aeron_send_channel_endpoint_check_for_re_resolution`, `:754-774`).
+    /// (`aeron_send_channel_endpoint_check_for_re_resolution`, `:747-767`).
     ///
     /// Three conditions and a clock, in the reference's order:
     ///
     /// * a **manual** channel is the destination tracker's business, not this
-    ///   endpoint's — it has no single address to reconnect (`:757-761`);
+    ///   endpoint's — it has no single address to reconnect (`:750-754`);
     /// * a multicast channel is left alone: its endpoint is a group, and a name
     ///   that resolved to a group is not re-resolved at all;
     /// * only a channel that **named** an endpoint has a name to ask about
-    ///   (`:763`), and a response channel is not one of them (`:764`);
+    ///   (`:756`), and a response channel is not one of them (`:757`);
     /// * and only when nothing has been heard from the other side for
-    ///   [`DESTINATION_TIMEOUT_NS`] (`:765`) — which is "this endpoint has no
+    ///   [`DESTINATION_TIMEOUT_NS`] (`:758`) — which is "this endpoint has no
     ///   connection", spelled as a clock.
     pub fn needs_re_resolution(&self, now_ns: i64) -> bool {
         self.channel.control_mode != ControlMode::Manual
@@ -491,7 +491,7 @@ impl SendChannelEndpoint {
     }
 
     /// What this endpoint's name is, for the resolver to be asked about it
-    /// (`endpoint_name`, `:768`).
+    /// (`endpoint_name`, `:761`).
     pub fn endpoint_name(&self) -> Option<&str> {
         self.channel.endpoint_name.as_deref()
     }
@@ -504,7 +504,7 @@ impl SendChannelEndpoint {
     }
 
     /// Take the answer (`aeron_send_channel_endpoint_resolution_change`,
-    /// `:776-800`).
+    /// `:769-793`).
     ///
     /// A channel with several destinations hands it to the tracker, which
     /// matches destinations by name; a channel with one **reconnects** its
@@ -532,7 +532,7 @@ impl SendChannelEndpoint {
 
     /// Where this endpoint sends when its channel has several destinations, so
     /// that the sender can hand an arriving status message to it
-    /// (`aeron_send_channel_endpoint_on_status_message`, `:636-645`).
+    /// (`aeron_send_channel_endpoint_on_status_message`, `:629-638`).
     ///
     /// [`None`] for a unicast channel: there is nothing to learn from a status
     /// message when there is one address, and it is the one the channel named.
@@ -541,14 +541,14 @@ impl SendChannelEndpoint {
     }
 
     /// The same, for the destinations an error frame is attributed to
-    /// (`aeron_send_channel_endpoint_on_error`, `:688-692`).
+    /// (`aeron_send_channel_endpoint_on_error`, `:681-685`).
     pub fn destination_tracker(&self) -> Option<&DestinationTracker> {
         self.destination_tracker.as_ref()
     }
 
     /// Write the channel status
     /// (`aeron_counter_set_release(endpoint->channel_status.value_addr, ...)`,
-    /// `aeron_driver_conductor.c:2013`).
+    /// `aeron_driver_conductor.c:2064`).
     ///
     /// # Errors
     ///
@@ -568,7 +568,7 @@ impl SendChannelEndpoint {
 
     /// Hand **all** of this endpoint's counters back, in the reference's order
     /// (`aeron_send_channel_endpoint_delete`,
-    /// `aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:250-269`,
+    /// `aeron-driver/src/main/c/media/aeron_send_channel_endpoint.c:243-262`,
     /// which frees the channel status, the local sockaddr and the destination
     /// count). The answer is the channel status's, which is the one callers act
     /// on. The transport counter this media added goes back beside them, for the
@@ -619,7 +619,7 @@ impl SendChannelEndpoint {
     }
 
     /// Add a publication to the dispatch map
-    /// (`aeron_send_channel_endpoint_add_publication`, `:434-445`).
+    /// (`aeron_send_channel_endpoint_add_publication`, `:427-438`).
     ///
     /// Returns whether the `(stream, session)` pair was free: the reference's
     /// map `put` overwrites, and a second publication for the same pair on one
@@ -637,7 +637,7 @@ impl SendChannelEndpoint {
     }
 
     /// Remove a publication from the dispatch map
-    /// (`aeron_send_channel_endpoint_remove_publication`, `:447-456`).
+    /// (`aeron_send_channel_endpoint_remove_publication`, `:440-449`).
     pub fn remove_publication(
         &mut self,
         stream_id: i32,
@@ -653,7 +653,7 @@ impl SendChannelEndpoint {
 
     /// The publication a control frame names
     /// (`aeron_int64_to_ptr_hash_map_get(&endpoint->publication_dispatch_map,
-    /// aeron_map_compound_key(stream_id, session_id))`, `:557-560`).
+    /// aeron_map_compound_key(stream_id, session_id))`, `:550-553`).
     pub fn find_publication(&self, stream_id: i32, session_id: i32) -> Option<i64> {
         self.publications
             .iter()
@@ -667,7 +667,7 @@ impl SendChannelEndpoint {
     }
 
     /// How many publications send through this endpoint. The registry's
-    /// reference count is this number (`aeron_driver_conductor.c:1995-2010`).
+    /// reference count is this number (`aeron_driver_conductor.c:2046-2061`).
     pub fn publication_count(&self) -> usize {
         self.publications.len()
     }
@@ -681,14 +681,14 @@ impl SendChannelEndpoint {
     ///
     /// The reference fills the slot from the driver context's supplier, which
     /// the endpoint's own create calls
-    /// (`aeron_send_channel_endpoint.c:237-240`) — so it is set once, before
+    /// (`aeron_send_channel_endpoint.c:230-233`) — so it is set once, before
     /// anything sends, and `None` is the deployment nobody configured.
     pub fn set_data_loss_generator(&mut self, generator: Box<dyn LossGenerator>) {
         self.data_loss_generator = Some(generator);
     }
 
     /// Send datagrams through the endpoint's socket
-    /// (`aeron_send_channel_send`, `:383-414`).
+    /// (`aeron_send_channel_send`, `:376-407`).
     ///
     /// With a generator attached, each **datagram** is offered to it first and
     /// the ones it refuses never reach the socket. They are still **counted as
@@ -813,7 +813,7 @@ impl SendChannelEndpoint {
 
     /// The socket's receive buffer, as the kernel reports it — what the
     /// reference checks an agreed `so-rcvbuf` against
-    /// (`aeron_driver_conductor.c:1936-1956`).
+    /// (`aeron_driver_conductor.c:1977-1997`).
     ///
     /// # Errors
     ///
@@ -859,7 +859,7 @@ pub enum SendEndpointError {
     /// The socket could not be opened or connected.
     Socket(io::Error),
     /// The wildcard port manager had no port left to give
-    /// (`aeron_wildcard_port_manager_get_managed_port`, `aeron_port_manager.c:93-104`).
+    /// (`aeron_wildcard_port_manager_get_managed_port`, `aeron_port_manager.c:98-109`).
     ///
     /// The words are the manager's own and they travel as they are: a client
     /// that has run a driver out of ports reads them in its
@@ -881,7 +881,7 @@ impl std::fmt::Display for SendEndpointError {
 impl std::error::Error for SendEndpointError {}
 
 /// Publish the address the socket was bound to, the two ways the reference
-/// publishes it (`aeron_send_channel_endpoint.c:158-228`): the channel status's
+/// publishes it (`aeron_send_channel_endpoint.c:151-221`): the channel status's
 /// label gains the address, and a counter of type 14 is allocated whose **key**
 /// is the address.
 ///
@@ -911,7 +911,7 @@ fn publish_local_sockaddr(
     .map_err(|error| SendEndpointError::Socket(io::Error::other(error)))?;
 
     // `"%s: %.*s %.*s"` — the name, the channel, the address
-    // (`aeron_position.c:229-244`), replacing the label the counter was
+    // (`aeron_position.c:234-249`), replacing the label the counter was
     // allocated with. The channel is bytes rather than text, as it is there:
     // it is whatever the client sent, and this end never decodes it.
     let mut label = format!("{}: ", counter_position::SEND_CHANNEL_STATUS_NAME).into_bytes();
@@ -952,7 +952,7 @@ fn publish_local_sockaddr(
 }
 
 /// The destination tracker a channel gets, and the `mdc-num-dest` counter that
-/// goes with it (`aeron_send_channel_endpoint_create`, `:61-88`, `:182-188`).
+/// goes with it (`aeron_send_channel_endpoint_create`, `:61-88`, `:175-181`).
 ///
 /// Only a multi-destination channel has one — a channel whose control mode is
 /// `manual` or `dynamic`
@@ -1061,7 +1061,7 @@ mod tests {
     /// An endpoint's own clock: only a **unicast** channel that named an
     /// endpoint, is not a response channel, and has heard nothing for five
     /// seconds has a name to resolve again
-    /// (`aeron_send_channel_endpoint_check_for_re_resolution`, `:754-774`).
+    /// (`aeron_send_channel_endpoint_check_for_re_resolution`, `:747-767`).
     ///
     /// The four other shapes are the reference's own exclusions, and each one is
     /// a different reason: a manual channel's addresses are its destinations'
@@ -1145,7 +1145,7 @@ mod tests {
         );
 
         // And a status message is what "it is connected" means: the clock
-        // starts again from it (`aeron_send_channel_endpoint.c:658`).
+        // starts again from it (`aeron_send_channel_endpoint.c:651`).
         unicast.on_status_message(just_past);
         assert!(
             !unicast.needs_re_resolution(just_past + DESTINATION_TIMEOUT_NS),
@@ -1247,7 +1247,7 @@ mod tests {
 
     /// The answer to a re-resolution reaches a **unicast** endpoint by
     /// reconnecting its transport, which is a thing a socket can be asked about
-    /// (`aeron_send_channel_endpoint_resolution_change`, `:776-800`).
+    /// (`aeron_send_channel_endpoint_resolution_change`, `:769-793`).
     #[test]
     fn an_answer_moves_a_unicast_endpoint() {
         let mut fixture = Fixture::new();
@@ -1421,7 +1421,7 @@ mod tests {
 
     /// `aeron.driver.connect=false`: the socket is **not** connected, so a
     /// datagram can be sent somewhere the channel never named — which is what
-    /// the setting is for (`aeron_send_channel_endpoint.c:89`) and what a
+    /// the setting is for (`aeron_send_channel_endpoint.c:81`) and what a
     /// connected socket refuses.
     #[test]
     fn an_endpoint_that_is_not_connected_can_send_somewhere_else() {
@@ -1605,7 +1605,7 @@ mod tests {
     #[test]
     fn a_socket_that_cannot_be_made_leaves_no_counter_behind() {
         // A channel with an explicit control address binds *that* address
-        // (`aeron_udp_channel.c:442-464`), so one already in use is a bind
+        // (`aeron_udp_channel.c:463-485`), so one already in use is a bind
         // failure — the case the create's cleanup exists for.
         let taken = crate::sys::socket::DatagramSocket::open(crate::sys::AddressFamily::Inet)
             .expect("a socket");
@@ -1652,14 +1652,14 @@ mod tests {
         );
         assert!(
             report.text().contains(
-                "[aeron_udp_channel_transport_init, aeron_udp_channel_transport.c:151] unicast bind, affinity=0"
+                "[aeron_udp_channel_transport_init, aeron_udp_channel_transport.c:165] unicast bind, affinity=0"
             ),
             "{}",
             report.text()
         );
         assert!(
             report.text().contains(&format!(
-                "[aeron_send_channel_endpoint_create, aeron_send_channel_endpoint.c:142] uri=aeron:udp?endpoint=127.0.0.1:10123|control={bound}"
+                "[aeron_send_channel_endpoint_create, aeron_send_channel_endpoint.c:135] uri=aeron:udp?endpoint=127.0.0.1:10123|control={bound}"
             )),
             "{}",
             report.text()
@@ -1776,7 +1776,7 @@ mod tests {
     }
 
     /// A multi-destination one does, and with the counter that counts them
-    /// (`:182-188`).
+    /// (`:175-181`).
     #[test]
     fn a_multi_destination_endpoint_counts_its_destinations() {
         let mut fixture = Fixture::new();
@@ -1819,7 +1819,7 @@ mod tests {
     }
 
     /// The datagram goes to the destinations, not to the address the channel
-    /// named (`aeron_send_channel_send`, `:410-418`).
+    /// named (`aeron_send_channel_send`, `:403-411`).
     ///
     /// The destination here is a socket the test holds, so what arrives can be
     /// read back. That the channel's own address is a *different* socket is the

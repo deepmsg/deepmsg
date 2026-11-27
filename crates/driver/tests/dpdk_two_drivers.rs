@@ -169,7 +169,7 @@ impl Driver {
             .arg("-Daeron.threading.mode=SHARED")
             // The selection is the one setting with no `-D` spelling: the
             // reference reads it from the environment alone
-            // (`aeronmd.h:731`), and so does this build. Without it the driver
+            // (`aeronmd.h:748`), and so does this build. Without it the driver
             // is configured *for* the media and not *on* it — every `dpdk.*`
             // setting is read either way — and the channel goes to the kernel,
             // where 10.10.0.2 is an address it does not have.

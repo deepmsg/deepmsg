@@ -10,9 +10,9 @@
 //! The C harness records a handful of kilobytes and an archive's default segment
 //! file is 128 MiB, so every replay it makes reads from one file. This one writes
 //! segment files of 64 KiB — the power-of-two minimum the archive accepts
-//! (`Archive.java:1486-1489`) — and records past three of them, which is the only
-//! way the segment-to-segment arithmetic (`:580-592`) is reached end to end. It
-//! reads in 4 KiB blocks (`:372-374`) as the C suite's own replays do, so a short
+//! (`Archive.java:1554-1557`) — and records past three of them, which is the only
+//! way the segment-to-segment arithmetic (`:609-621`) is reached end to end. It
+//! reads in 4 KiB blocks (`:378-380`) as the C suite's own replays do, so a short
 //! read **at a segment boundary** is reached too — and that combination is what
 //! the C suite does not have.
 //!
@@ -21,7 +21,7 @@
 //! position lands on the recording's stop position **exactly**.
 //!
 //! That last one is how the padding is asserted. A padding frame is not a
-//! fragment — a subscriber's reader steps over it (`aeron_image.c:375-379`) — so
+//! fragment — a subscriber's reader steps over it (`aeron_image.c:379-383`) — so
 //! it cannot be looked for. It can be counted *through*: a dropped, doubled or
 //! misplaced padding frame moves the position the reader ends on.
 //!
@@ -114,17 +114,17 @@ fn bounded_replay_channels() -> [String; 3] {
 }
 
 /// How many replays the archive in the second test will run at once
-/// (`aeron.archive.max.concurrent.replays`, `Archive.java:445`).
+/// (`aeron.archive.max.concurrent.replays`, `Archive.java:474`).
 ///
 /// Two, and the number is the test: a bound of twenty would need twenty leaks
 /// to notice, and two needs one.
 const MAX_CONCURRENT_REPLAYS: usize = 2;
 
-/// The archive's segment file length for these tests (`Archive.java:342`).
+/// The archive's segment file length for these tests (`Archive.java:348`).
 ///
 /// It is a property because the default is 128 MiB and a test that records
 /// 128 MiB is not a test, and it is 64 KiB because that is the **power-of-two
-/// minimum** the archive accepts (`Archive.java:1486-1489`) — so this is the
+/// minimum** the archive accepts (`Archive.java:1554-1557`) — so this is the
 /// smallest segment a replay can be made to cross.
 const SEGMENT_FILE_LENGTH: i64 = 64 * 1024;
 
@@ -142,14 +142,14 @@ const MESSAGE_SIZE: usize = 1024;
 /// second test's replays are bounded at.
 const FIRST_MARK: usize = MESSAGE_COUNT / 2;
 
-/// The block size the replays read with (`:372-374`).
+/// The block size the replays read with (`:378-380`).
 ///
 /// Smaller than a segment by a factor of sixteen, so every read of every segment
 /// is a short one — which is the whole of what the field does.
 const FILE_IO_MAX_LENGTH: i32 = 4096;
 
 /// The type id of the counters the second test bounds its replays with. The C
-/// suite's own choice (`aeron_archive_test.cpp:3515`), and any id would do: it
+/// suite's own choice (`aeron_archive_test.cpp:3582`), and any id would do: it
 /// is a counter nothing but these tests reads.
 const BOUNDED_COUNTER_TYPE_ID: i32 = 10001;
 
@@ -171,7 +171,7 @@ fn a_recording(channel: &str) -> Recording {
 ///
 /// The other three are one setting and a bound. A recording's segment length is
 /// `max(aeron.archive.segment.file.length, termBufferLength)`
-/// (`ArchiveConductor.java:2006`, `conductor::segment_file_length`) — a segment
+/// (`ArchiveConductor.java:2028`, `conductor::segment_file_length`) — a segment
 /// has to be able to hold one term — so asking for 64 KiB segments while the
 /// driver's term is its 16 MiB default gets a recording of sixteen megabytes
 /// that **fits in one file**, which is every claim this file makes about

@@ -7,7 +7,7 @@ pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 40;
+pub const SBE_BLOCK_LENGTH: u16 = 48;
 pub const SBE_TEMPLATE_ID: u16 = 100;
 
 pub mod encoder {
@@ -45,6 +45,7 @@ pub mod encoder {
         fn nullify_optional_fields(&mut self) -> &mut Self {
             self.time_unit_opt(None);
             self.app_version_opt(None);
+            self.term_base_log_position_opt(None);
             self
         }
     }
@@ -210,6 +211,41 @@ pub mod encoder {
             };
             self
         }
+
+        /// primitive field 'termBaseLogPosition'
+        /// - min value: 0
+        /// - max value: 9223372036854775807
+        /// - null value: -1_i64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 40
+        /// - encodedLength: 8
+        /// - version: 18
+        #[inline]
+        pub fn term_base_log_position(&mut self, value: i64) -> &mut Self {
+            let offset = self.offset + 40;
+            self.get_buf_mut().put_i64_at(offset, value);
+            self
+        }
+
+        /// optional primitive field 'termBaseLogPosition'
+        /// - min value: 0
+        /// - max value: 9223372036854775807
+        /// - null value: -1_i64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 40
+        /// - encodedLength: 8
+        /// - version: 18
+        /// Set to `None` to encode the field null value.
+        #[inline]
+        pub fn term_base_log_position_opt(&mut self, value: Option<i64>) -> &mut Self {
+            match value {
+                Some(value) => self.term_base_log_position(value),
+                None => self.term_base_log_position(-1_i64),
+            };
+            self
+        }
     }
 } // end encoder
 
@@ -339,6 +375,17 @@ pub mod decoder {
 
             let value = self.get_buf().get_i32_at(self.offset + 36);
             if value == 0_i32 { None } else { Some(value) }
+        }
+
+        /// primitive field - 'OPTIONAL' { null_value: '-1_i64' }
+        #[inline]
+        pub fn term_base_log_position(&self) -> Option<i64> {
+            if self.acting_version() < 18 {
+                return None;
+            }
+
+            let value = self.get_buf().get_i64_at(self.offset + 40);
+            if value == -1_i64 { None } else { Some(value) }
         }
     }
 } // end decoder

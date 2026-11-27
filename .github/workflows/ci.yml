@@ -137,15 +137,15 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: |
           set -eu
-          curl -fsSLO https://repo1.maven.org/maven2/uk/co/real-logic/sbe-tool/1.40.2/sbe-tool-1.40.2.jar
-          curl -fsSLO https://repo1.maven.org/maven2/org/agrona/agrona/2.6.1/agrona-2.6.1.jar
-          echo "df2556a61a199383952030a6cd7fd2e3a82c3eb835bf4d5bc6fe3ca11295d058  sbe-tool-1.40.2.jar" | sha256sum -c -
-          echo "84c07eb02695c06bfda3d6c3a20c1984e3ff1bbd617b2f8e678140baf973fa28  agrona-2.6.1.jar" | sha256sum -c -
+          curl -fsSLO https://repo1.maven.org/maven2/uk/co/real-logic/sbe-tool/1.42.0/sbe-tool-1.42.0.jar
+          curl -fsSLO https://repo1.maven.org/maven2/org/agrona/agrona/2.7.1/agrona-2.7.1.jar
+          echo "1bd907517ad63b09a63ad379e1bc4527ccac24abfd47ef2e0c5bc0cf0d1f16ab  sbe-tool-1.42.0.jar" | sha256sum -c -
+          echo "f74421072629df93f3ac5148a4c41bb16a69e444a0ddca2b9f0c32919075bf5f  agrona-2.7.1.jar" | sha256sum -c -
 
       - name: Regenerate the SBE codecs
         env:
-          SBE_TOOL_JAR: ${{ runner.temp }}/sbe-tool-1.40.2.jar
-          AGRONA_JAR: ${{ runner.temp }}/agrona-2.6.1.jar
+          SBE_TOOL_JAR: ${{ runner.temp }}/sbe-tool-1.42.0.jar
+          AGRONA_JAR: ${{ runner.temp }}/agrona-2.7.1.jar
         run: cargo run --quiet -p deepmsg-tools --bin gen-sbe-codecs
 
       # `--porcelain` rather than a bare `git diff --exit-code`. The two agree

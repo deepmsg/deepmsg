@@ -14,7 +14,7 @@
 //! `log2(term_length)` around a term *count*. Two layouts, two meanings, one
 //! underlying type — which is exactly why the reference's comments have to
 //! keep reminding the reader which one a value is
-//! (`aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h:112-168`),
+//! (`aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h:113-169`),
 //! and why this module has two types instead.
 //!
 //! The `initial_term_id` matters for a second reason: it is randomised at

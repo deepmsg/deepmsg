@@ -40,7 +40,7 @@
 //! # The three methods that block
 //!
 //! `join_log_as_leader`, `try_join_log_as_follower` and `await_local_sockets_closed`
-//! spin in the reference (`ConsensusModuleAgent.java:1688`, `:1771`, `:2988`).
+//! spin in the reference (`ConsensusModuleAgent.java:1704`, `:1787`, `:3011`).
 //! In the host they are written as `loop { if done { break } idle()? }`, where
 //! `idle()` drives this agent's own client and polls archive events — and
 //! **nothing else** (plan §4.4). The election never writes such a loop itself;
@@ -96,10 +96,10 @@ pub trait ElectionHost {
 
     // ---- log recording identity ----------------------------------------
 
-    /// `logRecordingId()` at `:1869`.
+    /// `logRecordingId()` at `:1885`.
     fn log_recording_id(&self) -> i64;
 
-    /// `logRecordingId(long)` at `:1874`, called once from
+    /// `logRecordingId(long)` at `:1890`, called once from
     /// `Election.java:280` when a replication produces a recording.
     fn set_log_recording_id(&mut self, recording_id: i64);
 
@@ -279,32 +279,32 @@ pub trait ElectionHost {
 
     /// Record the leader the election settled on, and mark it on the member
     /// table. The reference does this in `electionComplete` through
-    /// `updateMemberDetails(election.leader())` (`ConsensusModuleAgent.java:1930`,
-    /// `:2370-2381`) — every member's `isLeader` is what the steady state's
+    /// `updateMemberDetails(election.leader())` (`ConsensusModuleAgent.java:1946`,
+    /// `:2387-2398`) — every member's `isLeader` is what the steady state's
     /// position engine addresses its publications by.
     fn set_leader_member_id(&mut self, leader_member_id: i32);
 
     /// Record the term the election settled on. The first line of the
     /// reference's `electionComplete` — `leadershipTermId(election.leadershipTermId())`
-    /// (`ConsensusModuleAgent.java:1907`) — which runs for a follower as well
+    /// (`ConsensusModuleAgent.java:1923`) — which runs for a follower as well
     /// as a leader. The term is the election's, and the caller is the election,
     /// so it is handed over before [`Self::election_complete`] runs.
     fn set_leadership_term_id(&mut self, leadership_term_id: i64);
 
     /// Hand control back to the steady state. `electionComplete(long)` at
-    /// `:1905`. The reference nulls `election` from inside this call; here the
+    /// `:1921`. The reference nulls `election` from inside this call; here the
     /// outer take-and-put-back drops the `Election` instead (plan §4.5).
     fn election_complete(&mut self, now_ns: i64) -> Result<(), ClusterError>;
 
     /// Poll archive events: a replication's recording signals, and the
     /// **control-response errors** that answer under the replication's own
-    /// correlation id. `pollArchiveEvents()` at `:2061`. Called from `idle()`
+    /// correlation id. `pollArchiveEvents()` at `:2077`. Called from `idle()`
     /// and from the election's replication state; returns the work count.
     ///
     /// # Errors
     ///
     /// The archive's refusal, for the arm the reference throws on
-    /// (`ConsensusModuleAgent.java:2096-2098`). The reference throws out of its
+    /// (`ConsensusModuleAgent.java:2112-2114`). The reference throws out of its
     /// duty cycle; this build returns the error to one.
     fn poll_archive_events(&mut self) -> Result<usize, ClusterError>;
 

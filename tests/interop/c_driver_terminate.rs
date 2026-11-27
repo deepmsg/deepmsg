@@ -46,7 +46,7 @@ fn start(
 
 #[test]
 fn a_refused_termination_is_still_a_sent_one() {
-    // The default validator is `deny` (`aeron-driver/src/main/c/aeron_driver_context.c:1247`),
+    // The default validator is `deny` (`aeron-driver/src/main/c/aeron_driver_context.c:1277`),
     // so a stock driver refuses every termination request whatever the token.
     let Some((reference, cnc)) = start("terminate-denied", &[]) else {
         return;
@@ -94,7 +94,7 @@ fn an_accepted_termination_actually_stops_the_driver() {
 
     // The observable consequence. A clean close release-stores `-1` into the
     // to-driver ring's consumer heartbeat
-    // (`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`); it is the only
+    // (`aeron-driver/src/main/c/aeron_driver_conductor.c:3590`); it is the only
     // external evidence that a terminate did anything at all, and the reference
     // never asserts on it.
     let deadline = Instant::now() + STOP_DEADLINE;

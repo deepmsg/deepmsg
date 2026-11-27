@@ -2,8 +2,8 @@
 //!
 //! The reference's C suite is this slice's judgement and it needs the reference
 //! checkout to run (`shouldFindMultipleRecordingDescriptors`,
-//! `aeron_archive_test.cpp:2394-2465`, and `shouldFindRecordingDescriptorForUri`,
-//! `:2468-2561`). This is the same claim made from inside the workspace, and it
+//! `aeron_archive_test.cpp:2407-2478`, and `shouldFindRecordingDescriptorForUri`,
+//! `:2481-2574`). This is the same claim made from inside the workspace, and it
 //! is the one CI actually executes: start our archiving media driver, make two
 //! recordings, and ask for them a page at a time.
 //!
@@ -24,7 +24,7 @@
 //!   page is unfinished.
 //! * **That a finished listing lets go of its session.** A listing holds the
 //!   session's `activeListing` slot, and the next request is refused with
-//!   `ACTIVE_LISTING` while it does (`ArchiveConductor.java:640-645`). So a
+//!   `ACTIVE_LISTING` while it does (`ArchiveConductor.java:639-644`). So a
 //!   request that follows one is the evidence that the one before it ended —
 //!   which is the only thing a client can observe about a page it was never
 //!   told the end of.
@@ -154,7 +154,7 @@ fn a_page_of_recordings_is_walked_from_a_cursor() {
     let control_session_id = session.control_session_id();
 
     // Two recordings, on one stream and two channels — what the reference's own
-    // two cases build (`aeron_archive_test.cpp:2394-2465`).
+    // two cases build (`aeron_archive_test.cpp:2407-2478`).
     let first_session = record(&mut session, &mut client, &channel_a(), 1);
     let second_session = record(&mut session, &mut client, &channel_b(), 2);
 
@@ -216,7 +216,7 @@ fn a_page_of_recordings_is_walked_from_a_cursor() {
     // ③ A page of **one** over a catalog of two: the page fills and there is no
     // answer at all — and the listing is over all the same, which is what the
     // request in ④ shows. A listing still in flight would be refused with
-    // `ACTIVE_LISTING` (`ArchiveConductor.java:640-645`).
+    // `ACTIVE_LISTING` (`ArchiveConductor.java:639-644`).
     let (page, end) = ask(&mut session, &mut client, 1, false, all(i64::MIN, 1));
     assert_eq!(
         vec![ids[0]],

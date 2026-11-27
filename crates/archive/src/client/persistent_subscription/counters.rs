@@ -17,7 +17,7 @@
 //! caller can provide one and let the other three be made. What is surprising
 //! is the other end: `context_close` (`:117-140`) closes **all four**, provided
 //! or not, and `shouldUseUserProvidedCounters`
-//! (`…_persistent_subscription_test.cpp:930-935`) asserts exactly that. A
+//! (`…_persistent_subscription_test.cpp:932-937`) asserts exactly that. A
 //! caller that hands in its own counters does not get them back at the end. This
 //! build does the same, because a subscription whose teardown closed only the
 //! counters it allocated would leave the ones it was handed alive and
@@ -25,7 +25,7 @@
 //!
 //! # The label is how a reader finds them
 //!
-//! `"%s: %d %s %d %s"` (`:353-355`) — the name, then the replay stream and
+//! `"%s: %d %s %d %s"` (`:370-372`) — the name, then the replay stream and
 //! channel, then the live stream and channel. Every one of the four carries the
 //! same four facts, so a file with several subscriptions in it says which is
 //! which without a registry anywhere.
@@ -42,15 +42,15 @@ use deepmsg_core::buffer::ReadWrite;
 /// states the subscription is in.
 pub const STATE_TYPE_ID: i32 = 114;
 
-/// `AERON_PERSISTENT_SUBSCRIPTION_JOIN_DIFFERENCE_TYPE_ID` (`:205`): how far
+/// `AERON_COUNTER_ARCHIVE_PERSISTENT_SUBSCRIPTION_JOIN_DIFFERENCE_TYPE_ID` (`:205`): how far
 /// the live stream was ahead of the replay position when live was joined, or
 /// [`NOTHING_JOINED`].
 pub const JOIN_DIFFERENCE_TYPE_ID: i32 = 115;
 
-/// `AERON_PERSISTENT_SUBSCRIPTION_LIVE_LEFT_COUNT_TYPE_ID` (`:207`).
+/// `AERON_COUNTER_ARCHIVE_PERSISTENT_SUBSCRIPTION_LIVE_LEFT_COUNT_TYPE_ID` (`:207`).
 pub const LIVE_LEFT_COUNT_TYPE_ID: i32 = 116;
 
-/// `AERON_PERSISTENT_SUBSCRIPTION_LIVE_JOINED_COUNT_TYPE_ID` (`:209`).
+/// `AERON_COUNTER_ARCHIVE_PERSISTENT_SUBSCRIPTION_LIVE_JOINED_COUNT_TYPE_ID` (`:209`).
 pub const LIVE_JOINED_COUNT_TYPE_ID: i32 = 117;
 
 /// The name the state counter's label starts with (`:544`).
@@ -71,7 +71,7 @@ pub const LIVE_JOINED_NAME: &str = "Persistent Subscription Live Joined Count";
 pub const NOTHING_JOINED: i64 = i64::MIN;
 
 /// The channel and stream a counter's label names — the replay side first,
-/// then the live one (`:353-355`).
+/// then the live one (`:370-372`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Identity<'a> {
     /// The replay channel as configured, **after** `conclude` rewrote it.
@@ -85,7 +85,7 @@ pub struct Identity<'a> {
 }
 
 impl Identity<'_> {
-    /// The label of a counter named `name` (`:353-355`).
+    /// The label of a counter named `name` (`:370-372`).
     #[must_use]
     pub fn label(&self, name: &str) -> String {
         format!(
@@ -287,7 +287,7 @@ mod tests {
         live_stream_id: 1000,
     };
 
-    /// `:353-355`: `"%s: %d %s %d %s"`, with the replay side first. A reader
+    /// `:370-372`: `"%s: %d %s %d %s"`, with the replay side first. A reader
     /// finds a counter by this text, so it is a contract rather than a message.
     #[test]
     fn a_label_names_both_sides_in_the_references_order() {

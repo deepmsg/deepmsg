@@ -194,11 +194,11 @@ fn the_two_build_identity_labels_are_ours_and_not_the_references() {
     let software = &ours[34].label;
 
     assert!(
-        errors.starts_with("Errors: version=1.53.2 commit=deepmsg-"),
+        errors.starts_with("Errors: version=1.54.2 commit=deepmsg-"),
         "{errors}"
     );
     assert!(
-        software.starts_with("Aeron software: version=1.53.2 commit=deepmsg-"),
+        software.starts_with("Aeron software: version=1.54.2 commit=deepmsg-"),
         "{software}"
     );
     assert_ne!(
@@ -213,8 +213,8 @@ fn the_values_the_reference_sets_once_are_set_here_too() {
     let (_temp, ours, _keys) = published_counters();
 
     assert_eq!(
-        79_106, ours[34].value,
-        "the Aeron version this build implements, packed: 1.53.2"
+        79_362, ours[34].value,
+        "the Aeron version this build implements, packed: 1.54.2"
     );
     assert_eq!(
         i64::from(deepmsg_core::version::semantic_version_compose(1, 0, 0)),

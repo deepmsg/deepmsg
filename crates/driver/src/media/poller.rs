@@ -39,7 +39,8 @@ use crate::sys::socket::{Descriptor, Poller};
 /// `AERON_UDP_TRANSPORT_POLLER_ITERATION_THRESHOLD`
 /// (`media/aeron_udp_transport_poller.h:22`): the number of transports at or
 /// below which the reference simply reads each one.
-pub const ITERATION_THRESHOLD: usize = 5;
+pub const ITERATION_THRESHOLD: usize =
+    crate::config::UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD_DEFAULT;
 
 /// The transports a driver reads each pass, and how to find out which of them
 /// have anything.
@@ -49,12 +50,15 @@ pub const ITERATION_THRESHOLD: usize = 5;
 /// caller's order matters: which endpoint is read first decides which image
 /// sees a datagram first, and that is not something a poller should shuffle.
 pub struct TransportPoller {
-    /// Made the first time a pass leaves more than [`ITERATION_THRESHOLD`]
+    /// The configured `aeron.udp.channel.transport.poller.iteration.threshold`:
+    /// at or below this many transports each is read directly.
+    iteration_threshold: usize,
+    /// Made the first time a pass leaves more than [`Self::iteration_threshold`]
     /// transports to watch, and given back — with every registration it held —
     /// when a pass falls back to that many or fewer. A driver with a handful of
     /// channels never makes one, and never has a socket in a set nobody waits
     /// on either. The reference is the other way round: it makes its instance
-    /// once, in `_init` (`:45`), and fills it on every add (`:96`) whether or
+    /// once, in `_init` (`:46`), and fills it on every add (`:96`) whether or
     /// not the branch it is on will ever wait on it.
     poller: Option<Poller>,
     /// The descriptors the poller was last told about, to avoid a syscall per
@@ -67,8 +71,9 @@ pub struct TransportPoller {
 
 impl TransportPoller {
     /// A poller that has registered nothing yet.
-    pub const fn new() -> Self {
+    pub const fn new(iteration_threshold: usize) -> Self {
         Self {
+            iteration_threshold,
             poller: None,
             registered: Vec::new(),
             readable: Vec::new(),
@@ -91,7 +96,7 @@ impl TransportPoller {
     pub fn ready(&mut self, descriptors: &[Descriptor], ready: &mut Vec<usize>) -> io::Result<()> {
         ready.clear();
 
-        if descriptors.len() <= ITERATION_THRESHOLD {
+        if descriptors.len() <= self.iteration_threshold {
             self.unregister();
             ready.extend(0..descriptors.len());
             return Ok(());
@@ -173,7 +178,7 @@ impl TransportPoller {
 
 impl Default for TransportPoller {
     fn default() -> Self {
-        Self::new()
+        Self::new(ITERATION_THRESHOLD)
     }
 }
 
@@ -270,12 +275,35 @@ mod tests {
         let owned = sockets(ITERATION_THRESHOLD);
         let descriptors: Vec<Descriptor> = owned.iter().map(|(_, d)| *d).collect();
 
-        let mut poller = TransportPoller::new();
+        let mut poller = TransportPoller::new(ITERATION_THRESHOLD);
         let mut ready = Vec::new();
         poller.ready(&descriptors, &mut ready).expect("a poll");
 
         assert_eq!(vec![0, 1, 2, 3, 4], ready);
         assert!(poller.poller.is_none(), "and no epoll instance was made");
+    }
+
+    /// The threshold is the configured one, not the compile-time default.
+    #[test]
+    fn the_threshold_is_the_one_it_was_built_with() {
+        let three = sockets(3);
+        let descriptors: Vec<Descriptor> = three.iter().map(|(_, d)| *d).collect();
+        let mut poller = TransportPoller::new(2);
+        let mut ready = Vec::new();
+
+        poller.ready(&descriptors, &mut ready).expect("a poll");
+        assert!(
+            poller.poller.is_some(),
+            "three transports is above a threshold of two"
+        );
+        assert!(ready.is_empty(), "nothing was sent");
+
+        let two = sockets(2);
+        let descriptors: Vec<Descriptor> = two.iter().map(|(_, d)| *d).collect();
+        let mut poller = TransportPoller::new(2);
+        poller.ready(&descriptors, &mut ready).expect("a poll");
+        assert_eq!(vec![0, 1], ready);
+        assert!(poller.poller.is_none());
     }
 
     /// Above it, only the descriptors the kernel says are readable — and in
@@ -286,7 +314,7 @@ mod tests {
         let descriptors: Vec<Descriptor> = owned.iter().map(|(_, d)| *d).collect();
 
         // Nothing is readable yet: a pass with no datagrams reads nowhere.
-        let mut poller = TransportPoller::new();
+        let mut poller = TransportPoller::new(ITERATION_THRESHOLD);
         let mut ready = Vec::new();
         poller.ready(&descriptors, &mut ready).expect("a poll");
         assert!(ready.is_empty(), "nothing was sent, so nothing is ready");
@@ -314,7 +342,7 @@ mod tests {
     fn the_registration_follows_the_transports() {
         let owned = sockets(ITERATION_THRESHOLD + 2);
         let descriptors: Vec<Descriptor> = owned.iter().map(|(_, d)| *d).collect();
-        let mut poller = TransportPoller::new();
+        let mut poller = TransportPoller::new(ITERATION_THRESHOLD);
         let mut ready = Vec::new();
 
         poller.ready(&descriptors, &mut ready).expect("a poll");
@@ -332,7 +360,7 @@ mod tests {
     fn falling_back_to_the_threshold_empties_the_set() {
         let many = sockets(ITERATION_THRESHOLD + 1);
         let descriptors: Vec<Descriptor> = many.iter().map(|(_, d)| *d).collect();
-        let mut poller = TransportPoller::new();
+        let mut poller = TransportPoller::new(ITERATION_THRESHOLD);
         let mut ready = Vec::new();
 
         poller.ready(&descriptors, &mut ready).expect("a poll");

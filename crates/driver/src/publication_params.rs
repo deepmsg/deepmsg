@@ -1,15 +1,15 @@
 //! What a channel URI says about the publication it names.
 //!
 //! Mirrors `aeron_diver_uri_publication_params`
-//! (`aeron-driver/src/main/c/uri/aeron_driver_uri.c:218-440`) together with the
-//! readers it calls (`:24-205`). (M20)
+//! (`aeron-driver/src/main/c/uri/aeron_driver_uri.c:223-445`) together with the
+//! readers it calls (`:29-210`). (M20)
 //!
 //! The shape of the work is *defaults, then overrides, then validation*: every
 //! field starts from the driver's configuration and a URI parameter replaces
 //! it, with the checks running where the reference runs them — which matters,
 //! because two of the checks read a field another parameter may already have
 //! changed. `pub-wnd` is validated against the final `mtu` and `term-length`
-//! (`:280-302`), so a URI that sets both is checked against what it asked for
+//! (`:285-307`), so a URI that sets both is checked against what it asked for
 //! rather than against the driver's defaults.
 //!
 //! # What is not read
@@ -19,7 +19,7 @@
 //! `rcv-wnd`) and they are ignored here rather than refused, which is what the
 //! reference does with them too: they reach the parser's generic parameter list
 //! and the publication path never looks. `control-mode` and `tags` are read
-//! *before* that list on an IPC channel (`aeron-client/src/main/c/uri/aeron_uri.c:195-220`),
+//! *before* that list on an IPC channel (`aeron-client/src/main/c/uri/aeron_uri.c:201-226`),
 //! and only `tags` has an effect on a publication.
 
 use deepmsg_core::logbuffer::descriptor;
@@ -59,12 +59,12 @@ pub mod key {
     pub const SPIES_SIMULATE_CONNECTION: &str = "ssc";
     /// `nak-delay`: how long the receiver waits before asking again for a
     /// gap, in place of the adaptive delays it would otherwise use
-    /// (`aeron-client/src/main/c/uri/aeron_uri.h:82`).
+    /// (`aeron-client/src/main/c/uri/aeron_uri.h:83`).
     pub const NAK_DELAY: &str = "nak-delay";
     /// `cc`: the congestion-control strategy the receiver's image is to use
     /// (`aeron-client/src/main/c/uri/aeron_uri.h:70`, and the same name in
     /// Java: `CommonContext.CONGESTION_CONTROL_PARAM_NAME`,
-    /// `aeron-client/src/main/java/io/aeron/CommonContext.java:386`).
+    /// `aeron-client/src/main/java/io/aeron/CommonContext.java:388`).
     pub const CONGESTION_CONTROL: &str = "cc";
     /// `response-correlation-id`: which request this channel answers.
     pub const RESPONSE_CORRELATION_ID: &str = "response-correlation-id";
@@ -89,7 +89,7 @@ pub mod key {
     /// channel has group semantics by the channel itself
     /// (`aeron_network_publication.c:136`, `has_group_semantics`), while a
     /// subscriber may be reading an implicitly-unicast source it knows several
-    /// others are reading too. `aeron_driver_uri.c:494-495` reads it in
+    /// others are reading too. `aeron_driver_uri.c:499-500` reads it in
     /// `aeron_driver_uri_subscription_params` and nowhere else.
     pub const GROUP: &str = "group";
 }
@@ -112,7 +112,7 @@ pub const MAX_RESEND_MAX: u64 = 256;
 /// The reference models this as a `has_position` flag plus three fields whose
 /// values are meaningless when it is clear. Here the three travel together or
 /// not at all, which is the invariant the reference's own validation enforces
-/// (`aeron_driver_uri.c:311-345`: the three parameters "must be used as a
+/// (`aeron_driver_uri.c:316-350`: the three parameters "must be used as a
 /// complete set").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartingPosition {
@@ -136,7 +136,7 @@ pub struct PublicationParams {
     /// Whether the URI *named* the MTU. A publication being shared has to
     /// agree about an MTU that was asked for and says nothing about one that
     /// was not (`aeron_confirm_publication_match`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1126-1136`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor.c:1167-1177`).
     pub mtu_length_named: bool,
     /// How far ahead of the slowest reader a producer may run.
     pub publication_window_length: i32,
@@ -150,7 +150,7 @@ pub struct PublicationParams {
     pub response_correlation_id: i64,
     /// Whether this publication is the *answer* half of a request, which is
     /// what `control-mode=response` on the publication's channel means
-    /// (`aeron_driver_uri.c:247-250`).
+    /// (`aeron_driver_uri.c:252-255`).
     ///
     /// It is the opposite of what `response_correlation_id` says: a publication
     /// that is a response one is the answer, and one that is not but names a
@@ -186,7 +186,7 @@ pub struct PublicationParams {
 /// What a channel URI says about the subscription it names.
 ///
 /// Mirrors `aeron_driver_uri_subscription_params`
-/// (`aeron-driver/src/main/c/uri/aeron_driver_uri.c:443-530`). Most of these
+/// (`aeron-driver/src/main/c/uri/aeron_driver_uri.c:448-535`). Most of these
 /// flags matter to the network transport rather than to IPC — a shared-memory
 /// image is neither reliable nor unreliable, and it never re-joins — but the
 /// link records them and the tether flag decides which of them a reader is
@@ -237,18 +237,18 @@ pub struct SubscriptionParams {
     ///
     /// Read here and carried on the subscription **link**, which is where the
     /// image looks for it (`subscription_link->group`,
-    /// `aeron_driver_conductor.c:6702-6703`) — the image is created from a
+    /// `aeron_driver_conductor.c:6795-6796`) — the image is created from a
     /// `SETUP`, long after the subscription that will read it.
     pub group: InferableBoolean,
 }
 
-/// `AERON_RELIABLE_STREAM_DEFAULT` (`aeron-driver/src/main/c/aeron_driver_context.c:213`).
+/// `AERON_RELIABLE_STREAM_DEFAULT` (`aeron-driver/src/main/c/aeron_driver_context.c:215`).
 pub const RELIABLE_STREAM_DEFAULT: bool = true;
 
-/// `AERON_TETHER_SUBSCRIPTIONS_DEFAULT` (`aeron_driver_context.c:214`).
+/// `AERON_TETHER_SUBSCRIPTIONS_DEFAULT` (`aeron_driver_context.c:216`).
 pub const TETHER_SUBSCRIPTIONS_DEFAULT: bool = true;
 
-/// `AERON_REJOIN_STREAM_DEFAULT` (`aeron_driver_context.c:228`).
+/// `AERON_REJOIN_STREAM_DEFAULT` (`aeron_driver_context.c:230`).
 pub const REJOIN_STREAM_DEFAULT: bool = true;
 
 /// The `control-mode` value that makes a channel a response channel
@@ -319,11 +319,11 @@ impl SubscriptionParams {
 
         // The subscribe side takes a plain number: there is no `tag:` form
         // here, because a subscription is not choosing a publication to
-        // continue (`aeron_driver_uri.c:159-168`).
+        // continue (`aeron_driver_uri.c:164-173`).
         params.session_id = uri.i32(key::SESSION_ID)?;
 
         // `nak-delay` is a duration, and it is one of the two things a receiver
-        // tunes per channel (`aeron_publication_image.c:100-118`). An
+        // tunes per channel (`aeron_publication_image.c:105-123`). An
         // unparseable one fails here, where the reference fails the *image*
         // later with `EINVAL` and leaves the subscription standing — a
         // difference in when a client hears about it, not in whether the
@@ -333,7 +333,7 @@ impl SubscriptionParams {
         // `cc=` is **not** read here at all, and that is the reference's
         // shape: the strategy is chosen when an *image* is built, off the
         // endpoint's channel (`aeron_congestion_control.c:165-205` called from
-        // `aeron_driver_conductor.c:6629`), and a subscription that names a
+        // `aeron_driver_conductor.c:6722`), and a subscription that names a
         // strategy this driver cannot serve is a subscription that exists and
         // never reads anything. This build refused those names here instead —
         // early, and with a message — which is where a `cc=` this build *did*
@@ -363,7 +363,7 @@ impl SubscriptionParams {
 ///
 /// Read from the URI's own `control-mode` field rather than from the parameter
 /// list, because an IPC channel parses that one key specially
-/// (`aeron-client/src/main/c/uri/aeron_uri.c:196-199`).
+/// (`aeron-client/src/main/c/uri/aeron_uri.c:202-205`).
 fn is_response_channel(uri: &ChannelUri<'_>) -> bool {
     uri.value(key::CONTROL_MODE) == Some(CONTROL_MODE_RESPONSE)
 }
@@ -382,18 +382,18 @@ pub enum PublicationParamsError {
     },
     /// `mtu` is not a multiple of 32 in `(32, 65504]`
     /// (`aeron_driver_context_validate_mtu_length`,
-    /// `aeron-driver/src/main/c/aeron_driver_context.c:1445-1462`).
+    /// `aeron-driver/src/main/c/aeron_driver_context.c:1489-1506`).
     Mtu {
         /// What the URI said.
         value: u64,
     },
-    /// `max-resend` is outside `1..=256` (`aeron_driver_uri.c:53-87`).
+    /// `max-resend` is outside `1..=256` (`aeron_driver_uri.c:58-92`).
     MaxResend {
         /// What the URI said.
         value: u64,
     },
     /// `pub-wnd` is below the MTU or above half the term
-    /// (`aeron_driver_uri.c:274-302`).
+    /// (`aeron_driver_uri.c:279-307`).
     PublicationWindow {
         /// What the URI said.
         value: u64,
@@ -403,7 +403,7 @@ pub enum PublicationParamsError {
         term_length: i32,
     },
     /// `response-correlation-id` is not an `int64`, or is below `-1`
-    /// (`aeron_driver_uri.c:655-683`).
+    /// (`aeron_driver_uri.c:660-688`).
     ///
     /// The reference reaches **one** label for both — a value its
     /// `aeron_uri_get_int64` cannot read and one it reads but finds below `-1`
@@ -412,14 +412,14 @@ pub enum PublicationParamsError {
     ResponseCorrelationId,
     /// The three position parameters were not a usable set.
     Position(PositionError),
-    /// `entity-tag` is not a decimal number (`aeron_driver_uri.c:256-273`).
+    /// `entity-tag` is not a decimal number (`aeron_driver_uri.c:261-278`).
     EntityTag {
         /// What the URI said.
         value: String,
     },
     /// `session-id=tag:N` names a network publication, and no publication in
     /// the driver carries that tag
-    /// (`aeron_driver_uri.c:184-187`: `must reference a network publication`).
+    /// (`aeron_driver_uri.c:189-192`: `must reference a network publication`).
     UnknownSessionIdTag {
         /// The tag the URI named.
         tag: i64,
@@ -432,7 +432,7 @@ pub enum PositionError {
     /// Fewer than all three of `init-term-id`, `term-id` and `term-offset`.
     Incomplete,
     /// `term-offset` is past the end of the term. The reference allows it to
-    /// be exactly the term length (`aeron_driver_uri.c:329`), which is a
+    /// be exactly the term length (`aeron_driver_uri.c:334`), which is a
     /// boundary one byte past anything writable — reproduced rather than
     /// corrected, since it is a URI a reference driver accepts.
     TermOffsetOutOfRange {
@@ -549,7 +549,7 @@ impl From<UriError> for PublicationParamsError {
 
 /// What a `session-id=tag:N` channel takes from the publication it names: the
 /// session, and the two lengths that make the two publications the same shape
-/// (`aeron_driver_uri.c:188-190`, which copies all three out of the
+/// (`aeron_driver_uri.c:193-195`, which copies all three out of the
 /// `aeron_network_publication_t`).
 ///
 /// The lengths are copied rather than compared, and the flags that say the URI
@@ -572,7 +572,7 @@ impl PublicationParams {
     /// `config` supplies every default; the URI overrides the ones it names.
     /// `find_by_tag` answers what `session-id=tag:N` names — the reference
     /// hands the reader the whole conductor for this one question
-    /// (`aeron_driver_uri.c:163`), so the lookup is a parameter here rather
+    /// (`aeron_driver_uri.c:168`), so the lookup is a parameter here rather
     /// than a field.
     ///
     /// # Errors
@@ -585,9 +585,9 @@ impl PublicationParams {
         find_by_tag: impl Fn(i64) -> Option<TaggedPublication>,
     ) -> Result<Self, PublicationParamsError> {
         // The defaults, in the reference's order and from the same settings
-        // (`aeron_driver_uri.c:224-254`). Three of them are chosen by
+        // (`aeron_driver_uri.c:229-259`). Three of them are chosen by
         // **transport**, which the reference spells as a ternary on every line
-        // (`:230`, `:232`, `:295`): a network publication is sized like a
+        // (`:235`, `:237`, `:300`): a network publication is sized like a
         // network publication, and one that names none of `term-length`,
         // `mtu=` or `pub-wnd` gets the network defaults rather than the IPC
         // ones. Reading them from the IPC settings for a UDP channel is a
@@ -654,7 +654,7 @@ impl PublicationParams {
 
         // The window comes from the *final* term length, and the URI's own
         // `pub-wnd` is then checked against the final MTU and term length
-        // (`aeron_driver_uri.c:280-302`).
+        // (`aeron_driver_uri.c:285-307`).
         params.publication_window_length = producer_window_length(
             if is_ipc {
                 config.ipc_publication_window_length
@@ -702,7 +702,7 @@ impl PublicationParams {
         }
         // The linger timeout defaults to the window limit one, but only when
         // the driver's own setting says "unset" — `-1` in the reference
-        // (`aeron_driver_uri.c:414-427`), whose `else if` is what makes a
+        // (`aeron_driver_uri.c:419-432`), whose `else if` is what makes a
         // configured value survive a URI that says nothing.
         if let Some(linger) = uri.duration_ns(key::UNTETHERED_LINGER_TIMEOUT)? {
             if linger > 0 {
@@ -722,7 +722,7 @@ impl PublicationParams {
 
     /// `session-id`, which is a number, or `tag:N` naming a network
     /// publication whose session this one shares
-    /// (`aeron_driver_uri.c:162-204`).
+    /// (`aeron_driver_uri.c:167-209`).
     ///
     /// `tag:` copies the publication's session **and its two lengths** — the
     /// mtu and the term — which is what makes a second channel that names a
@@ -780,7 +780,7 @@ impl PublicationParams {
     }
 
     /// `tags=a,b`: the second half is the entity tag
-    /// (`aeron_driver_uri.c:256-273`).
+    /// (`aeron_driver_uri.c:261-278`).
     fn read_entity_tag(&mut self, uri: &ChannelUri<'_>) -> Result<(), PublicationParamsError> {
         let Some(tags) = uri.value(key::TAGS) else {
             return Ok(());
@@ -833,7 +833,7 @@ pub(crate) fn check_mtu(mtu_length: u64) -> Result<i32, PublicationParamsError> 
     Ok(mtu_length as i32)
 }
 
-/// `aeron_producer_window_length` (`aeron-driver/src/main/c/aeron_driver_context.h:461-470`):
+/// `aeron_producer_window_length` (`aeron-driver/src/main/c/aeron_driver_context.h:469-478`):
 /// half the term, or the configured window when that is smaller and not zero.
 ///
 /// A window *larger* than half a term is ignored rather than clamped, which is
@@ -849,7 +849,7 @@ pub fn producer_window_length(configured: i32, term_length: i32) -> i32 {
 }
 
 /// The `init-term-id` / `term-id` / `term-offset` triple
-/// (`aeron_driver_uri.c:305-395`).
+/// (`aeron_driver_uri.c:310-400`).
 fn read_position(
     uri: &ChannelUri<'_>,
     term_length: i32,
@@ -919,11 +919,11 @@ fn read_position(
 }
 
 /// `response-correlation-id`, including `prototype`
-/// (`aeron_driver_uri.c:655-683`).
+/// (`aeron_driver_uri.c:660-688`).
 ///
 /// The read goes through [`ChannelUri::i64`] rather than a plain `parse` for
 /// the reference's own reason: it asks `aeron_uri_get_int64`, whose `strtoll`
-/// is **base zero** (`aeron-client/src/main/c/uri/aeron_uri.c:397`), so `0x10`
+/// is **base zero** (`aeron-client/src/main/c/uri/aeron_uri.c:401`), so `0x10`
 /// is sixteen there and must be here too.
 fn read_response_correlation_id(uri: &ChannelUri<'_>) -> Result<i64, PublicationParamsError> {
     let Some(value) = uri.value(key::RESPONSE_CORRELATION_ID) else {
@@ -935,7 +935,7 @@ fn read_response_correlation_id(uri: &ChannelUri<'_>) -> Result<i64, Publication
     }
 
     // Both arms end at the reference's single label, so both errors are the
-    // same value; `aeron_driver_uri.c:676-682` is one `goto`.
+    // same value; `aeron_driver_uri.c:681-687` is one `goto`.
     let correlation_id = uri
         .i64(key::RESPONSE_CORRELATION_ID)
         .map_err(|_| PublicationParamsError::ResponseCorrelationId)?
@@ -1010,7 +1010,7 @@ mod tests {
     #[test]
     fn a_nak_delay_that_is_not_a_duration_is_refused_rather_than_ignored() {
         // The reference fails the *image* with `EINVAL` and leaves the
-        // subscription standing (`aeron_publication_image.c:113-117`); this
+        // subscription standing (`aeron_publication_image.c:118-122`); this
         // refuses the subscription, which is the same answer a client can act
         // on, delivered earlier.
         let error = resolve_subscription("aeron:udp?endpoint=127.0.0.1:10123|nak-delay=soon")
@@ -1029,7 +1029,7 @@ mod tests {
     /// every one of the reference's three arms is decided when an image is
     /// built, not when the subscription is made
     /// (`aeron_congestion_control.c:165-205`, reached from
-    /// `aeron_driver_conductor.c:6629`).
+    /// `aeron_driver_conductor.c:6722`).
     ///
     /// This build used to refuse a name it could not serve here, which meant a
     /// subscription that named `cubic` was refused outright while the driver it
@@ -1091,7 +1091,7 @@ mod tests {
     #[test]
     fn a_network_channel_is_sized_like_a_network_channel() {
         // The reference chooses four defaults by *transport*, not once for both
-        // (`aeron_driver_uri.c:230`, `:232`, `:295`): a UDP channel that names
+        // (`aeron_driver_uri.c:235`, `:237`, `:300`): a UDP channel that names
         // no term, MTU or window gets the network settings. Reading them from
         // the IPC ones is a 64 MiB term where the reference has 16 MiB — which
         // is not an invisible number: the term length goes out in the SETUP
@@ -1305,7 +1305,7 @@ mod tests {
             Err(PublicationParamsError::ResponseCorrelationId)
         ));
         // Not a number takes the same arm: the reference has one `goto` for
-        // both (`aeron_driver_uri.c:676-682`), and its message names neither
+        // both (`aeron_driver_uri.c:681-687`), and its message names neither
         // the key's value nor which of the two it was.
         assert!(matches!(
             resolve("aeron:ipc?response-correlation-id=what"),
@@ -1338,7 +1338,7 @@ mod tests {
     }
 
     /// `session-id=tag:N` takes the named publication's session **and its two
-    /// lengths** (`aeron_driver_uri.c:188-190`), so a channel that names a tag
+    /// lengths** (`aeron_driver_uri.c:193-195`), so a channel that names a tag
     /// comes out the same shape as the publication it names — which is what
     /// `shouldMergeStreamsFromMultiplePublicationsWithSameParams` leans on:
     /// two channels that disagree about mtu or term are two publications, not
@@ -1363,12 +1363,12 @@ mod tests {
 
         // **Taken**, not named: the URI still says nothing about the lengths,
         // and that is what a publication being shared has to agree about
-        // (`aeron_confirm_publication_match`, `aeron_driver_conductor.c:1126-1136`).
+        // (`aeron_confirm_publication_match`, `aeron_driver_conductor.c:1167-1177`).
         assert!(!params.mtu_length_named);
         assert!(!params.term_length_named);
 
         // The tag is read before `mtu=` and `term-length=`
-        // (`aeron_driver_uri.c:277-300`), so a URI that names them overrides
+        // (`aeron_driver_uri.c:282-305`), so a URI that names them overrides
         // what the tag gave.
         let explicit = resolve_with_tag(
             "aeron:udp?endpoint=127.0.0.1:10123|session-id=tag:5|mtu=2048",
@@ -1390,7 +1390,7 @@ mod tests {
         assert_eq!(
             "session-id=tag:42 must reference a network publication",
             error.to_string(),
-            "the reference's words (`aeron_driver_uri.c:184-187`)"
+            "the reference's words (`aeron_driver_uri.c:189-192`)"
         );
 
         assert!(matches!(
@@ -1399,7 +1399,7 @@ mod tests {
         ));
 
         // Read in base zero, as the reference's `strtoll(..., 0)` reads it, so
-        // a tag written as hex is that tag (`aeron_driver_uri.c:166-178`).
+        // a tag written as hex is that tag (`aeron_driver_uri.c:171-183`).
         let params = resolve_with_tag("aeron:ipc?session-id=tag:0x10", |tag| {
             (16 == tag).then_some(TaggedPublication {
                 session_id: 4,

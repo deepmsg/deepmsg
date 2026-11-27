@@ -41,7 +41,7 @@ fn port(offset: u32) -> u32 {
 /// client sends its requests.
 ///
 /// **UDP, and it has to be**: the reference refuses anything else outright —
-/// `Archive.Context.controlChannel must be UDP media`, from `Archive.java:1225`
+/// `Archive.Context.controlChannel must be UDP media`, from `Archive.java:1291`
 /// by way of `Archive$Context.conclude`. That is a fact about the archive rather
 /// than about this test, and it is why the client half here is not the
 /// `aeron:ipc` one every other case in this slice uses. The stream is the

@@ -5,9 +5,9 @@ descriptor a producer writes into the terms. It is the second file the driver
 and its clients share, after the CnC file, and like that one it has no
 specification — the bytes are the contract.
 
-Baseline: Aeron **1.53.2**, commit `664f58e705`. The authority for the
+Baseline: Aeron **1.54.2**, commit `481d4271ad`. The authority for the
 metadata struct is `aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h:42-88`,
-for the file's length `:104-110`, and for the frame descriptor
+for the file's length `:105-111`, and for the frame descriptor
 `aeron-client/src/main/c/protocol/aeron_udp_protocol.h:23-62`. The
 constants in `crates/core/src/logbuffer/descriptor.rs` assert their
 relationships at compile time and their offsets in tests, and the two must
@@ -20,7 +20,7 @@ agree: a failure there means the layout moved.
 ```
 
 named after the **publication's** registration id
-(`aeron-client/src/main/c/util/aeron_fileutil.c:1208-1214`), and
+(`aeron-client/src/main/c/util/aeron_fileutil.c:1207-1213`), and
 
 ```
 AERON_ALIGN((AERON_LOGBUFFER_PARTITION_COUNT * term_length) + AERON_LOGBUFFER_META_DATA_LENGTH, page_size)
@@ -112,14 +112,14 @@ Six fields, and they are not six zeroes:
   not. The reference asks the kernel for them at start-up with a throwaway
   UDP socket (`aeron-client/src/main/c/util/aeron_netutil.c:883-919`) and
   passes the answer into the metadata init
-  (`aeron-driver/src/main/c/aeron_ipc_publication.c:117-124`); deepmsg does
+  (`aeron-driver/src/main/c/aeron_ipc_publication.c:122-129`); deepmsg does
   the same in `deepmsg_driver::sys::default_socket_buffers`, so the bytes a
   reader finds are the bytes the reference would have written on that machine.
 - `os_max_socket_sndbuf_length` and `os_max_socket_rcvbuf_length` are **0**,
   and that is also the reference's answer rather than a simplification: its
   context declares four buffer lengths and assigns only the two `default_*`
-  ones (`aeron-driver/src/main/c/aeron_driver_context.h:408-413` declares the
-  struct; `aeron_driver_context.c:1315-1316` fills the defaults and leaves the
+  ones (`aeron-driver/src/main/c/aeron_driver_context.h:416-421` declares the
+  struct; `aeron_driver_context.c:1359-1360` fills the defaults and leaves the
   maxima at the zero the context was allocated with).
 
 The consequence for testing is worth stating plainly: two of these fields
@@ -202,7 +202,7 @@ cannot be written with one get-and-add. The fragment assembler's continuity
 test is therefore always within one term: the next fragment of a message
 begins at `ALIGN(term_offset + frame_length, 32)`, and a fragment that begins
 anywhere else is a fragment whose predecessor is gone
-(`aeron-client/src/main/c/aeron_subscription.c:587-593`).
+(`aeron-client/src/main/c/aeron_subscription.c:575-581`).
 
 ## What each side owns
 

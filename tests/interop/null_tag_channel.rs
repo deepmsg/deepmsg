@@ -9,9 +9,9 @@
 //!
 //! * the reference **C** driver refuses the channel, because its parse-failure
 //!   sentinel and its "no tag" sentinel are the same `-1`
-//!   (`aeron_uri.h:89`, `aeron_uri.c:517-529`, `aeron_udp_channel.c:385-390`);
+//!   (`aeron_uri.h:90`, `aeron_uri.c:521-533`, `aeron_udp_channel.c:386-391`);
 //! * the reference **Java** driver serves it as a **real** tag of `-1`
-//!   (`UdpChannel.java:216-218`);
+//!   (`UdpChannel.java:243-245`);
 //! * **this** driver serves it as **no tag**, which is what the value means
 //!   (`crates/driver/src/udp_channel.rs::parse_tag`).
 //!

@@ -2,9 +2,9 @@
 //! driver keeps about that is there and says so.
 //!
 //! The reference creates `loss-report.dat` in the aeron directory whether or
-//! not anything is ever lost (`aeron-driver/src/main/c/aeron_driver.c:324-345`)
+//! not anything is ever lost (`aeron-driver/src/main/c/aeron_driver.c:341-362`)
 //! and appends one record per stream that lost something
-//! (`aeron_publication_image.c:123-155`). Its own system tests read it back —
+//! (`aeron_publication_image.c:128-160`). Its own system tests read it back —
 //! `SystemTests.verifyLossOccurredForStream` asserts the file exists and that a
 //! record points at the stream — and so do two readers that share no code with
 //! this build: the C client's `aeron_cnc_loss_reporter_read` and Java's

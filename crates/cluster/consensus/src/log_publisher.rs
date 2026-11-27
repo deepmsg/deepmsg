@@ -1,7 +1,7 @@
 //! Writing to the cluster log (`LogPublisher.java`).
 //!
 //! Seven writes, all aimed at one exclusive publication created by the
-//! election (`addLogPublication`, `ConsensusModuleAgent.java:1639-1686`):
+//! election (`addLogPublication`, `ConsensusModuleAgent.java:1655-1702`):
 //!
 //! | Here | Reference |
 //! |---|---|
@@ -10,7 +10,7 @@
 //! | [`LogPublisher::append_session_close`] | `appendSessionClose` (`:180-211`) |
 //! | [`LogPublisher::append_timer`] | `appendTimer` (`:213-239`) |
 //! | [`LogPublisher::append_cluster_action`] | `appendClusterAction` (`:241-276`) |
-//! | [`LogPublisher::append_new_leadership_term_event`] | `appendNewLeadershipTermEvent` (`:278-319`) |
+//! | [`LogPublisher::append_new_leadership_term_event`] | `appendNewLeadershipTermEvent` (`:277-318`) |
 //! | [`LogPublisher::add_destination`] | `addDestination` (`:107-113`) |
 //!
 //! # Where the publication lives
@@ -100,7 +100,7 @@ impl Default for LogPublisher {
 
 impl LogPublisher {
     /// An empty publisher; [`Self::publication`] is set by the agent in
-    /// `addLogPublication` (`ConsensusModuleAgent.java:1639-1686`).
+    /// `addLogPublication` (`ConsensusModuleAgent.java:1655-1702`).
     pub fn new() -> Self {
         Self {
             publication: None,
@@ -119,7 +119,7 @@ impl LogPublisher {
     /// that can never advance and is never told it is over. A re-elected
     /// cluster then cannot join the new term at all: the container waits in
     /// `joinActiveLog` for an image it will not let go of
-    /// (`BoundedLogAdapter.isDone`, `BoundedLogAdapter.java:115-118`), and the
+    /// (`BoundedLogAdapter.isDone`, `BoundedLogAdapter.java:130-133`), and the
     /// consensus module waits for the ack that join never sends.
     ///
     /// # Errors
@@ -168,7 +168,7 @@ impl LogPublisher {
     }
 
     /// The publication, for an extension or a snapshot taker that needs the
-    /// log's own handle (`ConsensusModuleAgent.java:1941`).
+    /// log's own handle (`ConsensusModuleAgent.java:1957`).
     pub fn publication(&self) -> Option<&ExclusivePublication> {
         self.publication.as_ref()
     }
@@ -388,12 +388,18 @@ impl LogPublisher {
         &mut self,
         client: &Client,
         leadership_term_id: i64,
+        term_base_log_position: i64,
         timestamp: i64,
         action: ClusterAction,
         flags: i32,
     ) -> Result<bool, ClusterError> {
         let position_limit = self.position_limit(client);
         let length = MESSAGE_HEADER_LENGTH + usize::from(CLUSTER_ACTION_BLOCK_LENGTH);
+        // The reference's `tryClaim` returns the **new stream position**, i.e.
+        // the position after the claimed frame (`ConcurrentPublication.claim`
+        // returns `termOffset + alignedLength`), and that is what the snapshot
+        // starts at. `offer` here returns the same position, so the recorded
+        // log position is computed the same way the old code did.
         let frame_length = align_up(DATA_HEADER_LENGTH + length, FRAME_ALIGNMENT as usize);
         let log_position = self.position() + frame_length as i64;
         self.size_buffer(length);
@@ -410,7 +416,8 @@ impl LogPublisher {
                 .log_position(log_position)
                 .timestamp(timestamp)
                 .action(action)
-                .flags(flags);
+                .flags(flags)
+                .term_base_log_position(term_base_log_position);
         }
 
         Ok(self.offer(position_limit, length)? > 0)
@@ -551,3 +558,60 @@ fn align_up(value: usize, alignment: usize) -> usize {
 /// How long a synchronous add waits for the driver, as the other startup calls
 /// do. Only re-exported so the agent and this module cannot disagree.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deepmsg_codec_cluster::ReadBuf;
+    use deepmsg_codec_cluster::cluster_action_request_codec::{
+        ClusterActionRequestDecoder, SBE_BLOCK_LENGTH,
+    };
+    use deepmsg_codec_cluster::message_header_codec::MessageHeaderDecoder;
+
+    fn encode_action(buffer: &mut [u8]) -> usize {
+        let encoder = ClusterActionRequestEncoder::default()
+            .wrap(WriteBuf::new(buffer), MESSAGE_HEADER_LENGTH);
+        let mut header = encoder.header(0);
+        let mut body = header.parent().expect("just wrapped");
+        body.leadership_term_id(5)
+            .log_position(1_024)
+            .timestamp(7)
+            .action(ClusterAction::SNAPSHOT)
+            .flags(0)
+            .term_base_log_position(4_096);
+
+        MESSAGE_HEADER_LENGTH + usize::from(SBE_BLOCK_LENGTH)
+    }
+
+    #[test]
+    fn a_cluster_action_carries_term_base_and_log_position() {
+        let mut buffer = vec![0_u8; 256];
+        let length = encode_action(&mut buffer);
+        assert_eq!(40, SBE_BLOCK_LENGTH);
+
+        let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(&buffer[..length]), 0);
+        assert_eq!(18, header.version());
+        let decoder = ClusterActionRequestDecoder::default().header(header, 0);
+        assert_eq!(5, decoder.leadership_term_id());
+        assert_eq!(1_024, decoder.log_position());
+        assert_eq!(Some(4_096), decoder.term_base_log_position());
+        assert_eq!(ClusterAction::SNAPSHOT, decoder.action());
+    }
+
+    #[test]
+    fn an_action_written_by_1_53_2_has_no_term_base() {
+        let mut buffer = vec![0_u8; 256];
+        encode_action(&mut buffer);
+
+        // The v11 shape: block length 32, acting version 11, no term-base field.
+        buffer[0..2].copy_from_slice(&32_u16.to_le_bytes());
+        buffer[6..8].copy_from_slice(&11_u16.to_le_bytes());
+        let length = MESSAGE_HEADER_LENGTH + 32;
+
+        let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(&buffer[..length]), 0);
+        let decoder = ClusterActionRequestDecoder::default().header(header, 0);
+        assert_eq!(5, decoder.leadership_term_id());
+        assert_eq!(1_024, decoder.log_position());
+        assert_eq!(None, decoder.term_base_log_position());
+    }
+}

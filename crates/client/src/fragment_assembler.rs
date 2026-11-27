@@ -377,7 +377,7 @@ impl FragmentAssembler {
 
         // A `BEGIN` while a message is in progress replaces it: the previous
         // one lost a fragment, and this one is the message the stream is
-        // actually on (`aeron_fragment_assembler.c:175-181`).
+        // actually on (`aeron_fragment_assembler.c:183-189`).
         if builder.next_term_offset.is_some() {
             self.abandoned += 1;
         }
@@ -474,7 +474,7 @@ fn complete(
 ///
 /// The reference has four of these and names them the same way
 /// (`ControlledFragmentHandler.java:30-53`; C spells them
-/// `AERON_ACTION_ABORT`…`AERON_ACTION_CONTINUE`, `aeronc.h:1719-1737`).
+/// `AERON_ACTION_ABORT`…`AERON_ACTION_CONTINUE`, `aeronc.h:1722-1740`).
 ///
 /// **The numbers are not part of the contract.** The two reference
 /// implementations agree on the order and disagree on where it starts — Java

@@ -2,7 +2,7 @@
 //! else runs.
 //!
 //! This is the reference's `io.aeron.archive.Archive` — `Archive.main`
-//! (`Archive.java:183-184`), "launch an `Archive` that communicates with an out
+//! (`Archive.java:189-190`), "launch an `Archive` that communicates with an out
 //! of process `MediaDriver` and await a shutdown signal". It is the third of the
 //! three main classes the reference's archive suite spawns, and the one this
 //! build was missing: a rehearsal of the whole suite counted 276 archive spawns,
@@ -36,7 +36,7 @@
 //!
 //! `DEDICATED` and `SHARED` are both served. The reference's own suite sets
 //! `SHARED` (`TestStandaloneArchive.h:121`), and what a deployment says nothing
-//! about is `DEDICATED` (`Archive.java:393`), which is the mode with threads of
+//! about is `DEDICATED` (`Archive.java:399`), which is the mode with threads of
 //! its own.
 //!
 //! ★ The replayer is still driven inside the conductor's turn under `DEDICATED`

@@ -1,13 +1,13 @@
 # Known-bad upstream paths
 
-Paths that look plausible but do **not** exist in the Aeron 1.53.2 checkout
-(commit `664f58e705`). Every one of them has been cited in this repository at
+Paths that look plausible but do **not** exist in the Aeron 1.54.2 checkout
+(commit `481d4271ad`). Every one of them has been cited in this repository at
 some point. Resolve a path with `ls` before trusting it.
 
 If an upstream bump makes a row here obsolete, update the row — do not delete
 it silently, since the shape of the mistake is the reusable part.
 
-| Cited path | Where it actually is at 1.53.2 |
+| Cited path | Where it actually is at 1.54.2 |
 |---|---|
 | `aeron-driver/src/main/c/aeron_sender.c` | `aeron_driver_sender.c` — the `_driver_` infix |
 | `aeron-driver/src/main/c/aeron_receiver.c` | `aeron_driver_receiver.c` |
@@ -33,7 +33,7 @@ it silently, since the shape of the mistake is the reusable part.
   on-disk formats live in `Catalog.java` and `ArchiveMarkFile.java`; the
   cluster's recording log is where `ENTRY_TYPE_INVALID_FLAG = 1 << 31` and
   `RECORD_ALIGNMENT = 64` are defined.
-- **There is no `aeron_dist/` directory** at 1.53.2. The distributed-log
+- **There is no `aeron_dist/` directory** at 1.54.2. The distributed-log
   structures sit directly under `concurrent/` — ring buffers, concurrent
   queues, term scanners and rebuilder.
 

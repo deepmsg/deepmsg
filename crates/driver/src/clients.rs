@@ -3,7 +3,7 @@
 //! There is no client-registration command in this protocol and no client
 //! record region in the CnC file. A client exists to the driver because a
 //! **resource command** carried its id — `get_or_add_client`
-//! (`aeron-driver/src/main/c/aeron_driver_conductor.c:982-1035`), called from
+//! (`aeron-driver/src/main/c/aeron_driver_conductor.c:1023-1076`), called from
 //! the seven resource paths and from nowhere else — and it stops existing when
 //! its **heartbeat counter** goes quiet for longer than
 //! `aeron.client.liveness.timeout`.
@@ -12,19 +12,19 @@
 //!
 //! Registration allocates a counter of type `11` labelled
 //! `client-heartbeat: id=<clientId>` with the client's id as its key,
-//! registration and owner (`aeron_position.c:320-337`), and stamps it with the
+//! registration and owner (`aeron_position.c:325-342`), and stamps it with the
 //! current millisecond. From then on the *client* writes that value on its own
-//! duty cycle (`aeron_client_conductor.c:1376`) — `CLIENT_KEEPALIVE` exists in
+//! duty cycle (`aeron_client_conductor.c:1424`) — `CLIENT_KEEPALIVE` exists in
 //! the protocol, but this driver's only use for it is refreshing a client it
 //! already knows, and the reference C client never sends it at all.
 //!
 //! # A pass is two phases, and the split is visible on the wire
 //!
-//! `aeron_client_on_time_event` (`:1038-1056`) runs over **every** client
+//! `aeron_client_on_time_event` (`:1079-1097`) runs over **every** client
 //! first: it counts the timeout in system counter 24, announces
 //! `ON_CLIENT_TIMEOUT` — unless the client closed itself — and announces
 //! `ON_UNAVAILABLE_COUNTER` for the heartbeat counter. Only then does the
-//! reclamation pass call `aeron_client_delete` (`:1218-1295`) for each client
+//! reclamation pass call `aeron_client_delete` (`:1259-1336`) for each client
 //! that reached end of life, freeing its counters one by one (each announced)
 //! and the heartbeat last. So [`Clients::on_time_event`] marks and announces,
 //! and [`Clients::reap_expired`] frees — and when two clients expire in the
@@ -33,7 +33,7 @@
 //!
 //! A client that is already gone must not be announced as timed out:
 //! `CLIENT_CLOSE` sets the heartbeat to zero so the next tick collects it, and
-//! `closed_by_command` is what tells the two apart (`:5269-5280`, `:6321-6331`).
+//! `closed_by_command` is what tells the two apart (`:5269-5280`, `:6418-6428`).
 
 use deepmsg_cnc::command::PublicationError;
 use deepmsg_cnc::command::{ImageBuffersReady, PublicationBuffersReady};
@@ -65,7 +65,7 @@ pub trait ClientEvents {
 
     /// `ON_CLIENT_TIMEOUT`: the client stopped being heard from. System counter
     /// 24 is incremented by the pool before this is raised
-    /// (`aeron_driver_conductor.c:1047-1049`), which is also why it is *not*
+    /// (`aeron_driver_conductor.c:1088-1090`), which is also why it is *not*
     /// raised for a client that closed itself.
     fn client_timed_out(&mut self, client_id: i64);
 
@@ -92,7 +92,7 @@ pub trait ClientEvents {
     /// and the client must unmap it. The channel is the **subscription's** —
     /// the one the client subscribed with — except where a publication is
     /// revoked, which sends the constant `aeron:ipc` instead
-    /// (`aeron_driver_conductor.c:510-517` against `:5975-5982`).
+    /// (`aeron_driver_conductor.c:510-517` against `:6072-6079`).
     fn unavailable_image(
         &mut self,
         correlation_id: i64,
@@ -106,9 +106,9 @@ pub trait ClientEvents {
     ///
     /// Not an answer to a command, so it carries no correlation id: it names
     /// the publication the client already knows by registration id
-    /// (`aeron_driver_conductor.c:2263-2323`). Two paths produce it and they
+    /// (`aeron_driver_conductor.c:2326-2386`). Two paths produce it and they
     /// meet in one handler — the IPC publication a client asked to reject
-    /// (`aeron_ipc_publication.c:249`) and the network publication whose
+    /// (`aeron_ipc_publication.c:254`) and the network publication whose
     /// receiver refused it (`aeron_network_publication.c:873`).
     fn publication_error(&mut self, error: &PublicationError<'_>);
 
@@ -314,16 +314,16 @@ impl Clients {
     ///
     /// The reference splits a pass in two, and the split is visible on the wire
     /// when more than one client expires in the same tick. `aeron_client_on_time_event`
-    /// (`aeron_driver_conductor.c:1038-1056`) runs over every client first —
+    /// (`aeron_driver_conductor.c:1079-1097`) runs over every client first —
     /// counting the timeout in system counter 24, then broadcasting
     /// `ON_CLIENT_TIMEOUT` and the heartbeat's `ON_UNAVAILABLE_COUNTER` — and
     /// only then does the pool's reclamation pass call `aeron_client_delete`
-    /// for each client that reached end of life (`:1692-1712`). Interleaving
+    /// for each client that reached end of life (`:1733-1753`). Interleaving
     /// the two per client produces an order a C driver never emits: A's
     /// counters going unavailable *before* B's timeout.
     ///
     /// Counter 24 is incremented here, before the announcement, and only for a
-    /// client that did not close itself — the reference's order (`:1047-1049`),
+    /// client that did not close itself — the reference's order (`:1088-1090`),
     /// and why a tool that drains the ring and reads the counter together never
     /// sees the event arrive first.
     ///
@@ -349,7 +349,7 @@ impl Clients {
 
             // Wrap, not saturate. The reference compares
             // `now > timestamp + timeout` with C's wrapping arithmetic
-            // (`aeron_driver_conductor.c:1042`), so a heartbeat near `i64::MAX`
+            // (`aeron_driver_conductor.c:1083`), so a heartbeat near `i64::MAX`
             // wraps negative and the client expires at once. Saturating instead
             // would make that heartbeat *never* expire: a client — or anything
             // that can write a counter — could pin a record and its counter for
@@ -376,7 +376,7 @@ impl Clients {
     }
 
     /// Phase two: free everything a marked client owned, announcing each
-    /// counter as it goes (`aeron_client_delete`, `:1218-1295`).
+    /// counter as it goes (`aeron_client_delete`, `:1259-1336`).
     ///
     /// The order is the reference's: the client's own counters first, each
     /// announced before it is freed, then the heartbeat — whose announcement
@@ -432,7 +432,7 @@ impl Clients {
     }
 
     /// Free everything one client owned, announcing each counter as it goes
-    /// (`aeron_client_delete`, `:1218-1295`).
+    /// (`aeron_client_delete`, `:1259-1336`).
     ///
     /// The order is the reference's: the client's own counters first, each
     /// announced before it is freed, then the heartbeat — whose announcement
@@ -445,7 +445,7 @@ impl Clients {
     /// The question a reaping sweep has to ask: a publication outlives the
     /// client that made it when another client holds a link on it, and the
     /// reference answers it the same way — by walking the links
-    /// (`aeron_driver_conductor.c:1220-1241`).
+    /// (`aeron_driver_conductor.c:1261-1282`).
     pub fn any_holds_publication(&self, publication_registration_id: i64) -> bool {
         self.records.iter().any(|record| {
             record
@@ -471,7 +471,7 @@ impl Clients {
     ) {
         let record = &mut self.records[index];
 
-        // The publications first, in the reference's order (`:1220-1241`): a
+        // The publications first, in the reference's order (`:1261-1282`): a
         // client that dies takes its links with it, and a publication whose last
         // link that was starts draining.
         publications.release_links(&record.publication_links, manager, regions);
@@ -500,7 +500,7 @@ impl Clients {
 }
 
 /// The reference's per-client truncation of the configured timeout
-/// (`aeron_driver_conductor.c:1020-1021`): milliseconds, and never zero — a
+/// (`aeron_driver_conductor.c:1061-1062`): milliseconds, and never zero — a
 /// client whose timeout rounded to zero would be reaped on arrival.
 fn liveness_timeout_ms(liveness_timeout_ns: i64) -> i64 {
     if liveness_timeout_ns < 1_000_000 {
@@ -918,7 +918,7 @@ mod tests {
     fn a_heartbeat_at_the_top_of_the_range_expires_instead_of_never() {
         let mut endpoints = crate::receive_endpoints::ReceiveChannelEndpoints::new();
         // The comparison wraps, as the reference's does
-        // (`aeron_driver_conductor.c:1042`): `i64::MAX + anything` is negative,
+        // (`aeron_driver_conductor.c:1083`): `i64::MAX + anything` is negative,
         // so the client is expired on the spot. Saturating instead would make
         // it *never* expire — a counter anyone can write, pinning a client
         // record and its counters for the driver's whole life.
@@ -964,7 +964,7 @@ mod tests {
         // two-phase pass is visible on the ring: both timeouts, then both
         // reclamations. An interleaved loop emits A's counters going away
         // before B's timeout, which no C driver ever does
-        // (`aeron_driver_conductor.c:1038-1056` then `:1692-1712`).
+        // (`aeron_driver_conductor.c:1079-1097` then `:1733-1753`).
         let mut fixture = Fixture::new();
         let (mut manager, regions) = fixture.open();
         let (_agent, mut publications, mut network_publications, mut subscriptions) = managers();
@@ -1026,7 +1026,7 @@ mod tests {
     #[test]
     fn the_timeout_is_counted_before_it_is_announced() {
         // System counter 24 is incremented before the broadcast
-        // (`aeron_driver_conductor.c:1047-1049`), so a reader that drains the
+        // (`aeron_driver_conductor.c:1088-1090`), so a reader that drains the
         // ring and reads the counter in the same breath never sees the event
         // arrive first. The sink here reads the counter at the moment the
         // event is raised, which is the only place the order is observable.

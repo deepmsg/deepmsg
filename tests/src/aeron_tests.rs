@@ -1,7 +1,7 @@
 //! The C and Java this suite runs, and where they live: **another repository**.
 //!
 //! Three of the probes below are C programs linked against the reference's own
-//! `libaeron`, and six are Java programs compiled against `aeron-all-1.53.2.jar`.
+//! `libaeron`, and six are Java programs compiled against `aeron-all-1.54.2.jar`.
 //! Neither belongs in this tree. Their build, their classpath and their lifetime
 //! belong to the reference's toolchain rather than to a Cargo workspace, and a
 //! `.c` or `.java` file here is a file no gate in this repository compiles — CI

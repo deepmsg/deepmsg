@@ -24,7 +24,7 @@
 //! creates the endpoints and the publications — and then *moves* them here
 //! through [`SenderCommand`]. That is the reference's arrangement too (its
 //! `aeron_driver_sender_proxy_on_add_endpoint` is called from
-//! `aeron_driver_conductor.c:2015`), and it is what keeps each data structure
+//! `aeron_driver_conductor.c:2066`), and it is what keeps each data structure
 //! with one owner: after the handover an endpoint's socket and a publication's
 //! term buffer have exactly one, and every other party addresses them by id.
 //!
@@ -65,9 +65,9 @@ use deepmsg_core::logbuffer::descriptor::TERM_MAX_LENGTH;
 /// How many datagrams the sender reads per poll, which is **one**.
 ///
 /// Not a capacity and not configurable: `aeron_driver_sender.c:154` builds a
-/// `struct mmsghdr mmsghdr[1]` and `:170` hands the poller `vlen = 1`, so the
+/// `struct mmsghdr mmsghdr[1]` and `:147` hands the poller `vlen = 1`, so the
 /// reference's sender is on `aeron_udp_channel_transport_recvmsg` rather than
-/// `..._recvmmsg` (`media/aeron_udp_channel_transport.c:551-554`) however many
+/// `..._recvmmsg` (`media/aeron_udp_channel_transport.c:572-575`) however many
 /// buffers `aeron.sender.io.vector.capacity` sized for it. A datagram that
 /// arrives while another is being dispatched waits for the next poll, and the
 /// next poll is one pass away.
@@ -107,7 +107,7 @@ pub enum SenderCommand {
     },
     /// The name resolved somewhere else: point the endpoint at it
     /// (`aeron_driver_sender_on_resolution_change`,
-    /// `aeron-driver/src/main/c/aeron_driver_sender.c:400-415`), which is also
+    /// `aeron-driver/src/main/c/aeron_driver_sender.c:402-417`), which is also
     /// where `Resolution changes` is counted.
     ResolutionChange {
         /// Which endpoint, by the id the conductor knows it by.
@@ -139,10 +139,10 @@ pub enum SenderCommand {
     },
     /// Put a destination on an endpoint's tracker
     /// (`aeron_driver_sender_on_add_destination`,
-    /// `aeron-driver/src/main/c/aeron_driver_sender.c:350-363`).
+    /// `aeron-driver/src/main/c/aeron_driver_sender.c:352-365`).
     ///
     /// The conductor answers the *client* before this runs — the reference does
-    /// (`aeron_driver_conductor.c:5366-5367`) — so this is the sender catching
+    /// (`aeron_driver_conductor.c:5463-5464`) — so this is the sender catching
     /// up, not a step anyone is waiting on.
     AddDestination {
         /// The endpoint whose tracker it goes on.
@@ -153,7 +153,7 @@ pub enum SenderCommand {
         /// would otherwise set the size of every one.
         channel: Box<UdpChannel>,
         /// Where it resolved to; [`None`] is an address that did not resolve,
-        /// which is kept and skipped rather than refused (`:5337-5343`).
+        /// which is kept and skipped rather than refused (`:5434-5440`).
         address: Option<SocketAddr>,
         /// The id the client removes it by.
         registration_id: i64,
@@ -201,7 +201,7 @@ pub enum SenderEvent {
     },
     /// A revoked publication has nothing left to tell its readers
     /// (`aeron_network_publication_check_managed_resources`'s LINGER arm,
-    /// `:1327-1340`), so the conductor may finish releasing it.
+    /// `:1368-1381`), so the conductor may finish releasing it.
     ///
     /// It is the second half of a two-phase removal: the client's link goes
     /// when it asks to, and the publication stays long enough to say
@@ -219,12 +219,12 @@ pub enum SenderEvent {
     /// An endpoint has heard nothing for its destination timeout, so its
     /// channel's name has to be resolved again
     /// (`aeron_driver_conductor_proxy_on_re_resolve_endpoint`,
-    /// `aeron-driver/src/main/c/aeron_driver_conductor_proxy.c:73-89`).
+    /// `aeron-driver/src/main/c/aeron_driver_conductor_proxy.c:78-94`).
     ///
     /// The conductor resolves it and answers with
     /// [`SenderCommand::ResolutionChange`] — or with nothing at all, when the
     /// name resolves to the address the endpoint already has, which is the
-    /// reference's `memcmp` (`aeron_driver_conductor.c:6932-6938`).
+    /// reference's `memcmp` (`aeron_driver_conductor.c:7028-7034`).
     ReResolveEndpoint {
         /// Which endpoint, by the id the conductor knows it by.
         endpoint_id: u64,
@@ -237,12 +237,12 @@ pub enum SenderEvent {
     },
     /// A responder answered a publication that asked for a response channel
     /// (`aeron_driver_conductor_proxy_on_response_setup`,
-    /// `aeron_driver_conductor_proxy.c:157-172`).
+    /// `aeron_driver_conductor_proxy.c:162-177`).
     ///
     /// The frame named the publication; the correlation id is read off the
     /// publication itself, which is what ties the answer to the subscription
     /// waiting for it — the frame carries no correlation id of its own
-    /// (`aeron_send_channel_endpoint.c:738-748`).
+    /// (`aeron_send_channel_endpoint.c:731-741`).
     ResponseSetup {
         /// The registration id of the subscription the publication was made
         /// for.
@@ -253,7 +253,7 @@ pub enum SenderEvent {
     /// A publication's receiver refused the stream: an `ERR` frame named this
     /// publication, and its client has to be told
     /// (`aeron_driver_conductor_proxy_on_publication_error`,
-    /// `aeron_driver_conductor_proxy.c:207-242`).
+    /// `aeron_driver_conductor_proxy.c:212-247`).
     ///
     /// The reference's sender reaches the conductor's handler directly through
     /// the proxy. Here the words travel as an event and the conductor sends the
@@ -265,7 +265,7 @@ pub enum SenderEvent {
     },
     /// A publication heard from a live receiver for the first time
     /// (`aeron_driver_conductor_proxy_on_response_connected`,
-    /// `aeron_driver_conductor_proxy.c:160-170`).
+    /// `aeron_driver_conductor_proxy.c:165-175`).
     ///
     /// The handshake a response channel runs is one-way until this: the image
     /// keeps saying the response session on every status-message period, and
@@ -496,6 +496,7 @@ impl Sender {
         status_message_timeout_ns: i64,
         send_to_sm_poll_ratio: u8,
         timer_interval_ns: i64,
+        poller_iteration_threshold: usize,
     ) -> io::Result<Self> {
         let SenderParts { proxy, agent } = Self::split(
             cnc,
@@ -509,6 +510,7 @@ impl Sender {
             status_message_timeout_ns,
             send_to_sm_poll_ratio,
             timer_interval_ns,
+            poller_iteration_threshold,
             &crate::media::TransportBindings::Default,
         )?;
 
@@ -546,6 +548,7 @@ impl Sender {
         status_message_timeout_ns: i64,
         send_to_sm_poll_ratio: u8,
         timer_interval_ns: i64,
+        poller_iteration_threshold: usize,
         bindings: &crate::media::TransportBindings,
     ) -> io::Result<SenderParts> {
         let (command_tx, command_rx) = mpsc::channel::<SenderCommand>();
@@ -573,7 +576,7 @@ impl Sender {
                 status_message_timeout_ns,
                 send_to_sm_poll_ratio,
                 timer_interval_ns,
-                bindings.poller(crate::media::Affinity::Sender),
+                bindings.poller(crate::media::Affinity::Sender, poller_iteration_threshold),
                 deepmsg_core::clock::monotonic_nano_time(),
                 event_tx,
                 command_rx,
@@ -612,7 +615,7 @@ fn stopped() -> io::Error {
 /// The publication a pass starts from, advancing the index for the next one.
 ///
 /// The reference's own reckoning, wrap included
-/// (`aeron_driver_sender.c:421-427`; Java the same, `Sender.java:227-231`): it
+/// (`aeron_driver_sender.c:423-429`; Java the same, `Sender.java:209-213`): it
 /// post-increments before it looks, and a wrap resets the index to **one**
 /// rather than to zero, because the pass that wrapped has already been counted.
 /// A count of one or zero publications therefore always starts at zero, and a
@@ -653,8 +656,8 @@ pub(crate) struct SenderThread {
     maintenance: Timer,
     publications: Vec<NetworkPublication>,
     /// Which publication the next pass of [`SenderThread::send_publications`]
-    /// starts from (`aeron_driver_sender.c:421`, `Sender.java:227`; both start
-    /// at zero, `aeron_driver_sender.c:94`).
+    /// starts from (`aeron_driver_sender.c:423`, `Sender.java:209`; both start
+    /// at zero, `aeron_driver_sender.c:97`).
     round_robin_index: usize,
     /// One buffer per receive slot, allocated once.
     buffers: Vec<Vec<u8>>,
@@ -674,7 +677,7 @@ pub(crate) struct SenderThread {
     /// The command loop has none — they arrive with [`SenderThread::do_work`] —
     /// and a tracker writes `mdc-num-dest` whenever its table changes. The
     /// reference applies these at the top of its send pass for the same reason
-    /// (`aeron_driver_sender.c:196-200`).
+    /// (`aeron_driver_sender.c:198-202`).
     pending_destinations: Vec<SenderCommand>,
     last_cycle_ns: i64,
     /// When this sender reads its control sockets, and how often.
@@ -717,7 +720,7 @@ impl SenderThread {
             publications: Vec::new(),
             round_robin_index: 0,
             // `sender->recv_buffers.vector_capacity`
-            // (`aeron_driver_sender.c:49`) — a pool sized by the setting whose
+            // (`aeron_driver_sender.c:42`) — a pool sized by the setting whose
             // first entry is the only one a poll fills, which is the reference's
             // own arrangement.
             buffers: (0..io_vector_capacity.max(DATAGRAMS_PER_CONTROL_POLL))
@@ -813,7 +816,7 @@ impl SenderThread {
     /// due — read the control sockets
     /// (`aeron_driver_sender_do_work`,
     /// `aeron-driver/src/main/c/aeron_driver_sender.c:132-190`: the send is
-    /// `aeron_driver_sender_do_send` at `:416-458`, and the decision below is
+    /// `aeron_driver_sender_do_send` at `:418-460`, and the decision below is
     /// `:149-152`).
     ///
     /// The order is the reference's and it is load-bearing: what a status
@@ -845,8 +848,8 @@ impl SenderThread {
         );
         // The reference runs both of these from the conductor, on its timer
         // tier — `aeron_network_publication_check_managed_resources`
-        // (`aeron_network_publication.c:1270-1290`), reached from
-        // `aeron_driver_conductor_on_check_managed_resources` (`:1692`), whose
+        // (`aeron_network_publication.c:1289-1309`), reached from
+        // `aeron_driver_conductor_on_check_managed_resources` (`:1733`), whose
         // `on_time_event` the publication list is wired to at `:766`. They run
         // here because the publications are this thread's; the deadline is the
         // same one. See [`Timer`].
@@ -858,7 +861,7 @@ impl SenderThread {
         // One decision for the pass: the send loop notices a revoke under the
         // same gate the two checks below run under, and all three are the
         // reference's `aeron_network_publication_check_managed_resources`
-        // (`aeron_network_publication.c:1240-1290`) on the conductor's tier.
+        // (`aeron_network_publication.c:1259-1309`) on the conductor's tier.
         let maintenance_due = self.maintenance.is_due(now_ns);
 
         if maintenance_due {
@@ -889,7 +892,7 @@ impl SenderThread {
         }
 
         // Read before the send, because a short send this pass is one of the
-        // four things that asks for the poll below (`:145-155`).
+        // four things that asks for the poll below (`:140-150`).
         let short_sends_before = system.value(system_counters::id::SHORT_SENDS);
 
         let mut work = Self::send_publications(
@@ -921,7 +924,7 @@ impl SenderThread {
                 &mut self.endpoints,
                 &mut self.publications,
                 // One datagram per poll, as the reference's sender reads
-                // (`aeron_driver_sender.c:154`, `:170`): the capacity sizes the
+                // (`aeron_driver_sender.c:154`, `:147`): the capacity sizes the
                 // pool, it does not decide how much of it a poll fills.
                 &mut self.buffers[..DATAGRAMS_PER_CONTROL_POLL],
                 &mut self.datagrams,
@@ -949,7 +952,7 @@ impl SenderThread {
     }
 
     /// Apply the destination changes the conductor asked for
-    /// (`aeron_driver_sender_do_send`, `:196-200`).
+    /// (`aeron_driver_sender_do_send`, `:198-202`).
     ///
     /// An endpoint that has gone away, or one whose channel is not
     /// multi-destination, is skipped: the client has already been answered, and
@@ -1009,9 +1012,9 @@ impl SenderThread {
     /// `aeron_network_publication.c:1011-1031`).
     ///
     /// The reference runs this from the **conductor**, on its timer tier —
-    /// `aeron_network_publication_on_time_event` (`:1287`, and only for a
+    /// `aeron_network_publication_on_time_event` (`:1306`, and only for a
     /// publication that is not exclusive), reached from
-    /// `aeron_driver_conductor_on_check_managed_resources` (`:1692`, `:1472`).
+    /// `aeron_driver_conductor_on_check_managed_resources` (`:1733`, `:1472`).
     /// It runs here for the reason the pass above does: everything it touches —
     /// the publication's log, its sender position, its own deadline — is on this
     /// thread, and the conductor holds only a *record* of a network publication
@@ -1037,7 +1040,7 @@ impl SenderThread {
 
     /// Ask about the names of the endpoints that have gone quiet
     /// (`aeron_udp_transport_poller_check_send_endpoint_re_resolutions`,
-    /// `media/aeron_udp_transport_poller.c:295-310`, which the sender calls on
+    /// `media/aeron_udp_transport_poller.c:332-347`, which the sender calls on
     /// its own deadline, `aeron_driver_sender.c:183-188`).
     ///
     /// One **event** per endpoint that needs it, because the resolution is the
@@ -1104,7 +1107,7 @@ impl SenderThread {
 
     /// Apply the answers the conductor sent back
     /// (`aeron_driver_sender_on_resolution_change`,
-    /// `aeron-driver/src/main/c/aeron_driver_sender.c:400-415`).
+    /// `aeron-driver/src/main/c/aeron_driver_sender.c:402-417`).
     ///
     /// The endpoint may be gone — a client can close the publication while a
     /// name is being resolved — and a command for an endpoint that is not there
@@ -1115,7 +1118,7 @@ impl SenderThread {
     /// `Resolution changes` is counted **here**, on the thread that made the
     /// change, which is the reference's own arrangement: the counter is the
     /// sender's (`sender->resolution_changes_counter`,
-    /// `aeron_driver_sender.c:110-111`), and a receiver counts its own.
+    /// `aeron_driver_sender.c:113-114`), and a receiver counts its own.
     fn apply_resolution_changes(
         endpoints: &mut [(u64, Box<SendChannelEndpoint>)],
         pending: &mut Vec<(u64, String, SocketAddr)>,
@@ -1134,7 +1137,7 @@ impl SenderThread {
                 .is_err()
             {
                 // A transport that will not reconnect is the reference's own
-                // failure here (`:408-414`, which logs and counts nothing).
+                // failure here (`:410-416`, which logs and counts nothing).
                 continue;
             }
 
@@ -1147,7 +1150,7 @@ impl SenderThread {
 
     /// Read everything the endpoints' sockets hold and hand each frame to the
     /// publication it names (`aeron_send_channel_endpoint_dispatch`,
-    /// `media/aeron_send_channel_endpoint.c:463-516`).
+    /// `media/aeron_send_channel_endpoint.c:456-509`).
     #[allow(clippy::too_many_arguments)] // the fields of one pass, made explicit
     fn receive_control_frames(
         endpoints: &mut [(u64, Box<SendChannelEndpoint>)],
@@ -1259,7 +1262,7 @@ impl SenderThread {
     }
 
     /// One frame, to the publication that names it
-    /// (`aeron_send_channel_endpoint_dispatch`, `:463-516`).
+    /// (`aeron_send_channel_endpoint_dispatch`, `:456-509`).
     ///
     /// An associated function rather than a method so that the borrow of the
     /// datagram buffers and the borrow of the publication list are visibly
@@ -1298,7 +1301,7 @@ impl SenderThread {
                 // out of it. What it is measured against is the publication's
                 // term length when a publication here answers to it, and the
                 // largest a term may be otherwise
-                // (`aeron_send_channel_endpoint.c:589-596`, `:613-617`).
+                // (`aeron_send_channel_endpoint.c:582-589`, `:606-610`).
                 let index = index_of_publication(
                     publications,
                     endpoints[endpoint_index].0,
@@ -1315,7 +1318,7 @@ impl SenderThread {
 
                 // Counted whether or not a publication here can read it: the
                 // counter answers "is the far end talking to us", which does not
-                // depend on our recognising what it said (`:625`).
+                // depend on our recognising what it said (`:618`).
                 system.increment(system_counters::id::STATUS_MESSAGES_RECEIVED);
 
                 let is_send_setup = header.flags & header_flags::SM_SEND_SETUP != 0;
@@ -1325,13 +1328,13 @@ impl SenderThread {
                 // `aeron_network_publication.c:841-856`) — and one the
                 // *destinations* must not act on either. The reference refuses
                 // it before the tracker ever sees it
-                // (`aeron_send_channel_endpoint.c:627-634`), so a message that
+                // (`aeron_send_channel_endpoint.c:620-627`), so a message that
                 // is not believed cannot keep a destination alive or bring one
                 // into being.
                 //
                 // `SEND_SETUP` is not a position report — it is a receiver
                 // saying it has no image and wants the stream described
-                // (`:649-656`) — so it is exempt from that check, which is what
+                // (`:642-649`) — so it is exempt from that check, which is what
                 // the reference's guard says too.
                 if !is_send_setup {
                     if let Some(index) = index {
@@ -1350,7 +1353,7 @@ impl SenderThread {
                 // reaches them whether or not a publication here answers to the
                 // frame: on a dynamic channel a status message from somewhere
                 // unknown *creates* a destination, which is the only way such a
-                // channel learns one (`:636-645`).
+                // channel learns one (`:629-638`).
                 if let Some(address) = source {
                     if let Some(tracker) = endpoints[endpoint_index].1.destination_tracker_mut() {
                         tracker.on_status_message(
@@ -1374,7 +1377,7 @@ impl SenderThread {
 
                 // The endpoint remembers when it last heard from anyone at all,
                 // which is what its own re-resolution measures
-                // (`aeron_send_channel_endpoint.c:658`, the line `:765` reads).
+                // (`aeron_send_channel_endpoint.c:651`, the line `:758` reads).
                 endpoints[endpoint_index].1.on_status_message(now_ns);
 
                 if let Some(response_correlation_id) = publications[index].on_status_message(
@@ -1397,7 +1400,7 @@ impl SenderThread {
 
                 // A gap report is only checked when a publication answers to it,
                 // because the term length it is measured against is that
-                // publication's (`:549-552`).
+                // publication's (`:542-545`).
                 let Some(index) = index_of_publication(
                     publications,
                     endpoints[endpoint_index].0,
@@ -1424,7 +1427,7 @@ impl SenderThread {
 
                 // The resend happens *inside* `on_nak` when the channel's delay
                 // is zero — the same place the reference's callback fires
-                // (`aeron_retransmit_handler.c:110-124`).
+                // (`aeron_retransmit_handler.c:115-129`).
                 let _ = publication.on_nak(&frame, &system, endpoint, counters, regions, now_ns);
             }
             frame_type::ERR => {
@@ -1465,7 +1468,7 @@ impl SenderThread {
                 // The reference asks the endpoint's destination tracker which
                 // destination the datagram belongs to, and answers
                 // `AERON_NULL_VALUE` when there is no tracker at all
-                // (`media/aeron_send_channel_endpoint.c:685-691`).
+                // (`media/aeron_send_channel_endpoint.c:678-684`).
                 let destination_registration_id = source
                     .and_then(|source| {
                         endpoints
@@ -1503,7 +1506,7 @@ impl SenderThread {
                 // A measurement request. Answering it is the publication's job,
                 // not the flow control strategy's: the strategy that *asks* for
                 // measurements is the peer's, and the one here has nothing to
-                // do with the answer (`aeron_send_channel_endpoint.c:709-728`).
+                // do with the answer (`aeron_send_channel_endpoint.c:702-721`).
                 if let Some(frame) = RttmFrame::read(bytes) {
                     let Some(index) = index_of_publication(
                         publications,
@@ -1537,7 +1540,7 @@ impl SenderThread {
             frame_type::RSP_SETUP => {
                 // A responder answering a publication that asked for a
                 // response channel. The reference does three things and no
-                // more (`aeron_send_channel_endpoint.c:730-751`): find the
+                // more (`aeron_send_channel_endpoint.c:723-744`): find the
                 // publication the frame names, read *its* correlation id, and
                 // report that to the conductor. An unresolvable frame, or one
                 // whose publication never asked for a response, is silence —
@@ -1569,8 +1572,8 @@ impl SenderThread {
     ///
     /// The reference walks its publications from `round_robin_index++`, whoever
     /// that lands on going first and the rest following in order after the wrap
-    /// (`aeron_driver_sender.c:421-427`, `:429-450`; Java is the same shape,
-    /// `Sender.java:227-231`). This does too. The set of datagrams a pass sends
+    /// (`aeron_driver_sender.c:423-429`, `:431-452`; Java is the same shape,
+    /// `Sender.java:209-213`). This does too. The set of datagrams a pass sends
     /// is the same either way — what the rotation changes is which one a pass
     /// reaches *first*.
     ///
@@ -1600,14 +1603,14 @@ impl SenderThread {
         maintenance_due: bool,
     ) -> usize {
         // Bytes, not publications: the reference's `do_send` returns
-        // `bytes_sent` and its duty cycle keys on that (`:150`, `:455`), so a
+        // `bytes_sent` and its duty cycle keys on that (`:150`, `:464`), so a
         // pass that walked ten publications and sent nothing is a pass that
         // sent nothing.
         let mut bytes_sent = 0;
 
         let starting_index = advance_round_robin(round_robin_index, publications.len());
 
-        // The two loops of `aeron_driver_sender.c:429-455` as one walk: from the
+        // The two loops of `aeron_driver_sender.c:431-457` as one walk: from the
         // starting publication to the end, then from the beginning to it. The
         // `continue` below skips a publication for this pass either way, which
         // is what the reference's does too.
@@ -1626,7 +1629,7 @@ impl SenderThread {
             // the reference notices it on the managed-resource tier, in the
             // same function as the two checks above
             // (`aeron_network_publication_check_managed_resources`'s ACTIVE
-            // arm, `aeron_network_publication.c:1246-1250`). It runs there
+            // arm, `aeron_network_publication.c:1265-1269`). It runs there
             // here too: what that tier decides is how soon a revoked
             // publication is told, and the reference's answer is an interval,
             // not a pass.
@@ -1663,7 +1666,7 @@ impl SenderThread {
 
     /// Measure the pass that just ended, and count it if it ran long — the
     /// same duty-cycle tracker the conductor keeps, on the sender's two
-    /// counters (`aeron-driver/src/main/c/aeron_driver_sender.c:262-276`).
+    /// counters (`aeron-driver/src/main/c/aeron_driver_sender.c:264-278`).
     fn track_cycle(
         counters: &CounterManager,
         regions: &CounterRegions<'_>,
@@ -1692,8 +1695,8 @@ impl SenderThread {
 }
 
 /// When the sender reads its control sockets, and how often — the reference's
-/// duty cycle for the poll (`aeron_driver_sender.c:94-98` sets it up, `:149-152`
-/// is the decision, `:179-180` is the poll).
+/// duty cycle for the poll (`aeron_driver_sender.c:97-101` sets it up, `:149-152`
+/// is the decision, `:157-158` is the poll).
 ///
 /// A sender that read its control sockets on every pass would spend a syscall
 /// per pass on a stream that is usually sending: the sockets carry status
@@ -1708,7 +1711,7 @@ struct DutyCycle {
     /// on a pass that sent nothing, because such a pass reads anyway.
     counter: u8,
     /// The longest the sender may go without reading at all: half the
-    /// status-message timeout (`:97`, whose `/ 2` is the reference's own).
+    /// status-message timeout (`:100`, whose `/ 2` is the reference's own).
     read_timeout_ns: i64,
     /// When the next read is due by time. Zero at startup, so the first pass
     /// reads.
@@ -1775,7 +1778,7 @@ impl DutyCycle {
 /// The lookup is the **arriving endpoint's**, which is what the reference's is:
 /// every control frame is answered out of `endpoint->publication_dispatch_map`,
 /// keyed by stream and session, on the endpoint the datagram came in on
-/// (`media/aeron_send_channel_endpoint.c:560`, `:616`, `:697`, `:722`, `:740`).
+/// (`media/aeron_send_channel_endpoint.c:553`, `:609`, `:690`, `:715`, `:733`).
 ///
 /// It has to be, because (stream, session, endpoint) is not a unique key across
 /// a driver: a publication that names another's session with
@@ -1798,7 +1801,7 @@ fn index_of_publication(
 
 /// Whether a gap report names a frame a term could hold
 /// (`aeron_send_channel_endpoint_is_valid_nak`,
-/// `media/aeron_send_channel_endpoint.c:519-526`).
+/// `media/aeron_send_channel_endpoint.c:512-519`).
 ///
 /// A report that names an unaligned offset, or a length that runs past the end
 /// of the term, is one the retransmit path would otherwise read a frame out of
@@ -1815,7 +1818,7 @@ fn is_valid_nak(frame: &NakFrame, term_length: i32) -> bool {
 }
 
 /// Whether a status message reports a position and a window a term could hold
-/// (`aeron_send_channel_endpoint_is_valid_status_message`, `:589-596`).
+/// (`aeron_send_channel_endpoint_is_valid_status_message`, `:582-589`).
 fn is_valid_status_message(frame: &StatusMessageFrame, term_length: i32) -> bool {
     let term_buffer_length = i64::from(term_length);
     let term_offset = i64::from(frame.consumption_term_offset);
@@ -1828,7 +1831,7 @@ fn is_valid_status_message(frame: &StatusMessageFrame, term_length: i32) -> bool
 }
 
 /// Whether an error frame's text fits inside its own frame
-/// (`aeron_send_channel_endpoint_is_valid_error`, `:658-662`).
+/// (`aeron_send_channel_endpoint_is_valid_error`, `:651-655`).
 fn is_valid_error(frame: &ErrorFrame, frame_length: i32) -> bool {
     let error_length = i64::from(frame.error_length);
 
@@ -1954,7 +1957,7 @@ mod tests {
     }
 
     /// The deadline is `status_message_timeout_ns / 2`, and it asks for a read
-    /// on its own (`aeron_driver_sender.c:97`).
+    /// on its own (`aeron_driver_sender.c:100`).
     #[test]
     fn the_read_timeout_asks_for_a_read_by_itself() {
         let mut duty = DutyCycle::new(6, 1_000_000);
@@ -2243,6 +2246,7 @@ mod tests {
             crate::config::RCV_STATUS_MESSAGE_TIMEOUT_NS_DEFAULT,
             crate::config::SEND_TO_STATUS_POLL_RATIO_DEFAULT,
             crate::config::TIMER_INTERVAL_NS_DEFAULT,
+            crate::config::UDP_CHANNEL_TRANSPORT_POLLER_ITERATION_THRESHOLD_DEFAULT,
         )
         .expect("a sender");
 

@@ -242,7 +242,7 @@ pub struct ReplaySession {
     aborted: bool,
     /// What this turn's read was: the bytes `readRecording` answered with, and
     /// the nanoseconds the read and the frame walk took — the two numbers the
-    /// replayer's counters 108–110 are fed (`ArchiveConductor.java:431-434`).
+    /// replayer's counters 108–110 are fed (`ArchiveConductor.java:430-433`).
     ///
     /// **This turn's**, not a running total: the totals are the replayer's
     /// (`crate::server::replayer::ReadTotals`), which is where the reference
@@ -785,7 +785,7 @@ impl ReplaySession {
     ///
     /// The read and the comparison are [`segment::header_matches_position`]'s,
     /// because a truncate asks the same question of the same file
-    /// (`ArchiveConductor.java:2550`). What is this method's is the **words** a
+    /// (`ArchiveConductor.java:2585`). What is this method's is the **words** a
     /// replay refuses in.
     fn check_aligned_to_fragment(&self, publication: &dyn Publication) -> Result<(), String> {
         let file = self.file.as_ref().ok_or("no segment file")?;
@@ -807,7 +807,7 @@ impl ReplaySession {
         if !matches {
             // `raiseError("replayPosition=" + framePosition(0) + " does not
             // point to a valid frame", …)` (`:332-333`), and `framePosition`
-            // spells the four numbers it is made of (`:463-471`). A reference
+            // spells the four numbers it is made of (`:462-470`). A reference
             // test asserts this text whole (`ReplaySessionTest.java:311-313`),
             // so it is spelled the same way here.
             return Err(format!(

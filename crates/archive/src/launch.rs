@@ -10,12 +10,12 @@
 //!   [`DriverHalf::Owned`], and the seam for the invoker is [`Driver::do_work`],
 //!   whose own documentation says it is "the entry point for a caller that
 //!   embeds the driver and drives it itself".
-//! - `Archive.main` (`Archive.java:183-184`) "launch[es] an `Archive` that
+//! - `Archive.main` (`Archive.java:189-190`) "launch[es] an `Archive` that
 //!   communicates with an out of process `MediaDriver` and await[s] a shutdown
 //!   signal" — the archive **attaches** to a driver somebody else started. That
 //!   is [`DriverHalf::Attached`]: nothing here advances the driver, because the
 //!   process that owns it does, and the archive allocates an error counter of
-//!   its own rather than being handed one (`Archive.java:1354-1361`).
+//!   its own rather than being handed one (`Archive.java:1420-1427`).
 //!
 //! The C archive suite spawns both: 214 of the 276 archive spawns a rehearsal
 //! counted are `ArchivingMediaDriver`, and 56 are `Archive`
@@ -46,9 +46,9 @@
 //! writes.
 //!
 //! The reference writes `signalReady` at the end of `Context.conclude()`
-//! (`Archive.java:1665`), which is *before* its conductor is constructed
+//! (`Archive.java:1733`), which is *before* its conductor is constructed
 //! (`:146-147`) and before either control subscription exists
-//! (`ArchiveConductor.java:229-241`). So the reference is exposed to a first
+//! (`ArchiveConductor.java:228-240`). So the reference is exposed to a first
 //! connect that arrives in that window. This build creates the mark file last,
 //! after both subscriptions are in place, which costs nothing and cannot fail
 //! a case the reference passes.
@@ -299,7 +299,7 @@ impl DriverHalf<'_> {
     /// archive error is counted where a driver error is.
     ///
     /// Attached: one the archive allocates for itself, which is the reference's
-    /// answer to the same absence (`Archive.java:1354-1361` is the `null ==
+    /// answer to the same absence (`Archive.java:1420-1427` is the `null ==
     /// errorCounter` arm of `conclude`, reached whenever no `ArchivingMediaDriver`
     /// handed one over): type `ARCHIVE_ERROR_COUNT_TYPE_ID` (101), keyed by the
     /// archive id, labelled `Archive Errors` + the archive id
@@ -310,10 +310,10 @@ impl DriverHalf<'_> {
         };
 
         // An archive id another archive is already serving is refused **by the
-        // 101 counter it would have allocated** (`Archive.java:1356-1360`), and
+        // 101 counter it would have allocated** (`Archive.java:1422-1426`), and
         // the message is the reference's own. This is the standalone path's
         // check; the 105 one the launcher makes for both paths is a different
-        // question with a different answer (`ArchiveConductor.java:1587-1593`).
+        // question with a different answer (`ArchiveConductor.java:1594-1600`).
         let counters = client
             .counters_reader()
             .ok_or_else(|| "the counter region is not readable".to_owned())?;
@@ -357,7 +357,7 @@ pub fn run(
     let aeron_dir = archive_config.aeron_dir.clone();
 
     // The archive's own directory, before anything is put in it
-    // (`Archive.java:1275-1282`), where the reference does it in `conclude`:
+    // (`Archive.java:1341-1348`), where the reference does it in `conclude`:
     // an archive told to start clean deletes what is there, and either way both
     // directories are made if they are missing.
     //
@@ -393,7 +393,7 @@ pub fn run(
 
     // The control channel the archive subscribes to is not quite the one it was
     // configured with: the reference forces its own sparse setting into the
-    // channel before subscribing (`ArchiveConductor.java:231-232`). In place,
+    // channel before subscribing (`ArchiveConductor.java:230-231`). In place,
     // so that a channel which already carries one keeps its position — the
     // channel's text is its identity.
     let control_channel = match (
@@ -423,7 +423,7 @@ pub fn run(
     };
 
     // Always, and with no condition on it: the reference builds the local one
-    // unconditionally (`:239-240`), and it is what makes an IPC client able to
+    // unconditionally (`:238-239`), and it is what makes an IPC client able to
     // reach the archive at all.
     let local_subscription_id = half.add_subscription(
         &mut client,
@@ -431,7 +431,7 @@ pub fn run(
         archive_config.local_control_stream_id,
     )?;
 
-    // Where the reference concludes it (`Archive.java:1354-1361`), which is
+    // Where the reference concludes it (`Archive.java:1420-1427`), which is
     // before the ready byte rather than after it: an archive that refuses this
     // id should not have signalled ready under it first.
     let archive_id = archive_config.archive_id.unwrap_or(ARCHIVE_ID_DEFAULT);
@@ -441,7 +441,7 @@ pub fn run(
         .map_err(|error| format!("could not open the counter region: {error}"))?;
 
     // ★ P2-9b: the three agents' duty-cycle counters, allocated where the
-    // reference allocates them (`Archive.Context.conclude`, `Archive.java:1402-1480`)
+    // reference allocates them (`Archive.Context.conclude`, `Archive.java:1470-1548`)
     // — at start-up, before the conductor has a turn to be measured by. Six
     // counters, of which a `SHARED` archive measures one pair (see [`DutyCycles`]).
     //
@@ -451,7 +451,7 @@ pub fn run(
     let duty_cycle_requests = request_duty_cycles(&mut client, archive_config, archive_id)?;
 
     // An archive id that is already being recorded by is one this archive
-    // refuses to serve (`Archive.java:1589-1595`): the reference looks for a
+    // refuses to serve (`Archive.java:1657-1663`): the reference looks for a
     // 105 — the recorder's max write time, the one counter a second archive
     // would fight the first over — and throws out of `conclude` if it finds one.
     // The check is a **read** of the counters region, so unlike the allocation
@@ -476,21 +476,21 @@ pub fn run(
     // dealt with.
     //
     // Two things about the call are worth stating, because the reference's are
-    // implicit. The capacity is `aeron.archive.catalog.capacity` (`Archive.java:487`,
-    // read as a size at `:861`) — **not** `aeron.archive.max.catalog.entries`,
+    // implicit. The capacity is `aeron.archive.catalog.capacity` (`Archive.java:516`,
+    // read as a size at `:923`) — **not** `aeron.archive.max.catalog.entries`,
     // which this used to pass the default of: that name has no reader in the
     // reference either (`maxCatalogEntries()` is defined and never called), so
     // what a deployment set there was being used as the file's starting size.
     // And a
     // **fresh** catalog starts at recording id 0, because the reference's field
     // starts at 0 and `Archive` constructs its `Catalog` without seeding it
-    // (`Catalog.java:148`, `Archive.java:1503-1511`).
+    // (`Catalog.java:151`, `Archive.java:1571-1579`).
     // And the third: how much of it is forced, which is
-    // `aeron.archive.catalog.file.sync.level` (`Catalog.java:161-162` for the two
-    // flags, `:226` for the directory force a *new* catalog takes). The reference
+    // `aeron.archive.catalog.file.sync.level` (`Catalog.java:164-165` for the two
+    // flags, `:229` for the directory force a *new* catalog takes). The reference
     // hands its `Catalog` the same level it handed `RecordingWriter`, having
     // refused a catalog below it before either was built
-    // (`Archive.java:1202-1205`, and `server::config` refuses it in the same
+    // (`Archive.java:1268-1271`, and `server::config` refuses it in the same
     // words).
     let mut catalog = Catalog::open_or_create(
         &archive_config.archive_dir,
@@ -504,7 +504,7 @@ pub fn run(
     // recording that was being written when the last archive died has a `VALID`
     // record and a **null** stop position, because the position is written when
     // a recording stops and this one never did. The reference repairs every
-    // descriptor as it loads the catalog (`Catalog.java:228-231`); this build's
+    // descriptor as it loads the catalog (`Catalog.java:231-234`); this build's
     // repair is a method precisely so a *reader* — `ArchiveTool describe` is one
     // — does not write to somebody's catalog because it looked at it, and the
     // archive starting up is the caller that means it.
@@ -519,7 +519,7 @@ pub fn run(
     // (`Archive.Configuration.recordChecksum()` is empty unless
     // `aeron.archive.record.checksum` names a class); the recording's stop
     // **timestamp** is now, which is the reference's answer too
-    // (`Catalog.java:1093-1095`) — the time it actually stopped is not knowable
+    // (`Catalog.java:1096-1098`) — the time it actually stopped is not knowable
     // from the files.
     let repaired = catalog
         .refresh_and_fix(None, clock::epoch_millis())
@@ -535,7 +535,7 @@ pub fn run(
     let mark_file = create_mark_file(archive_config, control_channel.as_deref(), &aeron_dir)?;
 
     // The ready byte, which is the mark file's *version* field rather than its
-    // length (`ArchiveMarkFile.java:331-338`). Written here, after everything
+    // length (`ArchiveMarkFile.java:342-349`). Written here, after everything
     // that serves is up, rather than where the reference writes it.
     mark_file
         .signal_ready(clock::epoch_millis())
@@ -543,7 +543,7 @@ pub fn run(
 
     // ★ P2-9a, and the whole of what `aeron.archive.threading.mode` decides:
     // under `DEDICATED` the recorder and the replayer are agents on threads of
-    // their own (`DedicatedModeArchiveConductor.java:54-55`), so what the
+    // their own (`DedicatedModeArchiveConductor.java:64-65`), so what the
     // conductor holds is a channel to each; under `SHARED` both are the
     // conductor's own objects, driven inside the conductor's turn
     // (`SharedModeArchiveConductor.java:57-66`). The **conductor** is on a thread
@@ -558,7 +558,7 @@ pub fn run(
             archive_id,
             &aeron_dir,
             // `ctx.recorderIdleStrategy()`, which is the recorder's own name or
-            // — when that names nothing — the archive's (`Archive.java:1423-1431`);
+            // — when that names nothing — the archive's (`Archive.java:1491-1499`);
             // the fallback is resolved in the configuration, where both names can
             // be refused in the same words.
             archive_config.recorder_idle_strategy.strategy(),
@@ -571,7 +571,7 @@ pub fn run(
         (RecorderHalf::new(archive_id), None)
     };
 
-    // `ArchiveConductor.java:224-225`, in the one place this build can put it:
+    // `ArchiveConductor.java:223-224`, in the one place this build can put it:
     // the reference builds the publication on its conductor because its
     // conductor owns the `Aeron`; here the client is the launcher's, so the
     // publication is asked for and taken here and handed to whatever runs the
@@ -595,7 +595,7 @@ pub fn run(
         let (thread, worker) = ReplayerThread::pair(
             archive_id,
             &aeron_dir,
-            // `ctx.replayerIdleStrategy()`, the same rule (`:1433-1440`).
+            // `ctx.replayerIdleStrategy()`, the same rule (`:1501-1508`).
             archive_config.replayer_idle_strategy.strategy(),
             COMMAND_TIMEOUT,
             archive_config.replayer_cycle_threshold_ns,
@@ -628,7 +628,7 @@ pub fn run(
         std::process::id()
     );
 
-    // The reference's `ctx.idleStrategy()` (`Archive.java:1397-1399`), made once
+    // The reference's `ctx.idleStrategy()` (`Archive.java:1465-1467`), made once
     // for the conductor's own loop — `AgentRunner.run` asks its context for one
     // strategy per runner and idles with it after every pass
     // (`org.agrona.concurrent.AgentRunner`), which is what this is.
@@ -669,8 +669,8 @@ pub fn run(
     // ★ The conductor is an agent on a thread of its own in **both** the
     // reference's running modes — `DEDICATED` and `SHARED` alike are
     // `AgentRunner.startOnThread(archive.conductorRunner, ctx.threadFactory())`
-    // (`Archive.java:262`) — and the process's own thread only waits
-    // (`barrier.await()`, `:201`). This build puts it there when there is more
+    // (`Archive.java:268`) — and the process's own thread only waits
+    // (`barrier.await()`, `:207`). This build puts it there when there is more
     // than one agent, which is where the two would otherwise be on one thread.
     //
     // What it costs is a scope: an archive that owns its media driver drives it
@@ -727,7 +727,7 @@ fn run_conductor(
     // it is here, outside the loop, and not on the signal path only.
     //
     // It is a method rather than a `Drop` for the reason the reference rethrows
-    // it (`LangUtil.rethrowUnchecked`, `:1115`): a failure has to be sayable,
+    // it (`LangUtil.rethrowUnchecked`, `:1118`): a failure has to be sayable,
     // and a drop cannot say anything.
     //
     // When both the loop and the close have something to report, **the loop
@@ -772,7 +772,7 @@ fn run_turns(
     }
 }
 
-/// `IoUtil.ensureDirectoryExists` (`Archive.java:1281-1282`), which makes the
+/// `IoUtil.ensureDirectoryExists` (`Archive.java:1347-1348`), which makes the
 /// directory and refuses a path that is something else.
 ///
 /// `create_dir_all` is Agrona's `mkdirs`; the second check is Agrona's, and the
@@ -796,7 +796,7 @@ fn ensure_directory(path: &Path, name: &str) -> Result<(), String> {
 }
 
 /// Create the archive's mark file, sized and ready to be written.
-/// Ask for the six duty-cycle counters (`Archive.java:1402-1480`).
+/// Ask for the six duty-cycle counters (`Archive.java:1470-1548`).
 ///
 /// **Asked for, not allocated**: this runs before anything is driven, and in the
 /// process where the archive and the driver are one binary nobody is driving the
@@ -841,7 +841,7 @@ fn create_mark_file(
         control_channel,
         local_control_channel: &archive_config.local_control_channel,
         // Nothing records yet, so no events channel exists to name
-        // (`Archive.java:1216-1226` requires the control channel; the events
+        // (`Archive.java:1282-1292` requires the control channel; the events
         // one is off unless `aeron.archive.recording.events.enabled`).
         events_channel: None,
         aeron_directory,
@@ -860,7 +860,7 @@ fn create_mark_file(
     ArchiveMarkFile::create(
         &directory,
         &header,
-        // `aeron.archive.error.buffer.length` (`Archive.java:627`), which is what
+        // `aeron.archive.error.buffer.length` (`Archive.java:656`), which is what
         // this was hardcoded to.
         archive_config.error_buffer_length,
         FILE_PAGE_SIZE_DEFAULT,

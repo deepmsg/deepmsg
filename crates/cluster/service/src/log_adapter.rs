@@ -47,9 +47,9 @@ use deepmsg_core::logbuffer::descriptor::FRAME_ALIGNMENT;
 use crate::error::ContainerError;
 use crate::proxy::SESSION_HEADER_LENGTH;
 
-/// `ConsensusModule.CLUSTER_ACTION_FLAGS_DEFAULT` (`ConsensusModule.java:132`).
+/// `ConsensusModule.CLUSTER_ACTION_FLAGS_DEFAULT` (`ConsensusModule.java:135`).
 pub const CLUSTER_ACTION_FLAGS_DEFAULT: i32 = 0;
-/// `ConsensusModule.CLUSTER_ACTION_FLAGS_STANDBY_SNAPSHOT` (`:137`): the flag a
+/// `ConsensusModule.CLUSTER_ACTION_FLAGS_STANDBY_SNAPSHOT` (`:140`): the flag a
 /// standby member's snapshot request carries.
 pub const CLUSTER_ACTION_FLAGS_STANDBY_SNAPSHOT: i32 = 1;
 
@@ -103,6 +103,9 @@ pub enum LogMessage {
         leadership_term_id: i64,
         /// The position the request was made at.
         log_position: i64,
+        /// The term's base position; `-1` (`Aeron.NULL_VALUE`) when a 1.53.2
+        /// peer wrote the action before the field existed.
+        term_base_log_position: i64,
         /// The log timestamp.
         timestamp: i64,
         /// What to do.
@@ -189,7 +192,7 @@ impl BoundedLogAdapter {
         }
     }
 
-    /// `maxLogPosition(position)` (`BoundedLogAdapter.java:110-113`).
+    /// `maxLogPosition(position)` (`BoundedLogAdapter.java:125-128`).
     pub fn set_max_log_position(&mut self, position: i64) {
         self.max_log_position = position;
     }
@@ -204,7 +207,7 @@ impl BoundedLogAdapter {
         self.image.is_some()
     }
 
-    /// `image(Image)` (`:120-123`), with the subscription it came from.
+    /// `image(Image)` (`:135-138`), with the subscription it came from.
     pub fn set_image(&mut self, subscription_registration_id: i64, image: Image) {
         self.subscription_registration_id = Some(subscription_registration_id);
         self.image = Some(image);
@@ -215,7 +218,7 @@ impl BoundedLogAdapter {
         self.subscription_registration_id
     }
 
-    /// `isDone()` (`:115-118`): the image reached its end, or is over.
+    /// `isDone()` (`:130-133`): the image reached its end, or is over.
     pub fn is_done(&self) -> bool {
         let Some(image) = self.image.as_ref() else {
             return true;
@@ -225,7 +228,7 @@ impl BoundedLogAdapter {
             || image.is_closed()
     }
 
-    /// `poll(limit)` (`:130-134`): read fragments that start before
+    /// `poll(limit)` (`:145-149`): read fragments that start before
     /// `min(limit, maxLogPosition)`.
     ///
     /// The caller publishes the reader's position to the subscription's
@@ -452,6 +455,7 @@ fn decode<'a>(
                 LogMessage::ClusterAction {
                     leadership_term_id: decoder.leadership_term_id(),
                     log_position: decoder.log_position(),
+                    term_base_log_position: decoder.term_base_log_position().unwrap_or(-1),
                     timestamp: decoder.timestamp(),
                     action: decoder.action(),
                     flags: decoder.flags().unwrap_or(CLUSTER_ACTION_FLAGS_DEFAULT),

@@ -49,7 +49,7 @@ fn a_same_major_older_minor_file_is_left_alone() {
 fn a_different_major_file_is_a_dead_directory() {
     // A major version this build cannot even describe is the one case the
     // reference does treat as not-a-driver: it reads the version, finds the
-    // major different, and takes the directory (`aeron_driver_context.c:1613-1624`
+    // major different, and takes the directory (`aeron_driver_context.c:1657-1668`
     // returns "not active", and the caller deletes).
     let synthetic = SyntheticCnc::new(semantic_version_compose(2, 0, 0));
     let config = config(synthetic.path());

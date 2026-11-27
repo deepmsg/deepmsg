@@ -7,13 +7,13 @@
 //! processes share through it is the flow-control counter this type's reader
 //! position feeds.
 //!
-//! Mirrors the read loop of `aeron-client/src/main/c/aeron_image.c:246-325`.
+//! Mirrors the read loop of `aeron-client/src/main/c/aeron_image.c:250-329`.
 //!
 //! # One reader position, two writers' expectations
 //!
 //! The driver reads this image's subscriber-position counter every duty cycle to
 //! work out `min_sub_pos`, which is what raises the publisher's window limit
-//! (`aeron_ipc_publication.c:296-313`). So a subscriber that maps the file and
+//! (`aeron_ipc_publication.c:301-318`). So a subscriber that maps the file and
 //! reads it but never advances the counter does not merely lag — it eventually
 //! **blocks the publisher**, which is the one failure in this slice that looks
 //! like someone else's bug.
@@ -66,7 +66,7 @@ pub struct Fragment<'a> {
 ///
 /// A window onto the term, not a copy — the reference hands its block handler
 /// the term buffer, an offset and a length
-/// (`aeron_image_block_poll`, `aeron_image.c:709-716`), and a copy here would
+/// (`aeron_image_block_poll`, `aeron_image.c:713-720`), and a copy here would
 /// be an allocation on the read path.
 pub struct Block<'a> {
     term: &'a AtomicBuffer<'a, ReadOnly>,
@@ -219,7 +219,7 @@ impl<'a> Fragment<'a> {
 
     /// Where the **next** fragment of this message would begin
     /// (`aeron_header_next_term_offset`,
-    /// `aeron-client/src/main/c/aeron_subscription.c:587-593`).
+    /// `aeron-client/src/main/c/aeron_subscription.c:575-581`).
     ///
     /// That is the continuity test the assembler makes: a fragment whose term
     /// offset is not this is a fragment whose predecessor is missing, and the
@@ -291,19 +291,19 @@ pub struct Image {
     subscriber_position_id: i32,
     /// Where this subscriber started reading — the position the driver wrote
     /// into the counter when it linked the subscription
-    /// (`aeron_driver_conductor.c:3547-3575`), read back here rather than taken
+    /// (`aeron_driver_conductor.c:3644-3672`), read back here rather than taken
     /// from the message that announced the image.
     ///
     /// `Image.joinPosition()` (`Image.java:214`);
-    /// `aeron_image_constants_t.join_position` (`aeronc.h:2140`).
+    /// `aeron_image_constants_t.join_position` (`aeronc.h:2143`).
     join_position: i64,
     /// Where the stream comes from, as the driver described it: `host:port` for
     /// a network publication and `"aeron:ipc"` for an IPC one
     /// (`Image.sourceIdentity()`, `Image.java:154`;
-    /// `aeron_image_constants_t.source_identity`, `aeronc.h:2130`).
+    /// `aeron_image_constants_t.source_identity`, `aeronc.h:2133`).
     ///
     /// It arrives in `ON_AVAILABLE_IMAGE`, whose tail carries it after the log
-    /// path (`on_available_image`, `aeron_driver_conductor.c:1327-1336`).
+    /// path (`on_available_image`, `aeron_driver_conductor.c:1368-1377`).
     source_identity: String,
     /// The mapping, **shared**: an image can leave the client that made it
     /// ([`Client::take_image`](crate::client::Client::take_image)) and be read
@@ -550,7 +550,7 @@ impl ImageView {
     ///
     /// **Java's answer, not C's**: a closed image answers the flag captured at
     /// the close (`Image.java:300-303`). The C client reads the metadata
-    /// whatever the flag says (`aeron_image.c:231-247`); the cluster exists in
+    /// whatever the flag says (`aeron_image.c:236-252`); the cluster exists in
     /// Java only, and this build is aligned with it.
     pub fn is_publication_revoked(&self) -> Option<bool> {
         if self.is_closed() {
@@ -722,7 +722,7 @@ impl Image {
     }
 
     /// How far this **reader** has consumed — not how far the publisher has
-    /// written (`aeron_image_position`, `aeron_image.c:735-738`;
+    /// written (`aeron_image_position`, `aeron_image.c:739-742`;
     /// `Image.position()`, `Image.java:224`).
     ///
     /// An image that has read nothing reports nothing, however much is in the
@@ -748,7 +748,7 @@ impl Image {
 
     /// Where this subscriber joined the stream
     /// (`Image.joinPosition()`, `Image.java:214`;
-    /// `aeron_image_constants_t.join_position`, `aeronc.h:2140`).
+    /// `aeron_image_constants_t.join_position`, `aeronc.h:2143`).
     pub const fn join_position(&self) -> i64 {
         self.join_position
     }
@@ -776,7 +776,7 @@ impl Image {
     /// The position the stream reached when the publisher signalled end of
     /// stream — [`END_OF_STREAM_OPEN`](deepmsg_core::logbuffer::descriptor::END_OF_STREAM_OPEN)
     /// until then (`Image.endOfStreamPosition()`, `Image.java:265`;
-    /// `aeron_image_end_of_stream_position`, `aeron_image.c:195-208`).
+    /// `aeron_image_end_of_stream_position`, `aeron_image.c:194-207`).
     ///
     /// A closed image answers the value captured at the close
     /// (`Image.java:267-270`).
@@ -824,7 +824,7 @@ impl Image {
 
     /// Whether the publication behind this image has been revoked
     /// (`Image.isPublicationRevoked()`, `Image.java:298`;
-    /// `aeron_image_is_publication_revoked`, `aeron_image.c:231-247`).
+    /// `aeron_image_is_publication_revoked`, `aeron_image.c:236-252`).
     ///
     /// A closed image answers the flag captured at the close
     /// (`Image.java:300-303`). **Java's answer, not C's**: the C client reads
@@ -864,11 +864,11 @@ impl Image {
     /// Read up to `fragment_limit` fragments that **start before
     /// `bound_position`** — `Image.boundedControlledPoll`
     /// (`Image.java:565-665`) and `aeron_image_bounded_controlled_poll`
-    /// (`aeron_image.c:528-633`).
+    /// (`aeron_image.c:532-637`).
     ///
     /// The bound is the cluster's: a follower applies only what the leader has
     /// committed, so it polls its log image up to `min(commitPosition, limit)`
-    /// and comes back for the rest (`ConsensusModuleAgent.java:2523`). A
+    /// and comes back for the rest (`ConsensusModuleAgent.java:2549`). A
     /// fragment that starts before the bound and ends after it is still read —
     /// the reference tests the start offset only.
     ///
@@ -895,7 +895,7 @@ impl Image {
         // **One term per call.** The partition index is fixed here, at the
         // entry, and the scan below stops at that term's end; the advance into
         // the next term happens on the *next* call, where the position already
-        // names it (`aeron_image.c:266-273` does the same, and the Java client
+        // names it (`aeron_image.c:270-277` does the same, and the Java client
         // with it). A poll that crossed terms would deliver more fragments than
         // the reference's for the same state, which is visible to any caller
         // that throttles by counting them — `docs/compat.md` has the row, and
@@ -913,7 +913,7 @@ impl Image {
 
         loop {
             // The reference's loop condition includes `!isClosed`
-            // (`Image.java:348`, `aeron_image.c:275-279`): a closed image
+            // (`Image.java:348`, `aeron_image.c:279-283`): a closed image
             // stops the scan wherever it stands.
             if self.is_closed() {
                 break;
@@ -947,7 +947,7 @@ impl Image {
                     }
                 }
                 // A padding frame covers the bytes it covers, and the scan
-                // steps over it (`aeron_image.c:375-379`, and Java's
+                // steps over it (`aeron_image.c:379-383`, and Java's
                 // `Image.java:357-359`) — which is the only handling that reads
                 // **both** shapes of padding correctly.
                 //
@@ -1002,13 +1002,13 @@ impl Image {
     /// has to write what it read can copy one run out instead of being called
     /// once per fragment (`RecordingSession.java:237` is the archive's use).
     /// The run is bounded by the same three things the reference's is
-    /// (`aeron_image_block_poll`, `aeron_image.c:647-722`): the caller's limit,
+    /// (`aeron_image_block_poll`, `aeron_image.c:651-726`): the caller's limit,
     /// the term's end, and the first frame that does not fit — a block never
     /// straddles a term, because a producer that could not fit one padded
     /// instead.
     ///
     /// A padding frame ends the run, and is **part of it only when it is the
-    /// run's first frame** (`aeron_image.c:670-677`): a producer's tail padding
+    /// run's first frame** (`aeron_image.c:674-681`): a producer's tail padding
     /// is the last thing in a term and belongs to the block that reached it,
     /// while a repaired hole means the frames after it are real data the reader
     /// has not been given yet. The reference's `poll` has the same rule, and
@@ -1053,7 +1053,7 @@ impl Image {
                 Step::Data { frame_length, .. } => {
                     // The reference stops **before** a frame that would cross
                     // the limit rather than delivering it whole
-                    // (`aeron_image.c:683-686`): the limit is a limit on the
+                    // (`aeron_image.c:687-690`): the limit is a limit on the
                     // block, and the next call starts at this frame.
                     let Ok(aligned) = usize::try_from(position::align_up(
                         frame_length,
@@ -1086,7 +1086,7 @@ impl Image {
         if length > 0 {
             // The term id is read from the frames rather than derived from the
             // position, which is what the reference does
-            // (`aeron_image.c:709-715`) — and is the only answer that is right
+            // (`aeron_image.c:713-719`) — and is the only answer that is right
             // for a run that begins mid-term.
             if let Some(term_id) = Frame::new(&term, offset).term_id() {
                 handler(&Block {
@@ -1137,8 +1137,8 @@ impl Image {
     ///
     /// **A closed image is not read and its position does not move.** The
     /// reference asks `is_closed` at the entry, once per step, and again before
-    /// each write to the subscriber position (`aeron_image.c:341-345`,
-    /// `:357-361`, `:414-418`, `:425-429`); the reader-thread counterpart of
+    /// each write to the subscriber position (`aeron_image.c:345-349`,
+    /// `:357-361`, `:418-422`, `:429-433`); the reader-thread counterpart of
     /// that last check is the one that matters here, because the flag can be
     /// set by another holder of the same image while this scan runs
     /// (`ImageView::close`). Its test is
@@ -1208,7 +1208,7 @@ impl Image {
 
                     // A `Commit` is a write to the subscriber position, so it
                     // goes through the reference's `is_closed` gate like any
-                    // other (`aeron_image.c:414-418`) — and not calling
+                    // other (`aeron_image.c:418-422`) — and not calling
                     // `commit` keeps the ledger equal to what was published.
                     if action.publishes_now() && !self.is_closed() {
                         publish(ledger.commit());
@@ -1915,7 +1915,7 @@ pub(crate) mod tests {
 
     /// A padding frame ends a run, and is part of one **only when it is the
     /// run's first frame** — the rule the reference states in one line
-    /// (`aeron_image.c:670-677`) and the one a repaired hole makes matter.
+    /// (`aeron_image.c:674-681`) and the one a repaired hole makes matter.
     #[test]
     fn a_block_ends_at_a_padding_frame_and_begins_with_one() {
         let log = TempLog::new("block-padding");
@@ -2092,8 +2092,8 @@ pub(crate) mod tests {
     /// `shouldStopPollFragmentsToControlledFragmentHandlerIfImageIsClosed`
     /// (`aeron-client/src/test/c/aeron_image_test.cpp:707-734`): a handler that
     /// closes the image stops the poll where it stands. The reference asks
-    /// `is_closed` once per step (`aeron_image.c:357-361`) and again before the
-    /// final write to the subscriber position (`:425-429`).
+    /// `is_closed` once per step (`aeron_image.c:361-365`) and again before the
+    /// final write to the subscriber position (`:429-433`).
     #[test]
     fn a_closed_image_stops_the_controlled_poll_where_it_stands() {
         let log = TempLog::new("closed-during-controlled-poll");
@@ -2118,7 +2118,7 @@ pub(crate) mod tests {
         );
         assert_eq!(start, image.position(), "and its reader did not move");
 
-        // The next poll is the reference's entry check (`:341-345`).
+        // The next poll is the reference's entry check (`:345-349`).
         let mut again = Scripted::new(&[]);
         assert_eq!(
             0,
@@ -2131,7 +2131,7 @@ pub(crate) mod tests {
     /// `boundedControlledPollCommitShouldNotAdvancePositionWhenClosedDuringHandler`
     /// (`aeron-client/src/test/c/aeron_image_test.cpp:894-927`): a `Commit` that
     /// arrives after the image closed is not published — the reference guards
-    /// that write with `is_closed` too (`aeron_image.c:414-418`).
+    /// that write with `is_closed` too (`aeron_image.c:418-422`).
     #[test]
     fn a_commit_answered_after_the_image_closed_is_not_published() {
         let log = TempLog::new("closed-before-commit");
@@ -2213,7 +2213,7 @@ pub(crate) mod tests {
     /// `shouldStopReadingIfImageIsClosed` (`aeron-client/src/test/c/aeron_image_test.cpp:332-356`):
     /// the plain poll stops where the handler closed the image, and the reader
     /// does not move. The reference's loop condition carries `!isClosed`
-    /// (`Image.java:348`, `aeron_image.c:275-279`).
+    /// (`Image.java:348`, `aeron_image.c:279-283`).
     #[test]
     fn a_closed_image_stops_the_fragment_poll_where_it_stands() {
         let log = TempLog::new("closed-during-poll");

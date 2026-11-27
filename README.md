@@ -3,12 +3,12 @@
 A from-scratch Rust implementation of the
 [Aeron](https://github.com/aeron-io/aeron) messaging system — client, media
 driver, archive and cluster — built for low-latency trading workloads and
-byte-level compatibility with Aeron **1.53.2**.
+byte-level compatibility with Aeron **1.54.2**.
 
 ## Where it is
 
 - **The client and the media driver are complete, in Rust** (P0 and P1). The
-  client runs against the reference C `aeronmd` 1.53.2 for real — CnC
+  client runs against the reference C `aeronmd` 1.54.2 for real — CnC
   negotiation, liveness, payloads over `aeron:ipc` — and `deepmsg-driver` is a
   media driver: it writes the CnC file byte for byte as a real one is written,
   runs the conductor's duty cycle, and speaks UDP both ways (SETUP, DATA,
@@ -121,7 +121,7 @@ elsewhere in `docs/benchmarks.md`.
 ## Principles
 
 1. **Compatibility is proven, not asserted.** The CnC file, the wire protocol
-   and the archive on-disk formats follow the 1.53.2 reference; the interop
+   and the archive on-disk formats follow the 1.54.2 reference; the interop
    suite (`tests/interop`, feature `interop`) diffs against the reference
    implementation (ADR-0001).
 2. **Pure Rust by default, no async runtime.** Threads with idle strategies,
@@ -183,7 +183,7 @@ elsewhere in `docs/benchmarks.md`.
     cargo build --workspace
     cargo test --workspace
 
-Interop tests need the reference C driver from the Aeron 1.53.2 checkout
+Interop tests need the reference C driver from the Aeron 1.54.2 checkout
 (`docs/reference.md` documents the expected sibling-directory layout):
 
     cargo test -p deepmsg-tests --features interop
@@ -204,10 +204,10 @@ the harness, the reference, and the fork the C and Java probes live in
 - Domain vocabulary follows ADR-0005: Aeron's concept names are kept,
   byte-boundary names are frozen, and Rust code avoids C-era abbreviations.
   `GLOSSARY.md` maps every term to a plain-English definition.
-- "The reference" means the Aeron 1.53.2 checkout expected at `../aeron`
+- "The reference" means the Aeron 1.54.2 checkout expected at `../aeron`
   (C client + driver sources, Java archive + cluster).
 - Source citations in code and docs use reference-repo-relative paths,
-  sometimes with `:line` pinned to 1.53.2.
+  sometimes with `:line` pinned to 1.54.2.
 
 ## License
 

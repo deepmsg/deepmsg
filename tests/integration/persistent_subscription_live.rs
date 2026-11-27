@@ -3,7 +3,7 @@
 //! # What is judged here
 //!
 //! `shouldReplayExistingRecordingThenJoinLive` — the reference's case
-//! (`…_persistent_subscription_test.cpp:1011`), which is a table of twelve:
+//! (`…_persistent_subscription_test.cpp:1013`), which is a table of twelve:
 //! three fragment limits by four channel shapes. What each cell asks for is one
 //! run of the whole thing:
 //!
@@ -21,7 +21,7 @@
 //! one). The channel shapes are two of the reference's four: an **IPC** stream,
 //! and a **UDP channel whose endpoint is port zero** — which is not one of the
 //! reference's four cells at all, but is the shape its *own default context*
-//! uses (`aeron:udp?endpoint=localhost:0`, `…_persistent_subscription_test.cpp:718`),
+//! uses (`aeron:udp?endpoint=localhost:0`, `…_persistent_subscription_test.cpp:720`),
 //! and it is the one that exercises `AWAIT_REPLAY_CHANNEL_ENDPOINT`: the driver
 //! picks the port and the archive has to be told which one.
 //!
@@ -30,8 +30,8 @@
 //! ★ `ATTEMPT_SWITCH` has two paths and these cells take the **short one**. The
 //! live subscription joins a stream that is *idle* at that moment, so the live
 //! image's position and the replay's are equal and the switch is immediate
-//! (`:2072-2074`); the two catch-up handlers that align an **ahead** live stream
-//! (`:2002-2058`) are never entered. Tried the other way round — publishing the
+//! (`:2074-2076`); the two catch-up handlers that align an **ahead** live stream
+//! (`:2004-2060`) are never entered. Tried the other way round — publishing the
 //! live batch after the subscription has reached the switch — and the image
 //! still joins at the position the replay has read to, because an image's
 //! position is where it has been *read*, and a live image's starts at its join
@@ -53,7 +53,7 @@
 //! # ★ And what one cell now judges that the reference's own case does not: the release
 //!
 //! Being live is the **end of the replay**, and the reference says what that
-//! means where the machine finds out it is live (`:2123-2131`): the archive is
+//! means where the machine finds out it is live (`:2125-2133`): the archive is
 //! told to **stop** the replay (`clean_up_replay`) and the subscription it was
 //! read through is **given back** (`clean_up_replay_subscription`) — both before
 //! the application is told it is live. This build did neither, and measured: the
@@ -99,7 +99,7 @@ use deepmsg_tests::temp::TempDir;
 
 /// The stream that is **recorded and then live**: the subscription's live stream
 /// id has to be this one, because a descriptor whose stream differs from the
-/// configured live stream is refused (`:1204`).
+/// configured live stream is refused (`:1270`).
 const LIVE_CHANNEL: &str = "aeron:ipc?alias=ps-live";
 const LIVE_STREAM_ID: i32 = 4218;
 
@@ -192,7 +192,7 @@ impl Source {
     /// Start a recording, publish `REPLAYED` into it, and **keep it live** —
     /// which is the reference's own shape: its `PersistentPublication` holds an
     /// exclusive publication that the archive records
-    /// (`…_persistent_subscription_test.cpp:225-557`), and the live half of the
+    /// (`…_persistent_subscription_test.cpp:225-559`), and the live half of the
     /// case publishes through it.
     fn start(aeron_dir: &std::path::Path) -> Self {
         let mut client = Client::connect(aeron_dir).expect("connect to our driver");
@@ -453,7 +453,7 @@ fn a_replay_channel_whose_port_the_driver_picks() {
     replay_then_join("ps-live-dynamic-port", REPLAY_CHANNEL_DYNAMIC_PORT, 10);
 }
 
-/// **`shouldHandlePublisherStoppingWhileLive`** (`…_persistent_subscription_test.cpp:1722`):
+/// **`shouldHandlePublisherStoppingWhileLive`** (`…_persistent_subscription_test.cpp:1724`):
 /// the publisher goes away while the subscription is reading it, and the
 /// subscription goes **back to replaying** rather than failing — with the
 /// messages it already delivered not delivered again.
@@ -576,7 +576,7 @@ fn the_subscription_goes_back_to_replaying_when_the_publisher_stops() {
 }
 
 /// **`shouldStartFromLiveWithNoInitialReplayIfRequested`**
-/// (`…_persistent_subscription_test.cpp:1101`): a subscription whose start
+/// (`…_persistent_subscription_test.cpp:1103`): a subscription whose start
 /// position is the live one **replays nothing** — the messages already recorded
 /// are not for it — and joins the live stream directly.
 ///

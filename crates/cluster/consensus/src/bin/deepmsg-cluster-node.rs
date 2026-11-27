@@ -1,5 +1,5 @@
 //! One consensus module process, the counterpart of
-//! `io.aeron.cluster.ConsensusModule.main` (`ConsensusModule.java:251-274`).
+//! `io.aeron.cluster.ConsensusModule.main` (`ConsensusModule.java:254-277`).
 //!
 //! The reference has two ways to run a node: `ClusteredMediaDriver.main`, which
 //! starts a media driver, an archive and a consensus module in one process, and

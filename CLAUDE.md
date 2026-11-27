@@ -1,7 +1,7 @@
 # deepmsg — notes for AI sessions
 
 A from-scratch Rust rewrite of the open-source Aeron stack — client, media
-driver and archive — targeting byte-level compatibility with **Aeron 1.53.2**.
+driver and archive — targeting byte-level compatibility with **Aeron 1.54.2**.
 
 Read `README.md` first; it is short and authoritative. This file adds only
 what a fresh session tends to get wrong.
@@ -56,7 +56,7 @@ cross-reference keys. They are **deliberate**. Do not remove, renumber or
 
 ## Citing the reference
 
-The reference is a sibling checkout of Aeron 1.53.2 (commit `664f58e705`),
+The reference is a sibling checkout of Aeron 1.54.2 (commit `481d4271ad`),
 plus `../aeron-rs` for prior art; `docs/reference.md` documents the layout.
 
 **Resolve every path before you cite it.** Guessed upstream paths are this
@@ -74,7 +74,7 @@ the authority only where no C exists — the archive server and the cluster.
 
 | Question | File |
 |---|---|
-| Why 1.53.2, and what "compatible" means | `docs/adr/0001` |
+| Why 1.54.2, and what "compatible" means | `docs/adr/0001` |
 | Numbers, versions, byte contracts | `docs/compat.md` |
 | What this build measures, and on what | `docs/benchmarks.md` |
 | How this build is compared against the reference's own benchmark harness, and how to run either batch | `bench/README.md` |

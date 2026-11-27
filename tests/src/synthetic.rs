@@ -145,7 +145,7 @@ impl SyntheticCnc {
     /// client reads it before it does anything else and gives up when it is
     /// missing (`aeron-client/src/main/c/aeron_client_conductor.c:1311-1334`),
     /// and the directory liveness rule calls the file dead
-    /// (`aeron-driver/src/main/c/aeron_driver.c:136-235`). So it is a choice
+    /// (`aeron-driver/src/main/c/aeron_driver.c:153-252`). So it is a choice
     /// each test makes, not a default: `client_round_trip` wants a running
     /// driver's file, and `dir_liveness` wants a dead one's.
     pub fn with_heartbeat(self, now_ms: i64) -> Self {

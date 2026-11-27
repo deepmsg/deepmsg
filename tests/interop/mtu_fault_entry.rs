@@ -110,15 +110,15 @@ fn both_drivers_record_the_same_entry_for_an_mtu_the_window_cannot_carry() {
         entry_for(reference.aeron_dir()).expect("the reference records the refusal")
     };
 
-    // The reference's own entry, spelled out — read off a live 1.53.2 driver
+    // The reference's own entry, spelled out — read off a live 1.54.2 driver
     // and pinned here so that a change to *either* side shows up as a failure
     // of this test rather than as agreement between two wrong numbers.
     assert_eq!(
         "(22) Invalid argument\n\
          [aeron_receiver_channel_endpoint_validate_sender_mtu_length, \
-         aeron_receive_channel_endpoint.c:1022] mtuLength=1408 > initialWindowLength=1376\n\
+         aeron_receive_channel_endpoint.c:1027] mtuLength=1408 > initialWindowLength=1376\n\
          [aeron_driver_conductor_execute_create_publication_image_validate, \
-         aeron_driver_conductor.c:6509] stream_id=10001 session_id=<masked>\n",
+         aeron_driver_conductor.c:6604] stream_id=10001 session_id=<masked>\n",
         masked(&theirs_entry)
     );
 

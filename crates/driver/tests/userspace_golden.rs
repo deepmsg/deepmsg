@@ -327,22 +327,22 @@ fn g6_every_datagram_carries_where_it_came_from() {
     );
 }
 
-/// G7 and G9: a batch is at most sixteen, and the caller is told what left
-/// rather than what it offered.
+/// G7 and G9: a batch is at most sixty-four (the 1.54.2 io vector maximum; it
+/// was sixteen), and the caller is told what left rather than what it offered.
 #[test]
-fn g7_a_batch_answers_what_left_and_at_most_sixteen() {
+fn g7_a_batch_answers_what_left_and_at_most_sixty_four() {
     let (_wire, machine) = machine();
     let mut transport = machine.open(40462).expect("a transport");
     machine.stack.insert_neighbour(PEER, PEER_MAC);
     let destination = Some(SocketAddr::from((PEER, 40999)));
 
-    let seventeen: Vec<&[u8]> = (0..17).map(|_| &b"sixteen at most"[..]).collect();
+    let sixty_five: Vec<&[u8]> = (0..65).map(|_| &b"sixty-four at most"[..]).collect();
     assert_eq!(
-        16,
-        transport.send(destination, &seventeen).expect("a send"),
-        "seventeen offered, sixteen taken — which is what the caller counts on"
+        64,
+        transport.send(destination, &sixty_five).expect("a send"),
+        "sixty-five offered, sixty-four taken — which is what the caller counts on"
     );
-    assert_eq!(16, machine.sent().len());
+    assert_eq!(64, machine.sent().len());
 
     let three: Vec<&[u8]> = (0..3).map(|_| &b"all of these"[..]).collect();
     assert_eq!(3, transport.send(destination, &three).expect("a send"));

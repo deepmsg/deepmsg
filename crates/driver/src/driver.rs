@@ -2,7 +2,7 @@
 //!
 //! The reference's driver is four pieces of work — conductor, native resource
 //! agent, receiver, sender — run by an `aeron_agent_runner_t` set whose shape
-//! `aeron.threading.mode` decides (`aeron_driver.c:1003-1122`): one thread
+//! `aeron.threading.mode` decides (`aeron_driver.c:1043-1162`): one thread
 //! each, three with the network pair sharing one, one thread for all of them,
 //! or none at all and the caller drives them.
 //!
@@ -17,17 +17,17 @@
 //!
 //! The slot numbered 0 (`AERON_AGENT_RUNNER_CONDUCTOR`, `aeron_driver.h:26`) is
 //! the conductor under `DEDICATED` and `SHARED_NETWORK` and the four-piece
-//! composite under `SHARED` and `INVOKER` (`aeron_driver.c:1003-1064`). It is
+//! composite under `SHARED` and `INVOKER` (`aeron_driver.c:1043-1104`). It is
 //! **not** given a thread of its own: the process's own thread drives it, which
 //! is what `aeronmd` does — it starts the driver with `manual_main_loop` true
 //! (`aeronmd.c:153`) and then runs `aeron_driver_main_do_work` in a loop of its
 //! own (`:165-168`). The runners above it are started here, in the reference's
-//! order, highest slot first (`aeron_driver.c:1214-1218`).
+//! order, highest slot first (`aeron_driver.c:1369-1373`).
 //!
 //! So a `DEDICATED` driver process has three agent threads plus the thread that
 //! called [`Driver::run`], and a `SHARED` one has none: one thread does
 //! everything. [`Driver::do_work`] is one pass of slot 0, whatever this driver's
-//! mode put there (`aeron_driver_main_do_work`, `:1252-1261`).
+//! mode put there (`aeron_driver_main_do_work`, `:1407-1416`).
 
 use std::io;
 use std::thread::JoinHandle;
@@ -201,7 +201,7 @@ impl Role {
 }
 
 /// The strategy a runner gets when nothing named one: the reference's `backoff`,
-/// which four of its six slots default to (`aeron_driver_context.c:1143-1147`).
+/// which four of its six slots default to (`aeron_driver_context.c:1173-1177`).
 ///
 /// Only the agents' own thread-owning constructors ask for this — a driver
 /// reads its slot's setting — and they do it so that a test can start one agent
@@ -215,14 +215,14 @@ pub(crate) fn default_strategy() -> Strategy {
 /// Some of what the data-plane threads do, the reference does on the conductor
 /// and **once per `timer_interval_ns`** rather than once per pass — its
 /// `aeron_driver_conductor_on_check_managed_resources` is gated that way
-/// (`aeron_driver_conductor.c:3377-3384`), and two lists hang off it:
+/// (`aeron_driver_conductor.c:3474-3481`), and two lists hang off it:
 ///
-/// - the images (`:1705-1706`), where `aeron_publication_image_on_time_event`
-///   (`:1294`) runs and calls `check_untethered_subscriptions` (`:1311`) from
+/// - the images (`:1746-1747`), where `aeron_publication_image_on_time_event`
+///   (`:1335`) runs and calls `check_untethered_subscriptions` (`:1352`) from
 ///   its `ACTIVE` arm — neither of which the receiver's own loop does
 ///   (`aeron_driver_receiver.c:170-209`);
-/// - the network publications (`aeron_driver_conductor.c:766`), where
-///   `aeron_network_publication_check_managed_resources` (`:1287`) reaches
+/// - the network publications (`aeron_driver_conductor.c:807`), where
+///   `aeron_network_publication_check_managed_resources` (`:1328`) reaches
 ///   `check_for_blocked_publisher` — which the sender's own loop runs every
 ///   pass (`sender.rs`).
 ///
@@ -332,7 +332,7 @@ pub(crate) struct AgentStates {
 }
 
 /// The sender and the receiver on one thread, which is `SHARED_NETWORK`'s slot
-/// 2 (`aeron_driver.c:746-755`, `aeron_driver_shared_network_do_work`).
+/// 2 (`aeron_driver.c:776-785`, `aeron_driver_shared_network_do_work`).
 ///
 /// Both are run every pass, in the reference's order — the sender first — and a
 /// `Stop` for either ends the pair: the reference stops the runner these two
@@ -356,7 +356,7 @@ impl Agent for SharedNetworkAgent {
 }
 
 /// The six per-slot idle strategies, as the configuration resolved them
-/// (`aeron_driver_context.c:1143-1148`).
+/// (`aeron_driver_context.c:1173-1178`).
 ///
 /// One per runner slot, which is what the reference keeps; a runner is built
 /// from its slot's setting when it starts, because a strategy carries the state
@@ -384,7 +384,7 @@ impl IdleStrategies {
 
     /// The setting slot 0's runner asks for: the conductor's where the conductor
     /// has that slot to itself, the shared one where all four pieces do
-    /// (`aeron_driver.c:1003-1122`).
+    /// (`aeron_driver.c:1043-1162`).
     fn runner_zero(&self, mode: ThreadingMode) -> &IdleStrategySetting {
         match mode {
             ThreadingMode::Dedicated | ThreadingMode::SharedNetwork => &self.conductor,
@@ -411,8 +411,8 @@ fn strategy(setting: &IdleStrategySetting) -> io::Result<Strategy> {
 /// and the shape `aeron.threading.mode` gives them.
 ///
 /// The driver owns the whole start-up and shutdown order — which runners exist,
-/// in what order they start (`aeron_driver.c:1214-1218`) and in what order they
-/// are stopped and closed (`:1274-1296`). What it does **not** own is a thread
+/// in what order they start (`aeron_driver.c:1369-1373`) and in what order they
+/// are stopped and closed (`:1429-1451`). What it does **not** own is a thread
 /// for itself: [`Driver::run`] blocks the calling thread, which is the slot the
 /// conductor or the composite runs on.
 pub struct Driver {
@@ -472,7 +472,7 @@ impl Driver {
     /// is the reference's `aeron_driver_main_do_work` over a conductor runner.
     /// Under `SHARED` and `INVOKER` it is all four pieces in the reference's
     /// fixed order — sender, receiver, native resource agent, conductor
-    /// (`aeron_driver_shared_do_work`, `aeron_driver.c:723-734`).
+    /// (`aeron_driver_shared_do_work`, `aeron_driver.c:753-764`).
     ///
     /// This is also the entry point for a caller that embeds the driver and
     /// drives it itself (`INVOKER`): it is what the reference's manual main loop
@@ -502,7 +502,7 @@ impl Driver {
     /// driver is asked to stop.
     ///
     /// The runners above slot 0 start in the reference's order, highest slot
-    /// first (`aeron_driver.c:1214-1218`): the sender, the receiver, the native
+    /// first (`aeron_driver.c:1369-1373`): the sender, the receiver, the native
     /// resource agent — or the sender and receiver together, under
     /// `SHARED_NETWORK`. Slot 0 itself is this thread's, which is
     /// `aeronmd.c:165-168`.
@@ -566,7 +566,7 @@ impl Driver {
     /// Stop and join everything this driver started, and close the conductor.
     ///
     /// The order is the reference's `aeron_driver_close`
-    /// (`aeron_driver.c:1274-1296`): every runner is stopped, then closed, and
+    /// (`aeron_driver.c:1429-1451`): every runner is stopped, then closed, and
     /// the conductor's own close is the last thing that happens. Here the
     /// conductor's close is what sends the `Stop` each agent's pass answers, so
     /// it comes **before** the join — a log buffer handed back to an agent that
@@ -685,7 +685,7 @@ impl Driver {
                 )?;
             }
             // `INVOKER` and `SHARED` build the same single runner
-            // (`aeron_driver.c:1003-1022`, one `case` arm for both), and under a
+            // (`aeron_driver.c:1043-1062`, one `case` arm for both), and under a
             // manual main loop they are the same driver: the pieces are the
             // calling thread's to run, so nothing is started here.
             ThreadingMode::Shared | ThreadingMode::Invoker => {}
@@ -714,7 +714,7 @@ impl Driver {
 }
 
 /// Put the three agents of a `DEDICATED` driver on threads, in the reference's
-/// order (`aeron_driver.c:1214-1218`), with the idle strategies and the names
+/// order (`aeron_driver.c:1369-1373`), with the idle strategies and the names
 /// the configuration asked for.
 ///
 /// This is what [`Conductor::start_agents`] uses; a driver that places its own
@@ -831,7 +831,7 @@ mod tests {
     }
 
     /// Slot 0 is the conductor's where it is alone, and the shared slot's where
-    /// all four pieces are on it (`aeron_driver.c:1003-1122`).
+    /// all four pieces are on it (`aeron_driver.c:1043-1162`).
     #[test]
     fn slot_zero_takes_its_strategy_from_the_slot_it_is() {
         let idle = IdleStrategies::new(&DriverConfig {

@@ -341,7 +341,7 @@ fn a_recording_whose_events_the_reference_reads(
 
     // ★ **Half the messages go out before the archive is asked to record.** The
     // recording's start position is the **image's join position**
-    // (`ArchiveConductor.java:2005`), so a stream the archive joined late is the
+    // (`ArchiveConductor.java:2027`), so a stream the archive joined late is the
     // only way this test can tell that field from a zero the writer happened to
     // start at.
     let before = publish_messages(&mut client, publication, reader, 0, MESSAGE_COUNT / 2);
@@ -439,7 +439,7 @@ fn a_recording_whose_events_the_reference_reads(
         "aeron:ipc", source_identity,
         "★ and this one is the reference's own constant for a **spy** image — a \
          network publication links its spies with `AERON_IPC_CHANNEL` as the \
-         source identity (`aeron_driver_conductor.c:4205-4220`), whatever the \
+         source identity (`aeron_driver_conductor.c:4302-4317`), whatever the \
          channel it is being spied on"
     );
 
@@ -487,7 +487,7 @@ fn a_recording_whose_events_the_reference_reads(
 }
 
 /// Where the catalog says the recording stopped, waiting for it to be written
-/// (`ArchiveConductor.closeRecordingSession`, `:1345-1352`).
+/// (`ArchiveConductor.closeRecordingSession`, `:1386-1393`).
 ///
 /// A row with no stop is answered `-1` rather than refused
 /// (`ArchiveConductor.java:1169-1175`), which is the state this waits out.

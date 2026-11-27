@@ -3,10 +3,10 @@
 //!
 //! Mirrors the conductor's half of the publication path in
 //! `aeron-driver/src/main/c/aeron_driver_conductor.c`:
-//! `execute_add_network_publication_*` (`:4113-4650`), the match rule a second
+//! `execute_add_network_publication_*` (`:4210-4747`), the match rule a second
 //! publication on one channel has to pass (`confirm_publication_match`,
-//! `:1105-1178`), the session speculation (`:4455-4478`) and the counters a
-//! publication's client reads (`:4508-4531`).
+//! `:1146-1219`), the session speculation (`:4552-4575`) and the counters a
+//! publication's client reads (`:4605-4628`).
 //!
 //! # The same state machine as IPC, with two more states
 //!
@@ -23,7 +23,7 @@
 //!
 //! A second `ADD_PUBLICATION` on a channel that already has one is *the same
 //! publication* when the two agree about the session, the MTU, the term length
-//! and the starting position (`confirm_publication_match`, `:1105-1178`) — and
+//! and the starting position (`confirm_publication_match`, `:1146-1219`) — and
 //! an explicit disagreement about any of them is a refusal rather than a second
 //! log buffer. The parameters that were *not* named say nothing: a client that
 //! did not ask for an MTU is agreeing to whatever the publication that exists
@@ -79,11 +79,11 @@ struct PendingNetworkPublication {
     /// decides the flow control, the group flag and the log buffer's `group`
     /// byte (`aeron_network_publication_create` reads
     /// `endpoint->conductor_fields.udp_channel`, `:136`; the strategy selector
-    /// is handed the same one, `aeron_driver_conductor.c:4492-4496`). A second
+    /// is handed the same one, `aeron_driver_conductor.c:4589-4593`). A second
     /// publication can share an endpoint whose agreement check looks at
     /// timestamp offsets, MTU and buffer lengths and at neither `control-mode`
     /// nor `fc=` (`validate_channel_against_send_channel_endpoint`,
-    /// `:1913-1959`), and the canonical form two channels have to match carries
+    /// `:1954-2000`), and the canonical form two channels have to match carries
     /// only the two addresses (`aeron_uri_udp_canonicalise`,
     /// `aeron_udp_channel.c:148-208`) — so the endpoint keeps the channel it was
     /// created from, and that is the channel read.
@@ -98,7 +98,7 @@ struct PendingNetworkPublication {
     /// and one was found. Carried from the resolve step to the create step
     /// because what the image has to be told is the *publication's* session id,
     /// which does not exist until the create runs
-    /// (`aeron_driver_conductor.c:4227-4232`).
+    /// (`aeron_driver_conductor.c:4324-4329`).
     response_publication_image: Option<i64>,
     /// The counters allocated for this publication.
     counters: PublicationCounters,
@@ -148,7 +148,7 @@ pub struct NetworkPublicationRecord {
     pub endpoint_channel: UdpChannel,
     /// Where its log buffer is. A second client given this publication maps the
     /// *same* file, so the reply to its `ADD_PUBLICATION` has to name it
-    /// (`aeron_driver_conductor.c:4195-4196`, which answers with
+    /// (`aeron_driver_conductor.c:4292-4293`, which answers with
     /// `publication->log_file_name` on both the shared and the new path).
     pub path: PathBuf,
     /// Whether the producer asked for a single-producer publication.
@@ -173,7 +173,7 @@ impl NetworkPublicationRecord {
     ///
     /// The bytes and not a `Path`: the reply is the reference's
     /// `aeron_publication_buffers_ready_t`, whose tail is the file name as the
-    /// driver wrote it (`aeron_driver_conductor.c:2417`).
+    /// driver wrote it (`aeron_driver_conductor.c:2480`).
     pub fn path_bytes(&self) -> Vec<u8> {
         self.path.as_os_str().as_encoded_bytes().to_vec()
     }
@@ -290,19 +290,19 @@ impl NetworkPublications {
     }
 
     /// Serve an `ADD_PUBLICATION` for a UDP channel
-    /// (`execute_add_network_publication_*`, `aeron_driver_conductor.c:4113-4650`).
+    /// (`execute_add_network_publication_*`, `aeron_driver_conductor.c:4210-4747`).
     ///
     /// The order is the reference's and only two of its steps are reordered
     /// here: the endpoint is resolved before the log buffer is asked for
-    /// (`:4435`, because a channel that cannot have a socket cannot have a
+    /// (`:4532`, because a channel that cannot have a socket cannot have a
     /// publication either), and the session id is speculated at the *end*
-    /// (`:4455-4478`), from the publications that exist by then — which is the
+    /// (`:4552-4575`), from the publications that exist by then — which is the
     /// point of speculating rather than picking one at the start.
     ///
     /// The channel arrives **already parsed**, because the reference parses it
     /// on the native resource agent and its conductor waits for it
     /// (`AERON_DRIVER_NATIVE_RESOURCE_AGENT_COMMAND_TYPE_PARSE_CHANNEL`,
-    /// `aeron_driver_conductor.c:4113-4132`) — a `getaddrinfo` here would be a
+    /// `aeron_driver_conductor.c:4210-4229`) — a `getaddrinfo` here would be a
     /// `getaddrinfo` on the control plane.
     ///
     /// # Errors
@@ -327,7 +327,7 @@ impl NetworkPublications {
         now: Now,
         events: &mut impl ClientEvents,
     ) -> Result<(), AddError> {
-        // VALIDATE (`:4135-4160`): the parse itself is the agent's and has
+        // VALIDATE (`:4232-4257`): the parse itself is the agent's and has
         // happened by the time this is called.
         let uri = ChannelUri::parse(request.channel)?;
         if uri.transport() != Transport::Udp {
@@ -352,7 +352,7 @@ impl NetworkPublications {
             return Err(AddError::NoClientRecord);
         };
 
-        // RESOLVE_PUBLICATION (`:4263-4381`): the endpoint first, because a
+        // RESOLVE_PUBLICATION (`:4360-4478`): the endpoint first, because a
         // second publication on the same channel shares it.
         let endpoint_params = transport_params(config, &channel);
 
@@ -362,7 +362,7 @@ impl NetworkPublications {
         let named_channel = channel.clone();
 
         // `params->mtu_length`, which the MTU-against-`so-sndbuf` check
-        // measures a frame against (`:1925`). Never negative — the URI's
+        // measures a frame against (`:1966`). Never negative — the URI's
         // parser refuses a length that is — but the cast goes through
         // `try_from` rather than an `as` for the same reason everything else
         // in this file does.
@@ -384,8 +384,8 @@ impl NetworkPublications {
                 let mut message = error.to_string();
 
                 // Two layers above the endpoint, and the reference appends one
-                // line for each (`aeron_driver_conductor.c:2008` where the
-                // endpoint is made, `:4433` where the publication's) — with the
+                // line for each (`aeron_driver_conductor.c:2059` where the
+                // endpoint is made, `:4530` where the publication's) — with the
                 // **empty message** its `AERON_APPEND_ERR("%s", "")` writes,
                 // which is why each ends in a space. Probed against a live
                 // reference driver for a send endpoint's `EADDRINUSE`.
@@ -395,11 +395,11 @@ impl NetworkPublications {
                 ) {
                     message.push_str(
                         "[aeron_driver_conductor_get_or_add_send_channel_endpoint, \
-                         aeron_driver_conductor.c:2008] \n",
+                         aeron_driver_conductor.c:2059] \n",
                     );
                     message.push_str(
                         "[aeron_driver_conductor_execute_add_network_publication_create_publication, \
-                         aeron_driver_conductor.c:4433] \n",
+                         aeron_driver_conductor.c:4530] \n",
                     );
                 }
 
@@ -437,14 +437,14 @@ impl NetworkPublications {
             .map_or_else(|| named_channel.clone(), |entry| entry.channel.clone());
 
         // A publication that already exists on this endpoint and stream may be
-        // shared (`:4287-4320`).
+        // shared (`:4384-4417`).
         //
         // The candidate is found by endpoint and stream **first**, and only
         // then checked for agreement: a second publication on the same stream
         // that names a different MTU is not a new publication, it is a
         // *refusal* — the reference reaches `aeron_confirm_publication_match`
         // with a candidate in hand and turns its disagreement into an error
-        // (`:4350-4360`), rather than starting a second log buffer on the same
+        // (`:4447-4457`), rather than starting a second log buffer on the same
         // stream.
         if !is_exclusive {
             if let Some(index) = self.find_shareable(
@@ -455,7 +455,7 @@ impl NetworkPublications {
                 publication_matches(&self.publications[index], &params).map_err(AddError::Share)?;
 
                 // The image comes after the agreement and not before it
-                // (`:4350-4370`): a second publication that disagrees with the
+                // (`:4447-4467`): a second publication that disagrees with the
                 // one it would share is refused for *that*, whatever it named
                 // for a correlation id.
                 let response_image =
@@ -474,7 +474,7 @@ impl NetworkPublications {
                 // And what the image is owed is said after the link, because it
                 // is the *publication's* session the image has to be told, and
                 // the publication it answered with is the one that already
-                // existed (`:4227-4232`, which is the last thing the reference's
+                // existed (`:4324-4329`, which is the last thing the reference's
                 // link does).
                 if let Some(image) = response_image {
                     let _ = receiver.set_response_session_id(
@@ -488,7 +488,7 @@ impl NetworkPublications {
         }
 
         // The session id: named, or speculated from what this endpoint and
-        // stream already run (`:4455-4478`).
+        // stream already run (`:4552-4575`).
         let session_id = match params.session_id {
             Some(session_id) => {
                 if let Some(clash) =
@@ -513,7 +513,7 @@ impl NetworkPublications {
         };
 
         // A response publication whose correlation id is the prototype names no
-        // image, and still gets the smallest term there is (`:4314-4317`): the
+        // image, and still gets the smallest term there is (`:4411-4414`): the
         // prototype is what a client sends before it has been told a session
         // id, so what it makes is a throwaway and there is nothing to reserve a
         // term for.
@@ -522,7 +522,7 @@ impl NetworkPublications {
         }
 
         // The reference finds the image in `create_publication`, one state
-        // further on (`:4416`), because there it has had to wait for the log
+        // further on (`:4513`), because there it has had to wait for the log
         // buffer to land before it can do anything at all. This is the third
         // deliberate reorder: the resolve half is synchronous here, so the
         // image is looked for *before* the buffer is asked for. Everything the
@@ -535,7 +535,7 @@ impl NetworkPublications {
             find_response_publication_image(images, &named_channel, &params)?;
 
         // The six counters a network publication's client reads
-        // (`:4508-4531`).
+        // (`:4605-4628`).
         let publication_counters = allocate_counters(
             counters,
             regions,
@@ -657,7 +657,7 @@ impl NetworkPublications {
 
     /// Create the publication whose log buffer arrived, announce it, and hand
     /// it to the sender (`execute_add_network_publication_create_publication`,
-    /// `:4405-4618`).
+    /// `:4502-4715`).
     ///
     /// The sender is told last, and the reply follows it: a client that has
     /// been answered is a client that may offer immediately, and an offer that
@@ -758,7 +758,7 @@ impl NetworkPublications {
         );
 
         // A stream that resumes starts its four counters where the URI said
-        // (`aeron_driver_conductor.c:4550-4560`, all four together): the
+        // (`aeron_driver_conductor.c:4647-4657`, all four together): the
         // producer's `pub-pos` and `pub-lmt`, the sender's `snd-pos` and
         // `snd-lmt`.
         //
@@ -861,7 +861,7 @@ impl NetworkPublications {
         }
 
         // The endpoint now owes its life to this publication too
-        // (`AERON_DRIVER_MANAGED_RESOURCE_INCREF`, `:4591`), counted here
+        // (`AERON_DRIVER_MANAGED_RESOURCE_INCREF`, `:4688`), counted here
         // because the pair is: the release path decrements once per record it
         // takes out of this list, so the two are the same set by construction.
         // A shared *publication* does not come through here — a second client
@@ -917,13 +917,13 @@ impl NetworkPublications {
 
         // Every spy that was waiting for this stream, between the reply and the
         // image's answer, which is where the reference does it
-        // (`:4201-4226`) — and after the reply for the same reason: a client
+        // (`:4298-4323`) — and after the reply for the same reason: a client
         // that has been answered is one that may offer, and the spies read the
         // buffer it is about to offer into.
         //
         // A link that fails is answered as an error on the publication's own
         // correlation id, which is what the reference's command state machine
-        // does with the failure this returns (`:4220-4224` then the ERROR arm
+        // does with the failure this returns (`:4317-4321` then the ERROR arm
         // of `:3305-3318`). It is a reader the client will never hear about,
         // and the alternative — silence — is a spy that waits for ever.
         let failed = subscriptions.link_spy_subscriptions(
@@ -944,7 +944,7 @@ impl NetworkPublications {
         }
 
         // And then the image is told which session to answer with, which is the
-        // last thing the reference's link does (`:4227-4232`) — after the client
+        // last thing the reference's link does (`:4324-4329`) — after the client
         // has been answered, because a client that has been answered is one
         // that may offer, and the image's answer is not on that path.
         if let Some(image) = pending.response_publication_image {
@@ -954,7 +954,7 @@ impl NetworkPublications {
 
     /// A publication a second `ADD_PUBLICATION` might share: same endpoint,
     /// same stream, the same `response-correlation-id`, and not exclusive
-    /// (`find_shared_network_publication_by_endpoint`, `:1851-1875`).
+    /// (`find_shared_network_publication_by_endpoint`, `:1892-1916`).
     ///
     /// The correlation id is the clause a reader would leave out and the one
     /// that decides what a response channel *is*: two response publications on
@@ -993,7 +993,7 @@ impl NetworkPublications {
     }
 
     /// Whether a session id is already taken on this stream in a way that
-    /// cannot be shared (`:4237-4250`).
+    /// cannot be shared (`:4334-4347`).
     fn find_session_clash(
         &self,
         endpoint_id: u64,
@@ -1029,11 +1029,11 @@ impl NetworkPublications {
         // client is handed a link onto the publication that exists, not a
         // publication of its own, and a client that is told no file name has
         // nothing to map and cannot offer at all
-        // (`aeron_driver_conductor.c:4195-4196`, which answers with the
+        // (`aeron_driver_conductor.c:4292-4293`, which answers with the
         // publication's `log_file_name` on this path too).
         let log_file = publication.path_bytes();
         // The two ids the reference's wire carries
-        // (`aeron_driver_conductor.c:2387-2388`): `correlation_id` is **this
+        // (`aeron_driver_conductor.c:2450-2451`): `correlation_id` is **this
         // link's** — the id the client removes by, and the one it matches the
         // answer to — and `registration_id` is the publication's own, shared by
         // every client on this channel.
@@ -1062,7 +1062,7 @@ impl NetworkPublications {
     /// A client's hold on a publication goes
     /// (`AERON_DRIVER_MANAGED_RESOURCE_DECREF`, `media/aeron_network_publication.c:...`,
     /// reached from `aeron_driver_conductor_on_remove_publication`,
-    /// `aeron_driver_conductor.c:4705-4735`), answering whether that was the
+    /// `aeron_driver_conductor.c:4802-4832`), answering whether that was the
     /// **last** one — which is when the publication itself may be released.
     ///
     /// `count` is how many links the caller is giving up at once, which is what
@@ -1119,10 +1119,10 @@ impl NetworkPublications {
 }
 
 /// The counters a network publication's client reads
-/// (`aeron_driver_conductor.c:4508-4531`).
+/// (`aeron_driver_conductor.c:4605-4628`).
 ///
 /// Each one carries the **stream-position key** the reference's own allocators
-/// build (`aeron_position.c:23-62`): the registration id, the session, the
+/// build (`aeron_position.c:28-67`): the registration id, the session, the
 /// stream and the channel. The key is not decoration — a tool that finds a
 /// counter by name reads the key to learn *which* stream it measures, and a
 /// counter allocated with an empty key is one no tool can attribute.
@@ -1259,7 +1259,7 @@ const SENDER_BPE_TYPE_ID: i32 = 13;
 const SENDER_NAKS_TYPE_ID: i32 = 19;
 
 /// Whether an existing publication may be shared with these parameters
-/// (`aeron_confirm_publication_match`, `aeron_driver_conductor.c:1105-1178`).
+/// (`aeron_confirm_publication_match`, `aeron_driver_conductor.c:1146-1219`).
 ///
 /// A parameter the URI did **not** name says nothing: a client that did not ask
 /// for an MTU is agreeing to whatever the publication that exists has, which is
@@ -1308,7 +1308,7 @@ fn publication_matches(
 /// The checks the reference makes on a channel *before* a publication is made
 /// from it (`validate_endpoint_for_publication` and
 /// `validate_control_for_publication`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:569-608`).
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:610-649`).
 ///
 /// # Errors
 ///
@@ -1346,7 +1346,7 @@ fn validate_for_publication(channel: &UdpChannel) -> Result<(), AddError> {
 }
 
 /// `aeron_driver_conductor_validate_response_subscription`
-/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:631-656`).
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:672-697`).
 ///
 /// A publication that is not on a response channel but names a
 /// `response-correlation-id` is claiming to answer a subscription, and the claim
@@ -1384,7 +1384,7 @@ fn validate_response_subscription(
 }
 
 /// `aeron_driver_conductor_find_response_publication_image`
-/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:1787-1833`).
+/// (`aeron-driver/src/main/c/aeron_driver_conductor.c:1828-1874`).
 ///
 /// A publication on a `control-mode=response` channel is the *answering* half
 /// of a response channel: the client publishing into it is the one a request
@@ -1405,7 +1405,7 @@ fn validate_response_subscription(
 /// The prototype value ([`PROTOTYPE_CORRELATION_ID`]) is a fourth case and not
 /// a refusal: it is what a client sends when it has no image yet, and it means
 /// "none", so the caller clamps the term length for it instead
-/// (`:4314-4317`).
+/// (`:4411-4414`).
 ///
 /// # Errors
 ///
@@ -1468,6 +1468,11 @@ pub fn transport_params(config: &DriverConfig, channel: &UdpChannel) -> Transpor
             channel.socket_sndbuf_length
         } else {
             usize::try_from(config.socket_so_sndbuf).unwrap_or(0)
+        },
+        socket_tos: if channel.socket_tos != -1 {
+            channel.socket_tos
+        } else {
+            config.socket_tos
         },
         multicast_if_index: channel.interface_index,
         ttl: if channel.multicast_ttl != 0 {

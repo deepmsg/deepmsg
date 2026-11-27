@@ -4,7 +4,7 @@
 //! leaves — and no image is left behind — the reference lets it go: the socket
 //! is closed, the `rcv-channel` counter's record is reclaimed, and the entry
 //! goes (`aeron_receive_channel_endpoint_try_remove_endpoint`,
-//! `media/aeron_receive_channel_endpoint.c:691-702`).
+//! `media/aeron_receive_channel_endpoint.c:696-707`).
 //!
 //! What that is worth is visible from outside: **binding the same port again**.
 //! Without the release the second bind fails with `Address already in use`,

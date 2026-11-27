@@ -24,7 +24,7 @@
 //!    is told, so an archive that is already recording somebody else's stream on the
 //!    same channel is not what this records.
 //! 3. ★ **It waits for the recording to be running before it forwards anything**
-//!    (`:97`, `awaitRecordingStart`). The wait is on a **recording position counter**,
+//!    (`:99`, `awaitRecordingStart`). The wait is on a **recording position counter**,
 //!    which the archive allocates into the *driver's* counters region when the image
 //!    arrives — so this is the one place in the benchmark where the far end reads a
 //!    counter the archive wrote, and the reason the reference's own poll has no
@@ -53,7 +53,7 @@ use crate::loadtest::transport::util::{
 ///
 /// `Aeron.NULL_VALUE`, which is what the reference's
 /// `RecordingPos.findCounterIdBySession` treats as "do not compare the archive id"
-/// (`RecordingPos.java:230`) — and which is also the reference archive's own default
+/// (`RecordingPos.java:202`) — and which is also the reference archive's own default
 /// id, so a run that never names one is asking the same question either way.
 pub const ANY_ARCHIVE_ID: i64 = -1;
 

@@ -4,7 +4,7 @@
 #
 # It reads the *reference* tree (not ours) and writes both TSVs:
 #     python3 -I reference-cases.gen.py <aeron-root> <deepmsg-root>
-# with <aeron-root> at 664f58e705 (tag 1.53.2). Never hand-edit the TSVs;
+# with <aeron-root> at 481d4271ad (tag 1.54.2). Never hand-edit the TSVs;
 # re-run this and review the diff.
 #
 # It is deliberately dumb: `assert_surface` is decided by direct syntactic
@@ -41,7 +41,7 @@ SYSTEM_CLASS = {
     "MultiNodeTest": ("A", "P3-6c"),
     "ClusterUncommittedStateTest": ("A", "P3-6a"),
     "ClusterSessionReliabilityTest": ("B", "P3-3c"),
-    "ClusterNetworkTopologyTest": ("A", "P3-6c"),
+    "ClusteredMediaDriverThreadAffinityTest": ("B", "P3-8"),
     "MultiModuleSharedDriverTest": ("A", "P3-6c"),
     "MultiClusteredServicesTest": ("B", "P3-2c"),
     "ClusterThreadNamingTest": ("B", "P3-8"),
@@ -107,7 +107,7 @@ UNIT_CLASS = {
 # slot so no row is ever `?` — `-` means "no card owns it, by decision".
 UNIT_NA = {
     "StandbySnapshotReplicatorTest": "n/a:premium",
-    "ClusterEventLoggerCborImplTest": "n/a:logging",
+    "CborClusterTracerTest": "n/a:logging",
     "ClusterEventCodeTest": "n/a:logging",
     "CborClusterEventCodecTest": "n/a:logging",
     "ClusterLoggingAgentTest": "n/a:logging",
@@ -356,7 +356,7 @@ def emit(kind: str, path: str, out_rows, cls_map, na_map):
 HEADER_COMMON = """\
 # What the reference's cluster test suite runs, one row per case — the
 # denominator P3-0b owes the rest of P3. Keys are the reference's own case
-# names, read from the tree at 664f58e705 (tag 1.53.2).
+# names, read from the tree at 481d4271ad (tag 1.54.2).
 #
 # Why two files: P3 runs two agent lanes (plan §6.2). A lane owns consensus,
 # B owns instruments and periphery. Each lane fills its own `ours` column, so
@@ -369,8 +369,8 @@ HEADER_COMMON = """\
 # is to name every case and record what it actually asserts.
 #
 # Columns:
-#   kind           system = aeron-system-tests/.../cluster (178 total)
-#                  unit   = aeron-cluster/src/test/java      (396 total)
+#   kind           system = aeron-system-tests/.../cluster (175 total)
+#                  unit   = aeron-cluster/src/test/java      (404 total)
 #   class          the reference's own class name
 #   method         the reference's own method name
 #   lane           A = consensus critical path, B = instruments/periphery

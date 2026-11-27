@@ -2,12 +2,12 @@
 //!
 //! Mirrors `aeron-driver/src/main/c/media/aeron_udp_channel_transport.c`, and
 //! the send-path choice in particular
-//! (`aeron_udp_channel_transport_send`, `:818-902`):
+//! (`aeron_udp_channel_transport_send`, `:845-929`):
 //!
 //! * a **connected** transport sends one datagram with `send`
-//!   (`:646-665`) and several with `sendmmsg` and no address (`:701-752`);
+//!   (`:673-692`) and several with `sendmmsg` and no address (`:728-779`);
 //! * an **unconnected** one always names the address
-//!   (`:668-696`).
+//!   (`:695-723`).
 //!
 //! Which matters because the sender's position advances by what the kernel
 //! took: a datagram that was not sent is one the publication will offer again.
@@ -15,7 +15,7 @@
 //! # Back pressure is not an error
 //!
 //! `EAGAIN`, `EWOULDBLOCK`, `ECONNREFUSED` and `EINTR` are "nothing happened
-//! this time" in the reference (`:728-731`, `:584-587`) and here: the sender
+//! this time" in the reference (`:755-758`, `:605-608`) and here: the sender
 //! comes back on its next pass, and a subscriber that is not there yet — which
 //! is an ICMP port-unreachable on a connected socket, reported as
 //! `ECONNREFUSED` — must not look like a broken driver.
@@ -35,10 +35,10 @@ use super::{Datagrams, Transport, TransportParams};
 /// `socket` is the one that sends, and the one that receives too unless
 /// `recv_socket` is there. The reference keeps the same pair as `fd` and
 /// `recv_fd` and starts them equal (`aeron_udp_channel_transport.c:141`); a
-/// second descriptor appears in exactly one case (`:157-164`): a **multicast**
+/// second descriptor appears in exactly one case (`:171-178`): a **multicast**
 /// transport that was also given a connect address. Only a *send* endpoint
-/// passes one (`aeron_send_channel_endpoint.c:91` — receive destinations pass
-/// `NULL`, `aeron_receive_destination.c:73`), which is why a subscriber to a
+/// passes one (`aeron_send_channel_endpoint.c:83` — receive destinations pass
+/// `NULL`, `aeron_receive_destination.c:79`), which is why a subscriber to a
 /// group has one descriptor and a publisher to it has two.
 ///
 /// The split is not about direction, and reading it that way is the mistake to
@@ -121,40 +121,42 @@ impl UdpTransport {
         let receive = recv_socket.as_ref().unwrap_or(&socket);
 
         if is_multicast {
-            // `:166-182`: both options, on the *receiving* descriptor, so that
+            // `:166-182`: `SO_REUSEADDR` on the *receiving* descriptor, so that
             // several subscribers to one group can share the port.
+            // `SO_REUSEPORT` is deliberately **not** set on Linux: 1.54.2
+            // stopped doing so (`aeron_udp_channel_transport.c:182-204`), and
+            // `SO_REUSEADDR` is what multicast sharing needs.
             receive.set_reuse_address()?;
-            receive.set_reuse_port()?;
 
-            // `:190-205`, `:257-272`: a group this socket did not join is not
+            // `:204-219`, `:271-286`: a group this socket did not join is not
             // this socket's to hear.
             receive.set_multicast_all_disabled()?;
 
             let interface =
                 multicast_interface.ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
 
-            // `:186-273`: the bind is the **wildcard** at the channel's port —
+            // `:200-287`: the bind is the **wildcard** at the channel's port —
             // the group is joined, never bound.
             receive
                 .bind(SocketAddr::new(wildcard(family), bind.port()))
                 .map_err(OpenError::Bind)?;
 
-            // `:275-293`: the join, on the receiving descriptor.
+            // `:289-307`: the join, on the receiving descriptor.
             receive.join_multicast_group(bind.ip(), interface.ip(), params.multicast_if_index)?;
 
-            // `:230-235`, `:295-302`: the interface sends leave by, on the
+            // `:244-249`, `:309-316`: the interface sends leave by, on the
             // sending one.
             socket.set_multicast_interface(interface.ip(), params.multicast_if_index)?;
 
             if params.ttl > 0 {
-                // `:304-312`: the hop limit, also on the sending descriptor.
+                // `:318-326`: the hop limit, also on the sending descriptor.
                 socket.set_multicast_ttl(params.ttl)?;
             }
         } else {
-            // `:147-154`: a unicast transport binds and nothing else, and it is
+            // `:161-168`: a unicast transport binds and nothing else, and it is
             // the bind whose failure the reference composes from the descriptor
-            // and the address. **No reuse options**: the `SO_REUSEADDR` /
-            // `SO_REUSEPORT` pair at `:168-190` is inside the *multicast* branch
+            // and the address. **No reuse options**: `SO_REUSEADDR` at
+            // `:182-204` is inside the *multicast* branch
             // — the `else` of `if (!is_multicast)`, whose first act is that
             // bind. Setting them here as well looks like the same behaviour and
             // is not: a receive destination naming an address another socket of
@@ -164,21 +166,29 @@ impl UdpTransport {
         }
 
         if let Some(address) = connect {
-            // `:316-324`.
+            // `:330-338`.
             socket.connect(address)?;
         }
 
         if params.socket_rcvbuf > 0 {
-            // `:326-334`: on the descriptor that receives.
+            // `:340-348`: on the descriptor that receives.
             receive.set_receive_buffer(params.socket_rcvbuf)?;
         }
 
         if params.socket_sndbuf > 0 {
-            // `:336-344`: on the one that sends.
+            // `:350-358`: on the one that sends.
             socket.set_send_buffer(params.socket_sndbuf)?;
         }
 
-        // `:356-366`: both descriptors, which for a unicast transport are the
+        if params.socket_tos >= 0 {
+            // `:145-158`: both descriptors, like the buffer lengths above.
+            socket.set_tos(params.socket_tos)?;
+            if let Some(recv_socket) = &recv_socket {
+                recv_socket.set_tos(params.socket_tos)?;
+            }
+        }
+
+        // `:370-380`: both descriptors, which for a unicast transport are the
         // same one.
         socket.set_nonblocking()?;
 
@@ -200,7 +210,7 @@ impl UdpTransport {
 
     /// Whether this transport holds two descriptors rather than one
     /// (`transport->recv_fd != transport->fd`,
-    /// `aeron_udp_channel_transport.c:394-409`, which is also the condition
+    /// `aeron_udp_channel_transport.c:408-423`, which is also the condition
     /// its close tests before closing a second one).
     pub const fn has_split_descriptors(&self) -> bool {
         self.recv_socket.is_some()
@@ -208,7 +218,7 @@ impl UdpTransport {
 
     /// The descriptor that receives — the second one where there is one, which
     /// is the reference's `transport->recv_fd` at every receive call site
-    /// (`:439`, `:506`, `:577`, `:904-915`, `:917-930`).
+    /// (`:453`, `:527`, `:598`, `:931-942`, `:944-957`).
     fn receiving(&self) -> &DatagramSocket {
         self.recv_socket.as_ref().unwrap_or(&self.socket)
     }
@@ -225,7 +235,7 @@ impl UdpTransport {
     /// `ECONNREFUSED` counts as "not now" for the reason the reference gives:
     /// on a connected UDP socket an ICMP port-unreachable from a subscriber
     /// that has not started yet arrives as a failed send
-    /// (`:511-516`, `:728-731`).
+    /// (`:532-537`, `:755-758`).
     fn is_back_pressure(error: &io::Error) -> bool {
         // `EAGAIN` and `EWOULDBLOCK` are the same number on Linux, so naming
         // both here would be an unreachable pattern.
@@ -239,7 +249,7 @@ impl UdpTransport {
 impl Transport for UdpTransport {
     fn send(&mut self, address: Option<SocketAddr>, buffers: &[&[u8]]) -> io::Result<usize> {
         if self.connected_address.is_some() && buffers.len() == 1 {
-            // `:827-837`: one datagram on a connected socket is a plain
+            // `:854-864`: one datagram on a connected socket is a plain
             // `send`.
             return match self.socket.send(buffers[0]) {
                 Ok(sent) => Ok(usize::from(sent > 0)),
@@ -263,13 +273,13 @@ impl Transport for UdpTransport {
     fn descriptor(&self) -> Option<crate::sys::socket::Descriptor> {
         // The **receiving** socket: a multicast transport binds one to hear
         // the group and sends by another, and it is the first that a poller
-        // can say anything about (`aeron_udp_channel_transport.c:917-930`
+        // can say anything about (`aeron_udp_channel_transport.c:944-957`
         // makes the same distinction for the local address).
         Some(self.receiving().descriptor())
     }
 
     fn receive(&mut self, buffers: &mut [Vec<u8>], datagrams: &mut Datagrams) -> io::Result<usize> {
-        // The reference's `recvmmsg` path (`:549-644`), with one difference
+        // The reference's `recvmmsg` path (`:570-665`), with one difference
         // worth naming: it does *not* count a failed receive as an error when
         // the failure is one of the "not now" errnos — it answers zero, and the
         // receiver's pass ends with nothing done.
@@ -281,12 +291,12 @@ impl Transport for UdpTransport {
     }
 
     /// Connect the socket somewhere else (`aeron_udp_channel_transport_reconnect`,
-    /// `aeron_udp_channel_transport.c:376-392`), which is how a name that
+    /// `aeron_udp_channel_transport.c:390-406`), which is how a name that
     /// resolved to a new address reaches a transport that was already connected
     /// to the old one.
     ///
     /// A transport with **no** connected address is left alone, and that is the
-    /// reference's own test (`NULL != transport->connected_address`, `:380`):
+    /// reference's own test (`NULL != transport->connected_address`, `:394`):
     /// an unconnected transport names the address on every send, so there is
     /// nothing to reconnect.
     ///
@@ -305,7 +315,7 @@ impl Transport for UdpTransport {
     }
 
     fn local_address(&self) -> io::Result<SocketAddr> {
-        // `:917-930`: the channel-status label reports the **receiving**
+        // `:944-957`: the channel-status label reports the **receiving**
         // descriptor's name — which for a multicast transport is the wildcard
         // it bound, not the group it joined.
         self.receiving().local_address()
@@ -317,7 +327,7 @@ impl Transport for UdpTransport {
 }
 
 /// The unspecified address of a family, which a multicast transport binds
-/// (`aeron_udp_channel_transport.c:186-211`, `:248-273`).
+/// (`aeron_udp_channel_transport.c:200-225`, `:262-287`).
 fn wildcard(family: AddressFamily) -> IpAddr {
     match family {
         AddressFamily::Inet => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -456,6 +466,7 @@ mod tests {
             &TransportParams {
                 socket_rcvbuf: 1 << 20,
                 socket_sndbuf: 1 << 20,
+                socket_tos: -1,
                 multicast_if_index: 0,
                 ttl: 4,
                 control: None,
@@ -573,8 +584,7 @@ mod tests {
         let interface = Some(SocketAddr::new(interface(), 0));
 
         // Two subscribers on one group and one port. That they can both bind
-        // at all is the `SO_REUSEADDR`/`SO_REUSEPORT` pair, and that both hear
-        // it is what they are for.
+        // at all is `SO_REUSEADDR`, and that both hear it is what it is for.
         let mut first = joined(data);
         let mut second = joined(data);
 

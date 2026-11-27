@@ -34,7 +34,7 @@
 //! `RecordingSignalEvent` fills the slot and completes the poll exactly like an
 //! answer does — but it is not the answer to anything. The reference's wait loop
 //! recognizes it, **dispatches it to the recording-signal handler, and goes back
-//! to polling** rather than returning it (`aeron_archive_client.c:109-115`).
+//! to polling** rather than returning it (`aeron_archive_client.c:175-181`).
 //! That is why the poller reports it as its own flag rather than folding it into
 //! "a response arrived": the layer above has to be able to tell.
 //!
@@ -108,21 +108,21 @@ pub struct ControlResponsePoller {
     encoded_challenge: Vec<u8>,
     /// `OK` or `ERROR` — `None` before anything is read, and for a challenge.
     code: Option<ControlResponseCode>,
-    /// The slot is full, and the next poll will reset it (`:59`).
+    /// The slot is full, and the next poll will reset it (`:62`).
     is_poll_complete: bool,
-    /// The slot holds a `ControlResponse` (`:60`).
+    /// The slot holds a `ControlResponse` (`:63`).
     ///
     /// One of three flags rather than a "kind" enum, because that is what the
     /// reference has and what its wait loop reads. The three are mutually
     /// exclusive by construction — exactly one branch of the dispatch sets one —
     /// and `is_poll_complete` is false for all of them until it does.
     is_control_response: bool,
-    /// The slot holds a challenge (`:62`). See [`Self::was_challenged`].
+    /// The slot holds a challenge (`:65`). See [`Self::was_challenged`].
     was_challenged: bool,
-    /// The slot holds a recording signal (`:63`). See [`Self::is_recording_signal`].
+    /// The slot holds a recording signal (`:66`). See [`Self::is_recording_signal`].
     is_recording_signal: bool,
     /// Set **by a message**, not by the caller: the header could not be read, or
-    /// the schema id was not this build's (`:180-190`). A handler cannot return
+    /// the schema id was not this build's (`:183-193`). A handler cannot return
     /// an error — the scan asks it what to *do* — so the reason travels in a
     /// field and the poll turns it into one.
     error_on_message: bool,
@@ -158,7 +158,7 @@ impl ControlResponsePoller {
         poller
     }
 
-    /// Forget what the last poll read (`:124-152`).
+    /// Forget what the last poll read (`:127-155`).
     ///
     /// Called by [`Self::poll`] when the slot is full, so a caller that reads
     /// one message per poll never needs it.
@@ -187,7 +187,7 @@ impl ControlResponsePoller {
     }
 
     /// Read up to `fragment_limit` messages, stopping at the first one this
-    /// poller understands (`:100-121`).
+    /// poller understands (`:103-124`).
     ///
     /// Answers how many messages were read, which is what the wait loop uses to
     /// decide whether to poll again or go idle.
@@ -196,16 +196,16 @@ impl ControlResponsePoller {
     ///
     /// [`ControlResponseError`] when a message on the subscription was
     /// malformed. The reference reports this through a flag the poll turns into
-    /// `-1` (`:112-116`), because the fragment handler it is called from has no
+    /// `-1` (`:178-182`), because the fragment handler it is called from has no
     /// way to return one.
     ///
     /// # A recorded deviation
     ///
     /// **The malformed-message flag is cleared here, at the start of every
-    /// poll.** The reference clears it only in its reset (`:133`), which runs
+    /// poll.** The reference clears it only in its reset (`:136`), which runs
     /// only when the slot completed — so it is *sticky*: after one malformed
     /// message, the next poll reads a good one, fills the slot with it, and
-    /// still reports `-1`, because the check at `:120` asks whether the flag is
+    /// still reports `-1`, because the check at `:123` asks whether the flag is
     /// set and not whether *this* poll set it. The poll after that resets, and
     /// the good message goes with it. Nothing reads the flag's age, so the
     /// message is lost rather than misreported — and a caller that retries a
@@ -213,7 +213,7 @@ impl ControlResponsePoller {
     /// caller that loses one.
     ///
     /// The reference's own wait loop never retries: it returns `-1` and the
-    /// operation is over (`aeron_archive_client.c:99-103`), which is why the
+    /// operation is over (`aeron_archive_client.c:165-169`), which is why the
     /// stickiness costs it nothing and would cost this build's callers
     /// something. Scoped to the poll, the flag means what its name says.
     pub fn poll(&mut self, client: &mut Client) -> Result<usize, ControlResponseError> {
@@ -255,7 +255,7 @@ impl ControlResponsePoller {
         self.is_control_response
     }
 
-    /// Whether the archive asked this client to prove itself (`:263`).
+    /// Whether the archive asked this client to prove itself (`:338`).
     ///
     /// The answer this client must give is [`Self::encoded_challenge`], and it
     /// goes back through [`crate::client::proxy::ArchiveProxy::challenge_response`].
@@ -352,7 +352,7 @@ impl ControlResponsePoller {
 
 impl ControlledHandler for ControlResponsePoller {
     /// Look at one whole message and say what the scan should do with it
-    /// (`:155-334`).
+    /// (`:226-405`).
     ///
     /// What stops the scan is `Break`: the message that filled the slot is
     /// **consumed**, and the scan stops there — so the next message is still on
@@ -374,7 +374,7 @@ impl ControlledHandler for ControlResponsePoller {
         let payload = message.payload;
 
         // The reference's `messageHeader_wrap` and the schema-id check
-        // (`:167-190`). Both fail the *poll*, not the message: the scan carries
+        // (`:238-261`). Both fail the *poll*, not the message: the scan carries
         // on and `poll` reports it (`:112-116`). The shared table also bounds
         // every template's fixed block and variable fields before a decoder
         // reads them — the generated reader panics where the reference's
@@ -414,7 +414,7 @@ impl ControlledHandler for ControlResponsePoller {
                 self.control_session_id = challenge.control_session_id();
                 self.correlation_id = challenge.correlation_id();
                 // The reference sets this one field to `AERON_NULL_VALUE` here
-                // and leaves the rest at whatever the reset put there (`:245`):
+                // and leaves the rest at whatever the reset put there (`:320`):
                 // a challenge is about no particular thing.
                 self.relevant_id = NULL_VALUE;
                 self.version = challenge.version();
@@ -448,7 +448,7 @@ impl ControlledHandler for ControlResponsePoller {
 
                 Action::Break
             }
-            // "do nothing" (`:330-332`): a template this poller does not read
+            // "do nothing" (`:409-411`): a template this poller does not read
             // is consumed and the poll carries on, up to the fragment limit.
             _ => Action::Continue,
         }

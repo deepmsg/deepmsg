@@ -257,7 +257,7 @@ pub trait Strategy {
 #[derive(Debug)]
 pub enum FlowControl {
     /// `fc=max` — and the default for a channel that names nothing, unicast or
-    /// multicast (`aeron_driver_context.c:201`).
+    /// multicast (`aeron_driver_context.c:203`).
     Max(MaxStrategy),
     /// `fc=min`: the sender waits for the slowest receiver
     /// (`aeron_min_flow_control.c:260-281`).
@@ -402,7 +402,7 @@ impl Default for MaxStrategy {
 /// The default retransmit receiver window multiple
 /// (`AERON_UNICAST_FLOW_CONTROL_RETRANSMIT_RECEIVER_WINDOW_MULTIPLE`,
 /// `aeron-driver/src/main/c/aeron_flow_control.h:31`, which the context starts
-/// from at `aeron_driver_context.c:505`).
+/// from at `aeron_driver_context.c:510`).
 ///
 /// Sixteen receiver windows: a retransmission may cover far more than the
 /// window itself, because the receiver asks for what it is missing and the
@@ -413,7 +413,7 @@ pub const UNICAST_RRWM_DEFAULT: usize = 16;
 /// multi-destination** endpoint
 /// (`AERON_MULTICAST_FLOW_CONTROL_RETRANSMIT_RECEIVER_WINDOW_MULTIPLE`,
 /// `aeron-driver/src/main/c/aeron_flow_control.h:30`, which the context starts
-/// from at `aeron_driver_context.c:504`).
+/// from at `aeron_driver_context.c:509`).
 ///
 /// Four receiver windows against unicast's sixteen. A multicast retransmission
 /// goes to every receiver on the group, so it is held to what the receiver that
@@ -422,13 +422,13 @@ pub const MULTICAST_RRWM_DEFAULT: usize = 4;
 
 /// Which strategy a channel that names no `fc=` gets — the driver's two
 /// supplier settings (`multicast_flow_control_supplier_func` and
-/// `unicast_flow_control_supplier_func`, `aeron_driver_context.c:400-408`).
+/// `unicast_flow_control_supplier_func`, `aeron_driver_context.c:403-411`).
 ///
 /// The reference resolves these from a **symbol name** through `dlsym`
 /// (`aeron_flow_control_strategy_supplier_load`, `aeron_flow_control.c:70-79`,
 /// reading `AERON_MULTICAST_FLOWCONTROL_SUPPLIER` and its unicast twin at
-/// `aeron_driver_context.c:563-580`), and the names are the four in its table
-/// (`:369-372`). This build has the same three strategies and no dynamic
+/// `aeron_driver_context.c:570-587`), and the names are the four in its table
+/// (`:372-375`). This build has the same three strategies and no dynamic
 /// loading, so the same names are mapped to them — and a name that is none of
 /// the four is refused, which is what the reference does too: its context init
 /// fails and the driver does not start.
@@ -437,7 +437,7 @@ pub enum Supplier {
     /// `aeron_max_multicast_flow_control_strategy_supplier`, and the unicast
     /// `aeron_unicast_flow_control_strategy_supplier`, which is the same
     /// strategy (`aeron_flow_control.c:30-40`). It is also both defaults
-    /// (`aeron_driver_context.c:201-202`).
+    /// (`aeron_driver_context.c:203-204`).
     #[default]
     Max,
     /// `aeron_min_flow_control_strategy_supplier`.
@@ -474,7 +474,7 @@ impl Supplier {
     /// `aeron-client/src/main/c/util/aeron_symbol_table.c:98-120`).
     ///
     /// Each entry of the table has **two** names and the scan takes either
-    /// (`aeron_flow_control.c:43-64`): the short one from `aeronmd.h:286-289`
+    /// (`aeron_flow_control.c:43-64`): the short one from `aeronmd.h:303-306`
     /// and the symbol's own. So `multicast_min` and
     /// `aeron_min_flow_control_strategy_supplier` are the same supplier, while
     /// `min` — the name `fc=` uses — is not on this list at all.
@@ -524,7 +524,7 @@ pub struct Defaults {
 /// `aeron_flow_control.c:400-475`).
 ///
 /// The selector is entered for **every** publication and takes the *endpoint's*
-/// channel (`aeron_driver_conductor.c:4492-4496`), not the publication's. What
+/// channel (`aeron_driver_conductor.c:4589-4593`), not the publication's. What
 /// it branches on is whether that channel is multi-destination or multicast.
 ///
 /// A **unicast** channel never looks at `fc=`: the unicast supplier is chosen
@@ -539,7 +539,7 @@ pub struct Defaults {
 /// picks the supplier: `max` is the only one this build has, so `min` and
 /// `tagged` come back as strategies it does not have rather than as malformed
 /// channels. No `fc=` at all falls to the context's multicast supplier, which is
-/// `max` (`aeron_driver_context.c:201`).
+/// `max` (`aeron_driver_context.c:203`).
 ///
 /// # Errors
 ///
@@ -921,7 +921,7 @@ impl Strategy for MinStrategy {
         // The reference removes these while walking the table backwards and
         // calls its `receiver_removed` log hook for each (`:126-137`); the hook
         // is one the driver context leaves null and no component here sets
-        // (`aeron_driver_context.c:1239-1240`), so there is nothing to call.
+        // (`aeron_driver_context.c:1269-1270`), so there is nothing to call.
         self.receivers.retain(|receiver| {
             let has_gone_quiet = receiver
                 .time_of_last_status_message_ns
@@ -1000,7 +1000,7 @@ impl Strategy for MinStrategy {
 
     /// A status message asked for a setup
     /// (`aeron_min_flow_control_strategy_process_on_trigger_send_setup`,
-    /// `:381-392`).
+    /// `:384-395`).
     ///
     /// The flag is only ever *set* here — and only by the first asking message
     /// since the last setup went out — and only ever cleared by `on_setup`.
@@ -1797,7 +1797,7 @@ mod tests {
 
     /// A multicast or multi-destination channel does read it, and no `fc=` at
     /// all falls to the context's multicast supplier, which is `max`
-    /// (`aeron_driver_context.c:201`).
+    /// (`aeron_driver_context.c:203`).
     #[test]
     fn a_channel_with_several_receivers_reads_fc_and_defaults_to_four() {
         let strategy = |fc| strategy_for_channel(true, fc, defaults()).expect("a strategy");

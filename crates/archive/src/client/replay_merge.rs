@@ -38,7 +38,7 @@
 //!   A handle here would borrow the subscription for the life of the merge, so
 //!   the merge takes an [`ImageFacts`] snapshot per turn through
 //!   [`MergePeer::image`] instead — the same reads, no borrow.
-//! * The reference asks that handle `isClosed` (`:457`) and means a closed
+//! * The reference asks that handle `isClosed` (`:462`) and means a closed
 //!   image the client still holds, whose last position can still be read. This
 //!   client removes an image when the driver says it is unavailable and holds
 //!   nothing closed, so the image **going** is that same event: [`MergePeer::image`]
@@ -132,7 +132,7 @@ impl State {
 /// A snapshot and not a handle, because a handle would borrow the subscription
 /// for the life of the merge — see the module note. The one thing a handle
 /// carries that a snapshot cannot is the reference's `Image.isClosed`
-/// (`:457`), a closed image the client still holds and whose last position can
+/// (`:462`), a closed image the client still holds and whose last position can
 /// still be read; there is no such image here, and the absence is said where it
 /// arrives instead: [`MergePeer::image`] answers `None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,7 +149,7 @@ pub struct ImageFacts {
 }
 
 /// Why a merge failed, which is the reference's two exceptions
-/// (`ReplayMerge.java:580-583`, `:598-608`) and the closed image of `:457`.
+/// (`ReplayMerge.java:585-588`, `:603-613`) and the closed image of `:462`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MergeFailure {
     /// No progress within the merge's timeout (`TimeoutException`).
@@ -159,15 +159,15 @@ pub enum MergeFailure {
         /// The transports the image had, when there was one to ask.
         active_transport_count: i32,
     },
-    /// The replay's image closed while the merge was catching up (`:457`).
+    /// The replay's image closed while the merge was catching up (`:462`).
     ImageClosed,
-    /// The archive answered `ERROR` (`ArchiveException`, `:602-606`).
+    /// The archive answered `ERROR` (`ArchiveException`, `:607-611`).
     Refused {
         /// The archive's words.
         message: String,
     },
     /// The driver would not give the subscription a destination
-    /// (`Subscription.asyncAddDestination` refusing, `:490`, `:501`).
+    /// (`Subscription.asyncAddDestination` refusing, `:495`, `:506`).
     ///
     /// Its own variant and not [`Self::Refused`]: these words come from the
     /// driver on the **command** channel, where `Refused`'s come from the
@@ -177,7 +177,7 @@ pub enum MergeFailure {
         /// The driver's words.
         message: String,
     },
-    /// The archive's control channel is not connected (`:611-613`).
+    /// The archive's control channel is not connected (`:616-618`).
     ArchiveNotConnected,
 }
 
@@ -242,13 +242,13 @@ pub trait MergePeer {
     /// one already** (`image_found`): before the replay's image has appeared it
     /// is "not yet", and after it has, `None` is the reference's closed image.
     /// The reference holds an `Image` handle and asks `isClosed` on it
-    /// (`:457`); this build's client removes an image when the driver says it
+    /// (`:462`); this build's client removes an image when the driver says it
     /// is unavailable and holds nothing closed, so an image that cannot be
     /// asked about any more is exactly the one the reference would call closed.
     fn image(&mut self, session_id: i32) -> Option<ImageFacts>;
 
     /// `AeronArchive.getMaxRecordedPosition`, answering whether the request
-    /// **went out** — the reference's `bool` (`:531-534`), which is false when
+    /// **went out** — the reference's `bool` (`:536-539`), which is false when
     /// the publication is back-pressured and the caller should try again.
     ///
     /// # Errors
@@ -260,7 +260,7 @@ pub trait MergePeer {
         correlation_id: i64,
     ) -> Result<bool, MergeFailure>;
 
-    /// `AeronArchive.replay` (`ReplayMerge.java:393-400`, with the length the
+    /// `AeronArchive.replay` (`ReplayMerge.java:398-405`, with the length the
     /// merge uses).
     ///
     /// # Errors
@@ -289,7 +289,7 @@ pub trait MergePeer {
 
     /// Poll the control channel once and answer the relevant id of the response
     /// to `correlation_id`, `None` while none has arrived
-    /// (`ReplayMerge.pollForResponse`, `:593-619`). `NULL_VALUE` asks for
+    /// (`ReplayMerge.pollForResponse`, `:598-624`). `NULL_VALUE` asks for
     /// whichever response is there.
     ///
     /// # Errors
@@ -301,14 +301,14 @@ pub trait MergePeer {
 
     /// Start putting a destination on the subscription, answering with the
     /// handle the driver will answer under
-    /// (`Subscription.asyncAddDestination`, `:490`, `:501`, `:666-674`).
+    /// (`Subscription.asyncAddDestination`, `:495`, `:506`, `:666-674`).
     ///
     /// **Started and not waited on**: the merge is a turn, and the driver's
     /// answer is read in a later one ([`MergePeer::destination_answered`]).
     /// The reference's merge is the reason the asynchronous form exists at all
     /// — its `async_destination` handle is polled at the top of every turn
     /// (`:717-731`) and holds the live join off while it is outstanding
-    /// (`:635-643`).
+    /// (`:640-648`).
     ///
     /// # Errors
     ///
@@ -336,12 +336,12 @@ pub trait MergePeer {
     fn destination_answered(&mut self, correlation_id: i64) -> Result<bool, MergeFailure>;
 
     /// Whether the `Aeron` client behind this is closed (`Aeron.isClosed`),
-    /// which `close` asks before it touches anything (`:206`).
+    /// which `close` asks before it touches anything (`:211`).
     fn client_is_closed(&self) -> bool;
 
     /// Whether the archive's control publication is still connected
     /// (`archive.archiveProxy().publication().isConnected()`), which `close`
-    /// asks before stopping a replay (`:215`).
+    /// asks before stopping a replay (`:220`).
     fn archive_publication_connected(&self) -> bool;
 
     /// Poll the fragments of the replay's image
@@ -373,7 +373,7 @@ pub trait MergePeer {
 ///   carries its correlation id across turns. A blocking add would stop a
 ///   merge's turn for as long as the driver took.
 /// * **A command the driver refuses is a merge that fails**, with the driver's
-///   words (`:490-501`).
+///   words (`:495-506`).
 ///
 /// # One contract difference that decides how this is used
 ///
@@ -609,7 +609,7 @@ impl MergePeer for ClientMergePeer<'_> {
 
     fn archive_publication_connected(&self) -> bool {
         // `close`'s own gate, and the same expression `Archive::close` uses
-        // (`:215-220`): a session whose request publication is not connected
+        // (`:220-225`): a session whose request publication is not connected
         // cannot be told anything.
         self.client
             .exclusive_publication(self.archive.proxy().request_publication())
@@ -669,12 +669,12 @@ pub struct ReplayMerge {
     image_found: bool,
     /// Whether the replay destination has gone onto the subscription yet.
     ///
-    /// The reference does this in `init` (`:490`), which has the subscription to
+    /// The reference does this in `init` (`:495`), which has the subscription to
     /// hand; here the first turn does it, so that no caller can construct a
     /// merge and forget to start it. See [`ReplayMerge::do_work`].
     replay_destination_added: bool,
     /// The destination command the driver has not answered yet, or
-    /// [`NULL_VALUE`] — the reference's `async_destination` handle (`:717-731`).
+    /// [`NULL_VALUE`] — the reference's `async_destination` handle (`:739-753`).
     ///
     /// Only one at a time, which is the reference's own rule: a merge that
     /// started a second before the first was answered would not know which
@@ -759,10 +759,10 @@ impl ReplayMerge {
         })
     }
 
-    /// One turn (`ReplayMerge.doWork`, `:240-294`).
+    /// One turn (`ReplayMerge.doWork`, `:245-299`).
     ///
     /// Returns the reference's work count. A turn that fails leaves the merge in
-    /// [`State::Failed`] — the C's `-1` and `FAILED` (`aeron_archive_replay_merge.c:301`),
+    /// [`State::Failed`] — the C's `-1` and `FAILED` (`aeron_archive_replay_merge.c:323`),
     /// which is what the Java's thrown exception becomes here — and
     /// [`ReplayMerge::failure_reason`] carries what the Java would have thrown.
     pub fn do_work<P: MergePeer>(&mut self, peer: &mut P, now_ms: i64) -> usize {
@@ -832,7 +832,7 @@ impl ReplayMerge {
         }
     }
 
-    /// Poll the image the merge is carrying (`:297-301`), which is the merge's
+    /// Poll the image the merge is carrying (`:319-323`), which is the merge's
     /// turn followed by the image's own poll — in that order, because the turn
     /// is what decides whether the image is still the right one.
     ///
@@ -865,13 +865,13 @@ impl ReplayMerge {
     }
 
     /// Whether the replay has been left behind and the subscription is live
-    /// only (`ReplayMerge.isMerged`, `:308`).
+    /// only (`ReplayMerge.isMerged`, `:313`).
     #[must_use]
     pub const fn is_merged(&self) -> bool {
         matches!(self.state, State::Merged)
     }
 
-    /// Whether the merge gave up (`:318`).
+    /// Whether the merge gave up (`:340`).
     #[must_use]
     pub const fn has_failed(&self) -> bool {
         matches!(self.state, State::Failed)
@@ -883,7 +883,7 @@ impl ReplayMerge {
         self.failure.as_ref()
     }
 
-    /// Whether the live destination has been added (`:338`).
+    /// Whether the live destination has been added (`:360`).
     #[must_use]
     pub const fn is_live_added(&self) -> bool {
         self.is_live_added
@@ -902,7 +902,7 @@ impl ReplayMerge {
         self.replay_session_id
     }
 
-    /// Close the merge and stop any replay (`:202-223`).
+    /// Close the merge and stop any replay (`:220-241`).
     ///
     /// The **live destination is left in place** — the reference says why: so
     /// that the subscription can go on being consumed live.
@@ -916,7 +916,7 @@ impl ReplayMerge {
                 let replay_destination = self.replay_destination.clone();
 
                 // Started **and drained**: the reference will not go on with the
-                // command outstanding (`:266-282`), because a removal nobody
+                // command outstanding (`:288-304`), because a removal nobody
                 // reads leaves the client holding a pending entry and the
                 // subscription still reading from a destination the caller
                 // thinks is gone. A refusal ends the wait rather than hanging
@@ -1011,7 +1011,7 @@ impl ReplayMerge {
         self.time_of_last_progress_ms = now_ms;
         self.active_correlation_id = NULL_VALUE;
 
-        // `:409-411`: the backoff is reset on the way into `CATCHUP`, which is
+        // `:431-433`: the backoff is reset on the way into `CATCHUP`, which is
         // the only place a merge starts making progress on its own.
         self.get_max_recorded_position_backoff_ms = INITIAL_GET_MAX_RECORDED_POSITION_BACKOFF_MS;
         self.time_of_next_get_max_recorded_position_ms = now_ms;
@@ -1057,7 +1057,7 @@ impl ReplayMerge {
     }
 
     fn attempt_live_join<P: MergePeer>(&mut self, peer: &mut P, now_ms: i64) -> Outcome {
-        // `:633-639`: a destination the driver has not answered is one whose
+        // `:655-661`: a destination the driver has not answered is one whose
         // answer this turn would be reading as its own — the reference bails
         // out of the state entirely rather than fall through to the decisions.
         if self.destination_correlation_id != NULL_VALUE {
@@ -1127,7 +1127,7 @@ impl ReplayMerge {
             self.active_correlation_id = correlation_id;
         }
 
-        // `:536-540`: the backoff doubles whether the request went out or not,
+        // `:558-562`: the backoff doubles whether the request went out or not,
         // and whether the answer has arrived or not. A merge that only backed
         // off on failure would ask once a turn forever.
         self.get_max_recorded_position_backoff_ms = self
@@ -1179,7 +1179,7 @@ impl ReplayMerge {
         Ok(())
     }
 
-    /// `:563-567`: the live destination goes on when the recording is within a
+    /// `:585-589`: the live destination goes on when the recording is within a
     /// quarter of a term (or 32 MiB, whichever is smaller) of where the replay
     /// has got to — close enough that the join will not be a hole.
     fn should_add_live_destination(&self, facts: ImageFacts) -> bool {
@@ -1188,7 +1188,7 @@ impl ReplayMerge {
                 <= i64::from(facts.term_buffer_length >> 2).min(LIVE_ADD_MAX_WINDOW)
     }
 
-    /// `:569-574`: the replay comes off once the live stream has caught up with
+    /// `:591-596`: the replay comes off once the live stream has caught up with
     /// it **and** is carrying two transports — one live transport would mean the
     /// replay's destination was still the only one, and removing it there is a
     /// gap rather than a merge.
@@ -1210,15 +1210,15 @@ impl ReplayMerge {
     /// id over one: `(replayId << 32) | sessionId` (`ReplaySession.java:338`),
     /// and the reference reaches the image by **truncating** it —
     /// `subscription.imageBySessionId((int)replaySessionId)`
-    /// (`ReplayMerge.java:436`), `(int32_t)replay_merge->replay_session_id` in
-    /// the C (`:591`). A narrowing that refused an id it did not fit would
+    /// (`ReplayMerge.java:441`), `(int32_t)replay_merge->replay_session_id` in
+    /// the C (`:596`). A narrowing that refused an id it did not fit would
     /// answer with a session no image has and leave the merge waiting in
     /// `CATCHUP` for a replay that had arrived.
     fn replay_session(&self) -> i32 {
         self.replay_session_id as i32
     }
 
-    /// `:556-561`: a state change drops whatever correlation the previous state
+    /// `:561-566`: a state change drops whatever correlation the previous state
     /// was waiting on, so a response that arrives late is not read as this
     /// state's.
     fn transition(&mut self, state: State) {
@@ -1433,7 +1433,7 @@ mod tests {
         fn poll_for_response(&mut self, correlation_id: i64) -> Result<Option<i64>, MergeFailure> {
             let waiting = if correlation_id == NULL_VALUE {
                 // The drain `checkProgress` does before anything is waited on
-                // (`:588-592`): whatever is there, or nothing.
+                // (`:593-597`): whatever is there, or nothing.
                 (!self.pending.is_empty()).then_some(0)
             } else {
                 self.pending
@@ -1543,7 +1543,7 @@ mod tests {
     /// The whole walk: the states in order, the live destination added once the
     /// replay is within a quarter term, and the replay taken off once the live
     /// stream has caught up on two transports
-    /// (`ReplayMerge.java:240-294`, `:472-521`).
+    /// (`ReplayMerge.java:245-299`, `:477-526`).
     #[test]
     fn a_merge_walks_its_states_to_merged() {
         let mut merge = merge(MERGE_PROGRESS_TIMEOUT_DEFAULT_MS);
@@ -1588,7 +1588,7 @@ mod tests {
         // The live destination is on and the recording has not moved, but the
         // live stream has only **one** transport — the archive's replay
         // transport. Taking the replay destination off here is a gap rather
-        // than a merge (`:569-574`).
+        // than a merge (`:574-579`).
         peer.max_recorded_position = 1024;
         peer.image = Some(catchup_facts(1024, 1));
 
@@ -1632,7 +1632,7 @@ mod tests {
         assert_eq!(vec![99], peer.stopped);
 
         // Closing a merged merge leaves the live destination alone — that is
-        // what makes the subscription still usable (`:198-200`).
+        // what makes the subscription still usable (`:203-205`).
         merge.close(&mut peer);
         assert_eq!(State::Closed, merge.state());
         assert_eq!(3, peer.started.len(), "and nothing more was removed");
@@ -1705,7 +1705,7 @@ mod tests {
     /// with, because a replay's `relevantId` is a replay id over a session id.
     ///
     /// The two halves are why the reference casts rather than converts
-    /// (`ReplayMerge.java:436`): the id a replay is answered with is
+    /// (`ReplayMerge.java:441`): the id a replay is answered with is
     /// `(replayId << 32) | sessionId` (`ReplaySession.java:338`), and it is the
     /// session an image is named by. A merge that refused an id it could not fit
     /// in an `i32` would look for a session no subscription has and wait in

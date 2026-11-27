@@ -70,7 +70,7 @@ pub const SETUP_TIMEOUT_NS: i64 = 100_000_000;
 pub const HEARTBEAT_TIMEOUT_NS: i64 = 100_000_000;
 
 /// What a network publication's own counters are
-/// (`aeron_counter_*_allocate`, `aeron-driver/src/main/c/aeron_driver_conductor.c:4508-4531`).
+/// (`aeron_counter_*_allocate`, `aeron-driver/src/main/c/aeron_driver_conductor.c:4605-4628`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublicationCounters {
     /// `pub-pos`: what the producer has written.
@@ -215,7 +215,7 @@ pub struct NetworkPublication {
     /// It is the whole of the tie between a response setup frame and the
     /// subscription waiting for it: the frame names the *publication*, and this
     /// is the only thing that says which subscription that publication was
-    /// made for (`aeron_send_channel_endpoint.c:738-748`).
+    /// made for (`aeron_send_channel_endpoint.c:731-741`).
     pub response_correlation_id: i64,
     /// Whether this publication *is* the response half — the one a responder
     /// creates with `control-mode=response` (`aeron_network_publication.c:316`).
@@ -329,7 +329,7 @@ impl NetworkPublication {
                 .ok_or(PublicationError::BadTermLength)?;
 
         // The three tails: the first term begins at offset zero, the two before
-        // it hold the wraps a rotation looks for (`aeron_ipc_publication.c:75-103`).
+        // it hold the wraps a rotation looks for (`aeron_ipc_publication.c:80-108`).
         //
         // A stream that resumes starts its tails at the term the URI named —
         // the reference writes the same block on the network path
@@ -441,8 +441,8 @@ impl NetworkPublication {
             counters,
             // Clamped where the reference clamps it — its context setter
             // refuses anything above `AERON_NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND`
-            // (`aeron_driver_context.c:3378-3384`), which is the sixteen
-            // `send_data`'s batch arrays are sized to. The setting is not read
+            // (`aeron_driver_context.c:3483-3485`), which is the sixty-four
+            // `send_data`'s batch arrays are sized to (1.54.2; it was 16). The setting is not read
             // here yet, so this is the default four and the clamp cannot bite
             // today; it is here so that adding the setting cannot turn a batch
             // into an out-of-bounds write.
@@ -539,7 +539,7 @@ impl NetworkPublication {
         // `pub-pos` and `pub-lmt` are **not** written here any more. They are
         // the conductor's (`PublicationMaintenance::update_pub_pos_and_lmt`),
         // which is where the reference writes them
-        // (`aeron_driver_conductor.c:3395-3399`), and more to the point where
+        // (`aeron_driver_conductor.c:3492-3496`), and more to the point where
         // the readers whose slowest one decides the limit now live. One writer:
         // a second one could move `pub-lmt` backwards and hold the producer to
         // a limit that went down — see that module.
@@ -568,7 +568,7 @@ impl NetworkPublication {
                 term_offset,
             )?;
 
-            // `:612-636`: an idle pass is where a publication with **only
+            // `:653-677`: an idle pass is where a publication with **only
             // spies** moves at all, and it moves because there is nothing to
             // send. `snd-pos` says what has left the machine, and with no
             // receiver nothing ever does — so for an `ssc` stream the spies
@@ -780,7 +780,7 @@ impl NetworkPublication {
         self.time_of_last_data_or_heartbeat_ns = now_ns;
 
         // Bytes: this value is what a pass that sent no data reports, and the
-        // sender adds it to `bytes-sent` (`:576`, `aeron_driver_sender.c:457`).
+        // sender adds it to `bytes-sent` (`:576`, `aeron_driver_sender.c:459`).
         Ok(if sent < 1 { 0 } else { buffer.len() })
     }
 
@@ -807,7 +807,7 @@ impl NetworkPublication {
     /// finished.
     ///
     /// Two of the reference's arms in one call
-    /// (`aeron_network_publication_check_managed_resources`, `:1240-1340`):
+    /// (`aeron_network_publication_check_managed_resources`, `:1259-1359`):
     ///
     /// * **ACTIVE → LINGER**, the first time the byte is seen. The limit stops
     ///   where the producer did, the log says where the stream ended, this
@@ -830,7 +830,7 @@ impl NetworkPublication {
     ) -> bool {
         // While a publication whose last client has let go is still draining,
         // the log is unblocked at the **sender's** position
-        // (`aeron_network_publication.c:1300-1315`). No gate and no
+        // (`aeron_network_publication.c:1321-1336`). No gate and no
         // `is_exclusive` test: the client is gone, so whatever is in the way
         // will never be committed, and being here is the evidence. The reference
         // skips it for a *revoked* publication, whose stream is being cut off
@@ -850,7 +850,7 @@ impl NetworkPublication {
         let Some(since) = self.linger_since_ns else {
             // Two ways in, and the reference meets them in one place: a
             // revoked publication says so in its heartbeats
-            // (`:1246-1277`), and one whose last client has let go writes the
+            // (`:1265-1296`), and one whose last client has let go writes the
             // end-of-stream position (`:1048-1069`). Both then linger.
             if !self.is_revoked() && !self.ending {
                 return false;
@@ -876,7 +876,7 @@ impl NetworkPublication {
 
         // The end-of-stream byte is **not** decided once, on the way in: the
         // reference sets it on every tick of the drain, the moment the sender
-        // has caught up with the producer (`:1319-1322`). It is what the flow
+        // has caught up with the producer (`:1340-1343`). It is what the flow
         // control's idle path reads to tell receivers the stream is over
         // (`:602-606` → `aeron_flow_control_on_idle`), so a publication whose
         // producer stopped writing before its sender did — which is the whole
@@ -889,7 +889,7 @@ impl NetworkPublication {
             }
         }
 
-        // Both waits are the reference's (`:1332-1344`: the linger timeout, or
+        // Both waits are the reference's (`:1353-1365`: the linger timeout, or
         // an EOS from a unicast receiver). The revoked one used to end as soon
         // as no receiver was still live — a shortcut that is wrong exactly
         // when it matters: a publication revoked while the network is dark has
@@ -934,7 +934,7 @@ impl NetworkPublication {
     ///
     /// Returns the **bytes** that went out, which is what the reference returns
     /// (`:576`) and what the sender counts as `bytes-sent`
-    /// (`aeron_driver_sender.c:457`). Not the datagram count: those differ by
+    /// (`aeron_driver_sender.c:459`). Not the datagram count: those differ by
     /// three orders of magnitude, and a counter named `bytes-sent` that held
     /// `1000` for a megabyte of frames is a counter that lies.
     ///
@@ -965,9 +965,9 @@ impl NetworkPublication {
         let mut filled = 0usize;
         // A fixed array, not a `Vec`: the reference's batch is
         // `struct iovec iov[AERON_NETWORK_PUBLICATION_MAX_MESSAGES_PER_SEND]`
-        // on the stack (`aeron_network_publication.c:515`), that macro is 16
-        // (`aeron_driver_context.h:57`), and the context setter clamps the
-        // setting to the same sixteen this build's socket shim batches with
+        // on the stack (`aeron_network_publication.c:515`), that macro is 64
+        // (`aeron_driver_context.h:57`; 16 before 1.54.2), and the context
+        // setter clamps the setting to the same sixty-four this build's socket shim batches with
         // (`crate::sys::socket::MAX_BATCH`). Two `Vec`s here were a `malloc`
         // and a `free` in every send — the allocator is ~14% of this thread
         // and the chain that reaches it is this one.
@@ -1054,7 +1054,7 @@ impl NetworkPublication {
             // What `do_send` returns is **bytes**, not datagrams: the sender
             // adds it to `bytes-sent`, and the reference's `send_data` returns
             // the byte count its `do_send` accumulated
-            // (`aeron_network_publication.c:576`, `aeron_driver_sender.c:457`).
+            // (`aeron_network_publication.c:576`, `aeron_driver_sender.c:459`).
             // A partial send is the first `sent` datagrams — `send` reports how
             // many of the batch it took, in order.
             sent = self.do_send(endpoint, &slices[..frames], counters, regions, now_ns)?;
@@ -1354,7 +1354,7 @@ impl NetworkPublication {
     ) -> Option<i64> {
         // `status-messages-received` is counted at the endpoint, before this —
         // and whether or not a publication answered to the message
-        // (`media/aeron_send_channel_endpoint.c:625`).
+        // (`media/aeron_send_channel_endpoint.c:618`).
         self.status_message_deadline_ns = now_ns + self.connection_timeout_ns;
 
         let had_receivers = self.has_receivers();
@@ -1397,12 +1397,12 @@ impl NetworkPublication {
         self.refresh_connected_status();
 
         // A publication that has just acquired its **first** live receiver
-        // reports the fact (`:805-812`), and the correlation id it reports is
+        // reports the fact (`:798-805`), and the correlation id it reports is
         // its own `response-correlation-id` — for the publication a response
         // channel was asked for, that is the registration id of the *image*
         // which owes it a response setup, and the conductor is what can reach
         // that image (`aeron_driver_conductor_on_response_connected`,
-        // `aeron_driver_conductor.c:7117-7131`).
+        // `aeron_driver_conductor.c:7213-7227`).
         //
         // It is reported whether or not this publication is on a response
         // channel, as the reference reports it: what makes it meaningful is the
@@ -1416,8 +1416,8 @@ impl NetworkPublication {
     ///
     /// `RTTM_REPLY` on the way in means *answer this*: a receiver measuring its
     /// round trip sends the request with the flag
-    /// (`aeron_receive_channel_endpoint.c:407-410`, called with `is_reply` true
-    /// from `aeron_publication_image.c:1096`). The answer echoes the
+    /// (`aeron_receive_channel_endpoint.c:412-415`, called with `is_reply` true
+    /// from `aeron_publication_image.c:1101`). The answer echoes the
     /// requester's own timestamp and reports no time spent here, so what the
     /// peer measures is its round trip and none of this driver's — and the
     /// answer carries **no** flags, which is what stops it being answered in
@@ -1471,7 +1471,7 @@ impl NetworkPublication {
     ///
     /// Returns whether that receiver was one this publication was still waiting
     /// on — the reference's `liveness_on_remote_close`, and the whole of what
-    /// decides whether its client hears about it (`:872-875`): an `ERR` from a
+    /// decides whether its client hears about it (`:877-880`): an `ERR` from a
     /// receiver the publication has already given up on is news about nothing.
     pub fn on_error(
         &mut self,
@@ -1486,7 +1486,7 @@ impl NetworkPublication {
         let _ = (counters, regions);
 
         // `error-frames-received` is counted at the endpoint, before the
-        // publication is looked up (`media/aeron_send_channel_endpoint.c:686`).
+        // publication is looked up (`media/aeron_send_channel_endpoint.c:679`).
         // The strategy is told first (`aeron_network_publication.c:869`): it
         // keeps its own receivers, and a reader that refused the stream is one
         // of them leaving rather than one that has gone quiet.
@@ -1504,7 +1504,7 @@ impl NetworkPublication {
     /// With a zero delay the handler answers with the retransmission it wants
     /// sent *now*, and the reference sends it from inside the handler through
     /// the `resend` callback it was given (`aeron_retransmit_handler_on_nak`,
-    /// `aeron_retransmit_handler.c:110-124`). This does the same: the answer is
+    /// `aeron_retransmit_handler.c:115-129`). This does the same: the answer is
     /// a `NakOutcome::Send` the caller must not have to act on separately,
     /// because a caller that forgot would be a driver that acknowledges a NAK
     /// and sends nothing.
@@ -1519,7 +1519,7 @@ impl NetworkPublication {
         now_ns: i64,
     ) -> NakOutcome {
         // `nak-messages-received` is counted at the endpoint, once the report
-        // has been found well formed (`media/aeron_send_channel_endpoint.c:566`).
+        // has been found well formed (`media/aeron_send_channel_endpoint.c:559`).
         // The system counter answers "is this driver being asked to
         // retransmit"; this one answers "which publication is"
         // (`aeron_network_publication.c:733`).
@@ -2600,7 +2600,7 @@ mod tests {
     /// used to do — means the heartbeats never go out at all, and the remote
     /// images stay `DRAINING` for ever behind a reader that is waiting for a
     /// commit position the next term will never produce. Waiting the window is
-    /// the reference's rule (`aeron_network_publication.c:1332-1344`).
+    /// the reference's rule (`aeron_network_publication.c:1353-1365`).
     #[test]
     fn a_revoked_publication_waits_the_linger_window_even_with_no_receivers() {
         let mut fixture = fixture();
@@ -2795,7 +2795,7 @@ mod tests {
     /// A stream that resumes starts its tails at the term the URI named,
     /// **offset included** — the reference writes that block on the network
     /// path (`aeron_network_publication.c:163-182`) exactly as it does on the
-    /// IPC one (`aeron_ipc_publication.c:75-103`).
+    /// IPC one (`aeron_ipc_publication.c:80-108`).
     ///
     /// It is what makes a publication that took another's session with
     /// `session-id=tag:N` describe the *same* stream rather than a fresh one

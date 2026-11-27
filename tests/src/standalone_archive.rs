@@ -5,7 +5,7 @@
 //! the 276 archive spawns the reference's C suite makes are this one
 //! (`TestStandaloneArchive.h:136`), and what it exists for there is a topology
 //! the one-process archiving media driver cannot give: an archive that can die
-//! without the driver dying with it (`..._resilience_test.cpp:1671-1672`).
+//! without the driver dying with it (`..._resilience_test.cpp:1674-1675`).
 //!
 //! It is built on [`ReferenceDriver`] rather than beside it for the reason
 //! [`crate::archiving_driver`] gives for its own: one place decides how a test
@@ -93,7 +93,7 @@ impl OwnStandaloneArchive {
             // `aeron.archive.mark.file.dir` is deliberately **not** set. The C
             // suite sets it to the aeron directory (`TestStandaloneArchive.h:104`),
             // and that shape is covered there; here the default is what is
-            // wanted — empty means "beside the archive" (`Archive.java:321`), so
+            // wanted — empty means "beside the archive" (`Archive.java:327`), so
             // the mark file this harness then waits on is in the one directory
             // it already has in hand. Setting it would split the archive's
             // directory from the file that says the archive is up, and

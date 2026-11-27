@@ -2,7 +2,7 @@
 //!
 //! Only a media driver creates `cnc.dat`. The reference has no client-side
 //! creation path at all: `aeron_cnc_length` is a function of the *driver's*
-//! context (`aeron-driver/src/main/c/aeron_driver_context.c:1690`), and the
+//! context (`aeron-driver/src/main/c/aeron_driver_context.c:1734`), and the
 //! client's context merely unmaps the file it was given
 //! (`aeron-client/src/main/c/aeron_context.c:220`). A client that finds a
 //! directory with no CnC in it is looking at a dead driver, not at a job to do.
@@ -14,9 +14,9 @@
 //!
 //! | step | reference |
 //! |---|---|
-//! | the nine fields, plainly | `aeron-driver/src/main/c/aeron_driver.c:250-269` |
-//! | `cnc_version`, release | `aeron_driver.c:972`, inline store at `aeron_driver_context.h:456-459` |
-//! | `msync` over the file | `aeron_driver.c:973` |
+//! | the nine fields, plainly | `aeron-driver/src/main/c/aeron_driver.c:267-286` |
+//! | `cnc_version`, release | `aeron_driver.c:1012`, inline store at `aeron_driver_context.h:464-467` |
+//! | `msync` over the file | `aeron_driver.c:1013` |
 //!
 //! A reader acquires on the version and only then copies the rest
 //! (`crate::file`), so this order is what lets the block be read as plain
@@ -30,8 +30,8 @@
 //! gap — the conductor, the sender and the receiver all start between the
 //! metadata being written and the version being stored — and one piece of that
 //! work is the first heartbeat on the to-driver ring
-//! (`aeron-driver/src/main/c/aeron_driver.c:971`, one line before the version
-//! at `:972`). A client that passes the version gate must not then find a
+//! (`aeron-driver/src/main/c/aeron_driver.c:1011`, one line before the version
+//! at `:1012`). A client that passes the version gate must not then find a
 //! heartbeat of zero and conclude the driver is dead, so the same gap has to
 //! exist here even though it is currently one call deep.
 
@@ -72,7 +72,7 @@ pub const FILE_PAGE_SIZE_DEFAULT: usize = 4096;
 
 /// Smallest page size the reference accepts
 /// (`aeron-client/src/main/c/concurrent/aeron_logbuffer_descriptor.h:30`,
-/// checked with the power-of-two rule at `aeron-driver/src/main/c/aeron_driver.c:467-485`).
+/// checked with the power-of-two rule at `aeron-driver/src/main/c/aeron_driver.c:484-502`).
 pub const FILE_PAGE_SIZE_MIN: usize = 4 * 1024;
 
 /// Largest page size the reference accepts (`aeron_logbuffer_descriptor.h:31`).
@@ -139,7 +139,7 @@ impl CncLayout {
     ///
     /// [`CncCreateError::FileLengthTooLarge`] if the total does not fit in the
     /// `int32` the metadata field is — the reference caps it at `INT32_MAX` at
-    /// `aeron-driver/src/main/c/aeron_driver.c:298`.
+    /// `aeron-driver/src/main/c/aeron_driver.c:315`.
     pub fn file_length(&self) -> Result<usize, CncCreateError> {
         let total = self.unaligned_length();
         let length = layout::align_up(total, self.page_size);
@@ -155,7 +155,7 @@ impl CncLayout {
     /// would accept.
     ///
     /// The bounds are the ones the reference parses its configuration with
-    /// (`aeron-driver/src/main/c/aeron_driver_context.c:670-695`): the two ring
+    /// (`aeron-driver/src/main/c/aeron_driver_context.c:677-702`): the two ring
     /// regions have their defaults as *floors* and `INT32_MAX` as a ceiling,
     /// the counters region has a range of its own, and the page size must be a
     /// power of two so that [`layout::align_up`] means anything.
@@ -349,7 +349,7 @@ pub enum CncCreateError {
         offset: usize,
     },
     /// The page size is not a power of two, so the total cannot be aligned to
-    /// it (`aeron-driver/src/main/c/aeron_driver.c:475-482`).
+    /// it (`aeron-driver/src/main/c/aeron_driver.c:492-499`).
     InvalidPageSize {
         /// What it was set to.
         value: usize,
@@ -379,7 +379,7 @@ pub enum CncCreateError {
     NotReadable(CncError),
     /// The version was about to be published before the driver had written a
     /// heartbeat, which would produce a file every client reads as a dead
-    /// driver (`aeron-driver/src/main/c/aeron_driver.c:971-972`).
+    /// driver (`aeron-driver/src/main/c/aeron_driver.c:1011-1012`).
     NoHeartbeat,
     /// The metadata block is not inside the mapping.
     ///
@@ -485,7 +485,7 @@ impl CncFile {
     /// The directory must already exist: an aeron directory is the driver's to
     /// make, and with the reference's discipline the decision to *reuse* one —
     /// the stale-driver check, the `EBUSY` on a live one — happens before this
-    /// is called (`aeron-driver/src/main/c/aeron_driver.c:136-235`). Creating
+    /// is called (`aeron-driver/src/main/c/aeron_driver.c:153-252`). Creating
     /// parents here would quietly make that decision for the caller.
     ///
     /// The file is left mapped read-write and its layout is validated by the
@@ -497,7 +497,7 @@ impl CncFile {
     /// # Errors
     ///
     /// [`CncCreateError`]: an invalid layout, a file that already exists
-    /// (`O_EXCL`, `aeron-client/src/main/c/util/aeron_fileutil.c:967`), a
+    /// (`O_EXCL`, `aeron-client/src/main/c/util/aeron_fileutil.c:966`), a
     /// missing directory, or a write that does not read back.
     pub fn create(
         aeron_dir: &Path,
@@ -539,7 +539,7 @@ impl CncFile {
 
         // Plain bytes for the fields, and no release store: the version stays
         // zero until `publish`, which is what keeps this block unreadable
-        // while it is still being filled (`aeron_driver.c:250-269`).
+        // while it is still being filled (`aeron_driver.c:267-286`).
         head.copy_in(0, &block)
             .ok_or(CncCreateError::MetadataNotMapped {
                 length: file_length,

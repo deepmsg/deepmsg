@@ -132,7 +132,7 @@ fn a_rejected_image_tells_the_publisher_and_nobody_else() {
         .position();
 
     // **The command and nothing else**: it does not wait for the driver
-    // (`aeron_client_conductor_reject_image`, `aeron_client_conductor.c:3627-3651`),
+    // (`aeron_client_conductor_reject_image`, `aeron_client_conductor.c:3712-3736`),
     // so everything the rest of this test asserts is downstream of a command
     // whose answer nobody read.
     subscriber_client
@@ -186,7 +186,7 @@ fn a_rejected_image_tells_the_publisher_and_nobody_else() {
     // An IPC publication answers no destination and hears from no receiver, so
     // the three ids the driver had none of are the null value — and the source
     // is a loopback address with a zero port rather than an absence, which is
-    // what the reference sends (`aeron_ipc_publication.c:231-243`).
+    // what the reference sends (`aeron_ipc_publication.c:236-248`).
     assert_eq!(-1, error.destination_registration_id);
     assert_eq!(-1, error.receiver_id);
     assert_eq!(-1, error.group_tag);

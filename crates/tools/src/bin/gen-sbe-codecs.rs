@@ -33,8 +33,8 @@ use std::process::{Command, ExitCode};
 /// The generator and the runtime it needs on its classpath. Both match the
 /// reference's `gradle/libs.versions.toml`; a mismatch is refused rather than
 /// tolerated.
-const SBE_TOOL_VERSION: &str = "1.40.2";
-const AGRONA_VERSION: &str = "2.6.1";
+const SBE_TOOL_VERSION: &str = "1.42.0";
+const AGRONA_VERSION: &str = "2.7.1";
 
 /// Each schema; the package name `sbe-tool` derives from its `package`
 /// attribute (dots to underscores), which is where it stages the crate; and the
@@ -92,7 +92,7 @@ Regenerate the SBE codecs from schemas/ and place them in their crates.
   --dest DIR       where the crates live (default: crates/codec)
   -h, --help       show this message
 
-The generator (`sbe-tool` 1.40.2) and its runtime (`agrona` 2.6.1) are found
+The generator (`sbe-tool` 1.42.0) and its runtime (`agrona` 2.7.1) are found
 by looking at $SBE_TOOL_JAR and $AGRONA_JAR first, then in the Gradle module
 cache ($GRADLE_USER_HOME, else ~/.gradle).
 

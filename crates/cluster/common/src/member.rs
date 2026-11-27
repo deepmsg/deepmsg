@@ -6,7 +6,7 @@
 //! * **The string.** `id,ingress,consensus,log,catchup,archive[,archiveResponse[,egressResponse]]`
 //!   per member, members separated by `|`. Six attributes are required, eight
 //!   at most (`:561-564`). Both optional endpoints are kept — the seventh is
-//!   read by the log replication (`P3-0e`), the eighth by nothing in 1.53.2.
+//!   read by the log replication (`P3-0e`), the eighth by nothing in 1.54.2.
 //! * **The arithmetic.** `quorumThreshold`, `quorumPosition`,
 //!   `hasQuorumAtPosition`, `compareLog` and the vote predicates. These are
 //!   pure functions over members and a clock, and they are where an election
@@ -76,7 +76,7 @@ pub struct ClusterMember {
     pub archive_endpoint: String,
     /// The seventh attribute, or `None`. Read by log replication (`P3-0e`).
     pub archive_response_endpoint: Option<String>,
-    /// The eighth attribute, or `None`. Read by nothing in 1.53.2.
+    /// The eighth attribute, or `None`. Read by nothing in 1.54.2.
     pub egress_response_endpoint: Option<String>,
     /// The attributes joined back together, as the reference keeps them.
     pub endpoints: String,

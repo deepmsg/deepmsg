@@ -19,11 +19,11 @@
 //! that compiled-in table and has no `dlopen` fallback
 //! (`aeron_udp_channel_interceptor_bindings_load`, `:123-184`), so serving them
 //! is not a departure from ADR-0002 — nothing is loaded. A name that is *not*
-//! in the table stops the reference's driver (`aeron_driver_context.c:1283-1290`
+//! in the table stops the reference's driver (`aeron_driver_context.c:1313-1320`
 //! returns `NULL` into a `goto error`), and this build refuses it the same way.
 //!
 //! The settings are the reference's, environment-only
-//! (`aeron-driver/src/main/c/aeronmd.h:745-746`):
+//! (`aeron-driver/src/main/c/aeronmd.h:779-780`):
 //!
 //! ```text
 //! AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS=loss,fixed-loss
@@ -54,10 +54,10 @@ pub const MAX_INTERCEPTOR_NAMES: usize = 10;
 /// `AERON_MAX_INTERCEPTORS_LEN` (`:120`).
 pub const MAX_INTERCEPTORS_LEN: usize = 4094;
 
-/// `AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS_ENV_VAR` (`aeronmd.h:746`).
+/// `AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS_ENV_VAR` (`aeronmd.h:780`).
 pub const INCOMING_INTERCEPTORS_ENV: &str = "AERON_UDP_CHANNEL_INCOMING_INTERCEPTORS";
 
-/// `AERON_UDP_CHANNEL_OUTGOING_INTERCEPTORS_ENV_VAR` (`aeronmd.h:745`).
+/// `AERON_UDP_CHANNEL_OUTGOING_INTERCEPTORS_ENV_VAR` (`aeronmd.h:779`).
 pub const OUTGOING_INTERCEPTORS_ENV: &str = "AERON_UDP_CHANNEL_OUTGOING_INTERCEPTORS";
 
 /// The args variable each interceptor reads its own parameters from
@@ -456,7 +456,7 @@ fn parse_multi_gap_loss(args: &str) -> Result<MultiGapLossParams, InterceptorErr
 /// None of the three compiled-in interceptors has an outgoing half
 /// (`outgoing_init_func` is `NULL` in all three `_load` functions), so a list
 /// here names something the reference cannot resolve — the table lookup fails
-/// and its driver does not start (`aeron_driver_context.c:1274-1281`).
+/// and its driver does not start (`aeron_driver_context.c:1304-1311`).
 ///
 /// # Errors
 ///
@@ -832,7 +832,7 @@ mod tests {
         );
 
         // A name outside the table is what stops the reference's driver
-        // (`aeron_driver_context.c:1283-1290`).
+        // (`aeron_driver_context.c:1313-1320`).
         assert_eq!(
             Err(InterceptorError::Unknown {
                 setting: INCOMING_INTERCEPTORS_ENV,

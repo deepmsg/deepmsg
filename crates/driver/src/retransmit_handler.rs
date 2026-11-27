@@ -13,14 +13,14 @@
 //! `Lingering` when it is served (its own expiry now `linger_timeout_ns` away,
 //! during which a NAK inside the same range is *not* served again), and
 //! `Inactive` when the linger expires — which frees the slot
-//! (`aeron_retransmit_handler_process_timeouts`, `:158-198`).
+//! (`aeron_retransmit_handler_process_timeouts`, `:163-203`).
 //!
 //! # Unicast has one slot, multicast has many
 //!
 //! `max_retransmits` is `max_resend` under group semantics and **one**
-//! otherwise (`:38`): a unicast publication answers one NAK at a time and
+//! otherwise (`:43`): a unicast publication answers one NAK at a time and
 //! reuses that slot for a NAK that does not overlap the one being served
-//! (`:222-240`). That is what makes a peer that keeps asking for the same
+//! (`:227-245`). That is what makes a peer that keeps asking for the same
 //! range unable to make the sender send it over and over.
 
 /// Where an action is (`aeron_retransmit_action_state_t`,

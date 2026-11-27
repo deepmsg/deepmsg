@@ -1,7 +1,7 @@
 # The wire: UDP frames
 
 The datagrams a media driver puts on a socket, byte for byte, as Aeron
-**1.53.2** defines them. The authority is
+**1.54.2** defines them. The authority is
 `aeron-client/src/main/c/protocol/aeron_udp_protocol.h` — hand-written C
 structs under `#pragma pack(4)`, **not** SBE, and not generated: the codec in
 `crates/driver/src/protocol.rs` mirrors that header field for field, with a
@@ -17,7 +17,7 @@ Two facts decide everything below.
   160 bytes in the term, and what goes on the wire is those 160 bytes — which
   is why a packet's length is a multiple of 32 and why
   `aeron_publication_image_validate_packet` can reject a packet that does not
-  end on a frame boundary (`aeron-driver/src/main/c/aeron_publication_image.c:645-735`).
+  end on a frame boundary (`aeron-driver/src/main/c/aeron_publication_image.c:650-740`).
 
 ## The frame header
 
@@ -56,11 +56,11 @@ Four of these are worth a note each, because the obvious reading is wrong:
 - **RSP_SETUP carries no correlation id.** Its `session_id` and `stream_id` are
   the *sender's own*, and they are how the far end finds the publication being
   answered; the correlation id never crosses the wire, each side reads it out of
-  the publication it already holds (`aeron_send_channel_endpoint.c:738-748`).
+  the publication it already holds (`aeron_send_channel_endpoint.c:731-741`).
   The `response_session_id` is the session the far end's subscription should
   adopt for the stream it is about to read
-  (`aeron_driver_conductor.c:7100-7105`). Its flags byte is always zero and no
-  bit of it is read (`aeron_receive_channel_endpoint.c:446`), so unlike the
+  (`aeron_driver_conductor.c:7196-7201`). Its flags byte is always zero and no
+  bit of it is read (`aeron_receive_channel_endpoint.c:451`), so unlike the
   others it has no `write_with_flags`; and like a NAK it is only ever a
   datagram rather than a frame in a term, which is why its 20 bytes need not be
   a multiple of 32.
@@ -109,7 +109,7 @@ The sequence the interop tests exercise, in order:
    (`aeron_network_publication.c:383-437`);
 3. the subscriber learns the sender's address from that datagram and answers
    with an **SM** carrying `SEND_SETUP`, to `control` when the channel named one
-   and to the *source* otherwise (`aeron_data_packet_dispatcher.c:616-659`);
+   and to the *source* otherwise (`aeron_data_packet_dispatcher.c:621-664`);
 4. a conductor on the receiving side builds a publication image from the
    SETUP, and the subscriber's SMs carry its consumption position and window —
    which is the publisher's entire flow control
@@ -134,19 +134,19 @@ short:
 
 1. a response **subscription** builds no image from the SETUP it receives. It is
    registered with the receiver as a *response* stream rather than as interest
-   in one (`aeron_driver_conductor.c:5072-5092`), so a SETUP that lands on it is
+   in one (`aeron_driver_conductor.c:5169-5189`), so a SETUP that lands on it is
    answered the way traffic for a stream nobody reads is — with an SM carrying
    `SEND_SETUP` — rather than turned into an image;
 2. a publication that carries `response-correlation-id=` says so in its SETUP
    with the `SEND_RESPONSE` bit, and the image built from that SETUP records it
    (`aeron_publication_image.h:346-349`). That record is what lets a **response
    publication** be created against the image
-   (`aeron_driver_conductor.c:1787-1833`), and creating one is what gives the
+   (`aeron_driver_conductor.c:1828-1874`), and creating one is what gives the
    image a session id to answer with: an **RSP_SETUP** back down the control
    path;
 3. the RSP_SETUP stops as soon as a status message from that publication
    arrives: the first live SM is what tells the image the pair is up
-   (`aeron_driver_conductor.c:7117-7131`);
+   (`aeron_driver_conductor.c:7213-7227`);
 4. from then on DATA flows, and only to the address that SM came from
    (`aeron_network_publication.h:243-274`).
 

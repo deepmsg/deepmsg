@@ -299,16 +299,17 @@ fn the_snapshot_markers_carry_the_type_and_position() {
     let mut send = MockSnapshotSend::answering(&[OK, OK], &[]);
     let mut taker = taker(&mut send);
 
-    taker.mark_begin(1_024, 5).expect("BEGIN");
-    taker.mark_end(1_024, 5).expect("END");
+    taker.mark_begin(5, 4_096, 1_024).expect("BEGIN");
+    taker.mark_end(5, 4_096, 1_024).expect("END");
 
     for (index, bytes) in send.claims.borrow().iter().enumerate() {
-        assert_eq!(48, bytes.len());
+        assert_eq!(56, bytes.len());
         let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(bytes), 0);
         let decoder = SnapshotMarkerDecoder::default().header(header, 0);
         assert_eq!(SNAPSHOT_TYPE_ID, decoder.type_id());
         assert_eq!(1_024, decoder.log_position());
         assert_eq!(5, decoder.leadership_term_id());
+        assert_eq!(Some(4_096), decoder.term_base_log_position());
         assert_eq!(0, decoder.index());
         assert_eq!(
             if index == 0 {

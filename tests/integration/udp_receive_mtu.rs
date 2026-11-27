@@ -3,9 +3,9 @@
 //! The receiver's buffers are `AERON_DRIVER_RECEIVER_MAX_UDP_PACKET_LENGTH`,
 //! **not** `aeron.mtu.length` (`aeron-driver/src/main/c/aeron_driver_context.h:60`;
 //! both the allocation and the `iov_len` are that constant at
-//! `aeron_driver_receiver.c:48-62`). The distinction only shows when a
+//! `aeron_driver_receiver.c:40-54`). The distinction only shows when a
 //! *publication* names a larger `mtu=` than the driver's default — which is
-//! what P3-6b's second arm does (`ClusterTest.java:1831-1839` restarts a
+//! what P3-6b's second arm does (`ClusterTest.java:1835-1843` restarts a
 //! cluster on `mtu=8992`).
 //!
 //! Sizing the buffers from the default truncates every datagram past 1408
@@ -75,7 +75,7 @@ fn round_trip(term_length: &str, mtu: &str, payload_len: usize, port_offset: u16
 /// driver's default.
 ///
 /// `262144` is one eighth of the 2 MiB term — the largest message the
-/// reference's second arm sends after the restart (`ClusterTest.java:1906`).
+/// reference's second arm sends after the restart (`ClusterTest.java:1910`).
 #[test]
 fn a_message_larger_than_the_drivers_default_mtu_crosses_udp() {
     round_trip("2m", "8992", 4_000, 0);

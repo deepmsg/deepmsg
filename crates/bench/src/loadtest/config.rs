@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 /// Which properties name the transceiver, the idle strategy, and so on.
 ///
 /// Spelled out rather than inlined so that a reader can compare them with
-/// `Configuration.java:111-208` at a glance.
+/// `Configuration.java:112-209` at a glance.
 pub mod property {
     /// `Configuration.ITERATIONS_PROP_NAME`.
     pub const ITERATIONS: &str = "io.aeron.benchmarks.iterations";
@@ -340,7 +340,7 @@ impl TimeUnit {
     }
 
     /// What to divide recorded nanoseconds by to print in this unit
-    /// (`Configuration.outputScaleRatio`, `:885-896`).
+    /// (`Configuration.outputScaleRatio`, `:918-929`).
     #[must_use]
     pub fn scale_ratio(self) -> f64 {
         match self {
@@ -608,7 +608,7 @@ impl Properties {
     }
 
     /// The value for a property that has to be there
-    /// (`Configuration.getPropertyValue`, `:1017-1026`).
+    /// (`Configuration.getPropertyValue`, `:1050-1059`).
     fn required(&self, name: &'static str) -> Result<&str, ConfigError> {
         self.get(name)
             .ok_or(ConfigError::Required { property: name })
@@ -628,7 +628,7 @@ impl Properties {
     }
 
     /// An `int`, refusing anything else with the reference's complaint
-    /// (`Configuration.intProperty`, `:1003-1015`).
+    /// (`Configuration.intProperty`, `:1036-1048`).
     fn integer(&self, name: &'static str) -> Result<i32, ConfigError> {
         let value = self.required(name)?;
 
@@ -639,7 +639,7 @@ impl Properties {
     }
 
     /// A rate: a plain number, or one ending in `K` or `M`
-    /// (`Configuration.rateProperty`, `:961-1001`).
+    /// (`Configuration.rateProperty`, `:994-1034`).
     ///
     /// The suffix arithmetic is the reference's, including that it multiplies
     /// an `int` and refuses a prefix that would overflow one.
@@ -705,7 +705,7 @@ impl Properties {
     }
 }
 
-/// `Configuration.checkValueRange` (`:899-912`), whose two complaints are
+/// `Configuration.checkValueRange` (`:932-945`), whose two complaints are
 /// compared against the reference's tests word for word.
 fn check_range(
     value: i32,
@@ -735,7 +735,7 @@ fn check_range(
 }
 
 /// Create a directory and insist that it is a writable one
-/// (`Configuration.validateDirectory`, `:1061-1082`).
+/// (`Configuration.validateDirectory`, `:1094-1115`).
 fn validate_directory(directory: &Path, purpose: &'static str) -> Result<PathBuf, ConfigError> {
     let absolute = absolute_path(directory)?;
 
@@ -807,7 +807,7 @@ pub struct Configuration {
 
 impl Configuration {
     /// The settings a set of properties describes
-    /// (`Configuration.fromSystemProperties`, `:715-786`).
+    /// (`Configuration.fromSystemProperties`, `:748-819`).
     pub fn from_properties(properties: &Properties) -> Result<Self, ConfigError> {
         let mut builder = Builder::new();
 
@@ -923,7 +923,7 @@ impl Configuration {
     }
 
     /// The name results are written under, with the rate, batch size and length
-    /// already folded in (`Configuration.computeFileNamePrefix`, `:482-495`).
+    /// already folded in (`Configuration.computeFileNamePrefix`, `:515-528`).
     #[must_use]
     pub fn output_file_name_prefix(&self) -> &str {
         &self.output_file_name_prefix
@@ -961,7 +961,7 @@ impl Configuration {
     }
 
     /// The rate as the file name spells it: `1M`, `500K`, or the number
-    /// (`Configuration.rateAsString`, `:469-481`).
+    /// (`Configuration.rateAsString`, `:502-514`).
     #[must_use]
     pub fn rate(&self) -> &str {
         &self.rate
@@ -1153,7 +1153,7 @@ impl Builder {
     /// # Errors
     ///
     /// [`ConfigError`] for the first setting that breaks a rule, in the order
-    /// `Configuration.java:248-271` checks them.
+    /// `Configuration.java:249-272` checks them.
     pub fn build(self) -> Result<Configuration, ConfigError> {
         let warmup_iterations = check_range(
             self.warmup_iterations,
@@ -1182,7 +1182,7 @@ impl Builder {
             property::MESSAGE_LENGTH,
         )?;
         // The reference makes the output directory before it checks the last
-        // two numbers (`Configuration.java:260-267`), so a run with a bad
+        // two numbers (`Configuration.java:261-268`), so a run with a bad
         // directory and a bad deadline complains about the directory.
         let output_directory = validate_directory(&self.output_directory, "output")?;
         let logs_directory = validate_directory(&output_directory.join(LOGS_DIR), "log")?;
@@ -1232,7 +1232,7 @@ impl Builder {
     }
 }
 
-/// `Configuration.rateAsString` (`:469-481`).
+/// `Configuration.rateAsString` (`:502-514`).
 ///
 /// Whole millions first, then whole thousands, then the number — so 7_890_000
 /// is `7890K` and not `7.89M`, because the reference only divides when the

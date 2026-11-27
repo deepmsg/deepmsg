@@ -82,7 +82,7 @@ impl Harness {
         ))
         .expect("the configuration parses");
         // This build has no class loader; the flag is the programmatic
-        // extension seam a zero-service cluster needs (`ConsensusModule.java:2158`).
+        // extension seam a zero-service cluster needs (`ConsensusModule.java:2193`).
         config.consensus_module_extension = true;
         let agent = ConsensusModuleAgent::launch_with_components(config, components)
             .expect("the module launches");

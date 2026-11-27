@@ -19,29 +19,29 @@ use deepmsg_codec_cluster::cluster_time_unit::ClusterTimeUnit;
 /// may expire.
 pub const POLL_LIMIT: usize = 20;
 
-/// `aeron.cluster.timer.service.supplier` (`ConsensusModule.java:935`).
+/// `aeron.cluster.timer.service.supplier` (`ConsensusModule.java:942`).
 pub const TIMER_SERVICE_SUPPLIER_PROP_NAME: &str = "aeron.cluster.timer.service.supplier";
 
-/// `TIMER_SERVICE_SUPPLIER_WHEEL` (`ConsensusModule.java:941`).
+/// `TIMER_SERVICE_SUPPLIER_WHEEL` (`ConsensusModule.java:948`).
 pub const TIMER_SERVICE_SUPPLIER_WHEEL: &str = "io.aeron.cluster.WheelTimerServiceSupplier";
 
-/// `TIMER_SERVICE_SUPPLIER_PRIORITY_HEAP` (`ConsensusModule.java:947-948`).
+/// `TIMER_SERVICE_SUPPLIER_PRIORITY_HEAP` (`ConsensusModule.java:954-955`).
 pub const TIMER_SERVICE_SUPPLIER_PRIORITY_HEAP: &str =
     "io.aeron.cluster.PriorityHeapTimerServiceSupplier";
 
-/// `TIMER_SERVICE_SUPPLIER_DEFAULT` (`ConsensusModule.java:954`).
+/// `TIMER_SERVICE_SUPPLIER_DEFAULT` (`ConsensusModule.java:961`).
 pub const TIMER_SERVICE_SUPPLIER_DEFAULT: &str = TIMER_SERVICE_SUPPLIER_WHEEL;
 
-/// `aeron.cluster.wheel.tick.resolution` (`ConsensusModule.java:892`).
+/// `aeron.cluster.wheel.tick.resolution` (`ConsensusModule.java:899`).
 pub const WHEEL_TICK_RESOLUTION_PROP_NAME: &str = "aeron.cluster.wheel.tick.resolution";
 
-/// `WHEEL_TICK_RESOLUTION_DEFAULT_NS` (`ConsensusModule.java:898`).
+/// `WHEEL_TICK_RESOLUTION_DEFAULT_NS` (`ConsensusModule.java:905`).
 pub const WHEEL_TICK_RESOLUTION_DEFAULT_NS: i64 = 8_000_000;
 
-/// `aeron.cluster.ticks.per.wheel` (`ConsensusModule.java:905`).
+/// `aeron.cluster.ticks.per.wheel` (`ConsensusModule.java:912`).
 pub const TICKS_PER_WHEEL_PROP_NAME: &str = "aeron.cluster.ticks.per.wheel";
 
-/// `TICKS_PER_WHEEL_DEFAULT` (`ConsensusModule.java:912`).
+/// `TICKS_PER_WHEEL_DEFAULT` (`ConsensusModule.java:919`).
 pub const TICKS_PER_WHEEL_DEFAULT: i32 = 128;
 
 /// `TimerService.TimerHandler`: answer whether the expiry was handled.
@@ -123,7 +123,7 @@ impl std::fmt::Display for TimerSupplierError {
 impl std::error::Error for TimerSupplierError {}
 
 /// Which implementation a supplier name selects
-/// (`ConsensusModule.java:4589-4607`).
+/// (`ConsensusModule.java:4653-4671`).
 ///
 /// The reference builds the object here; this returns the name of the shape so
 /// the agent can build it with its own handler.
@@ -150,7 +150,7 @@ pub enum TimerServiceKind {
 }
 
 /// `WheelTimerServiceSupplier`'s tick derivation
-/// (`ConsensusModule.java:4594-4600`): the configured resolution, converted
+/// (`ConsensusModule.java:4658-4664`): the configured resolution, converted
 /// into the clock's own unit, rounded up to a power of two.
 ///
 /// With the millisecond clock the default is `nextPow2(8) = 8` ms; with a

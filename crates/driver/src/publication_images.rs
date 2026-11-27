@@ -3,11 +3,11 @@
 //!
 //! Mirrors the conductor's half of the image path in
 //! `aeron-driver/src/main/c/aeron_driver_conductor.c`:
-//! `execute_create_publication_image_*` (`:6490-6800`), the match rule a
+//! `execute_create_publication_image_*` (`:6587-6897`), the match rule a
 //! subscription has to pass to read an image
-//! (`network_subscription_link_matches_allowing_wildcard`, `:6440-6470`), and
+//! (`network_subscription_link_matches_allowing_wildcard`, `:6537-6567`), and
 //! the registration id an image is named by — which is a correlation id the
-//! *driver burns*, not one a client sent (`:6530`).
+//! *driver burns*, not one a client sent (`:6625`).
 //!
 //! # The shape is the publications' shape, one step further out
 //!
@@ -21,7 +21,7 @@
 //! # The path is a byte contract
 //!
 //! An image's log buffer is named `images/<registration id>.logbuffer`
-//! (`aeron-client/src/main/c/util/aeron_fileutil.c:1222-1232`), and that name
+//! (`aeron-client/src/main/c/util/aeron_fileutil.c:1221-1231`), and that name
 //! is sent to the client in `ON_AVAILABLE_IMAGE`. The registration id is
 //! therefore not an internal detail: it is in a file name a client maps.
 
@@ -54,7 +54,7 @@ pub struct PublicationImageRecord {
     pub channel: Vec<u8>,
     /// Where the packets came from, formatted as the reference formats a
     /// source identity — what `ON_AVAILABLE_IMAGE` tells a client its image is
-    /// reading (`aeron_publication_image.c:336-343`).
+    /// reading (`aeron_publication_image.c:341-348`).
     pub source_identity: String,
     /// Where its log buffer is.
     pub path: PathBuf,
@@ -106,7 +106,7 @@ impl PublicationImageRecord {
     /// yet drained. A subscription is linked only if all of that holds, so a
     /// **lingering** image — one whose readers have already been told it is
     /// gone (`aeron_driver_conductor_image_transition_to_linger`,
-    /// `aeron_driver_conductor.c:1642-1675`) — is never handed to a
+    /// `aeron_driver_conductor.c:1683-1716`) — is never handed to a
     /// subscription that arrives after it, even though the record is still in
     /// hand until the image reaches `DONE`.
     ///
@@ -114,7 +114,7 @@ impl PublicationImageRecord {
     /// subscribers live with the image in the receiver's thread, so the
     /// "working position" and "drained" clauses are the receiver's to know and
     /// it says so by moving the state — a drained image leaves `DRAINING` for
-    /// `LINGER` (`aeron_publication_image.c:1338-1358`). What a caller sees is
+    /// `LINGER` (`aeron_publication_image.c:1364-1384`). What a caller sees is
     /// the same either way: never a `LINGER` or `DONE` image.
     pub const fn is_accepting_subscriptions(&self) -> bool {
         matches!(self.state, ImageState::Active | ImageState::Draining)
@@ -154,13 +154,13 @@ struct PendingImage {
     untethered: crate::publication_params::SubscriptionParams,
     /// Whether this image is one of a group, which lands in the log buffer's
     /// `group` byte (`aeron_driver_conductor_treat_image_as_multicast`,
-    /// `aeron_driver_conductor.c:674-680`).
+    /// `aeron_driver_conductor.c:715-721`).
     group_semantics: bool,
 }
 
 /// Whether an image is to be treated as one of a group
 /// (`aeron_driver_conductor_treat_image_as_multicast`,
-/// `aeron-driver/src/main/c/aeron_driver_conductor.c:674-680`).
+/// `aeron-driver/src/main/c/aeron_driver_conductor.c:715-721`).
 ///
 /// Three inputs, and the reference's expression is worth reading twice because
 /// it names only two of them:
@@ -262,11 +262,11 @@ impl PublicationImages {
     }
 
     /// The images a subscription joins as it is created
-    /// (`aeron_driver_conductor.c:5122-5143`).
+    /// (`aeron_driver_conductor.c:5219-5240`).
     ///
     /// The rule is [`SubscriptionLink::matches_image`] **and** the image still
     /// accepting subscriptions — the two clauses the reference's loop asks, in
-    /// that order (`:5126-5128`).
+    /// that order (`:5223-5225`).
     ///
     /// A subscription may well arrive while the same `(endpoint, stream,
     /// session)` is still an image in hand but one that has already been
@@ -289,7 +289,7 @@ impl PublicationImages {
     }
 
     /// Begin building an image for a session a `SETUP` announced
-    /// (`execute_create_publication_image_validate`, `:6490-6560`).
+    /// (`execute_create_publication_image_validate`, `:6587-6657`).
     ///
     /// The registration id is burned here, before the log buffer is asked for,
     /// because the buffer's *name* carries it.
@@ -298,7 +298,7 @@ impl PublicationImages {
     /// channel, not off this `SETUP`'s: the window a receiver offers is a
     /// property of the subscription that made the socket
     /// (`aeron_udp_channel_receiver_window(endpoint->…->udp_channel, …)`,
-    /// `aeron_driver_conductor.c:6496-6497`), which is why the conductor reads
+    /// `aeron_driver_conductor.c:6593-6594`), which is why the conductor reads
     /// them off the entry and hands them in.
     ///
     /// # Errors
@@ -328,7 +328,7 @@ impl PublicationImages {
     ) -> Result<(), AddError> {
         // The sender's MTU has to fit the endpoint's socket and the window this
         // receiver offers (`validate_sender_mtu_length`,
-        // `media/aeron_receive_channel_endpoint.c:984-1044`). A refusal here is
+        // `media/aeron_receive_channel_endpoint.c:989-1049`). A refusal here is
         // *recorded* rather than only answered: this is not a client's
         // registration being turned down, it is a stream the driver cannot
         // serve, and the conductor's fault list is what puts it in the error
@@ -342,15 +342,15 @@ impl PublicationImages {
             os_default_socket_rcvbuf,
         )
         .map_err(|first_line| {
-            // `:6509`: `AERON_APPEND_ERR` adds a second site line, and it is
+            // `:6604`: `AERON_APPEND_ERR` adds a second site line, and it is
             // the one that says *which* stream — the first line is about the
             // numbers and would read the same for every stream on the
             // endpoint. `aeron_err_update_entry` writes `[func, file:line] `,
-            // the message, and a newline (`util/aeron_error.c:337-349`).
+            // the message, and a newline (`util/aeron_error.c:357-369`).
             AddError::SenderMtu(format!(
                 "{first_line}\
                  [aeron_driver_conductor_execute_create_publication_image_validate, \
-                 aeron_driver_conductor.c:6509] stream_id={} session_id={}\n",
+                 aeron_driver_conductor.c:6604] stream_id={} session_id={}\n",
                 setup.stream_id, setup.session_id
             ))
         })?;
@@ -381,7 +381,7 @@ impl PublicationImages {
         )?;
 
         // Both position counters start at the join position, not at zero
-        // (`aeron_publication_image.c:391-392`). An image is created for a
+        // (`aeron_publication_image.c:396-397`). An image is created for a
         // stream that is already running, so its own position *is* where the
         // stream is: a zero here says the image has read nothing and is owed
         // everything from the beginning, which is a position the sender
@@ -513,7 +513,7 @@ impl PublicationImages {
         // (`aeron_congestion_control.c:165-205`) and its `rcv-wnd=` the window
         // (`aeron_udp_channel_receiver_window`), and the conductor hands the
         // supplier `endpoint->conductor_fields.udp_channel`
-        // (`aeron_driver_conductor.c:6629-6631`) rather than the subscription
+        // (`aeron_driver_conductor.c:6722-6724`) rather than the subscription
         // link's channel or the driver's own defaults.
         let entry = endpoints.get(pending.endpoint_id)?;
         let channel = &entry.channel;
@@ -529,12 +529,12 @@ impl PublicationImages {
         // other failure here: the image is never created, the publication is
         // left sending `SETUP`s into a receiver that keeps failing to build
         // one, and what is recorded is a line naming the stream and the session
-        // (`aeron_driver_conductor.c:6633-6640` appends exactly those two).
+        // (`aeron_driver_conductor.c:6726-6733` appends exactly those two).
         let uri = crate::channel_uri::ChannelUri::parse(&channel.original_uri).ok()?;
 
         // The **driver's** supplier decides first: `default` is the chooser and
         // reads `cc=`; `static` or `cubic` names the strategy outright
-        // (`aeron_driver_conductor.c:6629` calls whatever the context loaded).
+        // (`aeron_driver_conductor.c:6722` calls whatever the context loaded).
         let Some(strategy) = config
             .congestion_control_supplier
             .strategy(uri.value(crate::publication_params::key::CONGESTION_CONTROL))
@@ -743,8 +743,8 @@ impl PublicationImages {
 }
 
 /// The counters an image's client reads: `rcv-hwm` and `rcv-pos`
-/// (`aeron_position.c:157-199`) and `rcv-naks-sent`
-/// (`aeron_driver_conductor.c:6680-6683`).
+/// (`aeron_position.c:162-204`) and `rcv-naks-sent`
+/// (`aeron_driver_conductor.c:6773-6776`).
 ///
 /// All three are owned by the client that asked for the subscription, not by
 /// the driver that allocated them: the reference passes
@@ -807,7 +807,7 @@ fn allocate_counters(
 }
 
 /// Where an image's log buffer goes
-/// (`aeron-client/src/main/c/util/aeron_fileutil.c:1222-1232`): the `images`
+/// (`aeron-client/src/main/c/util/aeron_fileutil.c:1221-1231`): the `images`
 /// directory, named after the image's registration id.
 pub fn image_path(aeron_dir: &std::path::Path, registration_id: i64) -> PathBuf {
     aeron_dir
@@ -904,7 +904,7 @@ mod tests {
     /// `aeron-driver/src/main/c/aeron_publication_image.h:318-324`), and the
     /// positions live with the image in the receiver's thread. A drained image
     /// leaves `Draining` for `Linger` as it is drained
-    /// (`aeron_publication_image.c:1338-1358`), so the two agree everywhere
+    /// (`aeron_publication_image.c:1364-1384`), so the two agree everywhere
     /// except a drained image still in `Draining` inside the
     /// `IMAGE_SM_EOS_MULTIPLE` window, where the reference refuses and this
     /// build accepts.

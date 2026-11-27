@@ -14,7 +14,7 @@
 //! the park each time it finds nothing
 //! (`aeron-client/src/main/c/aeron_agent.c:112-163`, with the parameters from
 //! `aeron_agent.h:43-46`). The sixth — the native resource agent — defaults to
-//! `sleep-ns` (`aeron_driver_context.c:1148`): it maps files and resolves names,
+//! `sleep-ns` (`aeron_driver_context.c:1178`): it maps files and resolves names,
 //! and a thread that spins on a work queue nothing is filling is a core nobody
 //! can use.
 //!
@@ -207,14 +207,14 @@ impl SleepingMillis {
 /// A name that is not in that table is `None`, and the reference answers it by
 /// **refusing to start the driver** — its context calls the loader and jumps to
 /// its error arm when the loader returns null
-/// (`aeron_driver_context.c:1152-1158`), so a typo is not a strategy that
+/// (`aeron_driver_context.c:1182-1188`), so a typo is not a strategy that
 /// quietly becomes backoff.
 ///
 /// # Two tables, and this type is in both
 ///
 /// The C driver loads a name through `aeron_idle_strategy_load` and the Java
 /// side resolves one through `io.aeron.driver.Configuration.agentIdleStrategy`
-/// (`:2098-2143`), and the two lists are **not** the same list: the Java one has
+/// (`:2174-2219`), and the two lists are **not** the same list: the Java one has
 /// aliases the C one has no spelling for (`sleep-ms`), accepts the six
 /// strategies' full class names as well, and falls back to loading an arbitrary
 /// class by reflection. [`Strategy::by_name`] is the C table and
@@ -267,7 +267,7 @@ impl Strategy {
     }
 
     /// The strategy a **Java-side** configuration names
-    /// (`io.aeron.driver.Configuration.agentIdleStrategy`, `:2098-2143`).
+    /// (`io.aeron.driver.Configuration.agentIdleStrategy`, `:2246-2291`).
     ///
     /// Two things about it differ from [`Strategy::by_name`], and both are the
     /// Java table's own doing rather than this build's:
@@ -287,8 +287,8 @@ impl Strategy {
     ///
     /// `controllable` is `None` too, and for a subtler reason: its arm requires
     /// a `StatusIndicator`, and the archive's supplier is built with `null` for
-    /// one (`Archive.java:1399` passes null into
-    /// `Configuration.idleStrategySupplier`, which forwards it at `:781`), so a
+    /// one (`Archive.java:1467` passes null into
+    /// `Configuration.idleStrategySupplier`, which forwards it at `:843`), so a
     /// deployment that names it does not get a controllable strategy there — it
     /// gets a `NullPointerException` out of `conclude`.
     pub fn by_agrona_name(name: &str) -> Option<Self> {
@@ -302,7 +302,7 @@ impl Strategy {
             "sleep-ms" | "org.agrona.concurrent.SleepingMillisIdleStrategy" => Some(
                 Self::SleepingMillis(SleepingMillis::new(SleepingMillis::DEFAULT_PERIOD_MS)),
             ),
-            // The Java driver's four numbers (`Configuration.java:487-504`),
+            // The Java driver's four numbers (`Configuration.java:520-537`),
             // which are the same four the C strategy defaults to — so the two
             // tables agree here by value even though they are different lists.
             "backoff" | "org.agrona.concurrent.BackoffIdleStrategy" => {
@@ -454,7 +454,7 @@ mod tests {
         assert!(Strategy::by_name("sleep-ns", Some("1 fortnight")).is_none());
     }
 
-    /// The Java table (`Configuration.java:2098-2143`), which is a *different*
+    /// The Java table (`Configuration.java:2246-2291`), which is a *different*
     /// list from the C one above — and the difference is the point of having it:
     /// a name resolution that used the wrong table would accept `sleeping` on a
     /// Java-side setting and refuse `sleep-ms`.

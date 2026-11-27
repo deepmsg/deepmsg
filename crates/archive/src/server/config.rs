@@ -2,7 +2,7 @@
 //!
 //! The reference's archive is configured the way every Java Aeron component is:
 //! a pile of `System.getProperty` reads, one per name, with the default written
-//! into the constant beside it (`Archive.java:295-663` for the server's own,
+//! into the constant beside it (`Archive.java:301-669` for the server's own,
 //! `client/AeronArchive.java:2674-2848` for the ones the archive shares with the
 //! client it embeds). There is no environment layer to mirror — the C driver
 //! reads `AERON_*` because `aeronmd` turns `-D` into the environment for it
@@ -29,7 +29,7 @@
 //! Three settings have no default and are refused when missing or wrong, with
 //! the reference's own words: `aeron.dir` (the directory the archive is a
 //! client of), and the two control channels' media types
-//! (`Archive.java:1216-1233`).
+//! (`Archive.java:1282-1299`).
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -38,10 +38,10 @@ use crate::server::idle::IdleStrategy;
 
 /// How the archive's agents are run (`ArchiveThreadingMode.java:28-38`).
 ///
-/// The default is `Dedicated` (`Archive.java:394-397`), and this slice
+/// The default is `Dedicated` (`Archive.java:400-403`), and this slice
 /// implements `Shared` only — `Archive` picks its conductor with
 /// `DEDICATED == ctx.threadingMode() ? DedicatedModeArchiveConductor :
-/// SharedModeArchiveConductor` (`Archive.java:146-147`), so `Invoker` is
+/// SharedModeArchiveConductor` (`Archive.java:148-149`), so `Invoker` is
 /// `Shared` seen from the caller's side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadingMode {
@@ -76,7 +76,7 @@ impl fmt::Display for ThreadingMode {
 }
 
 /// Which spelling of its name a thread the archive starts is given
-/// (`CommonContext.java:534-566`, read through `CommonContext.threadName`).
+/// (`CommonContext.java:541-573`, read through `CommonContext.threadName`).
 ///
 /// **Not one of the archive's own 45 names.** `aeron.thread.naming` is a
 /// `CommonContext` name — the client, the driver and the archive all resolve it
@@ -84,24 +84,24 @@ impl fmt::Display for ThreadingMode {
 /// `every_name_the_reference_reads_is_accounted_for` keeps.
 ///
 /// The reference **throws** on a value that is neither spelling
-/// (`:563-565`), so a typo is a refusal here rather than a silent fall back to
+/// (`:588-590`), so a typo is a refusal here rather than a silent fall back to
 /// `classic`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadNaming {
-    /// `classic`, the default (`:547`): `archive-conductor`,
+    /// `classic`, the default (`:554`): `archive-conductor`,
     /// `archive-recorder`, `archive-replayer`.
     Classic,
-    /// `new` (`:543`): the same three as `aeron-ar-cnd` / `aeron-ar-rec` /
+    /// `new` (`:550`): the same three as `aeron-ar-cnd` / `aeron-ar-rec` /
     /// `aeron-ar-rep`.
     New,
 }
 
 impl ThreadNaming {
-    /// `THREAD_NAMING_DEFAULT` (`CommonContext.java:547`), which is `classic`.
+    /// `THREAD_NAMING_DEFAULT` (`CommonContext.java:554`), which is `classic`.
     pub const DEFAULT: Self = Self::Classic;
 
     /// The naming `value` names, or `None` for one the reference does not know
-    /// (its `default ->` arm, `:564-565`).
+    /// (its `default ->` arm, `:589-590`).
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "classic" => Some(Self::Classic),
@@ -126,18 +126,18 @@ pub enum ConfigError {
     /// (`crates/driver/src/config.rs:1187-1191`).
     MissingAeronDir,
     /// `aeron.archive.control.channel` is required when the control channel is
-    /// enabled (`Archive.java:1218-1221`).
+    /// enabled (`Archive.java:1284-1287`).
     MissingControlChannel,
-    /// ...and must be UDP (`Archive.java:1223-1227`).
+    /// ...and must be UDP (`Archive.java:1289-1293`).
     ControlChannelNotUdp { channel: String },
-    /// ...while the local one must be IPC (`Archive.java:1230-1233`).
+    /// ...while the local one must be IPC (`Archive.java:1296-1299`).
     LocalControlChannelNotIpc { channel: String },
     /// A value that was present and unparseable.
     InvalidValue { name: String, value: String },
     /// A threading mode that is not one of the three.
     UnknownThreadingMode { value: String },
     /// A thread naming mode that is neither `classic` nor `new`
-    /// (`CommonContext.java:563-565`).
+    /// (`CommonContext.java:588-590`).
     UnknownThreadNaming { value: String },
     /// An idle strategy name this build has no strategy for
     /// (`io.aeron.driver.Configuration.agentIdleStrategy:2098-2143`). The
@@ -147,16 +147,16 @@ pub enum ConfigError {
     /// through this table — the archive's own and each agent's.
     UnknownIdleStrategy { name: String, value: String },
     /// `aeron.archive.segment.file.length` is not a power of two
-    /// (`Archive.java:1482-1485`).
+    /// (`Archive.java:1550-1553`).
     SegmentFileLengthNotPowerOfTwo { length: usize },
-    /// ...or is outside the term buffer's own range (`:1486-1489`).
+    /// ...or is outside the term buffer's own range (`:1554-1557`).
     SegmentFileLengthOutOfRange { length: usize },
     /// `aeron.archive.file.io.max.length` is below a term or not a power of
-    /// two (`:1208-1211`). It is also a recording session's
+    /// two (`:1274-1277`). It is also a recording session's
     /// `blockLengthLimit`'s upper bound (`RecordingSession.java:81`).
     InvalidFileIoMaxLength { length: usize },
     /// The archive was told to publish recording events and not told **where**
-    /// (`Archive.java:1240-1245`), which the reference refuses in these words.
+    /// (`Archive.java:1306-1311`), which the reference refuses in these words.
     ///
     /// This is what replaced this build's own refusal of the name: until P2-13
     /// `aeron.archive.recording.events.enabled` was refused outright, because a
@@ -164,7 +164,7 @@ pub enum ConfigError {
     /// wrong — and it was the one row of `docs/compat.md`'s "Refused by name".
     RecordingEventsChannelMissing,
     /// `aeron.archive.catalog.file.sync.level` is below
-    /// `aeron.archive.file.sync.level` (`Archive.java:1202-1205`), which the
+    /// `aeron.archive.file.sync.level` (`Archive.java:1268-1271`), which the
     /// reference refuses with these words.
     CatalogSyncLevelBelowFileSyncLevel { catalog: i32, file: i32 },
 }
@@ -205,14 +205,14 @@ impl fmt::Display for ConfigError {
                 write!(f, "invalid fileIoMaxLength={length}")
             }
             // The reference's own composition, character for character
-            // (`Archive.java:1242-1244`).
+            // (`Archive.java:1308-1310`).
             Self::RecordingEventsChannelMissing => write!(
                 f,
                 "Archive.Context.recordingEventsChannel must be set if \
                  Archive.Context.recordingEventsEnabled is true"
             ),
             // The reference's own composition, character for character
-            // (`Archive.java:1204-1205`).
+            // (`Archive.java:1270-1271`).
             Self::CatalogSyncLevelBelowFileSyncLevel { catalog, file } => {
                 write!(f, "catalogFileSyncLevel {catalog} < fileSyncLevel {file}")
             }
@@ -246,35 +246,35 @@ mod settings {
     /// replacement binary out of the same argument list — `TestArchive.h:104`).
     pub const AERON_DIR: &str = "aeron.dir";
 
-    /// `Archive.java:307`, default `aeron-archive` (`:315`).
+    /// `Archive.java:313`, default `aeron-archive` (`:321`).
     pub const ARCHIVE_DIR: &str = "aeron.archive.dir";
-    /// `Archive.java:321`, default `""` — empty means "beside the archive"
-    /// (`:320`).
+    /// `Archive.java:327`, default `""` — empty means "beside the archive"
+    /// (`:326`).
     pub const MARK_FILE_DIR: &str = "aeron.archive.mark.file.dir";
-    /// `Archive.java:578`, default false (`:577`).
+    /// `Archive.java:607`, default false (`:606`).
     pub const DIR_DELETE_ON_START: &str = "aeron.archive.dir.delete.on.start";
-    /// `Archive.java:394`, default `DEDICATED` (`:393`).
+    /// `Archive.java:400`, default `DEDICATED` (`:399`).
     pub const THREADING_MODE: &str = "aeron.archive.threading.mode";
-    /// `CommonContext.java:534`, default `classic` (`:547`) — **not one of the
+    /// `CommonContext.java:541`, default `classic` (`:554`) — **not one of the
     /// archive's 45**: it is a `CommonContext` name, resolved by the same static
     /// the client and the driver use, so it is deliberately outside the three
     /// lists `every_name_the_reference_reads_is_accounted_for` keeps.
     pub const THREAD_NAMING: &str = "aeron.thread.naming";
-    /// `Archive.java:590`, default `DefaultAuthenticatorSupplier` (`:597`).
+    /// `Archive.java:619`, default `DefaultAuthenticatorSupplier` (`:626`).
     pub const AUTHENTICATOR_SUPPLIER: &str = "aeron.archive.authenticator.supplier";
-    /// `Archive.java:603`.
+    /// `Archive.java:632`.
     pub const AUTHORISATION_SERVICE_SUPPLIER: &str = "aeron.archive.authorisation.service.supplier";
-    /// `Archive.java:493`, default 5 s (`:502`).
+    /// `Archive.java:522`, default 5 s (`:531`).
     pub const CONNECT_TIMEOUT: &str = "aeron.archive.connect.timeout";
-    /// `Archive.java:510-511`, default 1 s (`:520`).
+    /// `Archive.java:539-540`, default 1 s (`:549`).
     pub const SESSION_LIVENESS_CHECK_INTERVAL: &str =
         "aeron.archive.session.liveness.check.interval";
-    /// `Archive.java:584`, default `""` (`:583`).
+    /// `Archive.java:613`, default `""` (`:612`).
     pub const REPLICATION_CHANNEL: &str = "aeron.archive.replication.channel";
-    /// `Archive.java:654`, default `-1` — "the Aeron client's own id"
-    /// (`:650-655`).
+    /// `Archive.java:683`, default `-1` — "the Aeron client's own id"
+    /// (`:679-684`).
     pub const ARCHIVE_ID: &str = "aeron.archive.id";
-    /// `Archive.java:663`, default true (`:662`).
+    /// `Archive.java:692`, default true (`:691`).
     pub const CONTROL_CHANNEL_ENABLED: &str = "aeron.archive.control.channel.enabled";
 
     /// `AeronArchive.java:2698`. No default: required when the control channel
@@ -297,18 +297,18 @@ mod settings {
     /// `AeronArchive.java:2834`, default: the media driver's own MTU (`:2840`).
     pub const CONTROL_MTU_LENGTH: &str = "aeron.archive.control.mtu.length";
 
-    /// `Archive.java:429`, default 20 (`:438`).
+    /// `Archive.java:458`, default 20 (`:467`).
     pub const MAX_CONCURRENT_RECORDINGS: &str = "aeron.archive.max.concurrent.recordings";
-    /// `Archive.java:445`, default 20 (`:452`). What bounds how many replays may
-    /// be in flight at once (`ArchiveConductor.java:775-780`).
+    /// `Archive.java:474`, default 20 (`:481`). What bounds how many replays may
+    /// be in flight at once (`ArchiveConductor.java:774-779`).
     pub const MAX_CONCURRENT_REPLAYS: &str = "aeron.archive.max.concurrent.replays";
-    /// `Archive.java:328`, default 128 MiB (`:336`).
+    /// `Archive.java:334`, default 128 MiB (`:342`).
     pub const SEGMENT_FILE_LENGTH: &str = "aeron.archive.segment.file.length";
-    /// `Archive.java:301`, default 1 MiB (`:295`).
+    /// `Archive.java:307`, default 1 MiB (`:305`).
     pub const FILE_IO_MAX_LENGTH: &str = "aeron.archive.file.io.max.length";
-    /// `Archive.java:342`, default: the segment file length (`:350`).
+    /// `Archive.java:348`, default: the segment file length (`:356`).
     pub const LOW_STORAGE_SPACE_THRESHOLD: &str = "aeron.archive.low.storage.space.threshold";
-    /// `Archive.java:361`, default 0 (`:369`).
+    /// `Archive.java:367`, default 0 (`:375`).
     pub const FILE_SYNC_LEVEL: &str = "aeron.archive.file.sync.level";
     /// `AeronArchive.java:2797`, default false (`:2803`).
     pub const RECORDING_EVENTS_ENABLED: &str = "aeron.archive.recording.events.enabled";
@@ -318,13 +318,13 @@ mod settings {
     /// `AeronArchive.java:2785`, default 30 (`:2791`).
     pub const RECORDING_EVENTS_STREAM_ID: &str = "aeron.archive.recording.events.stream.id";
 
-    /// `Archive.java:479`, default `Catalog.DEFAULT_CAPACITY` (`:487`,
-    /// `Catalog.java:105`), read as a size at `:861`.
+    /// `Archive.java:508`, default `Catalog.DEFAULT_CAPACITY` (`:516`,
+    /// `Catalog.java:107`), read as a size at `:864`.
     pub const CATALOG_CAPACITY: &str = "aeron.archive.catalog.capacity";
-    /// `Archive.java:380`, default `FILE_SYNC_LEVEL_DEFAULT` (`:388`), read at
-    /// `:756`.
+    /// `Archive.java:386`, default `FILE_SYNC_LEVEL_DEFAULT` (`:394`), read at
+    /// `:785`.
     pub const CATALOG_FILE_SYNC_LEVEL: &str = "aeron.archive.catalog.file.sync.level";
-    /// `Archive.java:627`, default 1 MiB (`:633`), read at `:946`.
+    /// `Archive.java:656`, default 1 MiB (`:662`), read at `:1008`.
     pub const ERROR_BUFFER_LENGTH: &str = "aeron.archive.error.buffer.length";
 
     /// `AeronArchive.java:2674`, default 10 s (`:2680`), read at `:2864`.
@@ -338,16 +338,16 @@ mod settings {
     /// What [`crate::server::response_proxy::SEND_ATTEMPTS`] already is.
     pub const MESSAGE_RETRY_ATTEMPTS: &str = "aeron.archive.message.retry.attempts";
 
-    /// `Archive.java:526`, default `Context.replayLingerTimeoutNs()` (`:535`),
-    /// read at `:884`.
+    /// `Archive.java:555`, default `Context.replayLingerTimeoutNs()` (`:542`),
+    /// read at `:946`.
     pub const REPLAY_LINGER_TIMEOUT: &str = "aeron.archive.replay.linger.timeout";
-    /// `Archive.java:647`, default off, read at `:1027`.
+    /// `Archive.java:676`, default off, read at `:1089`.
     pub const REPLAY_CHECKSUM: &str = "aeron.archive.replay.checksum";
-    /// `Archive.java:640`, default off, read at `:1017`. The recording side of
+    /// `Archive.java:669`, default off, read at `:1017`. The recording side of
     /// the same choice.
     pub const RECORD_CHECKSUM: &str = "aeron.archive.record.checksum";
-    /// `Archive.java:400`; the default is `DEFAULT_IDLE_STRATEGY` at `:420`,
-    /// read by the conductor's supplier at `:776-784`.
+    /// `Archive.java:429`; the default is `DEFAULT_IDLE_STRATEGY` at `:449`,
+    /// read by the conductor's supplier at `:775-783`.
     ///
     /// ★ **Honoured since P2-9a**, after being a name this build accepted and
     /// ignored — see [`crate::server::idle`].
@@ -359,21 +359,21 @@ mod settings {
     /// A name that is accepted and does nothing would make those slices look
     /// wired when they are not.
     ///
-    /// `Archive.java:542`, default 100 ms (`:548`), read at `:894`.
+    /// `Archive.java:571`, default 100 ms (`:555`), read at `:956`.
     pub const CONDUCTOR_CYCLE_THRESHOLD: &str = "aeron.archive.conductor.cycle.threshold";
-    /// `Archive.java:554`, default 100 ms (`:560`), read at `:904`.
+    /// `Archive.java:583`, default 100 ms (`:585`), read at `:966`.
     pub const RECORDER_CYCLE_THRESHOLD: &str = "aeron.archive.recorder.cycle.threshold";
-    /// `Archive.java:566`, default 100 ms (`:572`), read at `:914`.
+    /// `Archive.java:595`, default 100 ms (`:601`), read at `:976`.
     pub const REPLAYER_CYCLE_THRESHOLD: &str = "aeron.archive.replayer.cycle.threshold";
-    /// `Archive.java:406`, read by the recorder's idle strategy supplier
-    /// (`:786-802`).
+    /// `Archive.java:435`, read by the recorder's idle strategy supplier
+    /// (`:848-864`).
     pub const RECORDER_IDLE_STRATEGY: &str = "aeron.archive.recorder.idle.strategy";
-    /// `Archive.java:412`, similarly (`:804-820`).
+    /// `Archive.java:441`, similarly (`:866-882`).
     pub const REPLAYER_IDLE_STRATEGY: &str = "aeron.archive.replayer.idle.strategy";
 
-    /// `Archive.java:463`, default 8192 (`:472`), read at `:851` — and **read by
+    /// `Archive.java:492`, default 8192 (`:501`), read at `:913` — and **read by
     /// nobody else**: the reference exposes it and constructs its `Catalog`
-    /// without it (`Archive.java:1504-1511`, where the arguments are the sync
+    /// without it (`Archive.java:1572-1579`, where the arguments are the sync
     /// level, the capacity, the clock and the checksum). Accepted here for the
     /// same reason it is inert there.
     pub const MAX_CATALOG_ENTRIES: &str = "aeron.archive.max.catalog.entries";
@@ -428,7 +428,7 @@ pub const NOT_HONOURED: &[(&str, &str)] = &[
         settings::MAX_CATALOG_ENTRIES,
         "★ the reference has no reader for it either: `Archive.maxCatalogEntries()` is \
          defined and never called, and its `Catalog` is constructed without it \
-         (`Archive.java:1504-1511`)",
+         (`Archive.java:1572-1579`)",
     ),
     (
         settings::CLIENT_NAME,
@@ -438,7 +438,7 @@ pub const NOT_HONOURED: &[(&str, &str)] = &[
     ),
 ];
 
-/// The reference's default archive directory (`Archive.java:315`).
+/// The reference's default archive directory (`Archive.java:321`).
 const ARCHIVE_DIR_DEFAULT: &str = "aeron-archive";
 
 /// `AeronArchive.Configuration.MESSAGE_TIMEOUT_DEFAULT_NS` (`:2680`).
@@ -449,14 +449,14 @@ const MESSAGE_TIMEOUT_DEFAULT_NS: i64 = 10_000_000_000;
 const MESSAGE_RETRY_ATTEMPTS_DEFAULT: usize = 3;
 
 /// The reference's default for all three cycle thresholds
-/// (`Archive.java:548`, `:560`, `:572`).
+/// (`Archive.java:577`, `:585`, `:601`).
 const CYCLE_THRESHOLD_DEFAULT_NS: i64 = 100_000_000;
 
-/// `Archive.Configuration.ERROR_BUFFER_LENGTH_DEFAULT` (`:633`).
+/// `Archive.Configuration.ERROR_BUFFER_LENGTH_DEFAULT` (`:662`).
 const ERROR_BUFFER_LENGTH_DEFAULT: usize = 1024 * 1024;
 
-/// `Catalog.DEFAULT_CAPACITY` (`Catalog.java:105`), which is what
-/// `Archive.Configuration.CATALOG_CAPACITY_DEFAULT` is (`:487`).
+/// `Catalog.DEFAULT_CAPACITY` (`Catalog.java:107`), which is what
+/// `Archive.Configuration.CATALOG_CAPACITY_DEFAULT` is (`:516`).
 const CATALOG_CAPACITY_DEFAULT: usize = 1024 * 1024;
 /// `AeronArchive.java:2722`.
 const LOCAL_CONTROL_CHANNEL_DEFAULT: &str = "aeron:ipc?term-length=64k";
@@ -466,17 +466,17 @@ const CONTROL_STREAM_ID_DEFAULT: i32 = 10;
 const CONTROL_RESPONSE_STREAM_ID_DEFAULT: i32 = 20;
 /// `AeronArchive.java:2828`.
 const CONTROL_TERM_BUFFER_LENGTH_DEFAULT: usize = 64 * 1024;
-/// `Archive.java:502`.
+/// `Archive.java:531`.
 const CONNECT_TIMEOUT_DEFAULT_NS: i64 = 5 * 1_000_000_000;
-/// `Archive.java:520`.
+/// `Archive.java:549`.
 const SESSION_LIVENESS_CHECK_INTERVAL_DEFAULT_NS: i64 = 1_000_000_000;
-/// `Archive.java:438`.
+/// `Archive.java:467`.
 const MAX_CONCURRENT_RECORDINGS_DEFAULT: i32 = 20;
-/// `Archive.java:452`.
+/// `Archive.java:481`.
 const MAX_CONCURRENT_REPLAYS_DEFAULT: i32 = 20;
-/// `Archive.java:336`.
+/// `Archive.java:342`.
 const SEGMENT_FILE_LENGTH_DEFAULT: usize = 128 * 1024 * 1024;
-/// `Archive.java:295`.
+/// `Archive.java:301`.
 const FILE_IO_MAX_LENGTH_DEFAULT: usize = 1024 * 1024;
 
 /// `AeronArchive.Configuration.RECORDING_EVENTS_STREAM_ID_DEFAULT` (`:2791`).
@@ -485,21 +485,21 @@ const FILE_IO_MAX_LENGTH_DEFAULT: usize = 1024 * 1024;
 /// reads it: the channel may be absent and the stream id may not.
 const RECORDING_EVENTS_STREAM_ID_DEFAULT: i32 = 30;
 /// `LogBufferDescriptor.java:58` and `:63`, which the segment file length is
-/// bounded by (`Archive.java:1486-1489`).
+/// bounded by (`Archive.java:1554-1557`).
 const TERM_MIN_LENGTH: usize = 64 * 1024;
 /// See [`TERM_MIN_LENGTH`].
 const TERM_MAX_LENGTH: usize = 1024 * 1024 * 1024;
-/// `Archive.java:597`.
+/// `Archive.java:626`.
 const AUTHENTICATOR_SUPPLIER_DEFAULT: &str = "io.aeron.security.DefaultAuthenticatorSupplier";
-/// `Archive.java:610-611` — and this one is **not a class name**.
+/// `Archive.java:639-640` — and this one is **not a class name**.
 ///
 /// The two suppliers default differently, and the difference is in the
 /// reference rather than in this build. The authenticator's default is a class
-/// name, resolved through `Class.forName` (`:956-964`). The authorisation
+/// name, resolved through `Class.forName` (`:1018-1026`). The authorisation
 /// service's is a *supplier* — `DEFAULT_AUTHORISATION_SERVICE_SUPPLIER =
 /// () -> AuthorisationService.ALLOW_ALL` — and the property is read with no
 /// default at all, so an archive that does not set it gets the empty name and
-/// the built-in allow-all service (`:982-1002`):
+/// the built-in allow-all service (`:1044-1064`):
 ///
 /// ```text
 /// final String supplierClassName = System.getProperty(AUTHORISATION_SERVICE_SUPPLIER_PROP_NAME);
@@ -517,24 +517,24 @@ const AUTHORISATION_SERVICE_SUPPLIER_DEFAULT: &str = "";
 pub struct ArchiveConfig {
     /// The media driver's directory. The archive is a client of it.
     pub aeron_dir: PathBuf,
-    /// Where the catalog and segments live (`Archive.java:307`).
+    /// Where the catalog and segments live (`Archive.java:313`).
     pub archive_dir: PathBuf,
     /// Where `archive-mark.dat` lives; [`None`] means the archive directory
-    /// (`Archive.java:321-325`).
+    /// (`Archive.java:327-331`).
     pub mark_file_dir: Option<PathBuf>,
     /// Whether the archive directory is deleted on start.
     pub delete_dir_on_start: bool,
     /// The archive's identity, or [`None`] for "the Aeron client's own id",
-    /// which is the reference's `-1` (`Archive.java:650-655`).
+    /// which is the reference's `-1` (`Archive.java:679-684`).
     pub archive_id: Option<i64>,
-    /// Whether the UDP control channel is served (`Archive.java:663`).
+    /// Whether the UDP control channel is served (`Archive.java:692`).
     pub control_channel_enabled: bool,
     /// The UDP control channel, required when that channel is enabled.
     pub control_channel: Option<String>,
     /// The stream the control channel carries (`AeronArchive.java:2710`).
     pub control_stream_id: i32,
     /// The local (IPC) control channel, which is served whether or not the UDP
-    /// one is (`ArchiveConductor.java:239-240`).
+    /// one is (`ArchiveConductor.java:238-239`).
     pub local_control_channel: String,
     /// ...and its stream, which is the same 10 by default
     /// (`AeronArchive.java:2734`).
@@ -546,7 +546,7 @@ pub struct ArchiveConfig {
     pub control_response_stream_id: i32,
     /// Whether the control channel's term buffers are sparse
     /// (`AeronArchive.java:2816`), which this build forces onto the URI
-    /// (`ArchiveConductor.java:230-234`).
+    /// (`ArchiveConductor.java:229-233`).
     pub control_term_buffer_sparse: bool,
     /// The control channel's term length (`AeronArchive.java:2828`).
     pub control_term_buffer_length: usize,
@@ -554,18 +554,18 @@ pub struct ArchiveConfig {
     /// (`AeronArchive.java:2840`).
     pub control_mtu_length: Option<usize>,
     /// How long a control session may take to get its first response out
-    /// (`Archive.java:502`).
+    /// (`Archive.java:531`).
     pub connect_timeout_ns: i64,
-    /// How often an active session is pinged (`Archive.java:520`).
+    /// How often an active session is pinged (`Archive.java:549`).
     pub session_liveness_check_interval_ns: i64,
-    /// `DEDICATED`, `SHARED` or `INVOKER` (`Archive.java:394-397`).
+    /// `DEDICATED`, `SHARED` or `INVOKER` (`Archive.java:400-403`).
     pub threading_mode: ThreadingMode,
     /// Which spelling the threads the archive starts are named with
-    /// (`CommonContext.java:557-566`). Read only when there are threads to name
+    /// (`CommonContext.java:582-591`). Read only when there are threads to name
     /// — see [`crate::server::threading`].
     pub thread_naming: ThreadNaming,
     /// How the conductor waits when it has nothing to do
-    /// (`Archive.java:400`, default `BackoffIdleStrategy` at `:420`).
+    /// (`Archive.java:429`, default `BackoffIdleStrategy` at `:449`).
     ///
     /// ★ **This is the conductor's, and it used to be hardcoded.** The loop
     /// yielded (`launch::run`'s own `yield_now`), which is what the reference's
@@ -580,41 +580,41 @@ pub struct ArchiveConfig {
     /// `AgentInvoker` (`:40-44`), which has no idle strategy at all, and the
     /// conductor's `doWork` invokes both inside its own turn (`:57-64`).
     pub idle_strategy: IdleStrategy,
-    /// The recorder's own (`Archive.java:406`), which is what its thread idles
+    /// The recorder's own (`Archive.java:435`), which is what its thread idles
     /// with under `DEDICATED`; the archive's when this names nothing
-    /// (`:1423-1431`). ★ Honoured since P2-9a — the thread that idles arrived
+    /// (`:1491-1499`). ★ Honoured since P2-9a — the thread that idles arrived
     /// with the recorder's own thread.
     pub recorder_idle_strategy: IdleStrategy,
-    /// The replayer's (`Archive.java:412`), the same rule (`:1433-1440`).
+    /// The replayer's (`Archive.java:441`), the same rule (`:1501-1508`).
     pub replayer_idle_strategy: IdleStrategy,
-    /// The authenticator to build (`Archive.java:590-597`).
+    /// The authenticator to build (`Archive.java:619-626`).
     pub authenticator_supplier: String,
-    /// The authorisation service to build (`Archive.java:603-610`).
+    /// The authorisation service to build (`Archive.java:632-639`).
     pub authorisation_service_supplier: String,
-    /// The channel replication streams arrive on (`Archive.java:584`).
+    /// The channel replication streams arrive on (`Archive.java:613`).
     pub replication_channel: Option<String>,
 
-    /// How many recordings may be active at once (`Archive.java:429`, `:438`).
+    /// How many recordings may be active at once (`Archive.java:458`, `:467`).
     pub max_concurrent_recordings: i32,
-    /// How many replays may be in flight at once (`Archive.java:445`, `:452`).
+    /// How many replays may be in flight at once (`Archive.java:474`, `:481`).
     pub max_concurrent_replays: i32,
-    /// How long one segment file of a recording is (`Archive.java:328`,
-    /// `:336`).
+    /// How long one segment file of a recording is (`Archive.java:334`,
+    /// `:342`).
     pub segment_file_length: usize,
     /// The largest block a recording session hands to its writer
-    /// (`Archive.java:301`, `:295`). A session's limit is
+    /// (`Archive.java:307`, `:305`). A session's limit is
     /// `min(image.termBufferLength(), this)` (`RecordingSession.java:81`).
     pub file_io_max_length: usize,
     /// Below this much usable space a recording is refused
-    /// (`ArchiveConductor.java:2597-2617`), and it defaults to the segment
-    /// file length (`Archive.java:350`).
+    /// (`ArchiveConductor.java:2632-2652`), and it defaults to the segment
+    /// file length (`Archive.java:356`).
     pub low_storage_space_threshold: u64,
     /// Above zero every recorded block is forced to disk, above one the
     /// metadata as well (`RecordingWriter.java:88-89`).
     pub file_sync_level: i32,
-    /// The same two meanings, for the **catalog** (`Catalog.java:161-162`), and
+    /// The same two meanings, for the **catalog** (`Catalog.java:164-165`), and
     /// the archive-directory entry that goes with a newly created catalog
-    /// (`:226`). Default 0 — see the refusal in [`ArchiveConfig::from_args`]
+    /// (`:229`). Default 0 — see the refusal in [`ArchiveConfig::from_args`]
     /// for why it is not the file level.
     pub catalog_file_sync_level: i32,
     /// Whether the archive publishes recording events
@@ -636,19 +636,19 @@ pub struct ArchiveConfig {
     /// (`AeronArchive.java:2692`, three) — what
     /// [`crate::server::response_proxy::SEND_ATTEMPTS`] is.
     pub message_retry_attempts: usize,
-    /// The mark file's error buffer (`Archive.java:633`, 1 MiB).
+    /// The mark file's error buffer (`Archive.java:662`, 1 MiB).
     pub error_buffer_length: usize,
     /// How long one turn of the conductor's may take before it is counted as
-    /// over the threshold (`Archive.java:548`, 100 ms). What this build's
+    /// over the threshold (`Archive.java:577`, 100 ms). What this build's
     /// archive already is — and now a name a deployment can set.
     pub conductor_cycle_threshold_ns: i64,
-    /// The recorder's (`Archive.java:560`, 100 ms). Allocated and labelled,
+    /// The recorder's (`Archive.java:589`, 100 ms). Allocated and labelled,
     /// never measured in this build: the reference measures it only from
-    /// `DedicatedModeArchiveConductor` (`:191`) and this build runs `SHARED`.
+    /// `DedicatedModeArchiveConductor` (`:197`) and this build runs `SHARED`.
     pub recorder_cycle_threshold_ns: i64,
-    /// The replayer's (`Archive.java:572`, 100 ms), for the same reason.
+    /// The replayer's (`Archive.java:601`, 100 ms), for the same reason.
     pub replayer_cycle_threshold_ns: i64,
-    /// The size a catalog **starts** at (`Archive.java:487`,
+    /// The size a catalog **starts** at (`Archive.java:516`,
     /// `Catalog.DEFAULT_CAPACITY`); it grows as records are added, so this is
     /// where the file begins rather than how large it may become.
     pub catalog_capacity: usize,
@@ -738,7 +738,7 @@ impl ArchiveConfig {
 
         // The reference's own refusal, and it is a throw rather than a fall
         // back: `CommonContext.threadName`'s `default ->` arm
-        // (`CommonContext.java:564-565`).
+        // (`CommonContext.java:589-590`).
         let thread_naming = match get(settings::THREAD_NAMING) {
             None => ThreadNaming::DEFAULT,
             Some(value) => {
@@ -749,9 +749,9 @@ impl ArchiveConfig {
         };
 
         // The reference's default is written as the **class name**
-        // (`Archive.java:420`), and a name it cannot resolve is a failure to
+        // (`Archive.java:449`), and a name it cannot resolve is a failure to
         // start rather than a fall back — the supplier throws out of `conclude`
-        // (`:2134-2142`'s `default ->` arm rethrows the `ClassNotFoundException`).
+        // (`:2202-2210`'s `default ->` arm rethrows the `ClassNotFoundException`).
         // See [`crate::server::idle`] for the two names the reference resolves
         // and this build refuses instead.
         let idle_strategy = match get(settings::IDLE_STRATEGY) {
@@ -766,7 +766,7 @@ impl ArchiveConfig {
 
         // ★ P2-9a: the two per-agent names, and the reference's fallback — a
         // per-agent name that names nothing gets the **archive's** strategy, not
-        // the default (`Archive.java:1423-1440`; the property is read by
+        // the default (`Archive.java:1491-1508`; the property is read by
         // `Configuration.recorderIdleStrategySupplier(null)` and only the
         // fallback is the archive's own supplier). Resolved here rather than
         // where each thread is built, so that a name this build has no strategy
@@ -793,9 +793,9 @@ impl ArchiveConfig {
             // [`ARCHIVE_ID_DEFAULT`]. **A configured id is an id whatever its
             // sign**: the reference parses this property as a long and tests
             // nothing about it (`Archive.Configuration.archiveId`,
-            // `Archive.java:1051-1058`), and its own suite runs a *destination*
-            // archive as `-7777` (`aeron_archive_test.cpp:452`) and asserts the
-            // id it reports back (`:2659`). Dropping negatives here made that
+            // `Archive.java:1113-1120`), and its own suite runs a *destination*
+            // archive as `-7777` (`aeron_archive_test.cpp:457`) and asserts the
+            // id it reports back (`:2727`). Dropping negatives here made that
             // archive answer `-1` instead — a whole family of criteria red
             // before their first request, which is how it was found.
             None => None,
@@ -812,7 +812,7 @@ impl ArchiveConfig {
 
         // The segment file length is checked where the reference checks it —
         // in the archive's own constructor rather than in the context
-        // (`Archive.java:1480-1489`) — and refused with its words.
+        // (`Archive.java:1548-1557`) — and refused with its words.
         let segment_file_length = size(
             get(settings::SEGMENT_FILE_LENGTH),
             settings::SEGMENT_FILE_LENGTH,
@@ -844,12 +844,12 @@ impl ArchiveConfig {
         }
 
         // The events publication's three names, and the one rule between them
-        // (`Archive.java:1240-1245`): an archive told to publish events without
+        // (`Archive.java:1306-1311`): an archive told to publish events without
         // being told **where** is an error rather than an archive that publishes
         // into nowhere. The reference's words for it are kept verbatim.
         //
         // ★ The channel has no default (`AeronArchive.Configuration
-        // .recordingEventsChannel()` is the property or `null`, `:2988`) while
+        // .recordingEventsChannel()` is the property or `null`, `:3172`) while
         // the stream id has one (`:2791`) — which is what makes the rule
         // expressible at all.
         let recording_events_enabled =
@@ -868,14 +868,14 @@ impl ArchiveConfig {
 
         // The two sync levels, and the order the reference puts them in: a
         // catalog below the recording files' is **refused**
-        // (`Archive.java:1202-1205`). A catalog that may be lost while the
+        // (`Archive.java:1268-1271`). A catalog that may be lost while the
         // data it describes survives is a catalog that cannot find that data
         // again, which is why the reference makes it an error rather than a
         // warning. Equal is allowed.
         //
         // ★ **The catalog's default is the static `0`, not the file level that
         // was configured** (`CATALOG_FILE_SYNC_LEVEL_DEFAULT` is
-        // `FILE_SYNC_LEVEL_DEFAULT`, `Archive.java:388`, `:369`), so
+        // `FILE_SYNC_LEVEL_DEFAULT`, `Archive.java:394`, `:375`), so
         // `file.sync.level=2` on its own is *refused* rather than quietly
         // syncing the catalog at 2 as well. That is the reference's own trap
         // and this build keeps it.
@@ -971,7 +971,7 @@ impl ArchiveConfig {
             file_io_max_length,
             // The **constant**, not whatever the segment file length resolved
             // to: `LOW_STORAGE_SPACE_THRESHOLD_DEFAULT = SEGMENT_FILE_LENGTH_DEFAULT`
-            // (`Archive.java:350`), so a build with a 1 MB segment length
+            // (`Archive.java:356`), so a build with a 1 MB segment length
             // still gets a 128 MB threshold.
             low_storage_space_threshold: size(
                 get(settings::LOW_STORAGE_SPACE_THRESHOLD),
@@ -1023,7 +1023,7 @@ impl ArchiveConfig {
     }
 
     /// Where `archive-mark.dat` goes: the mark file directory when one was
-    /// named, and the archive directory otherwise (`Archive.java:321-325`).
+    /// named, and the archive directory otherwise (`Archive.java:327-331`).
     pub fn mark_file_path(&self) -> PathBuf {
         self.mark_file_dir
             .as_deref()
@@ -1033,13 +1033,13 @@ impl ArchiveConfig {
 }
 
 /// A property that is present and empty is absent, which is what the
-/// reference's `""` defaults mean (`Archive.java:320`, `:583`).
+/// reference's `""` defaults mean (`Archive.java:326`, `:612`).
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.is_empty())
 }
 
 /// `"true".equals(value)`, which is how the reference reads every one of its
-/// booleans (`Archive.java:925`, `:1042`): anything that is not `true` is
+/// booleans (`Archive.java:987`, `:1104`): anything that is not `true` is
 /// false, and that is not an error.
 fn boolean(value: Option<&str>) -> Option<bool> {
     value.map(|value| value.eq_ignore_ascii_case("true"))
@@ -1085,7 +1085,7 @@ fn stream_id(value: Option<&str>, name: &str) -> Result<Option<i32>, ConfigError
 
 /// A size with a suffix: `64k`, `1m`, `1408` (`SystemUtil.parseSize`, the
 /// reference's own reader for the three control-channel sizes,
-/// `ArchiveConductor.java:459-467`).
+/// `ArchiveConductor.java:458-466`).
 fn size(value: Option<&str>, name: &str) -> Result<Option<usize>, ConfigError> {
     let Some(value) = value else {
         return Ok(None);
@@ -1193,11 +1193,11 @@ mod tests {
     /// **A negative archive id is an id.**
     ///
     /// The reference parses `aeron.archive.id` as a long and asks nothing about
-    /// its sign (`Archive.Configuration.archiveId`, `Archive.java:1051-1058`),
+    /// its sign (`Archive.Configuration.archiveId`, `Archive.java:1113-1120`),
     /// and its own suite relies on that: the *destination* archive of the
-    /// replication criteria is started as `-7777` (`aeron_archive_test.cpp:452`)
-    /// and the criteria assert that the id comes back (`:2659`, `:2793`,
-    /// `:2910`). Dropping negatives — which this resolver used to do, reading
+    /// replication criteria is started as `-7777` (`aeron_archive_test.cpp:457`)
+    /// and the criteria assert that the id comes back (`:2727`, `:2793`,
+    /// `:3094`). Dropping negatives — which this resolver used to do, reading
     /// "`-1` is not told" as "no negative is told" — made that archive answer
     /// `-1`, and all four criteria failed in their setup before sending a single
     /// request.
@@ -1256,7 +1256,7 @@ mod tests {
         assert_eq!(
             config.low_storage_space_threshold,
             128 * 1024 * 1024,
-            "the **constant**, not the configured segment file length (Archive.java:350)"
+            "the **constant**, not the configured segment file length (Archive.java:356)"
         );
     }
 
@@ -1334,7 +1334,7 @@ mod tests {
     }
 
     /// ★ The events publication's one rule, in the reference's own words
-    /// (`Archive.java:1240-1245`): an archive told to publish events and not
+    /// (`Archive.java:1306-1311`): an archive told to publish events and not
     /// told **where** is refused, because publishing into nowhere is the silent
     /// kind of wrong.
     ///
@@ -1418,7 +1418,7 @@ mod tests {
             config.idle_strategy,
             IdleStrategy::Backoff,
             "`aeron.archive.idle.strategy` is not one `TestArchive.h` sets, so its default is \
-             the one that shows (`Archive.java:420`)"
+             the one that shows (`Archive.java:449`)"
         );
         assert_eq!(
             config.archive_id, None,
@@ -1441,14 +1441,14 @@ mod tests {
         assert_eq!(
             config.thread_naming,
             ThreadNaming::Classic,
-            "`THREAD_NAMING_DEFAULT` is `classic` (`CommonContext.java:547`)"
+            "`THREAD_NAMING_DEFAULT` is `classic` (`CommonContext.java:554`)"
         );
 
         let config = resolve_with(&archive_defaults(), settings::THREAD_NAMING, "new")
             .expect("`new` is a spelling the reference knows");
         assert_eq!(config.thread_naming, ThreadNaming::New);
 
-        // The reference's `default ->` arm throws (`:564-565`), so this is a
+        // The reference's `default ->` arm throws (`:589-590`), so this is a
         // refusal and not a fall back to `classic`.
         assert!(
             matches!(
@@ -1465,7 +1465,7 @@ mod tests {
     /// accepted and ignored and nothing could tell.
     ///
     /// The default is the reference's, written there as a class name
-    /// (`Archive.java:420`), and a name it cannot resolve is a refusal rather
+    /// (`Archive.java:449`), and a name it cannot resolve is a refusal rather
     /// than a fall back to it.
     #[test]
     fn the_idle_strategy_is_the_references_and_a_name_it_has_none_for_is_refused() {
@@ -1517,7 +1517,7 @@ mod tests {
 
     /// ★ The reference's fallback for the two per-agent names: a name that names
     /// nothing gets the **archive's** strategy rather than the default
-    /// (`Archive.java:1423-1440` — the property is read first, and only an
+    /// (`Archive.java:1491-1508` — the property is read first, and only an
     /// absent one falls through to the archive's own supplier).
     #[test]
     fn an_agents_idle_strategy_falls_back_to_the_archives_own() {
@@ -1609,7 +1609,7 @@ mod tests {
 
     #[test]
     fn a_disabled_control_channel_needs_no_channel_and_the_local_one_still_exists() {
-        // `ArchiveConductor.java:239-240` adds the local subscription with no
+        // `ArchiveConductor.java:238-239` adds the local subscription with no
         // condition on it, so IPC-only mode still has one channel to serve.
         let config = ArchiveConfig::resolve(&props(&[
             (settings::AERON_DIR, "/dev/shm/a"),
@@ -1754,7 +1754,7 @@ mod tests {
             // P2-9a: the conductor's idle strategy, which used to be a name this
             // build accepted and did nothing with — the loop yielded whatever it
             // was told. Given as the **class name**, which is how the
-            // reference's own default is written (`Archive.java:420`).
+            // reference's own default is written (`Archive.java:449`).
             (
                 settings::IDLE_STRATEGY,
                 "org.agrona.concurrent.SleepingIdleStrategy",
@@ -1773,7 +1773,7 @@ mod tests {
             // would not pass.
             //
             // ★ `enabled` cannot be probed alone: the reference refuses it
-            // without a channel (`Archive.java:1240-1245`), so `companions()`
+            // without a channel (`Archive.java:1306-1311`), so `companions()`
             // supplies one. That is the same shape as the sync levels' pair, and
             // for the same reason — a cross-field rule is not a property of
             // either name.
@@ -1843,7 +1843,7 @@ mod tests {
     /// The defaults with one name set to `value`, spelled the way a deployment
     /// would.
     /// The order the reference puts the two levels in, in its own words
-    /// (`Archive.java:1202-1205`).
+    /// (`Archive.java:1268-1271`).
     #[test]
     fn a_catalog_below_the_recording_files_is_refused_with_the_references_words() {
         let refused = resolve_with(&archive_defaults(), settings::FILE_SYNC_LEVEL, "1")
@@ -1872,7 +1872,7 @@ mod tests {
 
     /// ★ The reference's trap, kept: the catalog's default is the **static** `0`
     /// rather than the file level that was configured
-    /// (`Archive.java:369`, `:388`, `:756`), so raising the file level on its
+    /// (`Archive.java:375`, `:388`, `:785`), so raising the file level on its
     /// own is refused instead of quietly syncing the catalog at the same level.
     ///
     /// The other side of the same rule is that the catalog **may** be raised
@@ -1895,7 +1895,7 @@ mod tests {
     ///
     /// ★ **One name here is not independently settable.**
     /// `aeron.archive.file.sync.level` is refused when the catalog's level is
-    /// **below** it (`Archive.java:1202-1205`), and the catalog's default is the
+    /// **below** it (`Archive.java:1268-1271`), and the catalog's default is the
     /// static `0` — so raising the file level by itself is an *error*, not a
     /// change, and a table that probed one name at a time would read the
     /// reference's own contract as a broken build.
@@ -1912,7 +1912,7 @@ mod tests {
         } else if name == settings::RECORDING_EVENTS_ENABLED && value == "true" {
             // The events channel, with no default of its own
             // (`AeronArchive.java:2988`): enabling the publication without one
-            // is the other refusal (`Archive.java:1240-1245`).
+            // is the other refusal (`Archive.java:1306-1311`).
             vec![(
                 settings::RECORDING_EVENTS_CHANNEL.to_owned(),
                 "aeron:ipc".to_owned(),

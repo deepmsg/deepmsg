@@ -2,7 +2,7 @@
 //! accepts.
 //!
 //! An archive may be configured to checksum what it records
-//! (`aeron.archive.record.checksum`, `Archive.java:640`), and the value is a
+//! (`aeron.archive.record.checksum`, `Archive.java:669`), and the value is a
 //! **name** that selects an implementation (`Checksums.newInstance`,
 //! `checksum/Checksums.java:65-80`): `CRC-32`, `CRC-32C`, or a class name that
 //! resolves to one of the two. The same names answer on the reading side

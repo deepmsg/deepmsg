@@ -555,7 +555,7 @@ impl SessionManager {
 
     /// `processPendingBackupSessions` (`SessionManager.java:569-580`): the
     /// follower's half of a backup query, which the leader does through
-    /// [`Self::process_all_pending_sessions`] (`ConsensusModuleAgent.java:2437-2443`).
+    /// [`Self::process_all_pending_sessions`] (`ConsensusModuleAgent.java:2454-2460`).
     ///
     /// # Errors
     ///

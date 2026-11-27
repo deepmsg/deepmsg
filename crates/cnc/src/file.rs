@@ -2,8 +2,8 @@
 //!
 //! The open sequence matters as much as the offsets do. The driver fills every
 //! other metadata field first and only then publishes `cnc_version` with a
-//! release store (`aeron-driver/src/main/c/aeron_driver.c:252-260`, then
-//! `:972`); a reader that reads the version with an acquire, and refuses to
+//! release store (`aeron-driver/src/main/c/aeron_driver.c:269-277`, then
+//! `:1012`); a reader that reads the version with an acquire, and refuses to
 //! look at anything else until it is non-zero, gets a coherent view of the
 //! whole block for free. Reading the other fields first would be reading
 //! memory the driver had not finished writing.
@@ -172,8 +172,8 @@ impl CncFile {
     /// Store the version — and with it, make the file readable.
     ///
     /// The one release store in the block, exactly where the reference puts it
-    /// (`aeron-driver/src/main/c/aeron_driver.c:972`, through the inline store
-    /// at `aeron_driver_context.h:456-459`), followed by the same flush
+    /// (`aeron-driver/src/main/c/aeron_driver.c:1012`, through the inline store
+    /// at `aeron_driver_context.h:464-467`), followed by the same flush
     /// (`:973`).
     ///
     /// Taking `&mut self` is the point: what this type reports is what the file
@@ -187,7 +187,7 @@ impl CncFile {
     /// as a version this build accepts.
     pub fn publish(&mut self) -> Result<(), CncCreateError> {
         // The order is the contract: the driver writes its first heartbeat and
-        // *then* the version (`aeron-driver/src/main/c/aeron_driver.c:971-972`).
+        // *then* the version (`aeron-driver/src/main/c/aeron_driver.c:1011-1012`).
         // A file published the other way round passes every client's version
         // gate and then fails its liveness rule, so every client that reads it
         // concludes the driver is already gone. The gap is closed here rather
@@ -234,8 +234,8 @@ impl CncFile {
     ///
     /// The driver calls this after it writes something another process has to
     /// be able to rely on: the ready version ([`CncFile::publish`]) and the
-    /// shutdown signal (`aeron-driver/src/main/c/aeron_driver_conductor.c:3494`,
-    /// after the heartbeat is set to `NULL_VALUE` at `:3493`). For a driver
+    /// shutdown signal (`aeron-driver/src/main/c/aeron_driver_conductor.c:3591`,
+    /// after the heartbeat is set to `NULL_VALUE` at `:3590`). For a driver
     /// about to exit, the second one is what the *next* driver reads to decide
     /// whether this one is still alive.
     ///
@@ -578,11 +578,11 @@ impl CncFile {
     /// the answer was made from.
     ///
     /// The rule is the reference's
-    /// (`aeron-driver/src/main/c/aeron_driver_context.c:1625-1643`): the
+    /// (`aeron-driver/src/main/c/aeron_driver_context.c:1669-1687`): the
     /// heartbeat's age must not exceed the timeout. A heartbeat of
     /// [`layout::NULL_VALUE`] means the driver stopped deliberately — it wrote
     /// that value on the way out
-    /// (`aeron-driver/src/main/c/aeron_driver_conductor.c:3493`) — which is
+    /// (`aeron-driver/src/main/c/aeron_driver_conductor.c:3590`) — which is
     /// reported as not active rather than as an impossibly old age.
     ///
     /// `None` if the region cannot be read.

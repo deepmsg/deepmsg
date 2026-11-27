@@ -28,10 +28,10 @@ pub const AERONMD_ENV: &str = "DEEPMSG_REF_AERONMD";
 pub const DEFAULT_AERONMD: &str = "../../aeron/cppbuild/Release/binaries/aeronmd";
 
 /// The Aeron version the byte contracts are written against.
-pub const EXPECTED_VERSION: &str = "1.53.2";
+pub const EXPECTED_VERSION: &str = "1.54.2";
 
 /// The commit that version was read from.
-pub const EXPECTED_COMMIT: &str = "664f58e705";
+pub const EXPECTED_COMMIT: &str = "481d4271ad";
 
 /// How long to wait for a freshly spawned driver to publish its CnC metadata.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -218,7 +218,7 @@ pub const AERON_ALL_ENV: &str = "DEEPMSG_REF_AERON_ALL_JAR";
 
 /// Where the jar is expected to be when the variable is unset: the reference's
 /// own Gradle output, which is what `aeron-archive`'s tools are run from.
-pub const DEFAULT_AERON_ALL: &str = "../../aeron/aeron-all/build/libs/aeron-all-1.53.2.jar";
+pub const DEFAULT_AERON_ALL: &str = "../../aeron/aeron-all/build/libs/aeron-all-1.54.2.jar";
 
 /// Find the reference's `aeron-all` jar, or `None` when there is no reference
 /// build.

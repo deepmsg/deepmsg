@@ -177,7 +177,7 @@ fn the_reference_container_schedules_and_cancels_the_same_way() {
 /// P3-8's container counters: `Cluster container max cycle time in ns` (218)
 /// and its threshold-exceeded count (219), allocated per `(clusterId,
 /// serviceId)` the way the reference's `Context.conclude` does
-/// (`ClusteredServiceContainer.java:969-984`).
+/// (`ClusteredServiceContainer.java:1003-1018`).
 #[test]
 fn our_container_allocates_the_cycle_time_counters() {
     use deepmsg_cluster_common::counters::{
@@ -221,7 +221,7 @@ fn our_container_allocates_the_cycle_time_counters() {
     }
 }
 
-/// `ClusterThreadNamingTest`'s second scenario (`:125-189`): the container's
+/// `ClusterThreadNamingTest`'s second scenario (`:128-192`): the container's
 /// thread carries `clustered-service-<clusterId>-<serviceId>`, cut to the
 /// kernel's 15 bytes. In-process only: an external container's thread is not
 /// in this process, and its own binary is covered by its unit test.

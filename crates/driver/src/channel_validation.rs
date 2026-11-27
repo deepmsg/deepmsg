@@ -1,7 +1,7 @@
 //! The checks a channel must pass against the endpoint it is about to join.
 //!
 //! Mirrors the validation half of `aeron-driver/src/main/c/aeron_driver_conductor.c`
-//! (`:464-568`) and `uri/aeron_driver_uri.c:555-600`. They live in a module of
+//! (`:464-568`) and `uri/aeron_driver_uri.c:560-605`. They live in a module of
 //! their own here rather than beside the endpoint lookups that call them,
 //! because they are **pure**: four numbers and two channel URIs in, an error
 //! message or nothing out. The reference keeps them in the conductor because it
@@ -73,6 +73,44 @@ pub fn validate_channel_buffer_length(
     })
 }
 
+/// `aeron_driver_conductor_validate_channel_socket_tos`
+/// (`aeron_driver_conductor.c:610-646`): a channel that names a `so-tos=` is
+/// asking for the socket the endpoint already has, and a traffic class that
+/// disagrees is a request that cannot be honoured.
+///
+/// `-1` (`AERON_NULL_VALUE`) on the arriving channel is agreement — it names
+/// nothing and takes the socket's; `-1` on the endpoint means the socket is on
+/// the OS default, which is its own message.
+///
+/// # Errors
+///
+/// The reference's message, verbatim: a client reads it.
+pub fn validate_channel_socket_tos(
+    named: i32,
+    existing: i32,
+    channel: &[u8],
+    existing_channel: &[u8],
+) -> Result<(), String> {
+    if named == -1 || named == existing {
+        return Ok(());
+    }
+
+    let channel = String::from_utf8_lossy(channel);
+    let existing_channel = String::from_utf8_lossy(existing_channel);
+
+    Err(if existing == -1 {
+        format!(
+            "so-tos={named} does not match existing value of OS default: \
+             existingChannel={existing_channel} channel={channel}"
+        )
+    } else {
+        format!(
+            "so-tos={named} does not match existing value of {existing}: \
+             existingChannel={existing_channel} channel={channel}"
+        )
+    })
+}
+
 /// `aeron_driver_conductor_validate_initial_window_for_rcvbuf`
 /// (`aeron_driver_conductor.c:464-526`).
 ///
@@ -120,7 +158,7 @@ pub fn validate_initial_window_for_rcvbuf(
 }
 
 /// `aeron_publication_params_validate_mtu_for_sndbuf`
-/// (`uri/aeron_driver_uri.c:574-600`, on `:555-568`).
+/// (`uri/aeron_driver_uri.c:579-605`, on `:555-568`).
 ///
 /// A frame has to fit the buffer that carries it, and the reference takes the
 /// buffer from the first of four places that has one. The name of the one it
@@ -152,7 +190,7 @@ pub fn validate_mtu_for_sndbuf(
 }
 
 /// `aeron_receiver_channel_endpoint_validate_sender_mtu_length`
-/// (`media/aeron_receive_channel_endpoint.c:984-1044`).
+/// (`media/aeron_receive_channel_endpoint.c:989-1049`).
 ///
 /// The check a receiver runs on the MTU a `SETUP` announces — the one time a
 /// sender's own frame size arrives on this side, and therefore the only place
@@ -168,17 +206,17 @@ pub fn validate_mtu_for_sndbuf(
 /// return the message a client reads. Nobody answers a client here: the image
 /// is being built from a `SETUP`, and what happens instead is that the driver
 /// writes an entry to the distinct error log, whose first line is the
-/// composition `AERON_SET_ERR` leaves (`util/aeron_error.c:351-378`). The code
+/// composition `AERON_SET_ERR` leaves (`util/aeron_error.c:371-398`). The code
 /// is the errno it was handed, a positive `EINVAL`, so the description is the
 /// OS's text and not the protocol table's.
 ///
 /// The caller appends its own line, which is what `AERON_APPEND_ERR` does at
-/// the reference's call site (`aeron_driver_conductor.c:6509`).
+/// the reference's call site (`aeron_driver_conductor.c:6604`).
 ///
 /// # Errors
 ///
 /// The reference's composition, verbatim. Its shape was read off a live
-/// 1.53.2 driver — `tests/interop/` runs both drivers through this fault and
+/// 1.54.2 driver — `tests/interop/` runs both drivers through this fault and
 /// compares — because the file names, the line numbers and the OS's wording
 /// are all things a careful reading gets almost right.
 pub fn validate_sender_mtu_length(
@@ -216,12 +254,12 @@ pub fn validate_sender_mtu_length(
 
     if sender_mtu_length > window_max_length {
         return Err(refused(
-            1022,
+            1027,
             format!("mtuLength={sender_mtu_length} > initialWindowLength={window_max_length}"),
         ));
     }
 
-    // `:1030-1041`: the last two, which are about the *socket* rather than
+    // `:1035-1046`: the last two, which are about the *socket* rather than
     // about the arithmetic — a window or a frame larger than the receive
     // buffer is a driver whose pipeline cannot hold its own configuration.
     validate_so_rcvbuf(
@@ -265,7 +303,7 @@ fn refused(line: u32, message: String) -> String {
 }
 
 /// The same, for `aeron_receive_channel_endpoint_validate_so_rcvbuf`, whose two
-/// arms are two sites (`:961` with a socket buffer, `:972` without).
+/// arms are two sites (`:966` with a socket buffer, `:977` without).
 fn refused_so_rcvbuf(line: u32, subject: &str, value: usize, limit: usize, suffix: &str) -> String {
     refused_by(
         "aeron_receive_channel_endpoint_validate_so_rcvbuf",
@@ -289,7 +327,7 @@ fn refused_by(function: &str, line: u32, message: String) -> String {
 }
 
 /// `aeron_receive_channel_endpoint_validate_so_rcvbuf`
-/// (`media/aeron_receive_channel_endpoint.c:953-982`).
+/// (`media/aeron_receive_channel_endpoint.c:958-987`).
 ///
 /// The one message in this module that names an environment variable: the
 /// reader is being told which knob to turn, and the knob's name is part of the
@@ -307,9 +345,9 @@ fn validate_so_rcvbuf(
     os_default_socket_rcvbuf: usize,
 ) -> Result<(), String> {
     let (limit, suffix, line) = if socket_rcvbuf != 0 {
-        (socket_rcvbuf, "", 961)
+        (socket_rcvbuf, "", 966)
     } else {
-        (os_default_socket_rcvbuf, " (OS Default)", 972)
+        (os_default_socket_rcvbuf, " (OS Default)", 977)
     };
 
     if limit >= value {
@@ -319,7 +357,7 @@ fn validate_so_rcvbuf(
     Err(refused_so_rcvbuf(line, subject, value, limit, suffix))
 }
 
-/// `aeron_publication_params_validate_mtu` (`uri/aeron_driver_uri.c:555-568`).
+/// `aeron_publication_params_validate_mtu` (`uri/aeron_driver_uri.c:560-573`).
 fn validate_mtu(socket_sndbuf: usize, mtu_length: usize, name: &str) -> Result<(), String> {
     if socket_sndbuf < mtu_length {
         return Err(format!(
@@ -349,6 +387,37 @@ mod tests {
         assert_eq!(
             Ok(()),
             validate_channel_buffer_length("so-sndbuf", 131_072, 131_072, CHANNEL, EXISTING)
+        );
+    }
+
+    #[test]
+    fn a_channel_that_named_a_different_tos_is_refused_by_name() {
+        assert_eq!(
+            Ok(()),
+            validate_channel_socket_tos(-1, 42, CHANNEL, EXISTING),
+            "naming no so-tos is agreement"
+        );
+        assert_eq!(
+            Ok(()),
+            validate_channel_socket_tos(42, 42, CHANNEL, EXISTING)
+        );
+
+        let refused = validate_channel_socket_tos(42, -1, CHANNEL, EXISTING)
+            .expect_err("a mismatch against the OS default");
+        assert_eq!(
+            "so-tos=42 does not match existing value of OS default: \
+             existingChannel=aeron:udp?endpoint=localhost:9999|so-sndbuf=131072 \
+             channel=aeron:udp?endpoint=localhost:9999|so-sndbuf=65536",
+            refused
+        );
+
+        let refused = validate_channel_socket_tos(42, 7, CHANNEL, EXISTING)
+            .expect_err("a mismatch against a value");
+        assert_eq!(
+            "so-tos=42 does not match existing value of 7: \
+             existingChannel=aeron:udp?endpoint=localhost:9999|so-sndbuf=131072 \
+             channel=aeron:udp?endpoint=localhost:9999|so-sndbuf=65536",
+            refused
         );
     }
 
@@ -496,7 +565,7 @@ mod tests {
         assert_eq!(
             "(22) Invalid argument\n\
              [aeron_receiver_channel_endpoint_validate_sender_mtu_length, \
-             aeron_receive_channel_endpoint.c:1022] mtuLength=1408 > initialWindowLength=1376\n",
+             aeron_receive_channel_endpoint.c:1027] mtuLength=1408 > initialWindowLength=1376\n",
             refused
         );
     }
@@ -526,7 +595,7 @@ mod tests {
             ),
             (
                 (1408, 1376, 131_072, 0),
-                1022,
+                1027,
                 "mtuLength=1408 > initialWindowLength=1376",
             ),
         ] {
@@ -557,7 +626,7 @@ mod tests {
         assert_eq!(
             "(22) Invalid argument\n\
              [aeron_receive_channel_endpoint_validate_so_rcvbuf, \
-             aeron_receive_channel_endpoint.c:961] Max Window length greater than socket SO_RCVBUF, \
+             aeron_receive_channel_endpoint.c:966] Max Window length greater than socket SO_RCVBUF, \
              increase 'AERON_RCV_INITIAL_WINDOW_LENGTH' to match window: \
              value=131072, SO_RCVBUF=65536\n",
             window
@@ -569,7 +638,7 @@ mod tests {
         let by_default =
             validate_sender_mtu_length(1408, 131_072, 0, 65_536).expect_err("too large");
         assert!(
-            by_default.contains("aeron_receive_channel_endpoint.c:972]"),
+            by_default.contains("aeron_receive_channel_endpoint.c:977]"),
             "{by_default}"
         );
         assert!(

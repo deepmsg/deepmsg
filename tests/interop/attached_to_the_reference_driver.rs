@@ -72,7 +72,7 @@ use deepmsg_tests::temp::TempDir;
 ///
 /// ★ **The reference's default is `-1`, and `-1` is `Aeron.NULL_VALUE`** — which
 /// `findCounterIdBySession` treats as "do not compare the archive id at all"
-/// (`RecordingPos.java:230`). A gate run at the default would therefore never exercise
+/// (`RecordingPos.java:202`). A gate run at the default would therefore never exercise
 /// the one field of the key whose *value* has to match, so it is set, and wide enough
 /// to be 64-bit (`java_archive_id.rs` sets the same number for the same reason).
 const ARCHIVE_ID: i64 = 0x0423_6483_BEEF;
@@ -92,7 +92,7 @@ const DEADLINE: Duration = Duration::from_secs(30);
 /// A port this run owns, for the two channels that have to be UDP with one.
 ///
 /// The reference's archive refuses a non-UDP control channel outright
-/// (`Archive.java:1227-1231`), and its client refuses anything but a concrete port for
+/// (`Archive.java:1293-1297`), and its client refuses anything but a concrete port for
 /// a publication, so neither channel can be left to the driver.
 fn port(offset: u32) -> u32 {
     8210 + (std::process::id() % 400) * 2 + offset

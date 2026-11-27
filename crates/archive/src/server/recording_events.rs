@@ -12,7 +12,7 @@
 //!
 //! # One publication, and who may hold it
 //!
-//! The reference builds it on the conductor (`ArchiveConductor.java:224-225`)
+//! The reference builds it on the conductor (`ArchiveConductor.java:223-224`)
 //! and hands the **same object** to every `RecordingSession`
 //! (`RecordingSession.java:44`, `:62`). That works there because Aeron's
 //! `Publication` may be written from any thread as long as one thread drives the

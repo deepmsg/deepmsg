@@ -56,6 +56,8 @@ shouldStartBoundedReplayUsingResponseChannel(String) [1] replayChannel = "aeron:
 shouldStartBoundedReplayUsingResponseChannel(String) [2] replayChannel = "aeron:udp?control-mode=response|control=localhost:10003|session-id=5"	io.aeron.archive.ArchiveResponseClientTest
 shouldStartReplayUsingResponseChannel(String) [1] replayChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.ArchiveResponseClientTest
 shouldStartReplayUsingResponseChannel(String) [2] replayChannel = "aeron:udp?control-mode=response|control=localhost:10003|session-id=5"	io.aeron.archive.ArchiveResponseClientTest
+shouldStartReplayUsingResponseChannelInTheInvokerMode(String) [1] replayChannel = "aeron:udp?control-mode=response|control=localhost:10002"	io.aeron.archive.ArchiveResponseClientTest
+shouldStartReplayUsingResponseChannelInTheInvokerMode(String) [2] replayChannel = "aeron:udp?control-mode=response|control=localhost:10003|session-id=5"	io.aeron.archive.ArchiveResponseClientTest
 recordAndReplayConcurrentPublication(ThreadingMode, ArchiveThreadingMode) [1] threadingMode = SHARED, archiveThreadingMode = SHARED	io.aeron.archive.ArchiveSystemTest
 recordAndReplayConcurrentPublication(ThreadingMode, ArchiveThreadingMode) [2] threadingMode = SHARED_NETWORK, archiveThreadingMode = SHARED	io.aeron.archive.ArchiveSystemTest
 recordAndReplayConcurrentPublication(ThreadingMode, ArchiveThreadingMode) [3] threadingMode = DEDICATED, archiveThreadingMode = DEDICATED	io.aeron.archive.ArchiveSystemTest

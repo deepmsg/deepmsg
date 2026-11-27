@@ -4,7 +4,7 @@
 //! through atomics. That is deliberate and it is what makes them testable:
 //! the caller reads `cnc_version` with an acquire first, and an acquire on
 //! that field orders every other field in the block, because the driver fills
-//! them before publishing the version (`aeron_driver.c:252-260` then `:972`).
+//! them before publishing the version (`aeron_driver.c:269-277` then `:1012`).
 //! After the acquire, a bounded copy is a coherent view of the block.
 
 use core::ops::Range;
@@ -86,7 +86,7 @@ impl CncMetadata {
     /// The inverse of [`CncMetadata::decode`], and the whole of the writer's
     /// side except the release store that publishes it: the reference fills
     /// every field plainly and only then stores `cnc_version`
-    /// (`aeron-driver/src/main/c/aeron_driver.c:250-269`, then `:972`), so
+    /// (`aeron-driver/src/main/c/aeron_driver.c:267-286`, then `:1012`), so
     /// `cnc_version` here is written like any other field and the caller
     /// decides when it becomes visible. [`crate::CncFile::create`] writes the
     /// block with the version still zero and publishes afterwards.
