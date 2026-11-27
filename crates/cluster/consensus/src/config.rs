@@ -198,6 +198,19 @@ pub const TOTAL_SNAPSHOT_DURATION_THRESHOLD_DEFAULT_NS: i64 = 10_000_000_000;
 pub const CLUSTER_CLOCK_PROP_NAME: &str = "aeron.cluster.clock";
 /// `aeron.dir`, the driver's directory (`CommonContext.java`).
 pub const AERON_DIR_PROP_NAME: &str = "aeron.dir";
+/// `aeron.archive.local.control.channel`
+/// (`AeronArchive.java:2716`, `LOCAL_CONTROL_CHANNEL_PROP_NAME`): the channel
+/// this member uses to reach its own archive. Local — the remote
+/// `aeron.archive.control.channel` is for an archive on another host.
+pub const ARCHIVE_LOCAL_CONTROL_CHANNEL_PROP_NAME: &str = "aeron.archive.local.control.channel";
+/// `LOCAL_CONTROL_CHANNEL_DEFAULT` (`AeronArchive.java:2722`).
+pub const ARCHIVE_LOCAL_CONTROL_CHANNEL_DEFAULT: &str = "aeron:ipc?term-length=64k";
+/// `aeron.archive.local.control.stream.id`
+/// (`AeronArchive.java:2728`, `LOCAL_CONTROL_STREAM_ID_PROP_NAME`).
+pub const ARCHIVE_LOCAL_CONTROL_STREAM_ID_PROP_NAME: &str = "aeron.archive.local.control.stream.id";
+/// `LOCAL_CONTROL_STREAM_ID_DEFAULT` (`AeronArchive.java:2734`), which is
+/// `CONTROL_STREAM_ID_DEFAULT` (`:2710`).
+pub const ARCHIVE_LOCAL_CONTROL_STREAM_ID_DEFAULT: i32 = 10;
 /// `aeron.cluster.idle.strategy` (`ClusteredServiceContainer.java:602`).
 pub const CLUSTER_IDLE_STRATEGY_PROP_NAME: &str = "aeron.cluster.idle.strategy";
 /// `DEFAULT_IDLE_STRATEGY` (`ClusteredServiceContainer.java:596`).
@@ -532,13 +545,32 @@ impl ConsensusModuleConfig {
         // `concludeArchiveContext` (`ConsensusModule.java:2112-2135`): the
         // local archive's two channels carry an alias that names this member,
         // so two members sharing a driver do not share a control session.
-        let request_uri = deepmsg_core::uri::ChannelUri::parse("aeron:ipc")
-            .expect("a built-in URI")
+        //
+        // Both channels and the request stream are the *local* control ones
+        // (`ConsensusModule.java:2114-2117`, from `AeronArchive.Configuration`),
+        // not the remote `aeron.archive.control.*`. Reading only the built-in
+        // defaults here — `aeron:ipc` and stream 10 — left a member waiting
+        // forever for an archive that runs on the reference harness's local
+        // stream 110: the client sees `cluster: connect timeout` and never
+        // binds its ingress.
+        let local_control_channel = properties
+            .get(ARCHIVE_LOCAL_CONTROL_CHANNEL_PROP_NAME)
+            .unwrap_or(ARCHIVE_LOCAL_CONTROL_CHANNEL_DEFAULT);
+        let request_uri = deepmsg_core::uri::ChannelUri::parse(local_control_channel)
+            .map_err(|error| {
+                ConfigProblem::Invalid(format!(
+                    "{ARCHIVE_LOCAL_CONTROL_CHANNEL_PROP_NAME}: {error}"
+                ))
+            })?
             .with_alias_if_absent(&format!(
                 "cm-archive-ctrl-req-cluster-{cluster_id}-member-{member_id}"
             ));
-        let response_uri = deepmsg_core::uri::ChannelUri::parse("aeron:ipc")
-            .expect("a built-in URI")
+        let response_uri = deepmsg_core::uri::ChannelUri::parse(local_control_channel)
+            .map_err(|error| {
+                ConfigProblem::Invalid(format!(
+                    "{ARCHIVE_LOCAL_CONTROL_CHANNEL_PROP_NAME}: {error}"
+                ))
+            })?
             .with_alias_if_absent(&format!(
                 "cm-archive-ctrl-resp-cluster-{cluster_id}-member-{member_id}"
             ));
@@ -546,6 +578,10 @@ impl ConsensusModuleConfig {
         archive.aeron_dir = aeron_dir.to_string_lossy().into_owned();
         archive.control_request_channel = Some(request_uri.build());
         archive.control_response_channel = Some(response_uri.build());
+        archive.control_request_stream_id = int(
+            ARCHIVE_LOCAL_CONTROL_STREAM_ID_PROP_NAME,
+            ARCHIVE_LOCAL_CONTROL_STREAM_ID_DEFAULT,
+        )?;
         // `Context.conclude` (`ConsensusModule.java:2112-2119`): the response
         // stream is per-cluster so two clusters can share one archive.
         archive.control_response_stream_id += cluster_id * 100 + 100;
@@ -1088,6 +1124,63 @@ mod tests {
             config.archive.control_response_stream_id,
             "the response stream is per cluster"
         );
+    }
+
+    #[test]
+    fn the_archive_control_uses_the_local_channel_and_stream() {
+        // `concludeArchiveContext` (`ConsensusModule.java:2114-2117`): the
+        // member's own archive is reached over `aeron.archive.local.control.*`.
+        // A member that read only the defaults (10, `aeron:ipc`) connected to
+        // nothing when the archive ran on the harness's 110 (2026-11-27: the
+        // C6 Rust arm died at startup with `cluster: connect timeout`, and the
+        // client never saw an ingress publication).
+        let mut source = properties();
+        source
+            .apply_args([
+                "-Daeron.archive.local.control.stream.id=110".to_owned(),
+                "-Daeron.archive.local.control.channel=aeron:ipc?term-length=64k".to_owned(),
+            ])
+            .unwrap();
+        let config = ConsensusModuleConfig::from_properties(&source).unwrap();
+        assert_eq!(110, config.archive.control_request_stream_id);
+        let request = config
+            .archive
+            .control_request_channel
+            .as_deref()
+            .expect("a request channel");
+        assert!(request.starts_with("aeron:ipc?"), "{request}");
+        assert!(request.contains("term-length=64k"), "{request}");
+        assert!(
+            request.contains("alias=cm-archive-ctrl-req-cluster-19-member-7"),
+            "{request}"
+        );
+        let response = config
+            .archive
+            .control_response_channel
+            .as_deref()
+            .expect("a response channel");
+        assert!(response.contains("term-length=64k"), "{response}");
+        // The response stream keeps its per-cluster offset on the reference's
+        // default base (20) — 19 * 100 + 100 + 20.
+        assert_eq!(
+            19 * 100 + 100 + 20,
+            config.archive.control_response_stream_id
+        );
+    }
+
+    #[test]
+    fn the_archive_control_defaults_are_the_references() {
+        // `LOCAL_CONTROL_STREAM_ID_DEFAULT` is 10 and
+        // `LOCAL_CONTROL_CHANNEL_DEFAULT` is `aeron:ipc?term-length=64k`
+        // (`AeronArchive.java:2722,2734`).
+        let config = ConsensusModuleConfig::from_properties(&properties()).unwrap();
+        assert_eq!(10, config.archive.control_request_stream_id);
+        let request = config
+            .archive
+            .control_request_channel
+            .as_deref()
+            .expect("a request channel");
+        assert!(request.contains("term-length=64k"), "{request}");
     }
 
     #[test]
