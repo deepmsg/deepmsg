@@ -2000,54 +2000,21 @@ fn collect_cross_signal(signal: &RecordingSignal) {
         .push(*signal);
 }
 
-/// `n` UDP ports this process may use, **probed rather than computed**.
-///
-/// These are ports something *binds* — the source archive of
-/// [`a_replication_reaches_an_archive_in_another_process`] binds the one its
-/// control channel names — so they cannot be the hard-coded kind the rest of
-/// this file uses for addresses nobody binds.
-///
-/// They used to be computed: `20_000 + pid % 20_000 + offset`, "a base that
-/// keeps two test binaries running at once apart". It does not, in either
-/// direction, and the failure that found this out was a **live replication that
-/// waited for ever** (the D2/D4 record's flake, `analysis/archive-client-api-flake.md`
-/// §B):
-///
-/// * **Two binaries' ports overlap by construction.** With pids one apart,
-///   `base + 9` for one is `base + 8` for the next, and the offsets in play
-///   here are 1, 7, 8 and 9 — smaller than the step between the pids. Two test
-///   binaries running at once therefore name the *same* port for two different
-///   roles, and the loser's bind is `EADDRINUSE`.
-/// * **And the arithmetic can land inside the kernel's own ephemeral range**
-///   (32 768-60 999): `base + offset` runs from 20 009 to 40 009, so any process
-///   whose pid is past ~12 759 `% 20 000` is naming ports the kernel hands out
-///   to anyone — including this test's own clients.
-///
-/// What that cost: the live destination's `add_receive_destination` was refused
-/// with `(98) Address already in use`, the replication session **never reads
-/// that answer** (neither does the reference — `ReplicationSession` polls its
-/// destinations only to retire them), so it set `isLiveAdded` anyway and waited
-/// for a stream that had never been added. One bind, and the merge never came.
-///
-/// So the kernel picks, all `n` at once so that they cannot collide with each
-/// other, and the sockets go as soon as their numbers are known — which is the
-/// driver's to bind next, the way every other fixed address in this file is
-/// somebody else's to bind.
-fn free_udp_ports<const N: usize>() -> [u16; N] {
-    let probes: Vec<std::net::UdpSocket> = (0..N)
-        .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").expect("the kernel can lend a UDP port"))
-        .collect();
-
-    let mut ports = [0u16; N];
-    for (port, probe) in ports.iter_mut().zip(&probes) {
-        *port = probe
-            .local_addr()
-            .expect("a bound socket knows its port")
-            .port();
-    }
-
-    ports
-}
+// The ports these three tests dial are **above the kernel's ephemeral range**
+// (`deepmsg_tests::ports::port`, 61 000..65 535), each test with its own offset
+// in this process's slot.
+//
+// They used to be probed: bind `:0`, read the number, close the socket and let
+// the driver bind it. That is a time-of-check/time-of-use race — the kernel
+// hands the number to any other socket in between — and it cost a live
+// replication that waited for ever (the D2/D4 record's flake,
+// `analysis/archive-client-api-flake.md` §B): a parallel test's probe took the
+// number, the archive's bind was refused with `(98) Address already in use`,
+// and the failure read as a missing signal rather than as a bind.
+//
+// The offset rule is `deepmsg_tests::ports`': test functions in one binary run
+// as parallel threads of one process, so every test here needs its own. The
+// offsets below are distinct within this binary.
 
 /// **A replicate fetches its source's descriptor, and makes the destination
 /// row.**
@@ -2386,7 +2353,7 @@ fn a_replication_reaches_an_archive_in_another_process() {
     };
 
     // **The source archive**, on a control channel the destination can dial.
-    let [source_control_port] = free_udp_ports::<1>();
+    let source_control_port = deepmsg_tests::ports::port(0);
     let source_control = format!("aeron:udp?endpoint=localhost:{source_control_port}");
     let source_control_property = format!("-Daeron.archive.control.channel={source_control}");
     // The driver's mode, said out loud because the archiving media driver
@@ -2648,7 +2615,7 @@ fn a_refused_replication_is_an_error_and_not_a_silence() {
     // The source archive, on a control channel the destination can dial — the
     // same arrangement as the cross-process copy above, because the refusal has
     // to come from a session that was opened against a real source.
-    let [source_control_port] = free_udp_ports::<1>();
+    let source_control_port = deepmsg_tests::ports::port(1);
     let source_control = format!("aeron:udp?endpoint=localhost:{source_control_port}");
     let source_control_property = format!("-Daeron.archive.control.channel={source_control}");
     let source_properties = ["-Daeron.threading.mode=SHARED", &source_control_property];
@@ -3015,7 +2982,9 @@ fn a_live_replication_merges_into_the_stream_it_is_copying() {
     // (*Address already in use*) wherever the source's own reader is on the
     // same host. The reference's test streams its live half dynamically too
     // (`ReplayMergeTest.java:81-88`).
-    let [control_port, source_port, live_port] = free_udp_ports::<3>();
+    let control_port = deepmsg_tests::ports::port(2);
+    let source_port = deepmsg_tests::ports::port(3);
+    let live_port = deepmsg_tests::ports::port(4);
     let control = format!("127.0.0.1:{control_port}");
     let source_endpoint = format!("127.0.0.1:{source_port}");
     let live_endpoint = format!("127.0.0.1:{live_port}");
